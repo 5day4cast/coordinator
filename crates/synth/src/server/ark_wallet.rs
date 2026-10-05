@@ -34,10 +34,25 @@ pub(super) fn router(state: Dashboard) -> Router {
 /// The dashboard's card.
 pub(super) async fn card(state: &Dashboard, now: OffsetDateTime) -> Markup {
     let Some(refiller) = &state.ark_refiller else {
+        let legacy = state.runner.db().list_arkade_topups(1).await;
+        let enabled = state
+            .rebalancer
+            .as_ref()
+            .is_some_and(|r| r.config().arkade.is_some());
         return html! {
             section id="ark-wallet" {
                 h2 { "Ark wallet" }
-                p.note { "Refilling ark-swapd's Ark wallet is not enabled (ark_refill)." }
+                p.note { (if enabled { "The rebalancer refills this wallet." } else { "Automatic wallet refills are off." }) }
+                @match legacy {
+                    Ok(rows) => {
+                        @if let Some(last) = rows.first() {
+                            p { "Last top-up: " (format::sats_signed(last.amount_sats)) " sats · " (last.status)
+                                " · " (format::time_text(&last.created_at, now)) }
+                        } @else { p { "No top-up recorded yet." } }
+                    },
+                    Err(_) => p.error { "Top-ups could not be read." },
+                }
+                p { a href=(PATH) { "Refill history →" } }
             }
         };
     };
@@ -100,10 +115,30 @@ pub(super) async fn history_live(state: &Dashboard) -> Markup {
     let now = OffsetDateTime::now_utc();
     let refills = ark_refill::list(state.runner.db(), HISTORY).await;
     let card = card(state, now).await;
+    let legacy = state.runner.db().list_arkade_topups(HISTORY).await;
     html! {
         (card)
         section.history {
-            h2 { "Refills" }
+            h2 { "Rebalancer top-ups" }
+            @match legacy {
+                Ok(rows) if rows.is_empty() => p { "No rebalancer top-ups recorded." },
+                Ok(rows) => div.scroll { table.stack {
+                    thead { tr { th { "When" } th.num { "Amount" } th { "Status" } th { "Transaction / error" } } }
+                    tbody { @for row in rows { tr {
+                        td { (format::time_text(&row.created_at, now)) }
+                        td.num { (format::sats_signed(row.amount_sats)) " sats" }
+                        td { (row.status) }
+                        td {
+                            @if let Some(txid) = &row.txid { (format::copyable_short(txid)) }
+                            @if let Some(error) = &row.error_message { span.error { (error) } }
+                        }
+                    } } }
+                } },
+                Err(_) => p.error { "Top-ups could not be read." },
+            }
+        }
+        section.history {
+            h2 { "Wallet refills" }
             @match &refills {
                 Err(_) => p.error { "Refills could not be read." },
                 Ok(refills) if refills.is_empty() => p { "No refill sent yet." },

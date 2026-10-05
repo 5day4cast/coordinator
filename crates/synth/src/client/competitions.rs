@@ -339,6 +339,20 @@ impl CompetitionResponse {
                 .unwrap_or(false)
     }
 
+    /// The stations its entries pick for.
+    pub fn stations(&self) -> Vec<String> {
+        self.event_submission
+            .get("locations")
+            .and_then(serde_json::Value::as_array)
+            .map(|stations| {
+                stations
+                    .iter()
+                    .filter_map(|station| station.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// When its entries close: when its observations start.
     pub fn entries_close(&self) -> Option<OffsetDateTime> {
         let at = self
@@ -590,6 +604,9 @@ impl CoordinatorClient {
 
     /// List all competitions
     pub async fn list_competitions(&self) -> Result<Vec<CompetitionResponse>> {
+        // HOOK(competitions-filters): the list carries every competition's contract and
+        // signatures. Once the coordinator takes a filter or pages, ask only for those taking
+        // entries here: the keep-open check, its one frequent caller, reads nothing else.
         let url = format!("{}/api/v1/competitions", self.base_url());
         let resp = super::retry_transport(3, || async {
             anyhow::Ok(self.http().get(&url).send().await?)

@@ -1,4 +1,5 @@
-use crate::db::{SynthDb, TestRun};
+use crate::db::{LifecycleEvidence, SynthDb};
+use crate::runner::keep_open::Forms;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -34,7 +35,7 @@ lazy_static::lazy_static! {
 
     pub static ref LIFECYCLE_HEALTHY: prometheus::Gauge = register_gauge!(
         "synth_competition_lifecycle_healthy",
-        "Latest assessed outcome of a run meant to pay out, full lifecycle or queued (1=paid out, 0=failed, NaN=unverified or absent)"
+        "Latest verdict on the runs meant to pay out, full lifecycle or queued (0=one failed and none has passed or paid out since, or the newest money verdict is stuck; 1=otherwise, once a payout was verified; NaN=no payout verified yet or no fresh evidence)"
     ).unwrap();
 
     pub static ref LAST_SUCCESS: prometheus::Gauge = register_gauge!(
@@ -52,9 +53,19 @@ lazy_static::lazy_static! {
         "Minutes until entries close for the open competition with the most time left (0 when none)"
     ).unwrap();
 
+    pub static ref OPEN_COMPETITION_ENTERABLE: prometheus::Gauge = register_gauge!(
+        "synth_open_competition_enterable",
+        "Whether a visitor can make every pick on the entry form of each competition open for visitors (1=yes, 0=a form has lines without a forecast or shows no picks, NaN=none open or not loaded yet)"
+    ).unwrap();
+
+    pub static ref ENTRY_FORM_MISSING_FORECASTS: prometheus::Gauge = register_gauge!(
+        "synth_entry_form_missing_forecasts",
+        "Forecast lines without a forecast on the entry forms of the competitions open for visitors, when last loaded"
+    ).unwrap();
+
     pub static ref KEEP_OPEN_STARTS: prometheus::Counter = register_counter!(
         "synth_keep_open_starts_total",
-        "Runs started early because no competition was open for visitors"
+        "Runs started early to keep a competition open for visitors"
     ).unwrap();
 
     pub static ref BACKFILL_PLAYERS: prometheus::Counter = register_counter!(
@@ -80,6 +91,26 @@ lazy_static::lazy_static! {
     pub static ref ARK_REFILL_FAILURES: prometheus::Counter = register_counter!(
         "synth_ark_refill_failures_total",
         "Refills of ark-swapd's Ark wallet that were refused, dropped, or never reached it"
+    ).unwrap();
+
+    pub static ref ARKADE_TOPUPS: prometheus::Counter = register_counter!(
+        "synth_arkade_topup_total",
+        "On-chain top-ups of ark-swapd's Ark wallet the rebalancer sent (rebalance.arkade)"
+    ).unwrap();
+
+    pub static ref ARKADE_TOPUP_SATS: prometheus::Counter = register_counter!(
+        "synth_arkade_topup_sat_total",
+        "Sats the rebalancer sent on-chain to top up ark-swapd's Ark wallet"
+    ).unwrap();
+
+    pub static ref ARKADE_TOPUP_LAST_SUCCESS: prometheus::Gauge = register_gauge!(
+        "synth_arkade_topup_last_success_timestamp_seconds",
+        "Unix timestamp when the rebalancer last sent a top-up of ark-swapd's Ark wallet"
+    ).unwrap();
+
+    pub static ref ARKADE_TOPUP_FAILURES: prometheus::Counter = register_counter!(
+        "synth_arkade_topup_failures_total",
+        "Top-ups of ark-swapd's Ark wallet the rebalancer could not send"
     ).unwrap();
 
     pub static ref LANE_START_RETRIES: prometheus::CounterVec = register_counter_vec!(
@@ -109,6 +140,11 @@ fn initialize() {
     lazy_static::initialize(&LAST_SUCCESS);
     lazy_static::initialize(&OPEN_COMPETITIONS);
     lazy_static::initialize(&OPEN_COMPETITION_MINUTES_LEFT);
+    lazy_static::initialize(&ENTRY_FORM_MISSING_FORECASTS);
+    // Set by the keep-open check once it has loaded a form.
+    if OPEN_COMPETITION_ENTERABLE.get() == 0.0 && ENTRY_FORM_MISSING_FORECASTS.get() == 0.0 {
+        OPEN_COMPETITION_ENTERABLE.set(f64::NAN);
+    }
     lazy_static::initialize(&KEEP_OPEN_STARTS);
     lazy_static::initialize(&BACKFILL_PLAYERS);
     lazy_static::initialize(&ARK_REFILLS);
@@ -117,6 +153,13 @@ fn initialize() {
     // Set before the router is built when a refill was ever sent.
     if ARK_REFILL_LAST_SUCCESS.get() == 0.0 {
         ARK_REFILL_LAST_SUCCESS.set(f64::NAN);
+    }
+    lazy_static::initialize(&ARKADE_TOPUPS);
+    lazy_static::initialize(&ARKADE_TOPUP_SATS);
+    lazy_static::initialize(&ARKADE_TOPUP_FAILURES);
+    // Set before the router is built when a top-up was ever sent.
+    if ARKADE_TOPUP_LAST_SUCCESS.get() == 0.0 {
+        ARKADE_TOPUP_LAST_SUCCESS.set(f64::NAN);
     }
     lazy_static::initialize(&LANE_START_RETRIES);
     lazy_static::initialize(&RESUMED_RUNS);
@@ -131,17 +174,56 @@ fn initialize() {
     crate::scenarios::stress::initialize_metrics();
 }
 
-pub(crate) fn lifecycle_health(run: Option<&TestRun>) -> f64 {
-    match run {
-        Some(run) if matches!(run.status.as_str(), "failed" | "interrupted") => 0.0,
-        Some(run) if matches!(run.money.as_deref(), Some("stuck" | "written_off")) => 0.0,
-        Some(run) if run.status == "passed" && run.money.as_deref() == Some("paid_out") => 1.0,
+/// The lifecycle gauge at `now`, in UNIX seconds, from the latest verdicts on the runs meant to
+/// end in a payout.
+///
+/// - 0 from when such a run fails after making its competition until the next pass: the next
+///   such run to finish with every step passed, or the next payout verified, whichever comes
+///   first. Also 0 while the newest such run whose money has a verdict left it stuck or written
+///   off.
+/// - 1 otherwise, once a payout has been verified: steps passing alone is not a payout.
+/// - NaN until a payout has been verified, and without fresh evidence.
+///
+/// Verdicts count by when they were reached, not by when their run started. A run takes a day
+/// to pay out, so one that failed in its first hour used to hide every earlier run that paid out
+/// after it, and the gauge stayed at 0 until a run started after the failure had paid out too.
+pub(crate) fn lifecycle_health(evidence: &LifecycleEvidence, now: i64) -> f64 {
+    // The slowest normal tracker cadence is fifteen minutes. Do not carry an old
+    // healthy result through a stopped tracker or an idle installation indefinitely.
+    let fresh = evidence
+        .observed
+        .is_some_and(|at| (0..=30 * 60).contains(&now.saturating_sub(at)));
+    if !fresh {
+        return f64::NAN;
+    }
+    let last_good = evidence.last_passed.max(evidence.last_paid_out);
+    // Within the same second the failure counts, which a later pass then clears.
+    let failed_since = evidence
+        .last_failed
+        .is_some_and(|failed| last_good.is_none_or(|good| good <= failed));
+    let money_lost = matches!(
+        evidence.newest_money.as_deref(),
+        Some("stuck" | "written_off")
+    );
+    if failed_since || money_lost {
+        0.0
+    } else if evidence.last_paid_out.is_some() {
+        1.0
+    } else {
+        f64::NAN
+    }
+}
+
+/// The enterable gauge for what the open competitions' entry forms last showed.
+pub(crate) fn enterable(forms: Option<Forms>) -> f64 {
+    match forms {
+        Some(forms) if forms.checked > 0 => f64::from(u8::from(forms.all_enterable())),
         _ => f64::NAN,
     }
 }
 
 async fn metrics_handler(State(db): State<SynthDb>) -> Response {
-    let (latest, last_success, observed_at) = match db.lifecycle_metrics().await {
+    let evidence = match db.lifecycle_metrics().await {
         Ok(evidence) => evidence,
         Err(error) => {
             log::warn!("Cannot read lifecycle metrics: {error:#}");
@@ -152,16 +234,12 @@ async fn metrics_handler(State(db): State<SynthDb>) -> Response {
                 .into_response();
         }
     };
+    if let Ok(Some(at)) = db.last_rebalance_at("arkade").await {
+        record_arkade_topup_last_success(at.unix_timestamp());
+    }
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
-    // The slowest normal tracker cadence is fifteen minutes. Do not carry an old
-    // healthy result through a stopped tracker or an idle installation indefinitely.
-    let fresh = observed_at.is_some_and(|at| (0..=30 * 60).contains(&now.saturating_sub(at)));
-    LIFECYCLE_HEALTHY.set(if fresh {
-        lifecycle_health(latest.as_ref())
-    } else {
-        f64::NAN
-    });
-    LAST_SUCCESS.set(last_success.map_or(f64::NAN, |at| at as f64));
+    LIFECYCLE_HEALTHY.set(lifecycle_health(&evidence, now));
+    LAST_SUCCESS.set(evidence.last_paid_out.map_or(f64::NAN, |at| at as f64));
     let mut buffer = Vec::new();
     if let Err(error) = TextEncoder::new().encode(&prometheus::gather(), &mut buffer) {
         log::warn!("Cannot encode metrics: {error}");
@@ -206,6 +284,33 @@ pub fn record_keep_open_start() {
     KEEP_OPEN_STARTS.inc();
 }
 
+/// Record what the entry forms of the competitions open for visitors showed when last loaded;
+/// None when none is open.
+pub fn record_entry_forms(forms: Option<Forms>) {
+    OPEN_COMPETITION_ENTERABLE.set(enterable(forms));
+    ENTRY_FORM_MISSING_FORECASTS.set(forms.map_or(0.0, |forms| forms.missing_forecasts as f64));
+}
+
+/// Record a top-up of ark-swapd's Ark wallet the rebalancer sent at `at`, in UNIX seconds.
+pub fn record_arkade_topup(sats: u64, at: i64) {
+    ARKADE_TOPUPS.inc();
+    ARKADE_TOPUP_SATS.inc_by(sats as f64);
+    record_arkade_topup_last_success(at);
+}
+
+/// Record when the rebalancer last sent a top-up, in UNIX seconds.
+pub fn record_arkade_topup_last_success(at: i64) {
+    let at = at as f64;
+    if ARKADE_TOPUP_LAST_SUCCESS.get().is_nan() || ARKADE_TOPUP_LAST_SUCCESS.get() < at {
+        ARKADE_TOPUP_LAST_SUCCESS.set(at);
+    }
+}
+
+/// Record a top-up the rebalancer could not send.
+pub fn record_arkade_topup_failure() {
+    ARKADE_TOPUP_FAILURES.inc();
+}
+
 /// Record a refill of ark-swapd's Ark wallet the payer sent at `at`, in UNIX seconds.
 pub fn record_ark_refill(sats: u64, at: i64) {
     ARK_REFILLS.inc();
@@ -245,26 +350,90 @@ pub fn record_resumed_run() {
 mod tests {
     use super::*;
 
+    const NOW: i64 = 1_791_000_000;
+
+    /// Verdicts at these times: the last failure, the last pass, the last verified payout, and
+    /// where the newest run with a money verdict left its money.
+    fn evidence(
+        failed: Option<i64>,
+        passed: Option<i64>,
+        paid_out: Option<i64>,
+        money: Option<&str>,
+    ) -> LifecycleEvidence {
+        LifecycleEvidence {
+            last_failed: failed,
+            last_passed: passed,
+            last_paid_out: paid_out,
+            newest_money: money.map(str::to_owned),
+            observed: Some(NOW - 60),
+        }
+    }
+
+    fn health(evidence: LifecycleEvidence) -> f64 {
+        lifecycle_health(&evidence, NOW)
+    }
+
     #[test]
     fn steps_passing_is_not_lifecycle_success() {
-        let mut run = TestRun {
-            id: "r".into(),
-            scenario: "full_lifecycle".into(),
-            status: "passed".into(),
-            started_at: "2026-10-01T00:00:00Z".into(),
-            completed_at: None,
-            error_message: None,
-            config_json: None,
-            competition_id: None,
-            money: Some("following".into()),
+        assert!(health(evidence(None, Some(10), None, None)).is_nan());
+        assert_eq!(
+            health(evidence(None, Some(10), Some(20), Some("paid_out"))),
+            1.0
+        );
+        assert!(lifecycle_health(&LifecycleEvidence::default(), NOW).is_nan());
+    }
+
+    /// One failed run read as unhealthy for a day, through nine later passes: the gauge took
+    /// the newest run by its start, and none started after the failure had paid out yet.
+    #[test]
+    fn a_failed_run_reads_unhealthy_only_until_the_next_pass() {
+        let failed = Some(100);
+        assert_eq!(
+            health(evidence(failed, Some(90), Some(80), Some("paid_out"))),
+            0.0
+        );
+        // The next run to finish with every step passed clears it,
+        assert_eq!(
+            health(evidence(failed, Some(110), Some(80), Some("paid_out"))),
+            1.0
+        );
+        // and so does the next payout verified, of a run that started long before.
+        assert_eq!(
+            health(evidence(failed, Some(90), Some(120), Some("paid_out"))),
+            1.0
+        );
+        // Before any payout was verified a failure counts, and a pass after it proves nothing.
+        assert_eq!(health(evidence(failed, None, None, None)), 0.0);
+        assert!(health(evidence(failed, Some(110), None, None)).is_nan());
+    }
+
+    #[test]
+    fn stuck_money_reads_unhealthy_and_stale_evidence_reads_as_none() {
+        for money in ["stuck", "written_off"] {
+            assert_eq!(
+                health(evidence(None, Some(110), Some(120), Some(money))),
+                0.0
+            );
+        }
+        let mut stale = evidence(None, Some(110), Some(120), Some("paid_out"));
+        stale.observed = Some(NOW - 31 * 60);
+        assert!(lifecycle_health(&stale, NOW).is_nan());
+        stale.observed = None;
+        assert!(lifecycle_health(&stale, NOW).is_nan());
+    }
+
+    #[test]
+    fn the_enterable_gauge_reads_the_forms_last_loaded() {
+        let forms = |checked, enterable, missing_forecasts| {
+            Some(Forms {
+                checked,
+                enterable,
+                missing_forecasts,
+            })
         };
-        assert!(lifecycle_health(Some(&run)).is_nan());
-        run.money = Some("paid_out".into());
-        assert_eq!(lifecycle_health(Some(&run)), 1.0);
-        run.money = Some("stuck".into());
-        assert_eq!(lifecycle_health(Some(&run)), 0.0);
-        run.money = Some("unverified".into());
-        assert!(lifecycle_health(Some(&run)).is_nan());
-        assert!(lifecycle_health(None).is_nan());
+        assert_eq!(enterable(forms(2, 2, 0)), 1.0);
+        assert_eq!(enterable(forms(2, 1, 9)), 0.0);
+        assert!(enterable(forms(0, 0, 0)).is_nan(), "none loaded");
+        assert!(enterable(None).is_nan(), "none open");
     }
 }

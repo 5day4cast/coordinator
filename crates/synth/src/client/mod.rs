@@ -2,6 +2,7 @@ pub mod admin;
 pub mod auth;
 pub mod competitions;
 pub mod entries;
+pub mod visitor;
 pub mod wallet;
 
 use anyhow::{Context, Result};
@@ -22,10 +23,12 @@ pub struct CoordinatorClient {
 impl CoordinatorClient {
     pub fn new(base_url: &str, admin_url: Option<&str>) -> Self {
         Self {
-            // A page or the tracker waiting on the coordinator must give up eventually.
+            // A page or the tracker waiting on the coordinator must give up eventually. Its
+            // lists run to a megabyte, so every request says it takes gzip.
             http: Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(5))
                 .timeout(std::time::Duration::from_secs(30))
+                .gzip(true)
                 .build()
                 .unwrap_or_default(),
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -151,6 +154,40 @@ mod tests {
         };
         assert!(retry_transport(3, not_transport).await.is_err());
         assert_eq!(failed.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    /// The coordinator's lists run to a megabyte; it may compress them for a client that asks.
+    #[tokio::test]
+    async fn requests_say_they_take_gzip() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let router = Router::new().route(
+            "/api/v1/competitions",
+            get(|headers: HeaderMap| async move {
+                let accepted = headers
+                    .get("accept-encoding")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
+                Json(serde_json::json!([{
+                    "id": uuid::Uuid::nil(),
+                    "created_at": "2026-10-05T00:00:00Z",
+                    "event_submission": { "accept_encoding": accepted },
+                }]))
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let listed = CoordinatorClient::new(&url, None)
+            .list_competitions()
+            .await
+            .unwrap();
+        let accepted = listed[0].event_submission["accept_encoding"]
+            .as_str()
+            .unwrap();
+        assert!(accepted.contains("gzip"), "{accepted}");
 
         server.abort();
         let _ = server.await;

@@ -431,7 +431,8 @@ async fn verify_pools(
         complete.len(),
         shape.players
     );
-    let placements = placements(client, users, traces).await?;
+    let pool_ids: Vec<_> = pools.iter().map(|pool| pool.competition_id).collect();
+    let placements = placements(client, users, traces, &pool_ids).await?;
     check_split(&shape.rules, pools, &complete, &placements)?;
     Ok(placements)
 }
@@ -442,6 +443,7 @@ async fn placements(
     client: &CoordinatorClient,
     users: &[SynthUser],
     traces: &[EntryTrace],
+    pool_ids: &[Uuid],
 ) -> Result<BTreeMap<Uuid, Uuid>> {
     let mut lookups = FuturesUnordered::new();
     for trace in traces.iter().filter(|trace| trace.entry_submitted) {
@@ -451,7 +453,7 @@ async fn placements(
             .find(|user| user.name == trace.user)
             .context("scenario user")?;
         lookups.push(async move {
-            let entries = client.list_entries(&user.nostr_keys, None).await?;
+            let entries = client.list_entries_in(&user.nostr_keys, pool_ids).await?;
             let mut found = entries.iter().filter(|entry| entry.ticket_id == ticket);
             let entry = found
                 .next()

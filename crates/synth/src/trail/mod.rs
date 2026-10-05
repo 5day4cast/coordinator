@@ -51,6 +51,9 @@ pub struct EntryTrace {
     pub rejected_submission: Option<crate::client::entries::ApiRejection>,
     #[serde(default)]
     pub entry_id: Option<Uuid>,
+    /// The key's derivation ID, saved before requesting a ticket. Queues later replace entry_id.
+    #[serde(default)]
+    pub key_derivation_id: Option<Uuid>,
     #[serde(default)]
     pub ticket_id: Option<Uuid>,
     #[serde(default)]

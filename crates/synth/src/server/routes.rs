@@ -137,13 +137,20 @@ pub(super) fn html_by_hx_request(markup: Markup) -> Response {
 /// The competitions open for visitors, as the keep-open check last found them: "Open for
 /// visitors: 1 · entries close in 5 h", or "none · starting a run" while one is on its way.
 fn open_for_visitors(status: crate::runner::keep_open::OpenStatus, now: OffsetDateTime) -> String {
-    match status.open.competitions {
+    let summary = match status.open.competitions {
         0 if status.starting => "Open for visitors: none · starting a run".into(),
         0 => "Open for visitors: none".into(),
         open => format!(
             "Open for visitors: {open} · entries close in {}",
             format::span_between(now, now + time::Duration::minutes(status.open.minutes_left))
         ),
+    };
+    match status.forms {
+        Some(forms) if forms.checked > 0 => format!(
+            "{summary} · {}/{} forms ready · {} missing forecasts",
+            forms.enterable, forms.checked, forms.missing_forecasts
+        ),
+        _ => summary,
     }
 }
 
@@ -1360,6 +1367,7 @@ mod tests {
                 minutes_left,
             },
             starting,
+            forms: None,
         };
         assert_eq!(
             open_for_visitors(status(1, 300, false), now),

@@ -449,12 +449,32 @@ impl CoordinatorClient {
         ))
     }
 
+    /// A player's entries in each of `competitions`, asked for one competition at a time: the
+    /// narrowest list the coordinator serves. A player's whole list grows with every competition
+    /// they ever entered, to a megabyte and more.
+    pub async fn list_entries_in(
+        &self,
+        keys: &Keys,
+        competitions: &[Uuid],
+    ) -> Result<Vec<EntryResponse>> {
+        // HOOK(entries-filters): once `GET /api/v1/entries` takes several competitions, a state
+        // or pages, ask once here instead of once per competition.
+        let mut entries = Vec::new();
+        for id in competitions {
+            let listed = self.list_entries(keys, Some(id)).await?;
+            // A coordinator that does not know the filter sends every entry.
+            entries.extend(listed.into_iter().filter(|entry| entry.event_id == *id));
+        }
+        Ok(entries)
+    }
+
     /// List entries for a user (requires Nostr auth)
     pub async fn list_entries(
         &self,
         keys: &Keys,
         competition_id: Option<&Uuid>,
     ) -> Result<Vec<EntryResponse>> {
+        // HOOK(entries-filters): `event_id` is the only filter the coordinator takes today.
         let mut url = format!("{}/api/v1/entries", self.base_url());
         if let Some(id) = competition_id {
             url = format!("{}?event_id={}", url, id);
