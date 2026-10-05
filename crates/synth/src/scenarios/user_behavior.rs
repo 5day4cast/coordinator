@@ -689,7 +689,28 @@ pub(super) async fn resume_paid_submission(
     if ensure_submission_time(deadline, config).is_err() {
         return Ok(false);
     }
+    if trace.submission_not_before.is_none() {
+        let delay = trace
+            .waits
+            .iter()
+            .find(|wait| wait.stage == "before_submit")
+            .map_or(0, |wait| {
+                wait.planned_ms.saturating_sub(wait.elapsed_ms.unwrap_or(0))
+            });
+        trace.submission_not_before = Some(
+            OffsetDateTime::now_utc()
+                + time::Duration::milliseconds(
+                    i64::try_from(delay).context("submission delay exceeds i64")?,
+                ),
+        );
+        crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
+    }
     if let Some(target) = trace.submission_not_before {
+        if target
+            >= deadline - time::Duration::seconds(config.entry_timing.deadline_margin_secs as i64)
+        {
+            return Ok(false);
+        }
         let remaining = (target - OffsetDateTime::now_utc())
             .whole_milliseconds()
             .max(0) as u64;
