@@ -194,7 +194,7 @@ pub enum ValueOption {
 }
 
 /// Request body for submitting an entry
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddEntry {
     pub id: Uuid,
     pub ticket_id: Uuid,

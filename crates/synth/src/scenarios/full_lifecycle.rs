@@ -252,6 +252,7 @@ pub(super) async fn register_entry(
         keymeld_registration_context,
         keymeld_escrow_policy,
     };
+    trace.pending_submission = Some(entry.clone());
     crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
     Ok(PreparedEntry {
         ticket,
@@ -425,6 +426,7 @@ pub(super) async fn submit_entry(
         .context("Failed to submit entry")?;
     trace.entry_id = Some(response.id);
     trace.entry_submitted = true;
+    trace.pending_submission = None;
     crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
     Ok(())
 }

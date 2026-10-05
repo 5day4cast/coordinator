@@ -81,6 +81,10 @@ pub struct EntryTrace {
     pub paid: bool,
     #[serde(default)]
     pub entry_submitted: bool,
+    /// Exact registered entry body, saved before payment for submission-only recovery.
+    /// Contains encrypted registration material, never the player's private key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_submission: Option<crate::client::entries::AddEntry>,
     /// Other players took every seat, so this one stood down without a ticket.
     #[serde(default)]
     pub seat_taken: bool,

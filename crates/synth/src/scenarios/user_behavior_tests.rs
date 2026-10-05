@@ -36,6 +36,8 @@ struct Protocol {
     payment_gate: Option<Arc<Barrier>>,
     db: Option<SynthDb>,
     durable_before_pay: Vec<bool>,
+    lose_submission_response: bool,
+    entry_deadline: Option<OffsetDateTime>,
     /// Seats other people paid for and entered.
     others: usize,
     /// Refunds settle only from then, as an escrow opens its refund leaf.
@@ -82,7 +84,7 @@ impl Mock {
 async fn competition(State(state): State<Shared>, Path(id): Path<Uuid>) -> Json<Value> {
     let state = state.lock().unwrap();
     Json(
-        json!({"id":id,"created_at":"2026-01-01T00:00:00Z", "event_submission":{"start_observation_date":(OffsetDateTime::now_utc()+time::Duration::hours(1)).format(&Rfc3339).unwrap(), "total_allowed_entries":state.capacity}, "total_entries":state.entries.len() + state.others, "total_paid_entries":state.paid.len() + state.others, "awaiting_attestation_at":if state.entries.len() + state.others==state.capacity { Some("2026-01-01T00:01:00Z") }else{None} }),
+        json!({"id":id,"created_at":"2026-01-01T00:00:00Z", "event_submission":{"start_observation_date":state.entry_deadline.unwrap_or_else(|| OffsetDateTime::now_utc()+time::Duration::hours(1)).format(&Rfc3339).unwrap(), "total_allowed_entries":state.capacity}, "total_entries":state.entries.len() + state.others, "total_paid_entries":state.paid.len() + state.others, "awaiting_attestation_at":if state.entries.len() + state.others==state.capacity { Some("2026-01-01T00:01:00Z") }else{None} }),
     )
 }
 
@@ -131,7 +133,7 @@ async fn ticket(State(state): State<Shared>, Json(body): Json<Value>) -> (Status
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(json!({"error":"No ticket available for competition"})),
-                )
+                );
             }
         }
     };
@@ -175,6 +177,10 @@ async fn pay(State(state): State<Shared>, Path(ticket): Path<Uuid>) -> (StatusCo
                 && trace.behavior.is_some()
                 && trace.waits[0].elapsed_ms.is_some()
                 && trace.waits[1].elapsed_ms.is_some()
+                && trace
+                    .pending_submission
+                    .as_ref()
+                    .is_some_and(|entry| entry.ticket_id == ticket)
         });
         state.lock().unwrap().durable_before_pay.push(durable);
         if !durable {
@@ -260,6 +266,12 @@ async fn submit(State(state): State<Shared>, Json(body): Json<Value>) -> (Status
     );
     let response = json!({"id":body["id"],"ticket_id":body["ticket_id"],"event_id":body["event_id"],"ephemeral_pubkey":body["ephemeral_pubkey"],"pubkey":"mock","signed_at":null,"paid_at":null,"paid_out_at":null});
     state.entries.push(response.clone());
+    if state.lose_submission_response {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"response lost after commit"})),
+        );
+    }
     (StatusCode::OK, Json(response))
 }
 
@@ -1231,4 +1243,165 @@ async fn resumed_ticket_uses_the_saved_key_even_after_a_queue_assigns_an_entry_i
     assert_eq!(restored.key_derivation_id, Some(key_id));
     let protocol = mock.state.lock().unwrap();
     assert_eq!(protocol.ticket_requests[0], protocol.ticket_requests[1]);
+}
+
+fn saved_paid_entry(user: &SynthUser, competition: Uuid) -> EntryTrace {
+    let derivation = Uuid::now_v7();
+    let ticket = Uuid::now_v7();
+    let key = user.derive_ephemeral_key(&derivation).unwrap();
+    let (_, payout_hash) = crate::crypto::payout::generate_payout_pair(&key.secret_bytes);
+    let entry = crate::client::entries::AddEntry {
+        id: ticket,
+        ticket_id: ticket,
+        ephemeral_pubkey: key.public_key,
+        payout_hash,
+        event_id: competition,
+        expected_observations: vec![],
+        encrypted_keymeld_private_key: None,
+        keymeld_auth_pubkey: None,
+        keymeld_registration_context: None,
+        keymeld_escrow_policy: None,
+    };
+    let trace = EntryTrace {
+        behavior: Some(EntryBehavior::Complete),
+        ticket_id: Some(ticket),
+        entry_id: Some(ticket),
+        key_derivation_id: Some(derivation),
+        paid: true,
+        payment_started: Some(true),
+        pending_submission: Some(entry),
+        ..EntryTrace::new(user)
+    };
+    // Exercise the actual persisted representation, including queued entry/key ID separation.
+    serde_json::from_str(&serde_json::to_string(&trace).unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn restart_submits_saved_paid_entry_once_even_when_the_response_is_lost() {
+    for lost in [false, true] {
+        let user = SynthUser::new_random("alice").unwrap();
+        let competition = Uuid::now_v7();
+        let mut trace = saved_paid_entry(&user, competition);
+        let original = trace.clone();
+        let ticket = trace.ticket_id.unwrap();
+        let mock = Mock::new(Protocol {
+            capacity: 1,
+            paid: BTreeSet::from([ticket]),
+            lose_submission_response: lost,
+            ..Default::default()
+        })
+        .await;
+        assert!(resume_paid_submission(
+            &mock.client,
+            &user,
+            &competition,
+            &config(1),
+            "user_alice_enter",
+            &mut trace
+        )
+        .await
+        .unwrap());
+        assert!(trace.entry_submitted && trace.pending_submission.is_none());
+        // Simulate another crash before recording the accepted response.
+        let mut trace = original;
+        assert!(resume_paid_submission(
+            &mock.client,
+            &user,
+            &competition,
+            &config(1),
+            "user_alice_enter",
+            &mut trace
+        )
+        .await
+        .unwrap());
+        let state = mock.state.lock().unwrap();
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.events, [format!("submit:{ticket}")]);
+        assert_eq!(state.attempts, 0, "no ticket or invoice requested");
+    }
+}
+
+#[tokio::test]
+async fn restart_does_not_submit_without_payment_or_for_intentional_abandonment() {
+    let user = SynthUser::new_random("alice").unwrap();
+    let competition = Uuid::now_v7();
+    let mock = Mock::new(Protocol::default()).await;
+    for behavior in [
+        EntryBehavior::AbandonPaid,
+        EntryBehavior::AbandonUnpaid,
+        EntryBehavior::LateSubmission,
+        EntryBehavior::DuplicateSubmission,
+    ] {
+        let mut trace = saved_paid_entry(&user, competition);
+        trace.behavior = Some(behavior);
+        assert!(!resume_paid_submission(
+            &mock.client,
+            &user,
+            &competition,
+            &config(1),
+            "user_alice_enter",
+            &mut trace
+        )
+        .await
+        .unwrap());
+    }
+    let mut trace = saved_paid_entry(&user, competition);
+    trace.paid = false;
+    assert!(!resume_paid_submission(
+        &mock.client,
+        &user,
+        &competition,
+        &config(1),
+        "user_alice_enter",
+        &mut trace
+    )
+    .await
+    .unwrap());
+    trace.paid = true;
+    trace.pending_submission = None;
+    assert!(!resume_paid_submission(
+        &mock.client,
+        &user,
+        &competition,
+        &config(1),
+        "user_alice_enter",
+        &mut trace
+    )
+    .await
+    .unwrap());
+    assert!(mock.state.lock().unwrap().events.is_empty());
+}
+
+#[tokio::test]
+async fn restart_leaves_closed_entries_for_refunds_and_rejects_mismatched_saved_bodies() {
+    let user = SynthUser::new_random("alice").unwrap();
+    let competition = Uuid::now_v7();
+    let mut trace = saved_paid_entry(&user, competition);
+    let mock = Mock::new(Protocol {
+        entry_deadline: Some(OffsetDateTime::now_utc() - time::Duration::minutes(1)),
+        ..Default::default()
+    })
+    .await;
+    assert!(!resume_paid_submission(
+        &mock.client,
+        &user,
+        &competition,
+        &config(1),
+        "user_alice_enter",
+        &mut trace
+    )
+    .await
+    .unwrap());
+    trace.pending_submission.as_mut().unwrap().ticket_id = Uuid::now_v7();
+    assert!(resume_paid_submission(
+        &mock.client,
+        &user,
+        &competition,
+        &config(1),
+        "user_alice_enter",
+        &mut trace
+    )
+    .await
+    .is_err());
+    assert!(mock.state.lock().unwrap().events.is_empty());
 }

@@ -926,9 +926,25 @@ impl SynthDb {
         error: Option<&str>,
         details_json: Option<&str>,
     ) -> Result<()> {
+        let status = if error.is_some() { "failed" } else { "passed" };
+        self.complete_step_with_status(id, duration_ms, error, details_json, status)
+            .await
+    }
+
+    pub async fn complete_step_with_status(
+        &self,
+        id: &str,
+        duration_ms: i64,
+        error: Option<&str>,
+        details_json: Option<&str>,
+        status: &str,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            matches!(status, "passed" | "failed" | "skipped"),
+            "invalid finished step status"
+        );
         let now =
             OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
-        let status = if error.is_some() { "failed" } else { "passed" };
 
         sqlx::query(
             "UPDATE test_steps SET status = ?, completed_at = ?, duration_ms = ?, details_json = ?, \
