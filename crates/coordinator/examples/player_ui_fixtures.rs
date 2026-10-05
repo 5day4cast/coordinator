@@ -247,7 +247,7 @@ fn competition(id: &str, phase: Phase, start: OffsetDateTime, entries: u64) -> C
         phase,
         start,
         end: start + Duration::DAY,
-        signing: end + time::Duration::minutes(5),
+        signing: start + Duration::DAY + Duration::minutes(5),
         expiry: None,
         entry_fee: 5_000,
         ticket_price: 5_150,
