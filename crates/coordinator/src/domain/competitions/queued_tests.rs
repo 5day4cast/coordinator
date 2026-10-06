@@ -1280,3 +1280,101 @@ async fn new_competitions_pay_one_place_unless_two_are_allowed() {
         "{created:?}"
     );
 }
+
+#[tokio::test]
+async fn a_player_s_unpaid_tickets_are_listed_oldest_first_while_they_can_be_paid() {
+    let start = OffsetDateTime::now_utc() + Duration::hours(3);
+    let queue = Queue::new(start, PoolRules::new(2, 25).unwrap(), 100).await;
+    let store = queue.store();
+    let id = queue.competition.id;
+    let deadline = queue.competition.ticket_deadline();
+    let reserve = |ticket: Uuid, player: &'static str| async move {
+        assert!(matches!(
+            store
+                .reserve_queued_ticket(id, ticket, player, 100, 3, deadline)
+                .await
+                .unwrap(),
+            QueuedReservation::Reserved(_)
+        ));
+    };
+    let set = |sql: &'static str, ticket: Uuid| {
+        let ticket = ticket.to_string();
+        let db = queue.db.clone();
+        async move {
+            db.execute_write(move |pool| async move {
+                sqlx::query(sql).bind(ticket).execute(&pool).await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+    };
+
+    // Ids in entry order, oldest first.
+    let [oldest, invoiced, expiring, paid, expired] =
+        [1u128, 2, 3, 4, 5].map(|n| Uuid::from_u128(n << 100));
+    // Three unpaid tickets is as many as a player may hold, so the last two are made once the
+    // first ones stop counting.
+    reserve(invoiced, "alice").await;
+    reserve(expiring, "alice").await;
+    reserve(paid, "alice").await;
+    reserve(Uuid::now_v7(), "bob").await;
+    set(
+        "UPDATE tickets SET payment_request = 'lnbc1', invoice_expires_at = datetime('now', '+1 hour')
+         WHERE id = ?",
+        invoiced,
+    )
+    .await;
+    set(
+        "UPDATE tickets SET payment_request = 'lnbc2', reserved_at = datetime('now', '-20 minutes'),
+             invoice_expires_at = datetime('now', '+1 minute')
+         WHERE id = ?",
+        expiring,
+    )
+    .await;
+    set(
+        "UPDATE tickets SET paid_at = datetime('now') WHERE id = ?",
+        paid,
+    )
+    .await;
+    reserve(expired, "alice").await;
+    set(
+        "UPDATE tickets SET payment_request = 'lnbc3', reserved_at = datetime('now', '-20 minutes'),
+             invoice_expires_at = datetime('now', '-1 minute')
+         WHERE id = ?",
+        expired,
+    )
+    .await;
+    // Reserved last, with no invoice yet, though its entry is the oldest.
+    reserve(oldest, "alice").await;
+
+    let listed = queue
+        .coordinator
+        .unpaid_tickets("alice", Some(id))
+        .await
+        .unwrap();
+    let ids: Vec<Uuid> = listed.iter().map(|ticket| ticket.ticket_id).collect();
+    // Bob's, the paid one, the expired invoice and the one expiring within two minutes are not
+    // there; the rest are, oldest entry first.
+    assert_eq!(ids, vec![oldest, invoiced]);
+    assert!(listed[0].invoice_expires_at.is_none());
+    assert!(listed[1].invoice_expires_at.is_some());
+    assert!(listed.iter().all(|ticket| ticket.competition_id == id));
+    assert_eq!(
+        queue
+            .coordinator
+            .unpaid_tickets("alice", None)
+            .await
+            .unwrap(),
+        listed
+    );
+    assert!(queue
+        .coordinator
+        .unpaid_tickets("alice", Some(Uuid::now_v7()))
+        .await
+        .unwrap()
+        .is_empty());
+    let json = serde_json::to_value(&listed[1]).unwrap();
+    assert_eq!(json["ticket_id"], invoiced.to_string());
+    assert!(json["invoice_expires_at"].is_string());
+}

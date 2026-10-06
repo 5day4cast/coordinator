@@ -345,6 +345,8 @@ fn payment_modal() -> Markup {
                     h3 id="ticketPaymentModalTitle" class="title is-4" { "Entry Ticket Payment" }
                     div class="content" {
                         p id="ticketPaymentAmount" { "Please pay the lightning invoice to enter the competition:" }
+                        // The invoice's expiry, counted down by entry_form.js.
+                        p id="ticketPaymentExpiry" class="has-text-centered is-size-7" role="timer" {}
 
                         // QR code; tapping it copies the invoice (entry_form.js),
                         // so the invoice text itself is not shown.

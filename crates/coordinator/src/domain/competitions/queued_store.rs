@@ -451,6 +451,35 @@ impl CompetitionStore {
             .await
     }
 
+    /// The unpaid tickets `player` holds in queued competitions, `competition_id`'s alone when
+    /// given: each still counts against the player's unpaid tickets (see [`LIVE_TICKET`]) and
+    /// can still be paid. Oldest entry first, since an exact tie goes to the earliest entry. A
+    /// ticket whose invoice expires within two minutes is left out: it could hardly be paid in
+    /// time, and it stops counting once it expires.
+    pub async fn unpaid_queued_tickets(
+        &self,
+        player: &str,
+        competition_id: Option<Uuid>,
+    ) -> Result<Vec<Ticket>, sqlx::Error> {
+        sqlx::query_as::<_, Ticket>(&format!(
+            "SELECT {TICKET_COLUMNS} FROM tickets
+             LEFT JOIN entries ON tickets.id = entries.ticket_id
+             WHERE tickets.reserved_by = ?1 AND tickets.paid_at IS NULL AND entries.id IS NULL
+               AND tickets.event_id IN (SELECT competition_id FROM queued_competitions)
+               AND (?2 IS NULL OR tickets.event_id = ?2)
+               AND ((tickets.payment_request IS NULL
+                     AND tickets.reserved_at > datetime('now', '-10 minutes'))
+                    OR (tickets.payment_request IS NOT NULL
+                        AND tickets.invoice_cancelled_at IS NULL
+                        AND tickets.invoice_expires_at > datetime('now', '+2 minutes')))
+             ORDER BY tickets.id"
+        ))
+        .bind(player)
+        .bind(competition_id.map(|id| id.to_string()))
+        .fetch_all(self.db_connection.read())
+        .await
+    }
+
     /// Paid entries of a queued competition, in the queue and in the pools it formed.
     /// The tickets that count against a queued competition's entry cap: paid, or held for an
     /// unexpired invoice, as [`Self::reserve_queued_ticket`] counts them.

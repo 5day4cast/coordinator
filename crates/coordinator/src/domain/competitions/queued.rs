@@ -47,6 +47,11 @@ pub const MAX_ENTRIES: u32 = 1_500;
 pub const MAX_REGISTRATION: Duration = Duration::days(6);
 /// Unpaid tickets one player may hold in one queued competition at a time.
 pub const MAX_UNPAID_TICKETS_PER_PLAYER: i64 = 3;
+/// Why a player holding [`MAX_UNPAID_TICKETS_PER_PLAYER`] unpaid tickets gets no other. The entry
+/// form resumes one of them rather than asking, so a player sees this only from another client.
+pub const TOO_MANY_UNPAID: &str =
+    "You have unpaid entries waiting in this competition; open its entry form and press Pay to \
+     pay one, or wait for its invoice to expire";
 /// A queued ticket's id is its entry's id, which the player's wallet makes when it opens the
 /// entry form. The oracle breaks an exact tie by entry id, so an id may not claim to be older
 /// than this, nor from the future.
@@ -101,6 +106,28 @@ pub struct QueueSummary {
     /// The pools formed when registration closed, by index. Empty until then.
     #[serde(default)]
     pub pools: Vec<PoolSummary>,
+}
+
+/// An unpaid ticket a player holds in a queued competition, which its Pay button resumes: the
+/// ticket's id is its entry's, so asking for a ticket for that entry again gets this ticket and
+/// its invoice back, and the wallet derives the same entry key from the id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnpaidTicket {
+    pub ticket_id: Uuid,
+    pub competition_id: Uuid,
+    /// When its invoice stops being payable; `None` until the invoice is made.
+    #[serde(with = "time::serde::rfc3339::option", default)]
+    pub invoice_expires_at: Option<OffsetDateTime>,
+}
+
+impl UnpaidTicket {
+    pub fn from_ticket(ticket: &super::Ticket) -> Self {
+        Self {
+            ticket_id: ticket.id,
+            competition_id: ticket.competition_id,
+            invoice_expires_at: ticket.invoice_expires_at,
+        }
+    }
 }
 
 /// One pool of a queued competition.
