@@ -108,8 +108,8 @@ impl PreimageKey {
 }
 
 impl PreimageKey {
-    /// A row's preimage, hex: the sealed copy if it has one, otherwise the plaintext a release
-    /// before sealing wrote. Either way it must pay to the row's payment hash (hex).
+    /// A row's preimage, hex: the sealed copy if it has one, and the plaintext only for a row
+    /// not yet sealed. Either way it must pay to the row's payment hash (hex).
     pub fn stored(
         &self,
         row: Row,

@@ -213,8 +213,8 @@ impl Store {
         .bind(&swap.escrow_address)
         .bind(swap.amount_sat as i64)
         .bind(&swap.payment_hash)
-        // The plaintext is still written for the release before this one, which reads only it.
-        .bind(&swap.preimage)
+        // Only the sealed copy is kept. The column predates sealing and cannot be null.
+        .bind("")
         .bind(self.seal(
             PreimageRow::Swap,
             swap.id,
@@ -374,7 +374,7 @@ impl Store {
         .bind(&refund.swap_tap_tree)
         .bind(&refund.swap_address)
         .bind(refund.state.as_str())
-        .bind(&refund.preimage)
+        .bind(None::<String>)
         .bind(self.seal_refund(refund)?)
         .bind(&refund.swap_vtxo)
         .bind(&refund.claim_txid)
@@ -392,8 +392,8 @@ impl Store {
                 claim_txid = ?, error = ?, updated_at = ? WHERE id = ?",
         )
         .bind(refund.state.as_str())
-        // The plaintext is still written for the release before this one, which reads only it.
-        .bind(&refund.preimage)
+        // Only the sealed copy is kept.
+        .bind(None::<String>)
         .bind(self.seal_refund(refund)?)
         .bind(&refund.swap_vtxo)
         .bind(&refund.claim_txid)
@@ -440,29 +440,28 @@ impl Store {
         rows.iter().map(|row| self.refund_row(row)).collect()
     }
 
-    /// Seal the preimages stored only in plaintext, by a release before this one, `batch` rows
-    /// at a time, and return how many were sealed. Rows already sealed are left alone, so this
-    /// can run any number of times. A row whose preimage does not pay to its hash is left as it
-    /// is, and refused when it is read.
+    /// Seal the preimages still stored in plaintext, `batch` rows at a time, and clear the
+    /// plaintext; return how many rows were cleared. Releases before this one wrote both, so a
+    /// rollback and a redeploy leave such rows. The plaintext of a row already sealed is cleared
+    /// only once its sealed copy opens to a preimage that pays to the row's hash. A row that
+    /// fails either check is left as it is, and refused when it is read. This can run any number
+    /// of times.
     pub async fn seal_plaintext_preimages(&self, batch: u32) -> anyhow::Result<u64> {
-        let mut sealed = 0;
+        let mut cleared = 0;
         for (row_kind, select, update) in [
             (
                 PreimageRow::Swap,
-                "SELECT id, payment_hash, preimage FROM swaps
-                 WHERE preimage_ciphertext IS NULL AND preimage <> '' AND id > ?
+                "SELECT id, payment_hash, preimage, preimage_ciphertext FROM swaps
+                 WHERE preimage <> '' AND id > ?
                  ORDER BY id LIMIT ?",
-                "UPDATE swaps SET preimage_ciphertext = ?
-                 WHERE id = ? AND preimage_ciphertext IS NULL",
+                "UPDATE swaps SET preimage_ciphertext = ?, preimage = '' WHERE id = ?",
             ),
             (
                 PreimageRow::Refund,
-                "SELECT id, payment_hash, preimage FROM refunds
-                 WHERE preimage_ciphertext IS NULL AND preimage IS NOT NULL AND preimage <> ''
-                   AND id > ?
+                "SELECT id, payment_hash, preimage, preimage_ciphertext FROM refunds
+                 WHERE preimage IS NOT NULL AND preimage <> '' AND id > ?
                  ORDER BY id LIMIT ?",
-                "UPDATE refunds SET preimage_ciphertext = ?
-                 WHERE id = ? AND preimage_ciphertext IS NULL",
+                "UPDATE refunds SET preimage_ciphertext = ?, preimage = NULL WHERE id = ?",
             ),
         ] {
             let mut after = String::new();
@@ -481,14 +480,22 @@ impl Store {
                     let id = Uuid::parse_str(id)?;
                     let payment_hash: String = row.try_get("payment_hash")?;
                     let preimage: String = row.try_get("preimage")?;
-                    let ciphertext = match self.seal(row_kind, id, &payment_hash, &preimage) {
+                    let sealed: Option<Vec<u8>> = row.try_get("preimage_ciphertext")?;
+                    let ciphertext = match sealed {
+                        Some(sealed) => self
+                            .preimages
+                            .stored(row_kind, id, &payment_hash, Some(sealed.clone()), None)
+                            .map(|_| sealed),
+                        None => self.seal(row_kind, id, &payment_hash, &preimage),
+                    };
+                    let ciphertext = match ciphertext {
                         Ok(ciphertext) => ciphertext,
                         Err(error) => {
                             log::error!("cannot seal the stored preimage of {id}: {error:#}");
                             continue;
                         }
                     };
-                    sealed += sqlx::query(update)
+                    cleared += sqlx::query(update)
                         .bind(ciphertext)
                         .bind(id.to_string())
                         .execute(&self.pool)
@@ -498,7 +505,7 @@ impl Store {
                 tokio::task::yield_now().await;
             }
         }
-        Ok(sealed)
+        Ok(cleared)
     }
 
     /// Seal `preimage` (hex) for a row, refusing one that does not pay to its hash.
@@ -988,13 +995,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preimages_are_sealed_and_still_written_plain_for_the_last_release() {
+    async fn preimages_are_stored_only_sealed() {
         let directory = tempfile::tempdir().unwrap();
         let store = open(&directory.path().join("swaps.sqlite")).await;
         let swap = swap_for(0x51, 1_790_000_000);
         store.insert(&swap).await.unwrap();
         let (plaintext, sealed) = stored_preimages(&store, "swaps", swap.id).await;
-        assert_eq!(plaintext.as_deref(), Some(swap.preimage.as_str()));
+        assert_eq!(plaintext.as_deref(), Some(""));
         let sealed = sealed.expect("sealed on insert");
         assert!(!hex::encode(sealed).contains(&swap.preimage));
         assert_eq!(
@@ -1012,7 +1019,7 @@ mod tests {
         refund.preimage = Some(preimage.clone());
         store.update_refund(&refund).await.unwrap();
         let (plaintext, sealed) = stored_preimages(&store, "refunds", refund.id).await;
-        assert_eq!(plaintext, Some(preimage.clone()));
+        assert_eq!(plaintext, None);
         assert!(sealed.is_some());
         assert_eq!(
             store.refund(refund.id).await.unwrap().unwrap().preimage,
@@ -1028,7 +1035,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plaintext_preimages_are_read_until_sealed_and_sealed_once() {
+    async fn plaintext_preimages_are_read_until_sealed_then_cleared_once() {
         let directory = tempfile::tempdir().unwrap();
         let store = open(&directory.path().join("swaps.sqlite")).await;
         let mut swaps = Vec::new();
@@ -1045,12 +1052,25 @@ mod tests {
         let unpaid = refund_for(&preimage_and_hash(0x67).1);
         store.insert_refund(&unpaid).await.unwrap();
 
-        // As the release before this one left them: plaintext only.
-        sqlx::query("UPDATE swaps SET preimage_ciphertext = NULL")
+        // As earlier releases left them: plaintext only, or plaintext and a sealed copy.
+        for (index, swap) in swaps.iter().enumerate() {
+            let clear_sealed = if index < 3 {
+                ", preimage_ciphertext = NULL"
+            } else {
+                ""
+            };
+            sqlx::query(&format!(
+                "UPDATE swaps SET preimage = ?{clear_sealed} WHERE id = ?"
+            ))
+            .bind(&swap.preimage)
+            .bind(swap.id.to_string())
             .execute(&store.pool)
             .await
             .unwrap();
-        sqlx::query("UPDATE refunds SET preimage_ciphertext = NULL")
+        }
+        sqlx::query("UPDATE refunds SET preimage = ?, preimage_ciphertext = NULL WHERE id = ?")
+            .bind(&preimage)
+            .bind(refund.id.to_string())
             .execute(&store.pool)
             .await
             .unwrap();
@@ -1065,16 +1085,21 @@ mod tests {
             Some(preimage.clone())
         );
 
-        // Sealed in batches smaller than the table, then nothing left to seal.
+        // Sealed and cleared in batches smaller than the table, then nothing left to do.
         assert_eq!(store.seal_plaintext_preimages(2).await.unwrap(), 6);
         assert_eq!(store.seal_plaintext_preimages(2).await.unwrap(), 0);
         for swap in &swaps {
-            assert!(stored_preimages(&store, "swaps", swap.id).await.1.is_some());
+            let (plaintext, sealed) = stored_preimages(&store, "swaps", swap.id).await;
+            assert_eq!(plaintext.as_deref(), Some(""));
+            assert!(sealed.is_some());
             assert_eq!(
                 store.get(swap.id).await.unwrap().unwrap().preimage,
                 swap.preimage
             );
         }
+        let (plaintext, sealed) = stored_preimages(&store, "refunds", refund.id).await;
+        assert_eq!(plaintext, None);
+        assert!(sealed.is_some());
         assert_eq!(
             stored_preimages(&store, "refunds", unpaid.id).await,
             (None, None)
@@ -1082,17 +1107,6 @@ mod tests {
         assert_eq!(
             store.refund(refund.id).await.unwrap().unwrap().preimage,
             Some(preimage)
-        );
-
-        // The sealed copy is what is read once it exists.
-        sqlx::query("UPDATE swaps SET preimage = '' WHERE id = ?")
-            .bind(swaps[0].id.to_string())
-            .execute(&store.pool)
-            .await
-            .unwrap();
-        assert_eq!(
-            store.get(swaps[0].id).await.unwrap().unwrap().preimage,
-            swaps[0].preimage
         );
     }
 
@@ -1133,11 +1147,26 @@ mod tests {
             .await
             .unwrap();
         assert!(store.get(first.id).await.is_err());
-        assert_eq!(store.seal_plaintext_preimages(10).await.unwrap(), 0);
-        assert!(stored_preimages(&store, "swaps", first.id)
+
+        // The plaintext of a row whose sealed copy does not open is kept.
+        sqlx::query("UPDATE swaps SET preimage = ? WHERE id = ?")
+            .bind(&second.preimage)
+            .bind(second.id.to_string())
+            .execute(&store.pool)
             .await
-            .1
-            .is_none());
+            .unwrap();
+        assert!(store.get(second.id).await.is_err());
+
+        // Neither is sealed or cleared.
+        assert_eq!(store.seal_plaintext_preimages(10).await.unwrap(), 0);
+        assert_eq!(
+            stored_preimages(&store, "swaps", first.id).await,
+            (Some("73".repeat(32)), None)
+        );
+        assert_eq!(
+            stored_preimages(&store, "swaps", second.id).await.0,
+            Some(second.preimage.clone())
+        );
     }
 
     #[tokio::test]
