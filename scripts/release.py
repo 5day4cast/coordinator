@@ -238,9 +238,56 @@ def package_synth(root, version, source, target, output):
         return archive(package, output)
 
 
+def package_recover(root, version, source, target, output):
+    """Package coordinator-recover, the player's CLI that recovers entries without the coordinator."""
+    binaries = root / "target" / target / "release"
+    require_files(binaries, ("coordinator-recover",))
+    with tempfile.TemporaryDirectory() as temporary:
+        package = Path(temporary) / f"coordinator-recover-{version}-{target}"
+        (package / "bin").mkdir(parents=True)
+        shutil.copy2(binaries / "coordinator-recover", package / "bin" / "coordinator-recover")
+        provenance = metadata(root, version, source)
+        provenance.update(target=target)
+        (package / "RELEASE.json").write_text(json.dumps(provenance, indent=2) + "\n")
+        (package / "README.txt").write_text(
+            f"coordinator-recover v{version}\nSource: {source}\n\n"
+            "bin/coordinator-recover finds a player's entries from their nsec (and, if they have it,\n"
+            "the recovery file from their account page) and claims them without the coordinator.\n"
+            "Run ./bin/coordinator-recover inspect, then claim, refund-escrow or unroll as it says.\n\n"
+            "Use sha256sum -c SHA256SUMS to verify files. See docs/RECOVERY.md:\n"
+            "https://github.com/5day4cast/coordinator/blob/v" + version + "/docs/RECOVERY.md\n"
+        )
+        return archive(package, output)
+
+
+RECOVER_PAGE_FILES = {
+    "index.html": "crates/coordinator/src/templates/pages/recover/standalone.html",
+    "recover.js": "crates/coordinator/src/templates/static/recover.js",
+    "recover.css": "crates/coordinator/src/templates/pages/recover/recover.css",
+    "bulma.min.css": "vendor/bulma/1.0.2/bulma.min.css",
+}
+
+
+def package_recover_page(root, version, source, wasm, output):
+    """Package the recovery page as static files, to host anywhere once the coordinator is gone."""
+    require_files(wasm, ["coordinator_wasm.js", "coordinator_wasm_bg.wasm"])
+    with tempfile.TemporaryDirectory() as temporary:
+        package = Path(temporary) / f"coordinator-recover-page-{version}"
+        (package / "pkg").mkdir(parents=True)
+        for name, path in RECOVER_PAGE_FILES.items():
+            require_files(root, [path])
+            shutil.copy2(root / path, package / name)
+        for name in ("coordinator_wasm.js", "coordinator_wasm_bg.wasm"):
+            shutil.copy2(wasm / name, package / "pkg" / name)
+        provenance = metadata(root, version, source)
+        provenance["wasm_sha256"] = digest(package / "pkg" / "coordinator_wasm_bg.wasm")
+        (package / "RELEASE.json").write_text(json.dumps(provenance, indent=2) + "\n")
+        return archive(package, output)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["validate", "wasm", "native", "enclave", "enclave-simulation", "swap", "synth", "checksums"])
+    parser.add_argument("command", choices=["validate", "wasm", "native", "enclave", "enclave-simulation", "swap", "synth", "recover", "recover-page", "checksums"])
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--version")
     parser.add_argument("--source")
@@ -270,6 +317,10 @@ def main():
         print(package_swap(args.root, args.version, args.source, args.target, args.output))
     elif args.command == "synth":
         print(package_synth(args.root, args.version, args.source, args.target, args.output))
+    elif args.command == "recover":
+        print(package_recover(args.root, args.version, args.source, args.target, args.output))
+    elif args.command == "recover-page":
+        print(package_recover_page(args.root, args.version, args.source, args.wasm, args.output))
     else:
         print(package_native(args.root, args.version, args.source, args.target, args.asset, args.wasm, args.output))
 
