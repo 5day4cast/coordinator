@@ -1087,10 +1087,31 @@ async fn a_payment_lnd_made_that_the_database_lost_holds_the_payouts_it_could_be
         .send_payment(lost, owed, 60, 1_000)
         .await
         .unwrap();
+    // The pot does not split evenly, so only the winners owed exactly that amount are held.
+    let owed_that = |entry: &UserEntry| {
+        winner_payout_sats(
+            settlement.contract.params(),
+            &Outcome::Attestation(0),
+            &entry.ephemeral_pubkey.parse::<Point>().unwrap(),
+        )
+        .unwrap()
+            == owed
+    };
+    let matching: Vec<&UserEntry> = entries.iter().filter(|e| owed_that(e)).collect();
+    assert!(
+        matching.len() >= 2,
+        "{} winners owed {owed}",
+        matching.len()
+    );
     let found = coordinator.reconcile_after_restore().await.unwrap();
-    assert_eq!(found.payouts_held, entries.len());
+    assert_eq!(found.payouts_held, matching.len());
     for entry in &entries {
-        assert!(store.payout_held(entry.id).await.unwrap(), "{}", entry.id);
+        assert_eq!(
+            store.payout_held(entry.id).await.unwrap(),
+            owed_that(entry),
+            "{}",
+            entry.id
+        );
     }
     assert!(matches!(
         coordinator
@@ -1120,9 +1141,15 @@ async fn a_payment_lnd_made_that_the_database_lost_holds_the_payouts_it_could_be
     );
     coordinator.reconcile_after_restore().await.unwrap();
     assert!(!store.payout_held(entries[0].id).await.unwrap());
-    assert!(store.payout_held(entries[1].id).await.unwrap());
-    assert_eq!(coordinator.payout_holds(false).await.unwrap().len(), 2);
-    assert_eq!(coordinator.payout_holds(true).await.unwrap().len(), 3);
+    assert!(store.payout_held(matching[1].id).await.unwrap());
+    assert_eq!(
+        coordinator.payout_holds(false).await.unwrap().len(),
+        matching.len() - 1
+    );
+    assert_eq!(
+        coordinator.payout_holds(true).await.unwrap().len(),
+        matching.len()
+    );
     settlement.database.close().await.unwrap();
 }
 
