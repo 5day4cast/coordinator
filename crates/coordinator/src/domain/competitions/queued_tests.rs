@@ -649,7 +649,7 @@ async fn queued_tickets_are_made_on_demand_up_to_the_cap() {
     let original = hash.clone();
     assert_eq!(
         hex::encode(dlctix::hashlock::sha256(
-            &hex::decode(&reserved.ticket.encrypted_preimage).unwrap()
+            &hex::decode(&reserved.ticket.legacy_preimage_hex).unwrap()
         )),
         hash
     );

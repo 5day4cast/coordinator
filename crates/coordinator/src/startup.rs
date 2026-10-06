@@ -29,7 +29,7 @@ use crate::{
         recovery::{Recovery, RecoveryPublisher},
         CompetitionRunners, CompetitionStore, CompetitionWakes, Coordinator, InvoiceSubscriber,
         InvoiceWatcher, PaymentSubscriber, PayoutWatcher, SubscriptionHealth, UserInfo, UserStore,
-        ARK_SWAP_BOARDS_EVERY,
+        ARK_SWAP_BOARDS_EVERY, TICKET_PREIMAGE_BATCH,
     },
     infra::{
         bitcoin::{Bitcoin, BitcoinClient, BitcoinSyncWatcher, ElectrumHeaders},
@@ -752,6 +752,43 @@ pub async fn build_app(
         },
     );
     threads.insert("automatic_payouts".to_string(), automatic_handle);
+
+    // Seal the preimages of tickets an older release stored only in plaintext. During a
+    // blue/green deploy the older release keeps writing such tickets, so this repeats.
+    let preimage_coordinator = coordinator.clone();
+    let preimage_cancel = cancel_token.clone();
+    let preimage_handle = spawn_supervised(
+        &tracker,
+        "ticket preimages",
+        cancel_token.clone(),
+        async move {
+            loop {
+                tokio::select! {
+                    _ = preimage_cancel.cancelled() => break,
+                    result = preimage_coordinator.worker_leases().tick(
+                        "ticket-preimages",
+                        preimage_coordinator
+                            .competition_store
+                            .backfill_ticket_preimages(TICKET_PREIMAGE_BATCH),
+                    ) => match result {
+                        Some(Ok(sealed)) if sealed > 0 => info!("Sealed {sealed} ticket preimages"),
+                        Some(Err(error)) => error!("Ticket preimage worker: {}", error),
+                        _ => {}
+                    }
+                }
+                tokio::select! {
+                    _ = preimage_cancel.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+                }
+            }
+            preimage_coordinator
+                .worker_leases()
+                .release("ticket-preimages")
+                .await;
+            Ok(())
+        },
+    );
+    threads.insert("ticket_preimages".to_string(), preimage_handle);
 
     if coordinator.ark().is_some() {
         let ark_coordinator = coordinator.clone();

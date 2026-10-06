@@ -2,6 +2,7 @@ use dlctix::{bitcoin::XOnlyPublicKey, hashlock, musig2::PubNonce, SigMap};
 use log::debug;
 use sqlx::{Execute, Sqlite};
 use std::collections::HashMap;
+use std::sync::Arc;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
 
@@ -14,7 +15,10 @@ use crate::{
     },
 };
 
-use super::{admission::before_deadline, Competition, EntryStatus, SearchBy, Ticket, UserEntry};
+use super::{
+    admission::before_deadline, ticket_preimage::stored_preimage, Competition, EntryStatus,
+    SearchBy, Ticket, TicketCipher, UserEntry,
+};
 
 /// A ticket reserved for a caller. When a stale reservation was taken over,
 /// the ticket has already been given a fresh preimage and hash, and
@@ -72,11 +76,22 @@ pub(super) const PAID_TICKETS_OF_PLAYER: &str =
 #[derive(Debug, Clone)]
 pub struct CompetitionStore {
     pub(super) db_connection: DBConnection,
+    /// Seals ticket preimages. Without it (tests and tools) tickets keep only the plaintext
+    /// column; see `ticket_preimage.rs`.
+    pub(super) ticket_cipher: Option<Arc<TicketCipher>>,
 }
 
 impl CompetitionStore {
     pub fn new(db_connection: DBConnection) -> Self {
-        Self { db_connection }
+        Self {
+            db_connection,
+            ticket_cipher: None,
+        }
+    }
+
+    pub fn with_ticket_cipher(mut self, cipher: Arc<TicketCipher>) -> Self {
+        self.ticket_cipher = Some(cipher);
+        self
     }
 
     pub async fn ping(&self) -> Result<(), sqlx::Error> {
@@ -946,19 +961,30 @@ impl CompetitionStore {
             .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
         let competition_id_str = competition.id.to_string();
 
-        // Prepare ticket data for the closure
-        let ticket_data: Vec<(String, String, String, String, Option<String>)> = tickets
-            .iter()
-            .map(|t| {
-                (
-                    t.id.to_string(),
-                    t.competition_id.to_string(),
-                    t.encrypted_preimage.clone(),
-                    t.hash.clone(),
-                    t.payment_request.clone(),
-                )
-            })
-            .collect();
+        // Prepare ticket data for the closure. Older releases read the plaintext column, so it is
+        // written beside the ciphertext.
+        let mut ticket_data = Vec::with_capacity(tickets.len());
+        for t in &tickets {
+            let ciphertext = match &t.preimage_ciphertext {
+                Some(sealed) => Some(sealed.clone()),
+                None if self.ticket_cipher.is_some() => {
+                    let preimage =
+                        stored_preimage(None, t.id, &t.hash, None, &t.legacy_preimage_hex)
+                            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+                    self.seal_preimage(t.id, &t.hash, &preimage)
+                        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?
+                }
+                None => None,
+            };
+            ticket_data.push((
+                t.id.to_string(),
+                t.competition_id.to_string(),
+                t.legacy_preimage_hex.clone(),
+                ciphertext,
+                t.hash.clone(),
+                t.payment_request.clone(),
+            ));
+        }
 
         self.db_connection
             .execute_write(move |pool| async move {
@@ -986,19 +1012,23 @@ impl CompetitionStore {
                         .await?;
                 }
 
-                for (id, event_id, encrypted_preimage, hash, payment_request) in &ticket_data {
+                for (id, event_id, legacy_preimage_hex, ciphertext, hash, payment_request) in
+                    &ticket_data
+                {
                     sqlx::query(
                         "INSERT INTO tickets (
                             id,
                             event_id,
                             encrypted_preimage,
+                            preimage_ciphertext,
                             hash,
                             payment_request
-                        ) VALUES (?, ?, ?, ?, ?)",
+                        ) VALUES (?, ?, ?, ?, ?, ?)",
                     )
                     .bind(id)
                     .bind(event_id)
-                    .bind(encrypted_preimage)
+                    .bind(legacy_preimage_hex)
+                    .bind(ciphertext)
                     .bind(hash)
                     .bind(payment_request)
                     .execute(&mut *tx)
@@ -1805,6 +1835,7 @@ impl CompetitionStore {
         let rotated_preimage = hashlock::preimage_random(&mut rand::rng());
         let rotated_preimage_hex = hex::encode(rotated_preimage);
         let rotated_hash_hex = hex::encode(hashlock::sha256(&rotated_preimage));
+        let cipher = self.ticket_cipher.clone();
 
         self.db_connection
             .execute_write(move |pool| async move {
@@ -1822,6 +1853,7 @@ impl CompetitionStore {
                               entries.id as entry_id,
                               tickets.ephemeral_pubkey as ephemeral_pubkey,
                               encrypted_preimage,
+                              preimage_ciphertext,
                               hash,
                               payment_request,
                               invoice_expires_at,
@@ -1919,6 +1951,19 @@ impl CompetitionStore {
                 let superseded_payment_hash =
                     superseded.and_then(|(payment_request, hash)| payment_request.map(|_| hash));
 
+                let rotated_ciphertext = match &cipher {
+                    Some(cipher) => Some(
+                        Uuid::parse_str(&ticket_id)
+                            .map_err(|e| sqlx::Error::Decode(Box::new(e)))
+                            .and_then(|id| {
+                                cipher
+                                    .seal(id, &rotated_hash_hex, &rotated_preimage)
+                                    .map_err(|e| sqlx::Error::Encode(Box::new(e)))
+                            })?,
+                    ),
+                    None => None,
+                };
+
                 // Reserve the ticket. A takeover (the row still names a
                 // previous holder) also rotates its preimage and hash and
                 // drops the invoice, escrow and pubkey that belonged to them.
@@ -1927,6 +1972,7 @@ impl CompetitionStore {
                        SET reserved_at = datetime('now'),
                            reserved_by = ?,
                            encrypted_preimage = CASE WHEN reserved_by IS NULL THEN encrypted_preimage ELSE ? END,
+                           preimage_ciphertext = CASE WHEN reserved_by IS NULL THEN preimage_ciphertext ELSE ? END,
                            hash = CASE WHEN reserved_by IS NULL THEN hash ELSE ? END,
                            payment_request = CASE WHEN reserved_by IS NULL THEN payment_request ELSE NULL END,
                            invoice_expires_at = CASE WHEN reserved_by IS NULL THEN invoice_expires_at ELSE NULL END,
@@ -1937,6 +1983,7 @@ impl CompetitionStore {
                 )
                 .bind(&pubkey_owned)
                 .bind(&rotated_preimage_hex)
+                .bind(rotated_ciphertext)
                 .bind(&rotated_hash_hex)
                 .bind(&ticket_id)
                 .bind(&competition_id_str)
@@ -1966,6 +2013,7 @@ impl CompetitionStore {
                               entries.id as entry_id,
                               tickets.ephemeral_pubkey as ephemeral_pubkey,
                               encrypted_preimage,
+                              preimage_ciphertext,
                               hash,
                               payment_request,
                               invoice_expires_at,
@@ -2007,6 +2055,7 @@ impl CompetitionStore {
                       entries.id as entry_id,
                       tickets.ephemeral_pubkey as ephemeral_pubkey,
                       encrypted_preimage,
+                      preimage_ciphertext,
                       hash,
                       payment_request,
                       invoice_expires_at,
@@ -2037,6 +2086,7 @@ impl CompetitionStore {
                       entries.id as entry_id,
                       tickets.ephemeral_pubkey as ephemeral_pubkey,
                       encrypted_preimage,
+                      preimage_ciphertext,
                       hash,
                       payment_request,
                       invoice_expires_at,
@@ -2068,6 +2118,7 @@ impl CompetitionStore {
                       entries.id as entry_id,
                       tickets.ephemeral_pubkey as ephemeral_pubkey,
                       encrypted_preimage,
+                      preimage_ciphertext,
                       hash,
                       payment_request,
                       invoice_expires_at,
@@ -2103,6 +2154,7 @@ impl CompetitionStore {
                       entries.id as entry_id,
                       tickets.ephemeral_pubkey as ephemeral_pubkey,
                       encrypted_preimage,
+                      preimage_ciphertext,
                       hash,
                       payment_request,
                       invoice_expires_at,
@@ -2150,6 +2202,7 @@ impl CompetitionStore {
                       entries.id as entry_id,
                       tickets.ephemeral_pubkey as ephemeral_pubkey,
                       encrypted_preimage,
+                      preimage_ciphertext,
                       hash,
                       payment_request,
                       invoice_expires_at,
@@ -2177,6 +2230,7 @@ impl CompetitionStore {
                       entries.id as entry_id,
                       tickets.ephemeral_pubkey as ephemeral_pubkey,
                       encrypted_preimage,
+                      preimage_ciphertext,
                       hash,
                       payment_request,
                       invoice_expires_at,
@@ -2210,6 +2264,7 @@ impl CompetitionStore {
                 e.id as entry_id,
                 t.ephemeral_pubkey,
                 t.encrypted_preimage,
+                t.preimage_ciphertext,
                 t.hash,
                 t.payment_request,
                 t.invoice_expires_at,
@@ -2373,6 +2428,7 @@ impl CompetitionStore {
                       entries.id as entry_id,
                       tickets.ephemeral_pubkey as ephemeral_pubkey,
                       encrypted_preimage,
+                      preimage_ciphertext,
                       hash,
                       payment_request,
                       invoice_expires_at,
@@ -2576,6 +2632,9 @@ impl CompetitionStore {
         let preimage = hashlock::preimage_random(&mut rand::rng());
         let new_preimage = hex::encode(preimage);
         let new_hash = hex::encode(hashlock::sha256(&preimage));
+        let new_ciphertext = self
+            .seal_preimage(ticket.id, &new_hash, &preimage)
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
 
         self.db_connection
             .execute_write(move |pool| async move {
@@ -2583,6 +2642,7 @@ impl CompetitionStore {
                 let result = sqlx::query(
                     "UPDATE tickets
                     SET encrypted_preimage = ?,
+                        preimage_ciphertext = ?,
                         hash = ?,
                         ephemeral_pubkey = NULL,
                         reserved_at = NULL,
@@ -2595,6 +2655,7 @@ impl CompetitionStore {
                     AND settled_at IS NULL",
                 )
                 .bind(new_preimage)
+                .bind(new_ciphertext)
                 .bind(new_hash)
                 .bind(&ticket_id_str)
                 .bind(expected_hash)
@@ -2641,12 +2702,21 @@ impl CompetitionStore {
     pub async fn reset_ticket_after_failed_escrow(
         &self,
         ticket_id: uuid::Uuid,
-        new_encrypted_preimage: &str,
+        new_preimage_hex: &str,
         new_hash: &str,
     ) -> Result<bool, DatabaseWriteError> {
         let ticket_id_str = ticket_id.to_string();
-        let new_encrypted_preimage_owned = new_encrypted_preimage.to_string();
+        let new_preimage_hex_owned = new_preimage_hex.to_string();
         let new_hash_owned = new_hash.to_string();
+        let new_ciphertext = match self.ticket_cipher {
+            Some(_) => {
+                let preimage = stored_preimage(None, ticket_id, new_hash, None, new_preimage_hex)
+                    .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+                self.seal_preimage(ticket_id, new_hash, &preimage)
+                    .map_err(|e| sqlx::Error::Encode(Box::new(e)))?
+            }
+            None => None,
+        };
 
         self.db_connection
             .execute_write(move |pool| async move {
@@ -2655,6 +2725,7 @@ impl CompetitionStore {
                     "UPDATE tickets
                     SET
                         encrypted_preimage = ?,
+                        preimage_ciphertext = ?,
                         hash = ?,
                         payment_request = NULL,
                         paid_at = NULL,
@@ -2665,7 +2736,8 @@ impl CompetitionStore {
                         reserved_at = NULL
                         WHERE id = ?",
                 )
-                .bind(new_encrypted_preimage_owned)
+                .bind(new_preimage_hex_owned)
+                .bind(new_ciphertext)
                 .bind(new_hash_owned)
                 .bind(&ticket_id_str)
                 .execute(&mut *tx)

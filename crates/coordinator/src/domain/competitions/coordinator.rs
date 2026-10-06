@@ -309,7 +309,10 @@ impl Coordinator {
         let private_key = bitcoin.get_derived_private_key().await?;
         let public_key = private_key.base_point_mul();
 
-        let competition_store = Arc::new(competition_store);
+        // Ticket preimages are sealed under a key derived from this one; see `ticket_preimage.rs`.
+        let ticket_cipher = super::TicketCipher::from_coordinator_key(&private_key.serialize());
+        let competition_store =
+            Arc::new(competition_store.with_ticket_cipher(Arc::new(ticket_cipher)));
         let worker_leases = Arc::new(super::WorkerLeases::new(
             competition_store.clone(),
             format!("{name}-{}", Uuid::now_v7()),
@@ -390,9 +393,8 @@ impl Coordinator {
             if ticket.paid_at.is_none() || ticket.settled_at.is_some() {
                 continue;
             }
-            self.ln
-                .settle_hold_invoice(ticket.encrypted_preimage.clone())
-                .await?;
+            let preimage = self.competition_store.ticket_preimage(ticket)?;
+            self.ln.settle_hold_invoice(hex::encode(preimage)).await?;
             self.competition_store
                 .mark_ticket_settled(ticket.id)
                 .await?;
@@ -691,7 +693,7 @@ impl Coordinator {
             .map(BitcoinPublicKey::from_str)
             .transpose()?
             .ok_or_else(|| anyhow!("ticket has no escrow key"))?;
-        let preimage = hex::decode(&ticket.encrypted_preimage)?;
+        let preimage = self.competition_store.ticket_preimage(ticket)?;
         let payment_hash = sha256::Hash::hash(&preimage).to_byte_array();
 
         let reclaim_tx = reclaim_escrow_tx(
@@ -1696,8 +1698,10 @@ impl Coordinator {
                         let user_pubkey = BdkPublicKey::from_str(user_pubkey)
                             .map_err(|e| anyhow!("Failed to parse user public key: {}", e))?;
                         let payment_hash_from_ticket = parse_hash32(&ticket.hash)?;
-                        let preimage = hex::decode(&ticket.encrypted_preimage)
-                            .map_err(|e| anyhow!("Failed to decode preimage: {}", e))?;
+                        let preimage = self
+                            .competition_store
+                            .ticket_preimage(ticket)
+                            .map_err(|e| anyhow!("Failed to read ticket preimage: {}", e))?;
                         let payment_hash_from_preimage =
                             sha256::Hash::hash(&preimage).to_byte_array();
 
@@ -2844,9 +2848,10 @@ impl Coordinator {
                     .await
                     .map_err(|e| anyhow!("Failed to get ticket for split TX: {}", e))?;
 
-                let ticket_preimage =
-                    dlctix::hashlock::preimage_from_hex(&ticket.encrypted_preimage)
-                        .map_err(|e| anyhow!("Failed to decode ticket preimage: {}", e))?;
+                let ticket_preimage = self
+                    .competition_store
+                    .ticket_preimage(&ticket)
+                    .map_err(|e| anyhow!("Failed to read ticket preimage: {}", e))?;
 
                 let win_cond = WinCondition {
                     outcome,
@@ -3701,9 +3706,10 @@ impl Coordinator {
                 .ticket_payout_policy(ticket.id, &ticket.hash)
                 .await?;
         }
-        // Decode preimage from encrypted_preimage
-        let preimage = hex::decode(&ticket.encrypted_preimage)
-            .map_err(|_| Error::BadRequest("Invalid preimage".into()))?;
+        let preimage = self
+            .competition_store
+            .ticket_preimage(&ticket)
+            .map_err(anyhow::Error::from)?;
 
         // Calculate payment hash from preimage
         let payment_hash = sha256::Hash::hash(&preimage).to_byte_array();

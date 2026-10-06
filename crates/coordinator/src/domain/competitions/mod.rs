@@ -35,6 +35,8 @@ mod reported;
 mod runners;
 pub mod states;
 mod store;
+mod ticket_preimage;
+pub use ticket_preimage::{TicketCipher, TicketPreimageError, TICKET_PREIMAGE_BATCH};
 mod ticket_registration;
 use crate::infra::{
     db::{
@@ -473,9 +475,12 @@ pub struct Ticket {
     pub id: Uuid,
     pub competition_id: Uuid,
     pub entry_id: Option<Uuid>,
-    /// Plaintext hex despite the name. Settles the ticket's HODL invoice, so it
-    /// must not reach logs or responses.
-    pub encrypted_preimage: String,
+    /// The `encrypted_preimage` column: the preimage as plaintext hex, despite the column's
+    /// name, kept for older releases. Read the preimage with `Ticket::preimage`, never from here.
+    /// It settles the ticket's HODL invoice, so it must not reach logs or responses.
+    pub legacy_preimage_hex: String,
+    /// The preimage sealed with the coordinator's ticket key; see `ticket_preimage.rs`.
+    pub preimage_ciphertext: Option<Vec<u8>>,
     pub hash: String,
     pub payment_request: Option<String>,
     pub invoice_expires_at: Option<OffsetDateTime>,
@@ -527,7 +532,8 @@ impl FromRow<'_, SqliteRow> for Ticket {
                     index: "entry_id".to_string(),
                     source: Box::new(e),
                 })?,
-            encrypted_preimage: row.get("encrypted_preimage"),
+            legacy_preimage_hex: row.get("encrypted_preimage"),
+            preimage_ciphertext: row.get("preimage_ciphertext"),
             hash: row.get("hash"),
             payment_request: row.get("payment_request"),
             invoice_expires_at: parse_optional_sqlite_datetime(row, "invoice_expires_at")?,
@@ -1558,7 +1564,9 @@ impl Competition {
             competition_id: self.id,
             entry_id: None,
             ephemeral_pubkey: None,
-            encrypted_preimage: ticket_preimage.to_lower_hex_string(), // TODO: encrypt this
+            // The store seals it when it writes the ticket.
+            legacy_preimage_hex: ticket_preimage.to_lower_hex_string(),
+            preimage_ciphertext: None,
             hash: ticket_hash.to_lower_hex_string(),
             payment_request: None,
             invoice_expires_at: None,

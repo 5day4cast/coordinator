@@ -466,7 +466,10 @@ impl Recovery {
             escrow: self.escrow_record(ticket),
             ticket: Some(TicketRecord {
                 hash: ticket.ticket_hash.clone(),
-                preimage: ticket.settled.then(|| ticket.ticket_preimage.clone()),
+                preimage: ticket
+                    .settled
+                    .then(|| ticket.ticket_preimage.clone())
+                    .flatten(),
             }),
             contract: contract.and_then(|(contract, index)| {
                 Some(ContractRecord {
