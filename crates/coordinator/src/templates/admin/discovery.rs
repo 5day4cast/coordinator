@@ -80,39 +80,76 @@ pub fn discovery(
                 },
                 Some(Err(error)) => div.notice role="alert" { (error) },
                 Some(Ok(candidates)) => {
-                    @if !candidates.is_empty() && filters.near.trim().is_empty() {
-                        h2 { "Start with a forecast" }
-                        div.metric-grid {
-                            @for (kind, label) in [("wind", "Follow stronger wind"), ("rain", "Compare wet-weather forecasts"), ("swing", "Explore temperature range")] {
-                                @let value = |c: &&crate::infra::admin_weather::Candidate| match kind {
-                                    "wind" => c.wind_knots,
-                                    "rain" => c.rain_chance,
-                                    _ => Some(c.high - c.low),
-                                };
-                                @if let Some(lead) = candidates.iter().filter(|c| value(c).is_some()).max_by_key(|c| value(c)) {
-                                    div.metric {
-                                        h3 { (label) }
-                                        p { (lead.eligible.station.station_name) }
-                                        p { @match kind {
-                                            "wind" => (format!("{:.0} mph forecast wind", lead.wind_knots.unwrap_or_default() as f64 * 1.15078)),
-                                            "rain" => (format!("{}% peak precipitation chance", lead.rain_chance.unwrap_or_default())),
-                                            _ => (format!("{}–{} °F forecast low and high", lead.low, lead.high)),
-                                        } }
-                                        a href=(nearby_link(filters, window, &lead.eligible.station.station_id, kind)) { "Compare nearby stations →" }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    h2 { (candidates.len()) " matching stations" }
-                    @if candidates.is_empty() { p { "No stations match this window and these filters. Try a wider area or a shorter window." } }
-                    @else {
+                    @if candidates.is_empty() {
+                        h2 { "0 matching stations" }
+                        p { "No stations match this window and these filters. Try a wider area or a shorter window." }
+                    } @else {
                         form id="game-creation" method="post" action="/admin/api/competitions" hx-post="/admin/api/competitions" hx-target="#competition-notification" hx-swap="innerHTML" hx-indicator="#creation-progress" {
                             input type="hidden" name="id" id="competitionIdInput" value=(uuid::Uuid::now_v7());
                             input type="hidden" name="start_observation_date" value=(window.start.format(&Rfc3339).unwrap_or_default());
                             input type="hidden" name="end_observation_date" value=(window.end.format(&Rfc3339).unwrap_or_default());
                             input type="hidden" name="signing_date" value=((window.end + time::Duration::HOUR).format(&Rfc3339).unwrap_or_default());
                             input type="hidden" name="history_days" value=(window.history_days);
+                            section.creation-panel {
+                                h2 { "Set up this game" }
+                                p { "Select up to 50 stations below. The server checks their current eligibility again when you create the competition." }
+                                p { "Observation: " (window.start.format(&Rfc3339).unwrap_or_default()) " → " (window.end.format(&Rfc3339).unwrap_or_default()) ". Signing starts one hour later." }
+                                div.form-grid {
+                                    label { "Stake per entry (sats)" input type="number" name="entry_fee" value="5000" min="1" required; }
+                                    // Empty means every category at every selected station; the admin
+                                    // script keeps the maximum in step with the stations chosen.
+                                    label { "Picks per entry"
+                                        input type="number" name="number_of_values_per_entry" min="1" step="1" placeholder="All" data-metrics=(metrics);
+                                        span.note data-picks-note { "Leave empty for all: " (metrics) " per selected station." }
+                                    }
+                                    label { "Entries per player" input type="number" name="max_entries_per_player" value="1" min="1" required; }
+                                    label { "Coordinator fee (%)" input type="number" name="coordinator_fee_percentage" value="5" min="0" max="100" step="0.01" required; }
+                                    label { "Minimum pool size" input type="number" name="min_players" value="2" min="2" max="13" required; }
+                                    // The default game: one pool of 20 seats paying 70% and 30% from ten players.
+                                    label { "Maximum pool size" input type="number" name="max_pool_size" value="20" min="3" max="25" required; }
+                                    label { "Maximum queued entries" input type="number" name="max_entries" value="20" min="2" max="1500" required; }
+                                    label { "Winning places" input type="number" name="number_of_places_win" value="2" min="1" max="2" required; }
+                                }
+                                p.note { "Two places pay 70% and 30% in pools of 10 or more, and need pools of at most 20; smaller pools pay their winner the pot." }
+                                label.check { input type="checkbox" name="queued" value="true" checked; " Form pools when registration closes" }
+                                details {
+                                    summary { "Advanced terms and fixed-size games" }
+                                    p.note { "Fixed-size terms apply when pool formation is unchecked." }
+                                    div.form-grid {
+                                        label { "Fixed-size seats" input type="number" name="total_allowed_entries" value="3" min="2" required; }
+                                        label { "Scoring" select name="scoring_rules" { option value="lines" { "Lines" } option value="fixed" { "Fixed" } } }
+                                        label { "Blocks between settlement stages" input type="number" name="relative_locktime_block_delta" value=(block_delta) min="1" required; }
+                                    }
+                                }
+                                button type="submit" disabled[!usable] { "Create competition" }
+                                span id="creation-progress" class="htmx-indicator" role="status" { " Checking eligibility and creating…" }
+                                div id="competition-notification" role="status" aria-live="polite" {}
+                            }
+                            @if filters.near.trim().is_empty() {
+                                h2 { "Start with a forecast" }
+                                div.metric-grid {
+                                    @for (kind, label) in [("wind", "Follow stronger wind"), ("rain", "Compare wet-weather forecasts"), ("swing", "Explore temperature range")] {
+                                        @let value = |c: &&crate::infra::admin_weather::Candidate| match kind {
+                                            "wind" => c.wind_knots,
+                                            "rain" => c.rain_chance,
+                                            _ => Some(c.high - c.low),
+                                        };
+                                        @if let Some(lead) = candidates.iter().filter(|c| value(c).is_some()).max_by_key(|c| value(c)) {
+                                            div.metric {
+                                                h3 { (label) }
+                                                p { (lead.eligible.station.station_name) }
+                                                p { @match kind {
+                                                    "wind" => (format!("{:.0} mph forecast wind", lead.wind_knots.unwrap_or_default() as f64 * 1.15078)),
+                                                    "rain" => (format!("{}% peak precipitation chance", lead.rain_chance.unwrap_or_default())),
+                                                    _ => (format!("{}–{} °F forecast low and high", lead.low, lead.high)),
+                                                } }
+                                                a href=(nearby_link(filters, window, &lead.eligible.station.station_id, kind)) { "Compare nearby stations →" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            h2 { (candidates.len()) " matching stations" }
                             (super::weather_map::map_slot(filters, window))
                             div id="map-selections" {}
                             div.station-grid {
@@ -133,39 +170,6 @@ pub fn discovery(
                                 }
                             }
                             @if candidates.len() > 100 { p.note { "Showing the first 100 matches. Narrow the location or radius to see others." } }
-                            section.creation-panel {
-                                h2 { "Set up this game" }
-                                p { "Select up to 50 stations above. The server checks their current eligibility again when you create the competition." }
-                                p { "Observation: " (window.start.format(&Rfc3339).unwrap_or_default()) " → " (window.end.format(&Rfc3339).unwrap_or_default()) ". Signing starts one hour later." }
-                                div.form-grid {
-                                    label { "Stake per entry (sats)" input type="number" name="entry_fee" value="5000" min="1" required; }
-                                    // Empty means every category at every selected station; the admin
-                                    // script keeps the maximum in step with the stations chosen.
-                                    label { "Picks per entry"
-                                        input type="number" name="number_of_values_per_entry" min="1" step="1" placeholder="All" data-metrics=(metrics);
-                                        span.note data-picks-note { "Leave empty for all: " (metrics) " per selected station." }
-                                    }
-                                    label { "Entries per player" input type="number" name="max_entries_per_player" value="1" min="1" required; }
-                                    label { "Coordinator fee (%)" input type="number" name="coordinator_fee_percentage" value="5" min="0" max="100" step="0.01" required; }
-                                    label { "Minimum pool size" input type="number" name="min_players" value="2" min="2" max="13" required; }
-                                    label { "Maximum pool size" input type="number" name="max_pool_size" value="25" min="3" max="25" required; }
-                                    label { "Maximum queued entries" input type="number" name="max_entries" value="500" min="2" max="1500" required; }
-                                }
-                                label.check { input type="checkbox" name="queued" value="true" checked; " Form pools when registration closes" }
-                                details {
-                                    summary { "Advanced terms and fixed-size games" }
-                                    p.note { "Fixed-size terms apply when pool formation is unchecked." }
-                                    div.form-grid {
-                                        label { "Fixed-size seats" input type="number" name="total_allowed_entries" value="3" min="2" required; }
-                                        label { "Winning places" input type="number" name="number_of_places_win" value="1" min="1" required; }
-                                        label { "Scoring" select name="scoring_rules" { option value="lines" { "Lines" } option value="fixed" { "Fixed" } } }
-                                        label { "Blocks between settlement stages" input type="number" name="relative_locktime_block_delta" value=(block_delta) min="1" required; }
-                                    }
-                                }
-                                button type="submit" disabled[!usable] { "Create competition" }
-                                span id="creation-progress" class="htmx-indicator" role="status" { " Checking eligibility and creating…" }
-                                div id="competition-notification" role="status" aria-live="polite" {}
-                            }
                         }
                     }
                 }
@@ -290,6 +294,12 @@ mod tests {
         assert!(html.contains("data-metrics=\"3\""));
         assert!(html.contains("Leave empty for all: 3 per selected station."));
         assert!(html.contains("Your current station choices stay in place"));
+        // Game rules and the create button come before the stations and map.
+        let create = html.find("Create competition</button>").unwrap();
+        assert!(html.find("Set up this game").unwrap() < create);
+        assert!(create < html.find("1 matching stations").unwrap());
+        assert!(create < html.find("/admin/competition/map?").unwrap());
+        assert!(create < html.find("name=\"locations\"").unwrap());
         assert!(!html.contains("every 2s"));
         assert!(html.contains("Refresh results</a>"));
         // The map loads once, after the cards, and is not polled.

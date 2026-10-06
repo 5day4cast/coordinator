@@ -7,8 +7,8 @@
 //! seals the entry key to a Keymeld enclave under the terms' deposit scope instead of a session,
 //! and the coordinator has the enclave check that deposit before showing the invoice.
 //!
-//! Pools: each creates its oracle event from the reference event's lines, pays one winner from
-//! `queued::pool_payouts`, and gives Keymeld the oracle's signed statement of its event when it
+//! Pools: each creates its oracle event from the reference event's lines, pays the places its
+//! size gives from `queued::pool_payouts`, and gives Keymeld the oracle's signed statement of its event when it
 //! binds the contract. See `queued.rs` and `queued_kickoff.rs`.
 
 use super::*;
@@ -33,6 +33,7 @@ impl Coordinator {
         &self,
         request: CreateQueuedCompetition,
     ) -> Result<Competition, Error> {
+        self.require_new_money_allowed()?;
         if !self.automatic_payouts || self.ark.is_none() || !self.is_keymeld_enabled() {
             return Err(Error::BadRequest(
                 "Queued competitions need Keymeld, automatic payouts and Arkade".into(),
@@ -45,9 +46,10 @@ impl Coordinator {
         create_event
             .validate_oracle_settings()
             .map_err(|reason| Error::BadRequest(reason.into()))?;
+        // The largest pool pays the most places, so it is the largest contract to sign.
         coordinator_escrow::capacity::validate_competition_capacity(
             create_event.total_allowed_entries,
-            create_event.number_of_places_win,
+            request.largest_pool_places(),
         )
         .map_err(|reason| Error::BadRequest(reason.to_string()))?;
         let competition = Competition::new(&create_event);
@@ -155,6 +157,10 @@ impl Coordinator {
                 .competition_store
                 .queued_entry_count(competition.id)
                 .await?;
+            let held = self
+                .competition_store
+                .queued_held_count(competition.id)
+                .await?;
             let pools = self
                 .competition_store
                 .competition_pools(competition.id)
@@ -166,7 +172,9 @@ impl Coordinator {
                     players: pool.members.len(),
                 })
                 .collect();
-            competition.queue = Some(queue_summary(&settings, entries, pools));
+            let mut summary = queue_summary(&settings, entries, pools);
+            summary.held = held;
+            competition.queue = Some(summary);
         }
         Ok(())
     }
@@ -577,7 +585,7 @@ impl Coordinator {
         }
         Ok(coordinator_escrow::queued::pool_payouts(
             entries.len(),
-            settings.terms.number_of_places_win as usize,
+            settings.terms.pool_places(entries.len()) as usize,
         )?)
     }
 }
@@ -587,6 +595,7 @@ fn queue_summary(settings: &QueueSettings, entries: u64, pools: Vec<PoolSummary>
         pool_rules: settings.pool_rules,
         entries,
         max_entries: settings.max_entries,
+        held: entries,
         stake_sats: settings.stake_sats,
         terms_digest: hex::encode(settings.terms_digest),
         pools,
@@ -637,7 +646,7 @@ fn check_queued_registration(
 }
 
 /// A pool's oracle event must be the one its players consented to: the pool's own id and seat
-/// count, one winner, and the terms' signing date, expiry and observation terms, lines included.
+/// count, the places its size pays, and the terms' signing date, expiry and observation terms, lines included.
 fn check_pool_event(
     competition: &Competition,
     settings: &QueueSettings,
@@ -656,7 +665,8 @@ fn check_pool_event(
         ));
     }
     if event.total_allowed_entries != competition.event_submission.total_allowed_entries
-        || event.number_of_places_win != terms.number_of_places_win
+        || event.number_of_places_win
+            != terms.pool_places(competition.event_submission.total_allowed_entries)
         || event.signing_date.unix_timestamp() != terms.signing_date
         || created.event_announcement.expiry != Some(terms.expiry)
     {
@@ -701,7 +711,7 @@ fn check_pool_statement(
         || statement.signing_date != terms.signing_date
         || statement.expiry != terms.expiry
         || announced.expiry != Some(statement.expiry)
-        || ranking.number_of_places_win != terms.number_of_places_win
+        || ranking.number_of_places_win != terms.pool_places(sorted.len())
         || ranking.entry_ids != sorted
         || !observation.same_as(&terms.observation)
         || statement.locking_points(terms.oracle_point()?) != announced.locking_points

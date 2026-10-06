@@ -184,7 +184,55 @@ pub trait Ln: Send + Sync {
 
     async fn subscribe_invoices(&self) -> Result<mpsc::Receiver<InvoiceUpdate>, anyhow::Error>;
     async fn subscribe_payments(&self) -> Result<mpsc::Receiver<PaymentUpdate>, anyhow::Error>;
+
+    /// The payments this node sent, created at or after `since` (Unix seconds), whatever their
+    /// status. The restore reconciliation compares them with the payouts the database knows.
+    async fn payments_since(&self, since: i64) -> anyhow::Result<Vec<SentPayment>> {
+        let _ = since;
+        anyhow::bail!("Payment history is unavailable for this backend")
+    }
 }
+
+/// A payment this node sent, as LND lists it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SentPayment {
+    pub payment_hash: String,
+    #[serde(default)]
+    pub payment_request: String,
+    /// What the payee received, without routing fees.
+    #[serde(default, deserialize_with = "u64_from_string")]
+    pub value_sat: u64,
+    pub status: PaymentStatus,
+    #[serde(default, deserialize_with = "u64_from_string")]
+    pub creation_time_ns: u64,
+}
+
+/// LND's REST API writes 64-bit integers as strings.
+fn u64_from_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Number {
+        Text(String),
+        Value(u64),
+    }
+    match Number::deserialize(deserializer)? {
+        Number::Text(text) if text.is_empty() => Ok(0),
+        Number::Text(text) => text.parse().map_err(serde::de::Error::custom),
+        Number::Value(value) => Ok(value),
+    }
+}
+
+/// One page of `GET /v1/payments`.
+#[derive(Debug, Deserialize)]
+struct PaymentsPage {
+    #[serde(default)]
+    payments: Vec<SentPayment>,
+    #[serde(default, deserialize_with = "u64_from_string")]
+    last_index_offset: u64,
+}
+
+/// Payments read per page of LND's payment history.
+const PAYMENTS_PAGE: usize = 500;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct NodeInfo {
@@ -645,6 +693,26 @@ impl Ln for LnClient {
 
     async fn channel_balance(&self) -> anyhow::Result<ChannelBalance> {
         self.operator_read("/v1/balance/channels").await
+    }
+
+    async fn payments_since(&self, since: i64) -> anyhow::Result<Vec<SentPayment>> {
+        let since = since.max(0);
+        let mut payments = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page: PaymentsPage = self
+                .operator_read(&format!(
+                    "/v1/payments?include_incomplete=true&creation_date_start={since}\
+                     &index_offset={offset}&max_payments={PAYMENTS_PAGE}"
+                ))
+                .await?;
+            let count = page.payments.len();
+            payments.extend(page.payments);
+            if count < PAYMENTS_PAGE || page.last_index_offset <= offset {
+                return Ok(payments);
+            }
+            offset = page.last_index_offset;
+        }
     }
 
     async fn ping(&self) -> Result<(), anyhow::Error> {

@@ -113,6 +113,20 @@ impl PayoutWatcher {
         .await
     }
 
+    /// Whether the payout's entry is held after a restore (`restore_reconcile.rs`): LND made a
+    /// payment the database does not know, for an amount this entry could be owed, so nothing is
+    /// sent until an operator releases it.
+    async fn held(&self, payout: &EntryPayout) -> Result<bool, anyhow::Error> {
+        let held = self.competition_store.payout_held(payout.entry_id).await?;
+        if held {
+            debug!(
+                "Payout {} waits: the Lightning payout of entry {} is held for an operator",
+                payout.id, payout.entry_id
+            );
+        }
+        Ok(held)
+    }
+
     /// Ask LND to pay the payout's invoice before `deadline`. Every send of a payout uses the
     /// invoice it was stored with, so LND sees one payment hash however often it is sent.
     async fn send(
@@ -181,6 +195,9 @@ impl PayoutWatcher {
         };
         let now = OffsetDateTime::now_utc().unix_timestamp();
         if state.next_send_at.is_none_or(|at| at > now) {
+            return Ok(());
+        }
+        if self.held(payout).await? {
             return Ok(());
         }
         let deadline = match self.send_eligibility(payout.entry_id, &invoice).await {
@@ -366,6 +383,9 @@ impl PayoutWatcher {
                             continue;
                         }
                     };
+                    if self.held(&payout).await? {
+                        continue;
+                    }
                     // Recover a crash between persisting the payout and sending it.
                     // Keep using the same invoice/hash: LND deduplicates attempts
                     // if the original request is accepted concurrently.

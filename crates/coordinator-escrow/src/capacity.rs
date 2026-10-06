@@ -34,9 +34,21 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 /// Admission caps for the confidential payout path. Each ranked outcome costs a
-/// signing item per winning place, so the place count dominates the batch size.
+/// signing item per winning place, so the place count dominates the batch size: a
+/// competition pays one place to up to 25 players, or two places to up to 20.
 pub const MAX_COMPETITION_PLAYERS: usize = 25;
-pub const MAX_COMPETITION_WINNING_PLACES: usize = 1;
+pub const MAX_COMPETITION_WINNING_PLACES: usize = 2;
+pub const MAX_TWO_PLACE_PLAYERS: usize = 20;
+
+/// Whether `players` competing for `winning_places` is a shape the game offers: 1 to 25
+/// players over one place, or at most 20 over two. [`validate_competition_capacity`] also
+/// checks that the shape fits Keymeld's signing batch and payload limits.
+pub fn supported_shape(players: usize, winning_places: usize) -> bool {
+    (1..=MAX_COMPETITION_PLAYERS).contains(&players)
+        && (1..=MAX_COMPETITION_WINNING_PLACES).contains(&winning_places)
+        && winning_places <= players
+        && (winning_places == 1 || players <= MAX_TWO_PLACE_PLAYERS)
+}
 
 /// The largest observation terms a queued competition may carry. Every entry's consent and each
 /// pool's oracle statement repeat them, so [`validate_competition_capacity`] charges them at these
@@ -166,6 +178,7 @@ fn modeled_queued_entry(market_maker: MarketMaker) -> Result<String, KeyMeldErro
             expiry: u32::MAX,
             observation: modeled_observation(),
             number_of_places_win: u32::MAX,
+            multi_place_min_players: Some(u32::MAX),
             pool_rules: PoolRules::new(10, MAX_COMPETITION_PLAYERS)
                 .map_err(|e| invalid(e.to_string()))?,
             stake_sats: u64::MAX,
@@ -187,15 +200,10 @@ pub fn validate_competition_capacity(
     players: usize,
     winning_places: usize,
 ) -> Result<CompetitionCapacity, KeyMeldError> {
-    if players == 0
-        || players > MAX_COMPETITION_PLAYERS
-        || winning_places == 0
-        || winning_places > MAX_COMPETITION_WINNING_PLACES
-        || winning_places > players
-    {
+    if !supported_shape(players, winning_places) {
         return Err(invalid(format!(
-            "Confidential competitions support 1-{MAX_COMPETITION_PLAYERS} players \
-             over 1-{MAX_COMPETITION_WINNING_PLACES} winning places"
+            "Confidential competitions support 1-{MAX_COMPETITION_PLAYERS} players over one \
+             winning place, or up to {MAX_TWO_PLACE_PLAYERS} players over two winning places"
         )));
     }
     let permutations = (0..winning_places)
@@ -500,38 +508,70 @@ mod tests {
 #[cfg(test)]
 mod supported_sizes {
     //! The admitted envelope is capped explicitly rather than discovered from
-    //! byte limits. Signing items stay well below MAX_BATCH_ITEMS at the cap, so
-    //! the payload size, not the item count, is what a larger cap would strain.
+    //! byte limits: one place up to 25 players, two places up to 20. Two places
+    //! need Keymeld's larger signing batch; until it ships, the item count refuses
+    //! them, so nothing is admitted that Keymeld cannot sign.
     use super::{
-        validate_competition_capacity, MAX_COMPETITION_PLAYERS, MAX_COMPETITION_WINNING_PLACES,
+        supported_shape, validate_competition_capacity, MAX_COMPETITION_PLAYERS,
+        MAX_COMPETITION_WINNING_PLACES, MAX_TWO_PLACE_PLAYERS,
     };
+    use keymeld_core::escrow::{MAX_BATCH_ITEMS, MAX_PAYLOAD_BYTES};
 
-    #[test]
-    fn the_capped_shape_is_admitted_with_headroom() {
-        let capacity =
-            validate_competition_capacity(MAX_COMPETITION_PLAYERS, MAX_COMPETITION_WINNING_PLACES)
-                .expect("the advertised maximum competition must be admitted");
-        assert!(
-            capacity.signing_items < keymeld_core::escrow::MAX_BATCH_ITEMS,
-            "item count should not be the binding limit at the cap"
-        );
+    fn fits_payloads(capacity: &super::CompetitionCapacity) {
         for size in [
             capacity.bind_request_bytes,
             capacity.signing_request_bytes,
             capacity.settlement_request_bytes,
             capacity.largest_receipt_bytes,
         ] {
-            assert!(size <= keymeld_core::escrow::MAX_PAYLOAD_BYTES);
+            assert!(size <= MAX_PAYLOAD_BYTES);
+        }
+    }
+
+    #[test]
+    fn the_capped_one_place_shape_is_admitted_with_headroom() {
+        let capacity = validate_competition_capacity(MAX_COMPETITION_PLAYERS, 1)
+            .expect("25 players over one place must be admitted");
+        assert!(
+            capacity.signing_items < MAX_BATCH_ITEMS,
+            "item count should not be the binding limit at the cap"
+        );
+        fits_payloads(&capacity);
+    }
+
+    #[test]
+    fn twenty_players_over_two_places_need_keymelds_larger_batch() {
+        // P(20, 2) ranked outcomes with three signatures each, plus refund-all and expiry.
+        let items = 20 * 19 * 3 + 2 * 20 + 2;
+        assert_eq!(items, 1_182);
+        let twenty = validate_competition_capacity(MAX_TWO_PLACE_PLAYERS, 2);
+        if MAX_BATCH_ITEMS >= items {
+            let capacity = twenty.expect("20 players over two places must be admitted");
+            assert_eq!(capacity.signing_items, items);
+            fits_payloads(&capacity);
+        } else {
+            let error = twenty.expect_err("refused until Keymeld signs larger batches");
+            assert!(error.to_string().contains("signing items"), "{error}");
         }
     }
 
     #[test]
     fn shapes_beyond_the_cap_are_refused() {
+        assert!(supported_shape(MAX_COMPETITION_PLAYERS, 1));
+        assert!(supported_shape(MAX_TWO_PLACE_PLAYERS, 2));
         assert!(validate_competition_capacity(MAX_COMPETITION_PLAYERS + 1, 1).is_err());
         assert!(validate_competition_capacity(0, 1).is_err());
         assert!(validate_competition_capacity(4, 0).is_err());
-        // Extra winning places multiply ranked outcomes and are not supported yet.
-        for players in 2..=MAX_COMPETITION_PLAYERS {
+        // Two places only up to 20 players, whatever Keymeld's batch allows.
+        for players in [MAX_TWO_PLACE_PLAYERS + 1, MAX_COMPETITION_PLAYERS] {
+            assert!(
+                !supported_shape(players, 2),
+                "{players} players over two places"
+            );
+            assert!(validate_competition_capacity(players, 2).is_err());
+        }
+        // A third place is not offered.
+        for players in 3..=MAX_COMPETITION_PLAYERS {
             assert!(
                 validate_competition_capacity(players, MAX_COMPETITION_WINNING_PLACES + 1).is_err(),
                 "{players} players over {} places must be refused",

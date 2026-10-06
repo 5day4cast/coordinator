@@ -56,6 +56,9 @@ pub enum Error {
     /// Retryable: the swap service cannot fund an entry's swap right now.
     #[error("{}", competitions::SWAPS_UNAVAILABLE)]
     SwapsUnavailable,
+    /// The coordinator only settles what it owes: no competition, ticket or entry is taken.
+    #[error("{}", competitions::SETTLE_ONLY_PAUSED)]
+    SettleOnly,
 }
 
 impl Error {
@@ -74,6 +77,7 @@ impl Error {
                 | Error::EntriesPaused
                 | Error::ArkadeUnavailable
                 | Error::SwapsUnavailable
+                | Error::SettleOnly
         )
     }
 

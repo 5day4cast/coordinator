@@ -149,6 +149,15 @@ test.describe("Competitions", () => {
     await expect(headers.nth(5)).toContainText("Entries");
   });
 
+  test("a competition paying two places shows how they share the pot", async ({ page }) => {
+    const row = page
+      .locator("#competitions-page a.competition-row[href$='/entry-form']")
+      .first();
+    await expect(row.locator(".cell-win")).toContainText("1st 70% · 2nd 30%", {
+      timeout: 15000,
+    });
+  });
+
   test("can navigate to entries page", async ({ page }) => {
     await page.locator("#allEntriesNavClick").click();
 

@@ -346,6 +346,7 @@ fn large_pools_preview(
         pool_rules: coordinator_escrow::pools::PoolRules::new(2, 25).unwrap(),
         entries: 75,
         max_entries: 500,
+        held: 75,
         stake_sats: 5000,
         terms_digest: "preview-terms".into(),
         pools: (0..3)

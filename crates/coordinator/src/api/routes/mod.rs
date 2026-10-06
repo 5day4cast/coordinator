@@ -52,6 +52,7 @@ impl IntoResponse for Error {
             Error::EntriesPaused => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             Error::ArkadeUnavailable => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             Error::SwapsUnavailable => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
+            Error::SettleOnly => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             // Retryable: the oracle is restarting or has not fitted its lines yet. Its message
             // may name internal addresses, so it is logged rather than returned.
             Error::OracleFailed(error) => {
@@ -134,6 +135,11 @@ mod tests {
                 Error::ArkadeUnavailable,
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Entries are paused while the Arkade network recovers; try again in a little while",
+            ),
+            (
+                Error::SettleOnly,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Entries are paused",
             ),
             (
                 Error::FeeEstimateUnavailable,

@@ -638,6 +638,25 @@ impl LnSettings {
 }
 
 impl CoordinatorSettings {
+    /// Apply the value of `COORDINATOR_SETTLE_ONLY`, when set: `true` or `1` turns settle-only
+    /// mode on, `false` or `0` off, and an empty value leaves the file's setting.
+    pub fn apply_settle_only_env(&mut self, value: Option<String>) -> Result<(), anyhow::Error> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        self.settle_only = match value.trim().to_ascii_lowercase().as_str() {
+            "" => return Ok(()),
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            other => {
+                return Err(anyhow!(
+                    "{SETTLE_ONLY_ENV} must be true or false, not {other:?}"
+                ))
+            }
+        };
+        Ok(())
+    }
+
     pub fn validate(&self, network: Network) -> Result<(), anyhow::Error> {
         if self.escrow_enabled && network == Network::Bitcoin {
             return Err(anyhow::anyhow!(
@@ -1032,6 +1051,33 @@ pub struct CoordinatorSettings {
     /// Default is 0 (settle immediately at broadcast).
     #[serde(default)]
     pub invoice_settlement_confirmations: u32,
+
+    /// Settle what is owed and take no new money, as after a restore from backups: no
+    /// competition, ticket or entry is accepted, while kickoffs, attestations, settlement
+    /// transactions, payouts, refunds and reclaims carry on. See `docs/ops/disaster-recovery.md`.
+    /// `COORDINATOR_SETTLE_ONLY` overrides it.
+    #[serde(default)]
+    pub settle_only: bool,
+
+    /// In settle-only mode, what happens to a competition or pool that has not kicked off:
+    /// "refund" (the default) cancels it and refunds every entry; "kickoff" lets those whose
+    /// entries are already paid start as usual.
+    #[serde(default)]
+    pub settle_only_unstarted: SettleOnlyUnstarted,
+}
+
+/// Environment variable that sets `coordinator_settings.settle_only`, overriding the file.
+pub const SETTLE_ONLY_ENV: &str = "COORDINATOR_SETTLE_ONLY";
+
+/// What settle-only mode does with a competition that has not kicked off yet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettleOnlyUnstarted {
+    /// Cancel it before its contract is built, and refund its entries.
+    #[default]
+    Refund,
+    /// Kick it off as usual once its paid entries are in.
+    Kickoff,
 }
 
 fn default_sweep_interval_secs() -> u64 {
@@ -1087,6 +1133,8 @@ impl Default for CoordinatorSettings {
             escrow_enabled: false,
             mock_oracle: false,
             invoice_settlement_confirmations: 0,
+            settle_only: false,
+            settle_only_unstarted: SettleOnlyUnstarted::Refund,
         }
     }
 }
@@ -1175,6 +1223,9 @@ pub fn get_settings() -> Result<Settings, anyhow::Error> {
     settings
         .metrics_settings
         .apply_env_override(env::var(METRICS_LISTEN_ADDR_ENV).ok())?;
+    settings
+        .coordinator_settings
+        .apply_settle_only_env(env::var(SETTLE_ONLY_ENV).ok())?;
     Ok(settings)
 }
 
@@ -1358,5 +1409,57 @@ mod mainnet_guards {
         assert!(CoordinatorSettings::default()
             .validate(Network::Bitcoin)
             .is_ok());
+    }
+}
+
+#[cfg(test)]
+mod settle_only_settings_tests {
+    use super::*;
+
+    #[test]
+    fn settle_only_is_off_and_refunds_unstarted_pools_by_default() {
+        let defaults = CoordinatorSettings::default();
+        assert!(!defaults.settle_only);
+        assert_eq!(defaults.settle_only_unstarted, SettleOnlyUnstarted::Refund);
+
+        // A config written before the setting existed loads with it off.
+        let text = toml::to_string(&Settings::default()).unwrap();
+        let without: String = text
+            .lines()
+            .filter(|line| !line.starts_with("settle_only"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed: Settings = toml::from_str(&without).unwrap();
+        assert!(!parsed.coordinator_settings.settle_only);
+        assert_eq!(
+            parsed.coordinator_settings.settle_only_unstarted,
+            SettleOnlyUnstarted::Refund
+        );
+
+        let configured: Settings = toml::from_str(&text.replace(
+            "settle_only_unstarted = \"refund\"",
+            "settle_only_unstarted = \"kickoff\"",
+        ))
+        .unwrap();
+        assert_eq!(
+            configured.coordinator_settings.settle_only_unstarted,
+            SettleOnlyUnstarted::Kickoff
+        );
+    }
+
+    #[test]
+    fn environment_overrides_settle_only() {
+        let mut settings = CoordinatorSettings::default();
+        settings.apply_settle_only_env(None).unwrap();
+        assert!(!settings.settle_only);
+        settings.apply_settle_only_env(Some("true".into())).unwrap();
+        assert!(settings.settle_only);
+        settings.apply_settle_only_env(Some(" ".into())).unwrap();
+        assert!(settings.settle_only);
+        settings.apply_settle_only_env(Some("0".into())).unwrap();
+        assert!(!settings.settle_only);
+        assert!(settings
+            .apply_settle_only_env(Some("maybe".into()))
+            .is_err());
     }
 }

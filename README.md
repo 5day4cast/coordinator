@@ -119,7 +119,7 @@ The coordinator reads from `./config/local.toml` by default. Key settings:
 ```toml
 [bitcoin_settings]
 network = "regtest"
-# electrs, for chain lookups LND cannot answer (escrow and outcome transactions)
+# electrs, for chain lookups and fees from local history and the mempool
 electrum_url = "tcp://localhost:60401"
 # Optional block explorer linked from the admin wallet page
 explorer_url = "http://localhost:9102"

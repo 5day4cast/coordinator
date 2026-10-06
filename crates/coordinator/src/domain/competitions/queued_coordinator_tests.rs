@@ -10,9 +10,21 @@ use time::Duration;
 async fn formed() -> (Queue, Competition, Vec<Uuid>) {
     let start = OffsetDateTime::now_utc() - Duration::minutes(10);
     let queue = Queue::new(start, PoolRules::new(2, 3).unwrap(), 100).await;
+    formed_from(queue, 5).await
+}
+
+/// The default competition, one pool of up to 20 paying two places from ten players, formed
+/// from `players` complete tickets.
+async fn formed_paying_two(players: usize) -> (Queue, Competition, Vec<Uuid>) {
+    let start = OffsetDateTime::now_utc() - Duration::minutes(10);
+    let queue = Queue::paying(start, PoolRules::new(2, 20).unwrap(), 20, 2).await;
+    formed_from(queue, players).await
+}
+
+async fn formed_from(queue: Queue, players: usize) -> (Queue, Competition, Vec<Uuid>) {
     queue.chain_closing_at(20, 30);
-    for player in ["a", "b", "c", "d", "e"] {
-        queue.ticket(player, true).await;
+    for player in 0..players {
+        queue.ticket(&format!("player{player}"), true).await;
     }
     queue.advance().await;
     let record = queue
@@ -189,4 +201,57 @@ async fn a_pool_event_made_before_a_restart_is_found_not_made_again() {
         (again.nonce_point, again.event_announcement),
         (first.nonce_point, first.event_announcement)
     );
+}
+
+/// A pool of ten pays its first two places 70% and 30%; a pool of five pays its winner the pot.
+/// The pool's oracle event, its statement and its payout table all carry the places its size
+/// gives, as every player's consent states.
+#[tokio::test]
+async fn a_pool_pays_the_places_its_size_gives() {
+    for (players, places) in [(10, 2), (5, 1)] {
+        let (queue, mut pool, members) = formed_paying_two(players).await;
+        let coordinator = &queue.coordinator;
+        assert_eq!(members.len(), players, "one pool of everyone");
+        assert_eq!(pool.event_submission.number_of_places_win, places);
+        let (settings, _) = coordinator.pool_of(&pool).await.unwrap().unwrap();
+        assert_eq!(settings.terms.number_of_places_win, 2);
+        assert_eq!(settings.terms.pool_places(players), places as u32);
+
+        coordinator.submit_event_to_oracle(&mut pool).await.unwrap();
+        let event = queue.oracle.get_event_terms(&pool.id).await.unwrap();
+        assert_eq!(event.number_of_places_win as usize, places);
+        coordinator
+            .submit_entries_to_oracle(&mut pool)
+            .await
+            .unwrap();
+        let statement = coordinator
+            .pool_statement(&pool, &settings, &members)
+            .await
+            .unwrap();
+        let coordinator_escrow::oracle_statement::Outcomes::Ranking(ranking) =
+            &statement.statement.outcomes;
+        assert_eq!(ranking.number_of_places_win as usize, places);
+
+        let mut entries = coordinator
+            .competition_store
+            .get_competition_entries(pool.id, vec![EntryStatus::Paid])
+            .await
+            .unwrap();
+        entries.sort_by_key(|entry| entry.ticket_id);
+        let payouts = coordinator
+            .accepted_pool_payouts(&pool, &settings, &members, &entries)
+            .await
+            .unwrap();
+        assert_eq!(
+            payouts,
+            coordinator_escrow::queued::pool_payouts(players, places).unwrap()
+        );
+        let first = &payouts[&dlctix::Outcome::Attestation(0)];
+        let shares: Vec<u64> = first.values().copied().collect();
+        if places == 2 {
+            assert_eq!(shares, vec![70, 30]);
+        } else {
+            assert_eq!(shares, vec![100]);
+        }
+    }
 }

@@ -277,15 +277,16 @@ impl CompetitionStore {
                     tx.rollback().await?;
                     return Ok(QueuedReservation::Closed);
                 }
-                let existing = sqlx::query(
+                let existing = sqlx::query(&format!(
                     "SELECT tickets.event_id, tickets.reserved_by, tickets.hash,
                             tickets.paid_at IS NOT NULL AS paid,
                             (tickets.payment_request IS NOT NULL
                              AND (tickets.invoice_expires_at IS NULL
                                   OR tickets.invoice_expires_at <= datetime('now'))) AS expired,
+                            {LIVE_TICKET} AS live,
                             EXISTS (SELECT 1 FROM entries WHERE entries.ticket_id = tickets.id) AS used
-                     FROM tickets WHERE tickets.id = ?",
-                )
+                     FROM tickets WHERE tickets.id = ?"
+                ))
                 .bind(&ticket)
                 .fetch_optional(&mut *tx)
                 .await?;
@@ -336,7 +337,27 @@ impl CompetitionStore {
                             .bind(&ticket)
                             .execute(&mut *tx)
                             .await?;
-                        } else if !paid && expired {
+                        } else if !paid && !row.try_get::<bool, _>("live")? {
+                            // Its hold lapsed, so it stopped counting toward the cap and others
+                            // may have filled the queue since: it is held again only if there is
+                            // still room.
+                            let live: i64 = sqlx::query_scalar(&count_live(""))
+                                .bind(&competition)
+                                .fetch_one(&mut *tx)
+                                .await?;
+                            if live >= i64::from(max_entries) {
+                                tx.rollback().await?;
+                                return Ok(QueuedReservation::Full);
+                            }
+                            sqlx::query(
+                                "UPDATE tickets SET reserved_at = datetime('now')
+                                 WHERE id = ? AND paid_at IS NULL",
+                            )
+                            .bind(&ticket)
+                            .execute(&mut *tx)
+                            .await?;
+                        }
+                        if holder.is_some() && !paid && expired {
                             // Its invoice can no longer be paid: a fresh preimage and hash, so
                             // nothing issued for the old one can pay for this ticket.
                             let old_hash: String = row.try_get("hash")?;
@@ -423,6 +444,18 @@ impl CompetitionStore {
     }
 
     /// Paid entries of a queued competition, in the queue and in the pools it formed.
+    /// The tickets that count against a queued competition's entry cap: paid, or held for an
+    /// unexpired invoice, as [`Self::reserve_queued_ticket`] counts them.
+    pub async fn queued_held_count(&self, competition_id: Uuid) -> Result<u64, sqlx::Error> {
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM tickets WHERE event_id = ? AND {LIVE_TICKET}"
+        ))
+        .bind(competition_id.to_string())
+        .fetch_one(self.db_connection.read())
+        .await?;
+        u64::try_from(count).map_err(|error| sqlx::Error::Decode(Box::new(error)))
+    }
+
     pub async fn queued_entry_count(&self, competition_id: Uuid) -> Result<u64, sqlx::Error> {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM entries e JOIN tickets t ON t.id = e.ticket_id

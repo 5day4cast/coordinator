@@ -401,9 +401,18 @@ pub struct ScenarioConfig {
     /// [`super::queued::QueueShape`]. `users` follows from it.
     #[serde(default)]
     pub queue_players: Option<usize>,
-    /// The largest pool of a queued scenario, instead of 25.
+    /// The largest pool of a queued scenario, instead of 20 for `queued_one_pool`, the default
+    /// competition, and 25 for the others.
     #[serde(default)]
     pub max_pool_players: Option<usize>,
+    /// The most entries a queued scenario's queue takes, instead of its pool's seats for
+    /// `queued_one_pool` and the coordinator's default for the others.
+    #[serde(default)]
+    pub queue_max_entries: Option<u32>,
+    /// The places a queued scenario's pools of ten or more pay, instead of 2 for
+    /// `queued_one_pool` (70% and 30%) and 1 for the others. Smaller pools pay one.
+    #[serde(default)]
+    pub places: Option<u32>,
     /// Draw the player count from this mix instead of using `users` (or the queued scenario's
     /// own number).
     #[serde(default)]
@@ -516,6 +525,8 @@ impl Default for ScenarioConfig {
             refund_timeout_secs: default_refund_timeout_secs(),
             queue_players: None,
             max_pool_players: None,
+            queue_max_entries: None,
+            places: None,
             player_mix: None,
             min_players: None,
             competition_id: None,
@@ -573,9 +584,7 @@ impl ScenarioConfig {
         config.competition_id.get_or_insert_with(uuid::Uuid::now_v7);
         if let Some(mix) = &self.player_mix {
             mix.validate()?;
-            let max_pool = self
-                .max_pool_players
-                .unwrap_or(coordinator_core::keymeld::pools::MAX_POOL_PLAYERS);
+            let max_pool = super::queued::QueueShape::max_pool(scenario, self);
             match mix.players_for(scenario, seed, self.min_players, max_pool) {
                 Some(players) if super::queued::is_queued(scenario) => {
                     config.queue_players = self.queue_players.or(Some(players));

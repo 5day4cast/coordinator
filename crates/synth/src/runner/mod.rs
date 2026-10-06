@@ -1244,6 +1244,8 @@ mod tests {
             stress: None,
             picker: None,
             picks_per_entry: None,
+            max_entries: None,
+            places: None,
         };
         let base = ScenarioConfig::default();
         lane.validate(&base).unwrap();
@@ -1489,6 +1491,8 @@ mod tests {
             stress: None,
             picker: None,
             picks_per_entry: None,
+            max_entries: None,
+            places: None,
         };
         let base = ScenarioConfig::default();
         let (started, mut starts) = mpsc::unbounded_channel();

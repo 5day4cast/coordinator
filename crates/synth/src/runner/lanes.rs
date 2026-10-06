@@ -74,6 +74,14 @@ pub struct LaneConfig {
     /// window scores, which is what an unset value takes.
     #[serde(default)]
     pub picks_per_entry: Option<usize>,
+    /// The most entries its queued runs take, instead of the scenario's own: for
+    /// `queued_one_pool`, its pool's seats.
+    #[serde(default)]
+    pub max_entries: Option<u32>,
+    /// The places its queued runs' pools of ten or more pay, instead of the scenario's own: two
+    /// (70% and 30%) for `queued_one_pool`, one for the others.
+    #[serde(default)]
+    pub places: Option<u32>,
 }
 
 fn default_interval_secs() -> u64 {
@@ -259,8 +267,15 @@ impl LaneConfig {
         };
         config.backfill = self.backfill();
         if config.backfill.is_some() {
-            // Pools as large as the coordinator allows, so the queue takes anyone who comes.
+            // The default competition's one pool of 20 seats, which takes anyone who comes until
+            // it is full.
             config.max_pool_players = None;
+        }
+        if self.max_entries.is_some() {
+            config.queue_max_entries = self.max_entries;
+        }
+        if self.places.is_some() {
+            config.places = self.places;
         }
         (scenario, config)
     }
@@ -338,6 +353,8 @@ mod tests {
             backfill_before_close_secs: 1800,
             backfill_margin: 1,
             picks_per_entry: None,
+            max_entries: None,
+            places: None,
         }
     }
 
@@ -469,5 +486,27 @@ mod tests {
         // The burst must fit the lane's entry window.
         stress.entry_window_secs = Some(120);
         assert!(stress.validate(&base).is_err());
+    }
+
+    /// The open lane's backfilled runs make the default competition: one pool of 20 seats that
+    /// pays two places from ten players. A lane may set its own cap and places.
+    #[test]
+    fn a_backfilled_lane_makes_the_default_competition() {
+        use crate::scenarios::queued::QueueShape;
+        let base = ScenarioConfig::default();
+        let mut open = lane(Align::Interval, &[DAY]);
+        open.scenarios = vec![QUEUED_ONE_POOL.into()];
+        open.fill = Fill::Backfill;
+        let (scenario, config) = open.run_config(&base, 0, None);
+        let shape = QueueShape::of(&scenario, &config).unwrap().unwrap();
+        assert_eq!(
+            (shape.rules.max_players(), shape.max_entries, shape.places),
+            (20, Some(20), 2)
+        );
+        open.places = Some(1);
+        open.max_entries = Some(12);
+        let (scenario, config) = open.run_config(&base, 0, None);
+        let shape = QueueShape::of(&scenario, &config).unwrap().unwrap();
+        assert_eq!((shape.max_entries, shape.places), (Some(12), 1));
     }
 }

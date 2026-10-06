@@ -146,6 +146,10 @@ pub fn help_page(open_advanced: bool) -> Markup {
                         "A pool needs a minimum number of players. The entry page shows the current minimum, "
                         "which can rise when Bitcoin network fees increase."
                     }
+                    li {
+                        "A competition's page shows how its prizes split. In one that pays two places, a pool of 10 or more "
+                        "players pays 70% of its pot to 1st and 30% to 2nd; a smaller pool's winner takes it all."
+                    }
                     li { "If a competition or pool doesn't get enough entries, it doesn't run. Funded entries follow the refund process below." }
                 }
             }
