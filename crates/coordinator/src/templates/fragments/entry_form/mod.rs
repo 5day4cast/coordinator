@@ -237,10 +237,11 @@ pub fn entry_form(
                     None => "Pay and enter".to_string(),
                 };
                 // A paid ticket is entered without paying again, paused or not. `entry_form.js`
-                // relabels the button when the paid notice comes or goes with a log-in.
+                // relabels the button when the paid notice comes or goes with a log-in; while
+                // entries are paused there is no price to go back to.
                 button type="button" id="submitEntry" class="button is-primary is-medium"
                        disabled[paused.is_some() && paid.is_none()]
-                       data-pay-label=(pay_label) {
+                       data-pay-label=[paused.is_none().then_some(&pay_label)] {
                     @if paid.is_some() {
                         (FINISH_LABEL)
                     } @else if paused.is_some() {
