@@ -39,8 +39,8 @@ use crate::{
         fragments::{
             entries_paused_banner,
             entry_form::{
-                edit_picks, entry_form, forecast_choices, forecasts_url, payout_line, picked,
-                picks_locked, ticket_status, unpaid_notice, Forecasts, NetworkFee,
+                edit_picks, entry_form, forecast_choices, forecasts_url, paid_notice, payout_line,
+                picked, picks_locked, ticket_status, unpaid_notice, Forecasts, NetworkFee,
                 PayoutDestination, TicketProgress,
             },
             leaderboard::{
