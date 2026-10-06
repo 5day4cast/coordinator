@@ -8,7 +8,7 @@
 //!   The queue forms `ceil(N / max)` pools whose sizes differ by at most one and which hold every
 //!   entry exactly once. Each pool then runs to funding and on to awaiting its attestation.
 //! - `queued_one_pool`: the default competition, one pool of up to 20 seats that pays 70% and
-//!   30% from ten players and its winner the pot below that; 5 players by default. It takes at
+//!   30% from ten players and its winner the pot below that; 20 players by default. It takes at
 //!   most 20 entries, so it never splits.
 //! - `queued_too_few`: 2 players against a minimum of 3. The queue is cancelled and both escrows
 //!   are refunded to the players' Lightning Address.
@@ -56,6 +56,8 @@ pub const QUEUED_LEFTOVER_REFUND: &str = "queued_leftover_refund";
 
 /// The default competition's seats: `queued_one_pool` plays as one pool of them.
 pub const DEFAULT_SEATS: usize = 20;
+/// Complete entries required before the default competition can form a pool.
+pub const DEFAULT_MIN_PLAYERS: usize = 3;
 /// The places the default competition pays once ten players entered: 70% and 30%.
 pub const DEFAULT_PLACES: u32 = 2;
 
@@ -112,7 +114,7 @@ impl QueueShape {
         let one_pool = scenario == QUEUED_ONE_POOL;
         let (min, default_players, abandoned) = match scenario {
             QUEUED_SPLIT => (2, 27, 0),
-            QUEUED_ONE_POOL => (2, 5, 0),
+            QUEUED_ONE_POOL => (DEFAULT_MIN_PLAYERS, DEFAULT_SEATS.min(max), 0),
             QUEUED_TOO_FEW => (3, 2, 0),
             _ => (2, 3, 1),
         };
@@ -139,6 +141,12 @@ impl QueueShape {
         ensure!(
             (1..=100).contains(&shape.users()),
             "a queued scenario takes 1 to 100 players"
+        );
+        ensure!(
+            max_entries.is_none_or(|cap| cap as usize >= shape.users()),
+            "{scenario} plans {} paid tickets but its entry cap is {}",
+            shape.users(),
+            max_entries.unwrap_or_default()
         );
         match scenario {
             QUEUED_SPLIT => ensure!(
@@ -249,6 +257,16 @@ pub(super) async fn check_queue(
             queue.max_entries
         );
     }
+    let places =
+        coordinator_core::keymeld::queued::pool_places(shape.places, shape.rules.max_players());
+    ensure!(
+        queue
+            .event_submission
+            .get("number_of_places_win")
+            .and_then(serde_json::Value::as_u64)
+            == Some(u64::from(places)),
+        "the queue's reference event does not pay the requested {places} places"
+    );
     Ok(())
 }
 

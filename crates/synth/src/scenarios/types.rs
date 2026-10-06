@@ -335,16 +335,20 @@ impl PlayerMix {
             super::queued::QUEUED_SPLIT => rng
                 .random_range(self.split.min..=self.split.max)
                 .max(max_pool + 1),
-            super::queued::QUEUED_ONE_POOL => self.draw(&mut rng, floor.max(2), max_pool),
+            super::queued::QUEUED_ONE_POOL => self.draw(
+                &mut rng,
+                floor.max(super::queued::DEFAULT_MIN_PLAYERS),
+                max_pool,
+            ),
             super::queued::QUEUED_LEFTOVER_REFUND => self.draw(&mut rng, floor.max(2), 100),
             _ => self.draw(&mut rng, floor, 100),
         })
     }
 }
 
-/// Longer weather windows plus a deliberate short case for refund-path coverage.
+/// One full observation day, which the oracle can attest without UTC-half alignment.
 pub fn default_observation_windows() -> Vec<u64> {
-    vec![7200, 10800, 14400, 600]
+    vec![86_400]
 }
 
 /// Choose once per manual run; its saved ScenarioConfig keeps the resolved duration.
@@ -936,10 +940,10 @@ mod plan_tests {
             assert_eq!(too_few.users, 2, "too few is what it tests");
         }
         let smaller = ScenarioConfig {
-            max_pool_players: Some(4),
+            max_pool_players: Some(5),
             ..mixed(1, None)
         };
-        assert!((2..=4).contains(&smaller.resolve_plan("queued_one_pool").unwrap().users));
+        assert!((3..=5).contains(&smaller.resolve_plan("queued_one_pool").unwrap().users));
         let split = mixed(3, None).resolve_plan("queued_split").unwrap();
         let again = split.resolve_plan("queued_split").unwrap();
         assert_eq!(
@@ -1024,6 +1028,7 @@ mod plan_tests {
     #[test]
     fn a_backfilled_plan_spreads_its_early_players_before_the_backfill() {
         let mut config = spread_config(3);
+        config.queue_players = Some(5);
         config.backfill = Some(Backfill {
             early_players: 1,
             before_close_secs: 1800,

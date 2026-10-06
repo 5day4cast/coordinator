@@ -469,7 +469,10 @@ mod tests {
     #[test]
     fn a_backfilled_lane_makes_the_default_competition() {
         use crate::scenarios::queued::QueueShape;
-        let base = ScenarioConfig::default();
+        let base = ScenarioConfig {
+            queue_players: Some(5),
+            ..Default::default()
+        };
         let mut open = lane(Align::Interval, &[DAY]);
         open.scenarios = vec![QUEUED_ONE_POOL.into()];
         open.fill = Fill::Backfill;

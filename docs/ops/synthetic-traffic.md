@@ -2,6 +2,14 @@
 
 Use synth to test staggered players, abandoned entries, and duplicate or late submissions. Each run records its scenario, seed, timing bounds, and resolved player plan before competition creation.
 
+The default scheduler runs only `queued_one_pool`. It plans 20 entries in one pool with a hard cap of 20 tickets. First place receives 70% and second receives 30% at that size.
+
+Registration stays open until its deadline. The queue needs at least three complete entries to form a pool. Paid tickets without completed entries do not meet that minimum. Fewer than three complete entries cancel the queue and leave its paid escrows for refund tracking.
+
+The competition's existing payout rule gives the winner the whole pot below ten players. With ten through twenty players, it pays two places. Fee checks can require more than three players before a formed pool funds.
+
+Other scenarios remain available for manual runs or explicit schedules. Existing runs continue their payout and refund tracking when their lanes are removed. Two-place competitions require the matching coordinator and Keymeld capacity releases before this default is deployed.
+
 These scenarios can pay real entries from the configured node. The remote CLI asks for confirmation unless `--yes` is supplied.
 
 ## Control scenarios
@@ -112,10 +120,11 @@ Synth exports `synth_ark_refill_total`, `synth_ark_refill_sat_total`, `synth_ark
 
 ```toml
 [defaults]
-users = 3
+users = 20
 max_ticket_fees_sats = 1000
 entry_window_secs = 1200
-observation_windows_secs = [7200, 10800, 14400, 600]
+observation_windows_secs = [86400]
+lightning_address = "player@example.org"
 
 [defaults.entry_timing]
 arrival = { min_secs = 0, max_secs = 90 }
@@ -126,14 +135,7 @@ deadline_margin_secs = 60
 [scheduler]
 enabled = true
 interval_secs = 3600
-scenarios = [
-  "full_lifecycle",
-  "abandoned_unpaid",
-  "paid_abandonment",
-  "duplicate_submission",
-  "late_submission",
-  "escrow_refund",
-]
+scenarios = ["queued_one_pool"]
 ```
 
 All ranges are inclusive seconds. Each player receives separate samples from the run's seeded random generator.
@@ -168,7 +170,7 @@ The example's 1,200-second entry window exceeds its 1,050-second minimum. The sa
 | `late_submission` | One player pays, then submits after entry closes. The submission must fail; cancellation must refund paid tickets. |
 | `escrow_refund` | An intentionally unfilled competition cancels and refunds its paid tickets. |
 | `queued_split` | 27 players enter a queued competition with pools of 2 to 25. When registration closes it must form `ceil(27 / 25)` pools whose sizes differ by at most one and which hold every entry exactly once. Each pool is then followed to funding and on to awaiting its attestation. |
-| `queued_one_pool` | 5 players enter a queued competition. It must form one pool of all 5, which is followed like a split's pools. |
+| `queued_one_pool` | 20 players enter one capped queue by default. At closing, at least 3 complete entries form one pool. The largest pool pays first 70% and second 30%. |
 | `queued_too_few` | 2 players enter a queued competition that needs 3 per pool. It must be cancelled without pools and refund both escrows to the players' Lightning Address. |
 | `queued_leftover_refund` | 4 players pay into a queued competition and one never submits an entry. The pool must form from the 3 complete tickets and run, and the incomplete ticket must be refunded from the queue. |
 | `stress_full_pool` | Players, 25 by default, arrive in a burst for a competition at the pool cap of 25 seats. See [Stress a full pool](#stress-a-full-pool). |
@@ -277,7 +279,9 @@ The burst must end at least 180 seconds before entries close. Every setting is o
 
 ## Preserve older configurations
 
-Without `scheduler.scenarios`, synth uses the existing `scheduler.scenario` value. Its default remains `full_lifecycle`.
+Without `scheduler.scenarios`, synth uses `scheduler.scenario`. Its default is `queued_one_pool`. An explicit scenario or lane list retains its configured cases.
+
+The default player band contains only 20 players. Set `defaults.players.bands` explicitly to vary counts. The default queued scenario draws at least three players and refuses plans that exceed its entry cap.
 
 Without timing fields, all waits and the configured margin remain zero. Existing single-scenario schedules retain observation-duration rotation.
 

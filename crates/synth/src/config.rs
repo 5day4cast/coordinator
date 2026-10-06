@@ -91,7 +91,7 @@ pub struct SchedulerConfig {
 }
 
 fn default_scenario() -> String {
-    "full_lifecycle".into()
+    crate::scenarios::queued::QUEUED_ONE_POOL.into()
 }
 
 /// Keep a competition anyone can enter on the public site. Every check, synth counts the listed
@@ -241,7 +241,7 @@ pub struct DefaultsConfig {
     #[serde(default)]
     pub users: Option<usize>,
     /// How many players a run draws when `users` is unset.
-    #[serde(default)]
+    #[serde(default = "default_players")]
     pub players: crate::scenarios::PlayerMix,
     /// NOAA stations to use for competitions
     pub stations: Vec<String>,
@@ -268,6 +268,17 @@ pub struct DefaultsConfig {
 
 fn default_refund_timeout_secs() -> u64 {
     30 * 60
+}
+
+fn default_players() -> crate::scenarios::PlayerMix {
+    crate::scenarios::PlayerMix {
+        bands: vec![crate::scenarios::PlayerBand {
+            min: crate::scenarios::queued::DEFAULT_SEATS,
+            max: crate::scenarios::queued::DEFAULT_SEATS,
+            weight: 1,
+        }],
+        ..Default::default()
+    }
 }
 
 impl Default for SynthConfig {
@@ -298,7 +309,7 @@ impl Default for SynthConfig {
             scheduler: SchedulerConfig {
                 enabled: false,
                 interval_secs: 3600,
-                scenario: "full_lifecycle".to_string(),
+                scenario: default_scenario(),
                 scenarios: None,
                 lanes: Vec::new(),
                 keep_open: None,
@@ -308,7 +319,7 @@ impl Default for SynthConfig {
                 seed: None,
                 entry_timing: Default::default(),
                 users: None,
-                players: Default::default(),
+                players: default_players(),
                 stations: vec!["KDEN".to_string(), "KJFK".to_string(), "KORD".to_string()],
                 entry_fee: 1000,
                 max_ticket_fees_sats: crate::scenarios::types::default_max_ticket_fees_sats(),
@@ -376,7 +387,7 @@ pub fn load_config(path: Option<&str>) -> anyhow::Result<SynthConfig> {
         .set_default("db.path", "./data/synth.db")?
         .set_default("scheduler.enabled", false)?
         .set_default("scheduler.interval_secs", 3600)?
-        .set_default("scheduler.scenario", "full_lifecycle")?
+        .set_default("scheduler.scenario", default_scenario())?
         .set_default("defaults.entry_fee", 1000)?
         .set_default("defaults.entry_window_secs", 120)?
         .set_default("defaults.signing_delay_secs", 60)?
@@ -416,6 +427,35 @@ mod tests {
     static CONFIG_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn defaults_schedule_only_one_twenty_entry_two_place_competition() {
+        let _environment = CONFIG_ENV.lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synth.toml");
+        std::fs::write(
+            &path,
+            "[scheduler]\nenabled = true\n[defaults]\nstations = [\"KDEN\"]\n",
+        )
+        .unwrap();
+        let loaded = load_config(Some(path.to_str().unwrap())).unwrap();
+        for config in [SynthConfig::default(), loaded] {
+            let cases = config.scheduler.scenario_names();
+            assert_eq!(cases, [crate::scenarios::queued::QUEUED_ONE_POOL]);
+            assert!(config.scheduler.lanes.is_empty());
+            let plan = config.scenario_config().resolve_plan(cases[0]).unwrap();
+            assert_eq!((plan.users, plan.entry_plan.len()), (20, 20));
+            assert!(plan.backfill.is_none());
+            let shape = crate::scenarios::queued::QueueShape::of(cases[0], &plan)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (shape.rules.min_players(), shape.rules.max_players()),
+                (3, 20)
+            );
+            assert_eq!((shape.max_entries, shape.places), (Some(20), 2));
+        }
+    }
+
+    #[test]
     fn list_only_scheduler_and_timing_profile_load_without_enabling_new_defaults() {
         let _environment = CONFIG_ENV.lock().unwrap();
         let directory = tempfile::tempdir().unwrap();
@@ -438,7 +478,7 @@ before_submit = { min_secs = 10, max_secs = 120 }
         assert_eq!(config.defaults.entry_timing.before_payment.min_secs, 5);
         assert_eq!(
             SynthConfig::default().scheduler.scenario_names(),
-            ["full_lifecycle"]
+            [crate::scenarios::queued::QUEUED_ONE_POOL]
         );
         assert_eq!(
             SynthConfig::default().defaults.entry_timing,
@@ -572,13 +612,13 @@ deadline_margin_secs = 60
     }
 
     #[test]
-    fn omitted_windows_use_varied_defaults_including_the_short_case() {
+    fn omitted_windows_use_one_full_observation_day() {
         let _environment = CONFIG_ENV.lock().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("synth.toml");
         std::fs::write(&path, "[defaults]\nstations = [\"KDEN\"]\n").unwrap();
         let config = load_config(Some(path.to_str().unwrap())).unwrap();
-        let expected = [7200, 10800, 14400, 600];
+        let expected = [86_400];
         assert_eq!(config.defaults.observation_windows_secs.values(), expected);
         assert_eq!(
             SynthConfig::default()

@@ -151,7 +151,17 @@ fn each_queued_scenario_has_its_own_shape_and_refuses_one_that_defeats_it() {
     assert!(shape(QUEUED_SPLIT, Some(101), None).is_err());
 
     let one = shape(QUEUED_ONE_POOL, None, None).unwrap();
-    assert_eq!(one.sizes(), Some(vec![5]));
+    assert_eq!(one.rules.min_players(), 3);
+    assert_eq!(one.sizes(), Some(vec![20]));
+    for players in [0, 1, 2] {
+        assert!(shape(QUEUED_ONE_POOL, Some(players), None).is_err());
+    }
+    for players in [3, 20] {
+        assert_eq!(
+            shape(QUEUED_ONE_POOL, Some(players), None).unwrap().sizes(),
+            Some(vec![players])
+        );
+    }
     assert!(shape(QUEUED_ONE_POOL, Some(26), None).is_err());
     // The default competition: one pool of 20 seats, paying two places from ten players.
     assert_eq!(
@@ -196,11 +206,84 @@ fn a_queue_takes_its_configured_entry_cap_and_places() {
     assert!(QueueShape::of(QUEUED_ONE_POOL, &configured(None, Some(2), Some(25))).is_err());
     assert!(QueueShape::of(QUEUED_ONE_POOL, &configured(Some(21), None, None)).is_err());
     assert!(QueueShape::of(QUEUED_ONE_POOL, &configured(None, Some(3), None)).is_err());
+    assert!(QueueShape::of(QUEUED_ONE_POOL, &configured(Some(4), None, None)).is_err());
     assert!(QueueShape::of(QUEUED_SPLIT, &configured(None, Some(2), None)).is_err());
     let split = QueueShape::of(QUEUED_SPLIT, &configured(Some(60), Some(2), Some(20)))
         .unwrap()
         .unwrap();
     assert_eq!((split.max_entries, split.places), (Some(60), 2));
+}
+
+#[tokio::test]
+async fn default_queue_requests_twenty_seats_three_minimum_and_two_places_before_any_payment() {
+    use axum::{
+        extract::State,
+        routing::{get, post},
+        Json, Router,
+    };
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    async fn create(
+        State(state): State<Arc<Mutex<Value>>>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        *state.lock().unwrap() = body.clone();
+        Json(
+            json!({"id": body["id"], "created_at": "2026-10-05T00:00:00Z",
+            "event_submission": body, "kind": "queued"}),
+        )
+    }
+    async fn get_queue(State(state): State<Arc<Mutex<Value>>>) -> Json<Value> {
+        let body = state.lock().unwrap();
+        Json(
+            json!({"id": body["id"], "created_at": "2026-10-05T00:00:00Z",
+            "event_submission": {"number_of_places_win": body["number_of_places_win"]},
+            "kind": "queued", "max_entries": body["max_entries"],
+            "pool_rules": {"min_players": body["min_players"], "max_players": body["max_pool_size"]}}),
+        )
+    }
+    let state = Arc::new(Mutex::new(Value::Null));
+    let app = Router::new()
+        .route("/api/v1/competitions/queued", post(create))
+        .route("/api/v1/competitions/{id}", get(get_queue))
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = crate::client::CoordinatorClient::new(
+        &format!("http://{}", listener.local_addr().unwrap()),
+        None,
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let config = crate::config::SynthConfig::default()
+        .scenario_config()
+        .resolve_plan(QUEUED_ONE_POOL)
+        .unwrap();
+    let shape = QueueShape::of(QUEUED_ONE_POOL, &config).unwrap().unwrap();
+    let id = create_queue(&client, &config, &shape).await.unwrap();
+    {
+        let body = state.lock().unwrap();
+        assert_eq!(body["min_players"], 3);
+        assert_eq!(body["max_pool_size"], 20);
+        assert_eq!(body["max_entries"], 20);
+        assert_eq!(body["number_of_places_win"], 2);
+    }
+    check_queue(&client, &id, &shape).await.unwrap();
+    // Refuse an older or misconfigured coordinator that silently ignored one of the terms.
+    for (field, wrong) in [
+        ("min_players", 2),
+        ("max_pool_size", 25),
+        ("max_entries", 21),
+        ("number_of_places_win", 1),
+    ] {
+        let original = state.lock().unwrap()[field].clone();
+        state.lock().unwrap()[field] = json!(wrong);
+        assert!(
+            check_queue(&client, &id, &shape).await.is_err(),
+            "accepted incorrect {field}"
+        );
+        state.lock().unwrap()[field] = original;
+    }
+    server.abort();
 }
 
 /// A coordinator whose queue has already closed: it formed `pools` from the tickets, in order,
