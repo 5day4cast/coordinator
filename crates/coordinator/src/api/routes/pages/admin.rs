@@ -264,6 +264,15 @@ pub async fn admin_create_competition_handler(
     State(state): State<Arc<AppState>>,
     Form(form): Form<CreateCompetitionForm>,
 ) -> Html<String> {
+    if state.coordinator.settle_only() {
+        return Html(
+            competition_error(
+                "The coordinator is in settle-only mode: it creates no competition until the \
+                 mode is turned off",
+            )
+            .into_string(),
+        );
+    }
     // Parse dates
     let signing_date = match OffsetDateTime::parse(
         &form.signing_date,

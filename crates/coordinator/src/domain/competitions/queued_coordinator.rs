@@ -33,6 +33,7 @@ impl Coordinator {
         &self,
         request: CreateQueuedCompetition,
     ) -> Result<Competition, Error> {
+        self.require_new_money_allowed()?;
         if !self.automatic_payouts || self.ark.is_none() || !self.is_keymeld_enabled() {
             return Err(Error::BadRequest(
                 "Queued competitions need Keymeld, automatic payouts and Arkade".into(),
