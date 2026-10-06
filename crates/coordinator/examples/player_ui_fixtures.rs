@@ -82,13 +82,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         ],
     };
     let payout = PayoutDestination::Address("player@lightning.example".into());
-    let entry = entry_form(&open, &forecasts, None, &payout, NetworkFee::Estimate(437));
+    let entry = entry_form(
+        &open,
+        &forecasts,
+        None,
+        &payout,
+        NetworkFee::Estimate(437),
+        None,
+    );
     let entry_queued = entry_form(
         &queued,
         &forecasts,
         None,
         &payout,
         NetworkFee::Estimate(437),
+        None,
     );
 
     let rows: Vec<LeaderboardRow> = [
