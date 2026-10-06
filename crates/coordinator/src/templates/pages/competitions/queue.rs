@@ -121,12 +121,20 @@ impl Queue {
 }
 
 impl QueueView {
+    /// Its seats, when its entry cap fits one pool: everyone who enters plays together.
+    pub fn seats(&self) -> Option<u64> {
+        self.max_entries.filter(|cap| *cap <= self.max_players)
+    }
+
     /// The note that says how entries are grouped.
     pub fn pool_note(&self) -> String {
-        format!(
-            "Players are split into pools of up to {} at the start",
-            self.max_players
-        )
+        match self.seats() {
+            Some(seats) => format!("Up to {seats} players, all in one pool"),
+            None => format!(
+                "Players are split into pools of up to {} at the start",
+                self.max_players
+            ),
+        }
     }
 }
 

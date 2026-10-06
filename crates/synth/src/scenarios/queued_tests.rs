@@ -153,6 +153,13 @@ fn each_queued_scenario_has_its_own_shape_and_refuses_one_that_defeats_it() {
     let one = shape(QUEUED_ONE_POOL, None, None).unwrap();
     assert_eq!(one.sizes(), Some(vec![5]));
     assert!(shape(QUEUED_ONE_POOL, Some(26), None).is_err());
+    // The default competition: one pool of 20 seats, paying two places from ten players.
+    assert_eq!(
+        (one.rules.max_players(), one.max_entries, one.places),
+        (20, Some(20), 2)
+    );
+    assert!(shape(QUEUED_ONE_POOL, Some(21), None).is_err());
+    assert_eq!((split.max_entries, split.places), (None, 1));
 
     let too_few = shape(QUEUED_TOO_FEW, None, None).unwrap();
     assert_eq!(too_few.rules.min_players(), 3);
@@ -170,6 +177,30 @@ fn each_queued_scenario_has_its_own_shape_and_refuses_one_that_defeats_it() {
     assert!(QueueShape::of("full_lifecycle", &ScenarioConfig::default())
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn a_queue_takes_its_configured_entry_cap_and_places() {
+    let configured = |max_entries, places, max_pool| ScenarioConfig {
+        queue_max_entries: max_entries,
+        places,
+        max_pool_players: max_pool,
+        ..Default::default()
+    };
+    // One place in the default competition's pool, as a lab may set until two-place signing ships.
+    let one_place = QueueShape::of(QUEUED_ONE_POOL, &configured(None, Some(1), None))
+        .unwrap()
+        .unwrap();
+    assert_eq!((one_place.max_entries, one_place.places), (Some(20), 1));
+    // Two places need pools of at most 20; a cap above one pool would split it.
+    assert!(QueueShape::of(QUEUED_ONE_POOL, &configured(None, Some(2), Some(25))).is_err());
+    assert!(QueueShape::of(QUEUED_ONE_POOL, &configured(Some(21), None, None)).is_err());
+    assert!(QueueShape::of(QUEUED_ONE_POOL, &configured(None, Some(3), None)).is_err());
+    assert!(QueueShape::of(QUEUED_SPLIT, &configured(None, Some(2), None)).is_err());
+    let split = QueueShape::of(QUEUED_SPLIT, &configured(Some(60), Some(2), Some(20)))
+        .unwrap()
+        .unwrap();
+    assert_eq!((split.max_entries, split.places), (Some(60), 2));
 }
 
 /// A coordinator whose queue has already closed: it formed `pools` from the tickets, in order,

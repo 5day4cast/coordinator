@@ -147,8 +147,9 @@ pub struct CreateArgs {
     pub scoring_rules: ScoringRules,
     /// Make a single competition with a fixed seat count (--max-entries) instead. By default
     /// a competition queues entries without a seat count and splits them into pools when
-    /// observation starts; each pool pays one winner and scores lines, so --max-entries,
-    /// --places-win and --scoring-rules apply to single competitions only.
+    /// observation starts; each pool scores lines, so --max-entries and --scoring-rules apply to
+    /// single competitions only. A queued competition's pools of ten or more pay --places-win
+    /// places (two only in pools of at most 20); smaller pools pay one.
     #[arg(long)]
     pub single: bool,
     /// A queued competition's smallest pool.
@@ -295,6 +296,7 @@ impl CreateArgs {
             max_pool_size: self.max_pool_size,
             max_entries: self.entry_cap,
             max_entries_per_player: self.max_entries_per_player,
+            number_of_places_win: self.places_win,
         })
     }
 }

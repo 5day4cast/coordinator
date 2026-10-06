@@ -65,7 +65,8 @@ pub struct CreateCompetition {
 
 /// Request body for a queued competition: entries without a seat count, split into pools of
 /// `min_players` to `max_pool_size` when registration closes at the observation start. Each pool
-/// pays one winner and is its own competition.
+/// is its own competition, and pays `number_of_places_win` places once it has ten players, one
+/// below that.
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateQueuedCompetition {
     pub id: Uuid,
@@ -86,6 +87,8 @@ pub struct CreateQueuedCompetition {
     /// The most entries the queue takes; the coordinator's default if unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_entries: Option<u32>,
+    /// The places a pool of ten or more pays: 1, or 2 in pools of at most 20.
+    pub number_of_places_win: usize,
 }
 
 /// What a `competitions` row is: a single competition, a queue, or one of a queue's pools.

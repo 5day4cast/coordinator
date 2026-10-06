@@ -5,6 +5,7 @@ use crate::RegistrationAssignment;
 pub use coordinator_escrow::{
     ark,
     authorization::{ArkEscrowPolicy, PayoutPolicy},
+    capacity,
     escrow::SignedEscrowPolicy,
     oracle_statement, payout, payout_protocol, pools, queued,
 };
@@ -427,6 +428,7 @@ mod tests {
                     lines: vec![],
                 },
                 number_of_places_win: 1,
+                multi_place_min_players: None,
                 pool_rules: pools::PoolRules::new(2, 25).unwrap(),
                 stake_sats: 5_000,
                 relative_locktime_block_delta: 72,
@@ -645,6 +647,7 @@ mod tests {
                     }],
                 },
                 number_of_places_win: 1,
+                multi_place_min_players: None,
                 pool_rules: pools::PoolRules::new(2, 25).unwrap(),
                 stake_sats: 1_000,
                 relative_locktime_block_delta: 72,

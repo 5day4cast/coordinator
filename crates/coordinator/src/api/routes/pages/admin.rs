@@ -344,7 +344,7 @@ pub async fn admin_create_competition_handler(
         .as_deref()
         .is_some_and(|queued| !queued.is_empty() && queued != "false")
     {
-        // Pools score lines and pay one winner; the seat count comes from demand.
+        // Pools score lines; pools of ten or more pay the places asked for, smaller ones one.
         let request = crate::domain::CreateQueuedCompetition {
             id: form.id,
             signing_date,
@@ -363,6 +363,7 @@ pub async fn admin_create_competition_handler(
                 .unwrap_or(coordinator_escrow::pools::MAX_POOL_PLAYERS),
             max_entries: form.max_entries,
             max_entries_per_player,
+            number_of_places_win: form.number_of_places_win,
         };
         return match state.coordinator.create_queued_competition(request).await {
             Ok(competition) => {

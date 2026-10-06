@@ -151,11 +151,20 @@ impl CompetitionView {
             .flatten();
     }
 
-    /// `3 of 25`, or `40 entered` for a queue, which has no seat count. It counts the
-    /// entries the page lists; a fee paid for an entry that never arrived is in the refund note.
+    /// `3 of 25`, or `40 entered` for a queue, which has no seat count. A queue that plays as
+    /// one pool has seats: `20 seats · 17 left` while it takes entries, `3 of 20` after. It
+    /// counts the entries the page lists; a fee paid for an entry that never arrived is in the
+    /// refund note.
     pub fn entries(&self) -> String {
         match &self.queue {
-            Queue::Queued(queue) => format!("{} entered", self.entry_count(queue)),
+            Queue::Queued(queue) => match queue.seats() {
+                Some(seats) if self.can_enter => format!(
+                    "{seats} seats · {} left",
+                    seats.saturating_sub(self.entry_count(queue))
+                ),
+                Some(seats) => format!("{} of {seats}", self.entry_count(queue)),
+                None => format!("{} entered", self.entry_count(queue)),
+            },
             _ => format!("{} of {}", self.total_entries, self.total_allowed_entries),
         }
     }
@@ -182,21 +191,32 @@ impl CompetitionView {
         self.phase == Phase::AwaitingResult && now >= self.signing
     }
 
-    /// The smallest and the largest pot among a queue's pools, and how many pools there are:
-    /// the pools it formed, or the ones its entries so far would make. Pools split the entries
-    /// evenly, so they differ by one player's entry when the entries don't divide exactly.
+    /// The smallest and the largest pot among a queue's pools, and how many pools there are.
     fn pool_pots(&self, queue: &QueueView) -> (u64, u64, u64) {
-        let pot = |players: u64| self.entry_fee.saturating_mul(players);
-        let sizes: Vec<u64> = queue.pools.iter().filter_map(|pool| pool.size).collect();
-        if !sizes.is_empty() && sizes.len() == queue.pools.len() {
-            let (min, max) = sizes.iter().fold((u64::MAX, 0), |(min, max), size| {
-                (min.min(*size), max.max(*size))
-            });
-            return (pot(min), pot(max), sizes.len() as u64);
+        let (smallest, largest, pools) = pool_sizes(queue, self.entry_count(queue));
+        (self.pot_of(smallest), self.pot_of(largest), pools)
+    }
+
+    /// What a pool of `players` puts in its pot.
+    fn pot_of(&self, players: u64) -> u64 {
+        self.entry_fee.saturating_mul(players)
+    }
+
+    /// The places a pool of `players` pays: a queue's pools below ten players pay one.
+    fn places_for(&self, players: u64) -> u64 {
+        match &self.queue {
+            Queue::Queued(_) => u64::from(coordinator_escrow::queued::pool_places(
+                self.paid_places as u32,
+                players as usize,
+            )),
+            _ => self.paid_places,
         }
-        let entries = self.entry_count(queue);
-        let pools = entries.div_ceil(queue.max_players.max(1)).max(1);
-        (pot(entries / pools), pot(entries.div_ceil(pools)), pools)
+    }
+
+    /// What first place takes from a queue's pool of `players`.
+    fn first_prize(&self, players: u64) -> u64 {
+        let share = get_percentage_weights(self.places_for(players) as usize)[0];
+        self.pot_of(players) * share / 100
     }
 
     /// The pot. A queue's is what its entries put in each pool, which its winner takes: a
@@ -236,14 +256,45 @@ impl CompetitionView {
         }
         match &self.queue {
             Queue::Queued(queue) => {
-                let (smallest, largest, _) = self.pool_pots(queue);
-                let least = self
-                    .entry_fee
-                    .saturating_mul(queue.min_players.unwrap_or(2));
-                Some((smallest.max(least), largest.max(least)))
+                let (smallest, largest, _) = pool_sizes(queue, self.entry_count(queue));
+                let least = queue.min_players.unwrap_or(2);
+                // A pool of ten that pays two places gives first place less than one of nine.
+                let (a, b) = (
+                    self.first_prize(smallest.max(least)),
+                    self.first_prize(largest.max(least)),
+                );
+                Some((a.min(b), a.max(b)))
             }
             _ => self.prizes().first().map(|(_, amount)| (*amount, *amount)),
         }
+    }
+
+    /// How the paid places share the pot, `1st 70% · 2nd 30%`, when more than one is paid.
+    pub fn prize_split(&self) -> Option<String> {
+        let largest = match &self.queue {
+            Queue::Queued(queue) => queue.max_players,
+            _ => self.total_allowed_entries,
+        };
+        let places = self.places_for(largest);
+        (places > 1 && self.has_ranked_prizes()).then(|| {
+            get_percentage_weights(places as usize)
+                .into_iter()
+                .enumerate()
+                .map(|(place, percent)| format!("{} {percent}%", format::ordinal(place + 1)))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        })
+    }
+
+    /// For a queue whose larger pools pay more than one place, what its smaller ones pay.
+    pub fn prize_rule(&self) -> Option<String> {
+        let queue = self.queue.queued()?;
+        (queue.pools.is_empty() && self.prize_split().is_some()).then(|| {
+            format!(
+                "Under {} players: winner takes all",
+                coordinator_escrow::queued::MULTI_PLACE_MIN_PLAYERS
+            )
+        })
     }
 
     /// What first place wins, as the pages show it: a range for a queue whose pools differ.
@@ -345,6 +396,21 @@ impl CompetitionView {
             format!("/competitions/{}/leaderboard", self.id)
         }
     }
+}
+
+/// The fewest and the most players among a queue's pools, and how many pools there are: the
+/// pools it formed, or the ones its `entries` so far would make. Pools split the entries evenly,
+/// so they differ by one player when the entries don't divide exactly.
+fn pool_sizes(queue: &QueueView, entries: u64) -> (u64, u64, u64) {
+    let sizes: Vec<u64> = queue.pools.iter().filter_map(|pool| pool.size).collect();
+    if !sizes.is_empty() && sizes.len() == queue.pools.len() {
+        let (min, max) = sizes.iter().fold((u64::MAX, 0), |(min, max), size| {
+            (min.min(*size), max.max(*size))
+        });
+        return (min, max, sizes.len() as u64);
+    }
+    let pools = entries.div_ceil(queue.max_players.max(1)).max(1);
+    (entries / pools, entries.div_ceil(pools), pools)
 }
 
 /// `65,000–70,000 sats`, or one amount when both ends are the same.
@@ -746,7 +812,14 @@ fn featured_card(competition: &CompetitionView, now: OffsetDateTime) -> Markup {
                 @if competition.can_enter {
                     div { dt { "Entry fee" } dd { (sats(competition.price())) } }
                 }
-                div { dt { "Prizes" } dd { (competition.win()) } }
+                div {
+                    dt { "Prizes" }
+                    dd {
+                        (competition.win())
+                        @if let Some(split) = competition.prize_split() { span class="cell-note prize-note" { (split) } }
+                        @if let Some(rule) = competition.prize_rule() { span class="cell-note prize-note" { (rule) } }
+                    }
+                }
                 div { dt { "Entries" } dd { (competition.entries()) } }
             }
             a class=(if competition.can_enter { "button is-primary is-fullwidth" } else { "button is-fullwidth" })
@@ -804,7 +877,10 @@ pub fn competition_row(competition: &CompetitionView, now: OffsetDateTime) -> Ma
         facts.push(format!("Entry fee {}", sats(competition.price())));
     }
     if competition.top_prize().is_some() {
-        facts.push(format!("Prizes {}", competition.win()));
+        facts.push(match competition.prize_split() {
+            Some(split) => format!("Prizes {} ({split})", competition.win()),
+            None => format!("Prizes {}", competition.win()),
+        });
     }
     facts.push(format::competition_duration(
         competition.start,
@@ -834,9 +910,10 @@ pub fn competition_row(competition: &CompetitionView, now: OffsetDateTime) -> Ma
                     span class="cell-note refund-line" { (refunds) }
                 }
                 @match &competition.queue {
-                    Queue::Queued(queue) if queue.pools.is_empty() => {
+                    Queue::Queued(queue) if queue.pools.is_empty() && queue.seats().is_none() => {
                         span class="cell-note" { "pools of up to " (queue.max_players) }
                     }
+                    Queue::Queued(queue) if queue.pools.is_empty() => {}
                     Queue::Queued(queue) if queue.pools.len() == 1 => { span class="cell-note" { "1 pool" } }
                     Queue::Queued(queue) => { span class="cell-note" { (queue.pools.len()) " pools" } }
                     Queue::Pool(pool) => { span class="cell-note" { (pool.label()) } }
@@ -849,7 +926,11 @@ pub fn competition_row(competition: &CompetitionView, now: OffsetDateTime) -> Ma
             span class="cell-fee" data-label="Entry fee" {
                 @if competition.can_enter { (sats(competition.price())) } @else { "—" }
             }
-            span class="cell-win" data-label="Prizes" { (competition.win()) }
+            span class="cell-win" data-label="Prizes" {
+                (competition.win())
+                @if let Some(split) = competition.prize_split() { span class="cell-note prize-note" { (split) } }
+                @if let Some(rule) = competition.prize_rule() { span class="cell-note prize-note" { (rule) } }
+            }
             span class="cell-entries" data-label="Entries" { (competition.entries()) }
             span class="cell-action" { (action) " →" }
         }
@@ -1627,5 +1708,52 @@ pub(crate) mod tests {
         assert!(phase_badge(&expired)
             .into_string()
             .contains(">Finished</span>"));
+    }
+
+    /// The default competition: a queue of 20 seats that plays as one pool and pays 70% and 30%
+    /// from ten players, its winner taking the pot below that.
+    pub(crate) fn twenty_seats(entries: u64) -> CompetitionView {
+        let mut competition = queued("q", entries);
+        competition.paid_places = 2;
+        if let Queue::Queued(queue) = &mut competition.queue {
+            queue.max_players = 20;
+            queue.max_entries = Some(20);
+        }
+        competition
+    }
+
+    #[test]
+    fn a_one_pool_queue_shows_its_seats_and_how_its_prizes_split() {
+        let open = twenty_seats(3);
+        assert_eq!(open.entries(), "20 seats · 17 left");
+        assert_eq!(open.prize_split().as_deref(), Some("1st 70% · 2nd 30%"));
+        assert_eq!(
+            open.prize_rule().as_deref(),
+            Some("Under 10 players: winner takes all")
+        );
+        // Three players: first place takes their pot.
+        assert_eq!(open.win(), "15,000 sats");
+        let row = competition_row(&open, NOW).into_string();
+        assert!(
+            row.contains(r#"data-label="Entries">20 seats · 17 left</span>"#),
+            "{row}"
+        );
+        assert!(row.contains("1st 70% · 2nd 30%"));
+        assert!(row.contains("Under 10 players: winner takes all"));
+        assert!(row.contains("Prizes 15,000 sats (1st 70% · 2nd 30%)"));
+        // One pool: no pool size to explain.
+        assert!(!row.contains("pools of up to"));
+
+        // From ten players first place takes 70% of the pot.
+        assert_eq!(twenty_seats(10).win(), "35,000 sats");
+        assert_eq!(twenty_seats(20).win(), "70,000 sats");
+        assert_eq!(twenty_seats(20).entries(), "20 seats · 0 left");
+        let mut closed = twenty_seats(12);
+        closed.can_enter = false;
+        assert_eq!(closed.entries(), "12 of 20");
+
+        // A queue that pays one place shows no split.
+        assert!(queued("q", 3).prize_split().is_none());
+        assert!(queued("q", 3).prize_rule().is_none());
     }
 }

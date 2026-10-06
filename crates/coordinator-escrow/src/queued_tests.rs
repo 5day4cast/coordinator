@@ -94,6 +94,7 @@ fn terms() -> QueuedTerms {
         expiry: (START + 3 * 86_400) as u32,
         observation: observation(),
         number_of_places_win: 1,
+        multi_place_min_players: None,
         pool_rules: PoolRules::new(2, 25).unwrap(),
         stake_sats: 5_000,
         relative_locktime_block_delta: 72,
@@ -404,4 +405,103 @@ fn a_pool_statement_that_differs_from_the_template_is_refused() {
     assert!(pool_authorization(&entry, &duplicated, &signed).is_err());
     let lonely = [uuid7(2)];
     assert!(pool_authorization(&entry, &lonely, &statement_for(&lonely)).is_err());
+}
+
+/// Terms paying two places: 70% and 30% from ten players, the winner taking the pot below that.
+fn two_place_terms() -> QueuedTerms {
+    QueuedTerms {
+        number_of_places_win: 2,
+        multi_place_min_players: Some(MULTI_PLACE_MIN_PLAYERS),
+        pool_rules: PoolRules::new(2, 20).unwrap(),
+        ..terms()
+    }
+}
+
+fn two_place_entry(n: u128) -> QueuedEntryTerms {
+    QueuedEntryTerms {
+        terms: two_place_terms(),
+        ..entry(n)
+    }
+}
+
+/// The oracle's statement of a pool of `members` paying `places`.
+fn statement_paying(members: &[Uuid], places: u32) -> SignedStatement {
+    resign(statement_for(members), |s| match &mut s.outcomes {
+        Outcomes::Ranking(ranking) => ranking.number_of_places_win = places,
+    })
+}
+
+#[test]
+fn two_place_terms_state_the_place_rule() {
+    let two = two_place_terms();
+    two.validate().unwrap();
+    assert_ne!(two.digest().unwrap(), terms().digest().unwrap());
+    for (players, places) in [(2, 1), (9, 1), (10, 2), (20, 2)] {
+        assert_eq!(two.pool_places(players), places, "a pool of {players}");
+    }
+    assert_eq!(terms().pool_places(20), 1);
+    // One-place terms encode as before the rule existed, so their digest is unchanged.
+    let one = serde_json::to_value(terms()).unwrap();
+    assert!(one.get("multi_place_min_players").is_none());
+    let read: QueuedTerms = serde_json::from_value(one).unwrap();
+    assert_eq!(read, terms());
+    assert_eq!(
+        serde_json::to_value(&two).unwrap()["multi_place_min_players"],
+        10
+    );
+
+    let invalid: &[fn(&mut QueuedTerms)] = &[
+        // Two places without the rule, or with another threshold.
+        |t| t.multi_place_min_players = None,
+        |t| t.multi_place_min_players = Some(9),
+        // Pools paying two places hold at most 20 players.
+        |t| t.pool_rules = PoolRules::new(2, 21).unwrap(),
+        |t| t.pool_rules = PoolRules::new(2, 25).unwrap(),
+        // A third place is not offered.
+        |t| t.number_of_places_win = 3,
+    ];
+    for change in invalid {
+        let mut changed = two_place_terms();
+        change(&mut changed);
+        assert!(changed.validate().is_err());
+    }
+    // The rule on terms that pay one place.
+    let mut one_place = terms();
+    one_place.multi_place_min_players = Some(MULTI_PLACE_MIN_PLAYERS);
+    assert!(one_place.validate().is_err());
+}
+
+#[test]
+fn a_pool_of_ten_or_more_pays_seventy_thirty() {
+    let payouts = pool_payouts(10, 2).unwrap();
+    // 90 ordered pairs, refund-all and expiry.
+    assert_eq!(payouts.len(), 92);
+    assert_eq!(
+        payouts[&Outcome::Attestation(0)],
+        BTreeMap::from([(0, 70), (1, 30)])
+    );
+    assert_eq!(
+        payouts[&Outcome::Attestation(9)],
+        BTreeMap::from([(1, 70), (0, 30)])
+    );
+    let equal: PayoutWeights = (0..10).map(|index| (index, 1)).collect();
+    assert_eq!(payouts[&Outcome::Attestation(90)], equal);
+    assert_eq!(payouts[&Outcome::Expiry], equal);
+    assert_eq!(place_percentages(2), vec![70, 30]);
+}
+
+#[test]
+fn a_pool_pays_the_places_its_size_gives() {
+    // Ten players pay two places; a statement of one place is refused.
+    let ten: Vec<Uuid> = (1..=10).map(uuid7).collect();
+    let entry = two_place_entry(4);
+    let derived = pool_authorization(&entry, &ten, &statement_paying(&ten, 2)).unwrap();
+    assert_eq!(derived.outcome_payouts, pool_payouts(10, 2).unwrap());
+    assert!(pool_authorization(&entry, &ten, &statement_paying(&ten, 1)).is_err());
+
+    // Three players pay their winner the pot; a statement of two places is refused.
+    let three = [uuid7(1), uuid7(2), uuid7(4)];
+    let derived = pool_authorization(&entry, &three, &statement_paying(&three, 1)).unwrap();
+    assert_eq!(derived.outcome_payouts, pool_payouts(3, 1).unwrap());
+    assert!(pool_authorization(&entry, &three, &statement_paying(&three, 2)).is_err());
 }

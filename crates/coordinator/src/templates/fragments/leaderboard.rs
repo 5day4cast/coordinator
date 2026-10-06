@@ -95,7 +95,16 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
                 @if let Some(queue) = queue {
                     div {
                         dt { "Paid places" (tip(&format!("{}.", queue.pool_note()))) }
-                        dd { "Each pool's winner" }
+                        dd {
+                            @if let Some(split) = competition.prize_split() {
+                                (split)
+                                @if let Some(rule) = competition.prize_rule() {
+                                    span class="cell-note prize-note" { (rule) }
+                                }
+                            } @else {
+                                "Each pool's winner"
+                            }
+                        }
                     }
                 } @else if competition.pot_refunded || competition.phase == Phase::Expired {
                     div class="refund-fact" {
@@ -520,6 +529,19 @@ mod tests {
         assert!(!leaderboard(&scored, NOW)
             .into_string()
             .contains("Results are late"));
+    }
+
+    #[test]
+    fn a_one_pool_queue_shows_how_its_prizes_split() {
+        let html = leaderboard(
+            &crate::templates::pages::competitions::tests::twenty_seats(4),
+            NOW,
+        )
+        .into_string();
+        assert!(html.contains("1st 70% · 2nd 30%"), "{html}");
+        assert!(html.contains("Under 10 players: winner takes all"));
+        assert!(html.contains("20 seats · 16 left"));
+        assert!(html.contains(r#"data-tip="Up to 20 players, all in one pool.""#));
     }
 
     #[test]

@@ -140,16 +140,18 @@ pub fn discovery(
                                     label { "Entries per player" input type="number" name="max_entries_per_player" value="1" min="1" required; }
                                     label { "Coordinator fee (%)" input type="number" name="coordinator_fee_percentage" value="5" min="0" max="100" step="0.01" required; }
                                     label { "Minimum pool size" input type="number" name="min_players" value="2" min="2" max="13" required; }
-                                    label { "Maximum pool size" input type="number" name="max_pool_size" value="25" min="3" max="25" required; }
-                                    label { "Maximum queued entries" input type="number" name="max_entries" value="500" min="2" max="1500" required; }
+                                    // The default game: one pool of 20 seats paying 70% and 30% from ten players.
+                                    label { "Maximum pool size" input type="number" name="max_pool_size" value="20" min="3" max="25" required; }
+                                    label { "Maximum queued entries" input type="number" name="max_entries" value="20" min="2" max="1500" required; }
+                                    label { "Winning places" input type="number" name="number_of_places_win" value="2" min="1" max="2" required; }
                                 }
+                                p.note { "Two places pay 70% and 30% in pools of 10 or more, and need pools of at most 20; smaller pools pay their winner the pot." }
                                 label.check { input type="checkbox" name="queued" value="true" checked; " Form pools when registration closes" }
                                 details {
                                     summary { "Advanced terms and fixed-size games" }
                                     p.note { "Fixed-size terms apply when pool formation is unchecked." }
                                     div.form-grid {
                                         label { "Fixed-size seats" input type="number" name="total_allowed_entries" value="3" min="2" required; }
-                                        label { "Winning places" input type="number" name="number_of_places_win" value="1" min="1" required; }
                                         label { "Scoring" select name="scoring_rules" { option value="lines" { "Lines" } option value="fixed" { "Fixed" } } }
                                         label { "Blocks between settlement stages" input type="number" name="relative_locktime_block_delta" value=(block_delta) min="1" required; }
                                     }
