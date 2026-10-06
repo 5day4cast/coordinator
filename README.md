@@ -161,6 +161,20 @@ listen_addr = "127.0.0.1:9992"
 `COORDINATOR_METRICS_LISTEN_ADDR` overrides the file; an empty value turns the
 listener off. Database-derived gauges are refreshed at most every 15 seconds.
 
+### Fund recovery records
+
+Off by default. When enabled, the coordinator publishes encrypted recovery
+records to Nostr relays and offers players a recovery file, so a player can
+recover their funds with their nsec alone. See [Fund recovery](docs/RECOVERY.md).
+
+```toml
+[recovery]
+enabled = true
+relays = ["wss://relay.example.org"]
+# Its own key, created on first start; every instance must share it.
+key_file = "./creds/coordinator_recovery_key.pem"
+```
+
 ### Operator access
 
 Operator routes are served only by the admin listener and require the token in

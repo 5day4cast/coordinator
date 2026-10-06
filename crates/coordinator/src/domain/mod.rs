@@ -1,6 +1,7 @@
 mod competitions;
 mod invoices;
 pub mod leaderboard;
+pub mod recovery;
 pub mod users;
 
 pub use competitions::*;

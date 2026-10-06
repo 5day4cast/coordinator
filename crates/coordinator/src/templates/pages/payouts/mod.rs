@@ -4,14 +4,23 @@ use crate::domain::EligiblePayout;
 use crate::templates::format::{copyable_id, sats};
 
 /// Payout status and invoice fallback. Each entry retains its authorized address;
-/// the profile address is a default for future entries only.
-pub fn payouts_page(payouts: &[EligiblePayout], lightning_address: Option<&str>) -> Markup {
+/// the profile address is a default for future entries only. `recovery_file` offers the
+/// player's recovery file.
+pub fn payouts_page(
+    payouts: &[EligiblePayout],
+    lightning_address: Option<&str>,
+    recovery_file: bool,
+) -> Markup {
     html! {
         div id="payouts" class="account-page" {
             div {
                 h1 class="title is-4 mb-4" { "Payouts" }
 
                 (lightning_address_panel(lightning_address))
+
+                @if recovery_file {
+                    (recovery_file_link())
+                }
 
                 @if payouts.is_empty() {
                     (no_payouts())
@@ -119,6 +128,16 @@ fn lightning_address_panel(lightning_address: Option<&str>) -> Markup {
     }
 }
 
+/// The recovery file, downloaded with the player's signature (`payouts.js`).
+fn recovery_file_link() -> Markup {
+    html! {
+        p class="help mb-4" id="recoveryFile" {
+            a href="/api/v1/recovery/kit" data-payout-action="recovery-file" { "Download recovery file" }
+            ". With your recovery key (nsec), it is all you need to get your funds back if this site is ever gone."
+        }
+    }
+}
+
 /// No payouts available message
 pub fn no_payouts() -> Markup {
     html! {
@@ -143,7 +162,7 @@ mod tests {
             allow_invoice_fallback: true,
             escrow_enabled: true,
         };
-        let html = payouts_page(&[payout], Some("freya@lnurl.example")).into_string();
+        let html = payouts_page(&[payout], Some("freya@lnurl.example"), false).into_string();
         // The page's CSP allows no inline script, handlers included.
         assert!(!html.contains("onclick"));
         assert!(html.contains(r#"data-payout-action="invoice""#));
@@ -163,11 +182,11 @@ mod tests {
             allow_invoice_fallback: false,
             escrow_enabled: false,
         };
-        let closed = payouts_page(&[payout.clone()], None).into_string();
+        let closed = payouts_page(&[payout.clone()], None, false).into_string();
         assert!(!closed.contains("Legacy recovery"));
         payout.status = "Awaiting invoice".into();
         payout.allow_invoice_fallback = true;
-        assert!(payouts_page(&[payout], None)
+        assert!(payouts_page(&[payout], None, false)
             .into_string()
             .contains("Legacy recovery"));
     }

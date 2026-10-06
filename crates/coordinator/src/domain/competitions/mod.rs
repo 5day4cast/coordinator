@@ -28,6 +28,7 @@ mod queued;
 mod queued_store;
 #[cfg(test)]
 mod queued_tests;
+mod recovery_store;
 mod reported;
 mod runners;
 pub mod states;
@@ -66,6 +67,7 @@ pub use queued::{
     DEFAULT_MIN_PLAYERS,
 };
 pub use queued_store::{PoolRecord, QueueSettings};
+pub use recovery_store::*;
 pub(crate) use reported::Reported;
 pub use runners::*;
 use serde::{Deserialize, Serialize};

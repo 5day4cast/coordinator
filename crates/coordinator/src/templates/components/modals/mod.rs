@@ -207,6 +207,9 @@ fn register_modal() -> Markup {
                                     input class="input" type="text" id="usernameNsecDisplay" readonly;
                                 }
                             }
+                            p class="help" {
+                                "This key, with the recovery file from your Payouts page (or the Nostr relays it is published to), is all you need to recover your funds."
+                            }
                             button class="button is-info is-fullwidth mt-2" id="copyUsernameNsec" {
                                 "Copy to clipboard"
                             }

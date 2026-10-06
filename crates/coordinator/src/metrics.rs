@@ -113,6 +113,28 @@ pub static COMPETITION_STEP_FAILURES: LazyLock<IntCounter> = LazyLock::new(|| {
     .expect("valid metric")
 });
 
+/// Recovery events offered to a relay, by whether the relay took them (`accepted`) or not
+/// (`failed`: refused, no answer, or unreachable).
+pub static RECOVERY_RELAY_PUBLISHES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "coordinator_recovery_relay_publishes_total",
+            "Recovery events offered to a relay, by result",
+        ),
+        &["result"],
+    )
+    .expect("valid metric")
+});
+
+/// Recovery events not yet taken by every relay. Set by the recovery publisher.
+pub static RECOVERY_OUTBOX_DEPTH: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "coordinator_recovery_outbox_depth",
+        "Recovery events waiting to be published",
+    )
+    .expect("valid metric")
+});
+
 /// Whether entries to Arkade competitions are paused because the Arkade server is failing
 /// batch steps (1) or not (0). Set where the pause is decided (`ArkadeHealth`).
 pub static ARKADE_UNAVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
@@ -443,6 +465,12 @@ impl Metrics {
         metrics.registry.register(Box::new(PAYOUT_HOLDS.clone()))?;
         metrics
             .registry
+            .register(Box::new(RECOVERY_RELAY_PUBLISHES.clone()))?;
+        metrics
+            .registry
+            .register(Box::new(RECOVERY_OUTBOX_DEPTH.clone()))?;
+        metrics
+            .registry
             .register(Box::new(LN_INVOICE_SUBSCRIPTION_UP.clone()))?;
         metrics
             .registry
@@ -477,6 +505,9 @@ impl Metrics {
         }
         for reason in PAYMENT_FAILURE_REASONS {
             PAYOUT_SEND_FAILURES.with_label_values(&[reason]);
+        }
+        for result in ["accepted", "failed"] {
+            RECOVERY_RELAY_PUBLISHES.with_label_values(&[result]);
         }
         Ok(metrics)
     }
@@ -663,6 +694,8 @@ mod tests {
             "coordinator_arkade_unavailable",
             "coordinator_settle_only",
             "coordinator_payout_holds",
+            "coordinator_recovery_relay_publishes_total",
+            "coordinator_recovery_outbox_depth",
             "coordinator_escrow_subscription_up",
             "coordinator_escrow_subscription_escrows",
             "coordinator_entry_form_unavailable",
@@ -689,6 +722,7 @@ mod tests {
             "coordinator_background_thread_up{thread=\"running_worker\"} 1",
             "coordinator_background_thread_up{thread=\"stopped_worker\"} 0",
             "coordinator_payout_attempts_total{result=\"failed\"}",
+            "coordinator_recovery_relay_publishes_total{result=\"failed\"}",
             "coordinator_payout_send_failures_total{reason=\"FAILURE_REASON_NO_ROUTE\"}",
             "coordinator_payout_send_failures_total{reason=\"other\"}",
         ] {

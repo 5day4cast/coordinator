@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     ] {
         fs::write(
             output.join(format!("{name}.html")),
-            base(&config, payouts_page(rows, default_address)).into_string(),
+            base(&config, payouts_page(rows, default_address, true)).into_string(),
         )?;
     }
     Ok(())

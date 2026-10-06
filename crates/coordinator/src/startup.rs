@@ -25,9 +25,11 @@ use crate::{
     },
     config::Settings,
     domain::{
-        leaderboard::Leaderboards, CompetitionRunners, CompetitionStore, CompetitionWakes,
-        Coordinator, InvoiceSubscriber, InvoiceWatcher, PaymentSubscriber, PayoutWatcher,
-        SubscriptionHealth, UserInfo, UserStore, ARK_SWAP_BOARDS_EVERY,
+        leaderboard::Leaderboards,
+        recovery::{Recovery, RecoveryPublisher},
+        CompetitionRunners, CompetitionStore, CompetitionWakes, Coordinator, InvoiceSubscriber,
+        InvoiceWatcher, PaymentSubscriber, PayoutWatcher, SubscriptionHealth, UserInfo, UserStore,
+        ARK_SWAP_BOARDS_EVERY,
     },
     infra::{
         bitcoin::{Bitcoin, BitcoinClient, BitcoinSyncWatcher, ElectrumHeaders},
@@ -342,6 +344,8 @@ pub struct AppState {
     pub background_threads: Arc<HashMap<String, JoinHandle<()>>>,
     /// Consumed reset challenges mapped to their owner and consumption time.
     pub forgot_password_challenges: Arc<RwLock<HashMap<String, (String, std::time::Instant)>>>,
+    /// Recovery records and the recovery file, when enabled.
+    pub recovery: Option<Arc<Recovery>>,
 }
 
 async fn create_bitcoin_client(config: &Settings) -> Result<Arc<dyn Bitcoin>, anyhow::Error> {
@@ -509,6 +513,24 @@ pub async fn build_app(
         config.ln_settings.mock_enabled,
         config.bitcoin_settings.network,
     );
+
+    // Recovery records read the oracle's key for the contract events they publish.
+    let recovery_oracle = oracle_client.clone();
+    let recovery = if config.recovery_settings.enabled {
+        let recovery = Recovery::load(
+            &config.recovery_settings.key_file,
+            config.bitcoin_settings.network,
+            config.recovery_settings.relays.clone(),
+            config.ark_settings.server_url.clone(),
+        )?;
+        info!(
+            "Recovery records enabled, key {}",
+            recovery.public_key().to_hex()
+        );
+        Some(Arc::new(recovery))
+    } else {
+        None
+    };
 
     let lease_holder = config.coordinator_settings.lease_holder();
     let pacing = config.coordinator_settings.pacing();
@@ -828,6 +850,23 @@ pub async fn build_app(
     leaderboards.spawn_refresher(&tracker, cancel_token.clone());
     admin_weather.spawn_refresher(&tracker, cancel_token.clone());
     admin_monitoring.spawn_refresher(&tracker, cancel_token.clone(), coordinator.clone());
+    if let Some(recovery) = recovery.clone() {
+        let publisher = RecoveryPublisher::new(
+            recovery,
+            coordinator.competition_store.clone(),
+            users_info.clone(),
+            recovery_oracle,
+            coordinator.worker_leases().clone(),
+            cancel_token.clone(),
+        );
+        let recovery_handle = spawn_supervised(
+            &tracker,
+            "recovery records",
+            cancel_token.clone(),
+            publisher.run(),
+        );
+        threads.insert("recovery_records".to_string(), recovery_handle);
+    }
     tracker.close();
 
     let wasm_version = crate::api::ui_files::package_version(&config.ui_settings.ui_dir);
@@ -863,6 +902,7 @@ pub async fn build_app(
         bitcoin: bitcoin_client,
         background_threads: Arc::new(threads),
         forgot_password_challenges: Arc::new(RwLock::new(HashMap::new())),
+        recovery,
     };
     Ok((
         app_state,
@@ -1035,6 +1075,14 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Result<Router, anyhow
         )
         .route("/api/v1/entries", post(add_event_entry))
         .route("/api/v1/entries", get(get_entries))
+        .route(
+            "/api/v1/recovery/info",
+            get(crate::api::routes::get_recovery_info),
+        )
+        .route(
+            "/api/v1/recovery/kit",
+            get(crate::api::routes::get_recovery_kit),
+        )
         .nest("/api/v1/users", users_endpoints);
     let api_routes = limited(
         api_routes,
@@ -1432,6 +1480,8 @@ mod startup_tests {
             settings.ln_settings.mock_enabled = true;
             settings.coordinator_settings.mock_oracle = true;
             settings.coordinator_settings.oracle_url = String::from("mock://oracle");
+            settings.recovery_settings.key_file =
+                data.path().join("recovery_key.pem").display().to_string();
             configure(&mut settings);
             let (state, tasks, cancel, databases) = build_app(settings).await.unwrap();
             Self {
@@ -1558,6 +1608,103 @@ mod startup_tests {
                 }
             }
         }
+        test.stop().await;
+    }
+
+    #[tokio::test]
+    async fn the_recovery_file_needs_a_signature_and_holds_only_its_players_records() {
+        use crate::domain::{recovery::RecoveryKit, RecoveryOutboxEvent};
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
+        let test = TestState::start().await;
+        let public = test.public();
+        let (status, _, _) = send(&public, request("GET", "/api/v1/recovery/info", &[], "")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        test.stop().await;
+
+        let test = TestState::start_with(|settings| {
+            settings.recovery_settings.enabled = true;
+        })
+        .await;
+        let public = test.public();
+        let recovery = test.state.recovery.clone().unwrap();
+        let (status, _, body) =
+            send(&public, request("GET", "/api/v1/recovery/info", &[], "")).await;
+        assert_eq!(status, StatusCode::OK);
+        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(info["coordinator_pubkey"], recovery.public_key().to_hex());
+        assert_eq!(info["network"], test.state.network);
+        let (status, _, _) = send(&public, request("GET", "/api/v1/recovery/kit", &[], "")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let alice = nostr::Keys::generate();
+        let bob = nostr::Keys::generate();
+        let mut events = Vec::new();
+        for keys in [&alice, &bob] {
+            let user = keys.public_key();
+            let competition_id = uuid::Uuid::now_v7();
+            let d_tag = format!("{}:entry:{competition_id}", recovery.blind(&user));
+            let content = recovery.encrypt(&user, &user.to_hex()).unwrap();
+            let event = nostr::EventBuilder::new(nostr::Kind::ApplicationSpecificData, content)
+                .sign_with_keys(keys)
+                .unwrap();
+            events.push(RecoveryOutboxEvent {
+                d_tag,
+                kind: "entry",
+                user_pubkey: Some(user.to_hex()),
+                competition_id: Some(competition_id),
+                content_sha256: String::new(),
+                event_json: serde_json::to_string(&event).unwrap(),
+                created_at: 0,
+            });
+        }
+        test.state
+            .coordinator
+            .competition_store
+            .put_recovery_events(events, 0, Some(0))
+            .await
+            .unwrap();
+
+        let url = format!("{}/api/v1/recovery/kit", test.state.remote_url);
+        let auth = crate::api::extractors::create_auth_event("GET", &url, None, &alice)
+            .await
+            .unwrap();
+        let header = format!(
+            "Nostr {}",
+            BASE64.encode(serde_json::to_string(&auth).unwrap())
+        );
+        let (status, headers, body) = send(
+            &public,
+            request(
+                "GET",
+                "/api/v1/recovery/kit",
+                &[("authorization", &header)],
+                "",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(headers["content-disposition"]
+            .to_str()
+            .unwrap()
+            .starts_with("attachment; filename=\"coordinator-recovery-npub1"));
+        assert!(headers["cache-control"]
+            .to_str()
+            .unwrap()
+            .contains("no-store"));
+        let kit: RecoveryKit = serde_json::from_str(&body).unwrap();
+        assert_eq!(kit.user_pubkey, alice.public_key().to_hex());
+        // Alice has no account here, so no wallet backup.
+        assert_eq!(kit.wallet, None);
+        assert_eq!(kit.entries.len(), 1);
+        let plaintext = nostr::nips::nip44::decrypt(
+            alice.secret_key(),
+            &recovery.public_key(),
+            &kit.entries[0],
+        )
+        .unwrap();
+        assert_eq!(plaintext, alice.public_key().to_hex());
+        assert!(!body.contains(&bob.public_key().to_hex()));
         test.stop().await;
     }
 
