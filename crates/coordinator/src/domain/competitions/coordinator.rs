@@ -4062,6 +4062,9 @@ impl Coordinator {
             }
         }
 
+        if self.is_keymeld_enabled() {
+            self.use_ticket_registration(&mut entry, &ticket).await?;
+        }
         let policy = self.validate_entry_payout_policy(&entry, &ticket).await?;
         if self.is_keymeld_enabled() {
             let data = ParticipantRegistrationData {
@@ -4175,6 +4178,95 @@ impl Coordinator {
 
         self.wake_competition(user_entry.event_id);
         Ok(user_entry)
+    }
+
+    /// An entry for a paid ticket that leaves out its Keymeld registration is entered with the
+    /// one sent for the ticket before paying: the player paid, then their page reloaded before
+    /// the entry went in, and a paid ticket's registration can no longer be sent again. It was
+    /// checked when it was sent, and is checked again below as the entry's. It must be for the
+    /// entry's key.
+    async fn use_ticket_registration(
+        &self,
+        entry: &mut AddEntry,
+        ticket: &Ticket,
+    ) -> Result<(), Error> {
+        if entry.encrypted_keymeld_private_key.is_some()
+            || entry.keymeld_auth_pubkey.is_some()
+            || entry.keymeld_registration_context.is_some()
+            || entry.keymeld_escrow_policy.is_some()
+        {
+            return Ok(());
+        }
+        let Some(stored) = self
+            .competition_store
+            .ticket_registration(ticket.id, &ticket.hash)
+            .await?
+        else {
+            return Ok(());
+        };
+        let stored: TicketRegistration =
+            serde_json::from_str(&stored).map_err(|e| Error::Bitcoin(e.into()))?;
+        if stored.ephemeral_pubkey != entry.ephemeral_pubkey {
+            return Err(Error::BadRequest(
+                "The entry key differs from the one its ticket was paid with".into(),
+            ));
+        }
+        entry.encrypted_keymeld_private_key = Some(stored.encrypted_keymeld_private_key);
+        entry.keymeld_auth_pubkey = Some(stored.keymeld_auth_pubkey);
+        entry.keymeld_registration_context = Some(stored.keymeld_registration_context);
+        entry.keymeld_escrow_policy = stored.keymeld_escrow_policy;
+        Ok(())
+    }
+
+    /// The tickets `pubkey` paid for and has not entered yet, the first paid first, so the entry
+    /// can be finished with the registration sent before paying (see [`Self::add_entry`]).
+    ///
+    /// For one competition: only while it takes entries. For all of them, the caller keeps the
+    /// ones whose competitions still do. A ticket without the registration its entry needs, or
+    /// without a payout authorization naming its entry id, is left out: it can only be refunded.
+    pub async fn paid_tickets(
+        &self,
+        pubkey: &str,
+        competition_id: Option<Uuid>,
+    ) -> Result<Vec<super::PaidTicket>, Error> {
+        if let Some(competition_id) = competition_id {
+            let competition = self
+                .competition_store
+                .get_competition(competition_id)
+                .await
+                .map_err(|e| match e {
+                    sqlx::Error::RowNotFound => Error::NotFound("Competition not found".into()),
+                    e => Error::from(e),
+                })?;
+            if competition
+                .require_entry_admission(OffsetDateTime::now_utc())
+                .is_err()
+            {
+                return Ok(Vec::new());
+            }
+        }
+        let keymeld = self.is_keymeld_enabled();
+        Ok(self
+            .competition_store
+            .paid_unentered_tickets(pubkey, competition_id)
+            .await?
+            .into_iter()
+            .filter(|ticket| ticket.registered || !keymeld)
+            .filter_map(|ticket| {
+                // The entry id names the entry key; without a payout authorization naming it, a
+                // page cannot finish the entry.
+                let policy: coordinator_escrow::authorization::PayoutPolicy =
+                    serde_json::from_str(ticket.payout_policy.as_deref()?).ok()?;
+                let consent =
+                    coordinator_escrow::queued::EntryConsent::from_policy(&policy).ok()?;
+                Some(super::PaidTicket {
+                    ticket_id: ticket.ticket_id,
+                    competition_id: ticket.competition_id,
+                    entry_id: consent.entry_id(),
+                    ephemeral_pubkey: ticket.entry_pubkey,
+                })
+            })
+            .collect())
     }
 
     /// Keep the Keymeld registration a player sends for their ticket before paying for it.

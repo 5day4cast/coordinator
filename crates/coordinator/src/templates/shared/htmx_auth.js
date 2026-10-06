@@ -21,7 +21,7 @@ const AUTH_REQUIRED = [
   /^\/competitions\/[^/]+\/tickets\/[^/]+\/status$/,
 ];
 const AUTH_OPTIONAL = [
-  /^\/competitions\/[^/]+\/entry-form(\/payout|\/unpaid)?$/,
+  /^\/competitions\/[^/]+\/entry-form(\/payout|\/unpaid|\/paid)?$/,
   // A queued competition's pools, with the player's own marked.
   /^\/competitions\/[^/]+\/pools$/,
   // A player's own picks before the window opens; the public dialog's

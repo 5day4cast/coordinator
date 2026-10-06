@@ -5,8 +5,8 @@ use maud::{html, Markup};
 use time::OffsetDateTime;
 
 use crate::domain::{
-    leaderboard::Phase, EntryPayment, LedgerEntry, LedgerTotals, PayoutState, Refund, RefundKind,
-    RefundState, Returned, UnpaidTicket,
+    leaderboard::Phase, EntryPayment, LedgerEntry, LedgerTotals, PaidTicket, PayoutState, Refund,
+    RefundKind, RefundState, Returned, UnpaidTicket,
 };
 use crate::templates::{
     components::tip,
@@ -31,9 +31,15 @@ pub struct UnpaidRow<'a> {
     pub competition: &'a CompetitionView,
 }
 
-/// Entries page content (requires auth): the player's unpaid entries, the totals over all
-/// `count` entries, and the first page of them. Each row's on-chain references link to
-/// `explorers`.
+/// A paid ticket whose entry never went in, in a competition still taking entries.
+pub struct PaidRow<'a> {
+    pub ticket: &'a PaidTicket,
+    pub competition: &'a CompetitionView,
+}
+
+/// Entries page content (requires auth): the player's paid tickets still to enter and unpaid
+/// entries, the totals over all `count` entries, and the first page of them. Each row's
+/// on-chain references link to `explorers`.
 pub fn entries_page(
     rows: &[EntryRow],
     totals: &LedgerTotals,
@@ -41,10 +47,12 @@ pub fn entries_page(
     open: Option<&CompetitionView>,
     explorers: Explorers,
     unpaid: &[UnpaidRow],
+    paid: &[PaidRow],
 ) -> Markup {
     html! {
         div id="allEntries" class="account-page" {
             h1 class="title is-4" { "Your entries" }
+            (paid_entries(paid))
             (unpaid_entries(unpaid, OffsetDateTime::now_utc()))
             @if rows.is_empty() {
                 (no_entries(open))
@@ -67,6 +75,28 @@ pub fn entries_page(
                     }
                 }
                 p class="help" { "Select an entry to see its picks and how each one scored." }
+            }
+        }
+    }
+}
+
+/// Tickets paid for whose entry never went in: each links to its competition's entry form, whose
+/// Pay enters the picks made there without paying again. Nothing when there are none.
+pub fn paid_entries(paid: &[PaidRow]) -> Markup {
+    html! {
+        @if !paid.is_empty() {
+            div id="paidEntries" class="notification is-info paid-entries" {
+                p { strong { "Paid — make your picks to finish entering" } }
+                ul {
+                    @for row in paid {
+                        li {
+                            (format::window(row.competition.start, row.competition.end))
+                            " "
+                            a href=(row.competition.url()) hx-get=(row.competition.url())
+                              hx-target="#main-content" hx-push-url="true" { "Make picks" }
+                        }
+                    }
+                }
             }
         }
     }
@@ -507,6 +537,7 @@ mod tests {
             None,
             explorers,
             &[],
+            &[],
         )
         .into_string()
     }
@@ -836,6 +867,7 @@ mod tests {
             None,
             Explorers::default(),
             &[],
+            &[],
         )
         .into_string();
         assert!(html.contains(r##"hx-get="/entries?from=25" hx-target="#olderEntries""##));
@@ -864,6 +896,7 @@ mod tests {
             0,
             Some(&open),
             Explorers::default(),
+            &[],
             &[],
         )
         .into_string();
@@ -915,9 +948,45 @@ mod tests {
             None,
             Explorers::default(),
             &rows,
+            &[],
         )
         .into_string();
         assert!(page.contains(r#"id="unpaidEntries""#));
+        assert!(page.contains("You haven't entered a competition yet."));
+    }
+
+    #[test]
+    fn paid_tickets_to_enter_link_to_their_entry_form() {
+        let competition = view("c1", Phase::Upcoming, 90);
+        let ticket = PaidTicket {
+            ticket_id: uuid::Uuid::from_u128(7),
+            competition_id: uuid::Uuid::from_u128(1),
+            entry_id: uuid::Uuid::from_u128(8),
+            ephemeral_pubkey: None,
+        };
+        let rows = [PaidRow {
+            ticket: &ticket,
+            competition: &competition,
+        }];
+        let html = paid_entries(&rows).into_string();
+        assert!(html.contains("Paid — make your picks to finish entering"));
+        assert!(html.contains(r#"href="/competitions/c1/entry-form""#));
+        assert!(html.contains("Make picks"));
+        assert!(!html.contains("Pay"), "nothing more to pay");
+        assert!(paid_entries(&[]).into_string().is_empty());
+
+        // Shown even before any entry went in, above the rest.
+        let page = entries_page(
+            &[],
+            &LedgerTotals::default(),
+            0,
+            None,
+            Explorers::default(),
+            &[],
+            &rows,
+        )
+        .into_string();
+        assert!(page.contains(r#"id="paidEntries""#));
         assert!(page.contains("You haven't entered a competition yet."));
     }
 
