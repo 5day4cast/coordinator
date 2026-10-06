@@ -334,6 +334,7 @@ async fn inspect(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn claim(
     session: &mut Session,
     esplora: &Esplora,
