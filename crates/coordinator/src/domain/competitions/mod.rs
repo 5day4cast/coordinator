@@ -25,6 +25,8 @@ pub use list_api::ListPage;
 mod operator_payouts;
 mod payout;
 mod queued;
+#[cfg(test)]
+mod queued_admission_tests;
 mod queued_store;
 #[cfg(test)]
 mod queued_tests;

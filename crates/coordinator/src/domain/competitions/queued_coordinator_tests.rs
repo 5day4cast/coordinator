@@ -208,7 +208,7 @@ async fn a_pool_event_made_before_a_restart_is_found_not_made_again() {
 /// gives, as every player's consent states.
 #[tokio::test]
 async fn a_pool_pays_the_places_its_size_gives() {
-    for (players, places) in [(10, 2), (5, 1)] {
+    for (players, places) in [(20, 2), (10, 2), (5, 1), (3, 1)] {
         let (queue, mut pool, members) = formed_paying_two(players).await;
         let coordinator = &queue.coordinator;
         assert_eq!(members.len(), players, "one pool of everyone");

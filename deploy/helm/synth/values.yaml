@@ -46,17 +46,19 @@ config:
   scheduler:
     enabled: false
     intervalSecs: 3600
-    scenario: "full_lifecycle"
+    scenario: "queued_one_pool"
   defaults:
-    users: 3
+    users: 20
     stations:
       - "KDEN"
       - "KJFK"
       - "KORD"
     entryFee: 1000
     entryWindowSecs: 120
-    observationWindowSecs: 300
+    observationWindowSecs: 86400
     signingDelaySecs: 60
+    # Required for queued-entry payouts and refunds when scheduling is enabled.
+    lightningAddress: ""
 
 litestream:
   enabled: false
