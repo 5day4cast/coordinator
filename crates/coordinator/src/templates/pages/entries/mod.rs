@@ -339,18 +339,15 @@ pub fn no_entries(open: Option<&CompetitionView>) -> Markup {
     }
 }
 
-/// What a signed-out visitor sees at an account page's address. The key lives
-/// only in this tab's memory, so a reload always lands here; logging in loads
-/// the page in place, signed (see htmx_auth.js).
+/// What a signed-out visitor sees at an account page's address. The page is
+/// rendered unsigned, so a reload lands here too; a remembered login or a new
+/// one loads the page in place, signed (see htmx_auth.js).
 pub fn sign_in_required(path: &str, what: &str) -> Markup {
     html! {
         div class="account-page sign-in-required"
             hx-get=(path) hx-trigger="fw:login from:body" hx-target="this" hx-swap="outerHTML" {
             h1 class="title is-4" { "Log in to see " (what) }
-            p {
-                "You're signed out. For safety your key is kept only in this tab's memory, "
-                "so reloading the page or opening a new tab signs you out."
-            }
+            p { "You're signed out. Logging in keeps you logged in on this browser until you log out." }
             div class="buttons mt-4" {
                 button type="button" class="button is-primary" data-open-modal="loginModal" { "Log in" }
                 button type="button" class="button is-light" data-open-modal="registerModal" { "Sign up" }
@@ -664,7 +661,7 @@ mod tests {
     #[test]
     fn signed_out_visitors_are_told_why_and_can_log_in() {
         let html = sign_in_required("/entries", "your entries").into_string();
-        assert!(html.contains("reloading the page or opening a new tab signs you out"));
+        assert!(html.contains("You're signed out"));
         assert!(html.contains(r#"data-open-modal="loginModal""#));
         assert!(html.contains(r#"hx-trigger="fw:login from:body""#));
     }

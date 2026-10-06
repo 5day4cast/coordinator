@@ -89,7 +89,14 @@ window.htmx?.registerExtension("fw-auth", {
       // page comes back from the server as its log-in prompt.
       if (mode === "optional" || ctx.request.headers["HX-History-Restore-Request"]) return;
       waitingForLogin = elt;
-      openAuthModal("loginModal");
+      // A remembered login being restored sends the request once it is in.
+      if (loginRestoring) {
+        loginRestoring.then((restored) => {
+          if (!restored && waitingForLogin === elt) openAuthModal("loginModal");
+        });
+      } else {
+        openAuthModal("loginModal");
+      }
       return false;
     }
     if (ctx.request.method !== "GET" || url.origin !== window.location.origin) {

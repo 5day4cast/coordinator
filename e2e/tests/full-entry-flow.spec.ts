@@ -320,7 +320,7 @@ test.describe("Competition Status Display", () => {
 
   test("an account page opened by its address offers the log-in dialog", async ({ page }) => {
     await page.goto("/entries");
-    await expect(page.locator(".sign-in-required")).toContainText("signs you out");
+    await expect(page.locator(".sign-in-required")).toContainText("You're signed out");
     await expect(page.locator("#loginModal")).toHaveClass(/is-active/);
     await expect(page.locator("nav.navbar")).toBeVisible();
   });
