@@ -82,7 +82,7 @@ function load(page, document, fetch) {
   const window = page.htmx ? { htmx: page.htmx } : {};
   const entryForm = loadBundle(["fragments/entry_form/entry_form.js"],
     { ...page, window, document, fetch, crypto: webcrypto, TextEncoder, console, session, isLoggedIn },
-    ["submitEntry", "collectPicks", "togglePick", "unpickWithSpace", "ticketPriceSats", "loadEntryTerms", "Entry", "picksLeft"]);
+    ["submitEntry", "collectPicks", "togglePick", "unpickWithSpace", "ticketPriceSats", "loadEntryTerms", "Entry", "picksLeft", "labelPay"]);
   assert.deepEqual(Object.keys(window), page.htmx ? ["htmx"] : [], "nothing is put on window");
   return entryForm;
 }
@@ -601,10 +601,12 @@ function payingPlayer({ ticket = () => ({ ok: true, json: async () => ({ ticket_
   payment_request: "lnbc53000n1ticket", ...price(), keymeld_session_id: "session",
   keymeld_registration: { user_id: "ticket", session_id: "session", payout_policy: "policy" } }) }),
   entry = () => ({ ok: true, json: async () => ({ id: "entry" }) }), sessionStorage,
-  unpaid = null, listed = [], timers = null } = {}) {
+  unpaid = null, listed = [], timers = null, paid = null } = {}) {
   const { elements, document } = entryPage();
   // The notice the form shows for the signed-in player's unpaid ticket, when they hold one.
   if (unpaid) elements.entryUnpaid = element({ dataset: { ticketId: unpaid } });
+  // The notice for a ticket they paid for and never entered.
+  if (paid) elements.entryPaid = element({ dataset: { ...paid } });
   if (timers) elements.ticketPaymentExpiry = element();
   Object.assign(elements, {
     ticketPaymentModal: element({ querySelector: () => null }),
@@ -687,7 +689,7 @@ function payingPlayer({ ticket = () => ({ ok: true, json: async () => ({ ticket_
   const tickets = () => requests.filter(({ url }) => url.endsWith("/ticket"));
   const entries = () => requests.filter(({ url }) => url.endsWith("/api/v1/entries"));
   const announce = (type, detail = {}) => [...(documentListeners[type] ?? [])].forEach((listener) => listener({ detail: { ticket_id: "ticket", ...detail } }));
-  return { sandbox, elements, modal, pay, settle, tickets, entries, polled, announce };
+  return { sandbox, elements, modal, pay, settle, tickets, entries, polled, announce, requests };
 }
 
 test("the payment dialog shows one all-in amount and no fee wording", async () => {
@@ -1180,4 +1182,73 @@ test("a locked entry's picks say why they were not saved", async () => {
   await sandbox.savePicks();
   assert.equal(elements.editPicksMessage.textContent, "Entries have closed, so these picks are locked");
   assert.ok(elements.editPicksMessage.classList.contains("is-danger"));
+});
+
+// A ticket paid for before the page reloaded, whose entry never went in. Its entry id is the one
+// the wallet derived the entry key from; the payingPlayer wallet derives "pubkey" for any id.
+const PAID = { ticketId: "paid-ticket", entryId: "0190b6a0-0000-7000-8000-0000000000bb", entryKey: "pubkey" };
+
+test("a paid ticket the form shows is entered with the picks, without paying or registering again", async () => {
+  const { sandbox, elements, tickets, entries, requests } = payingPlayer({ paid: PAID });
+  await sandbox.submitEntry();
+  assert.equal(tickets().length, 0, "nothing more to pay");
+  assert.equal(requests.filter(({ url }) => url.endsWith("/registration")).length, 0);
+  assert.equal(entries().length, 1);
+  const body = entries()[0].body;
+  assert.equal(body.id, PAID.entryId);
+  assert.equal(body.ticket_id, PAID.ticketId);
+  assert.equal(body.ephemeral_pubkey, "pubkey");
+  assert.equal(body.payout_hash, "hash");
+  assert.deepEqual(JSON.parse(JSON.stringify(body.expected_observations)), [{ stations: "KPWM", temp_high: "Over" }]);
+  // The coordinator uses the registration sent before paying.
+  assert.equal(body.encrypted_keymeld_private_key, null);
+  assert.equal(body.keymeld_registration_context, null);
+  assert.equal(elements.submitEntry.textContent, "Entered");
+  assert.equal(elements.entryPaid.dataset.ticketId, undefined, "entered now");
+});
+
+test("a paid ticket whose entry is refused is entered on the next Pay, still without paying", async () => {
+  let refuse = true;
+  const { sandbox, elements, tickets, entries } = payingPlayer({
+    paid: PAID,
+    entry: () => (refuse
+      ? { ok: false, status: 400, json: async () => ({ error: "Make exactly 1 pick" }) }
+      : { ok: true, json: async () => ({ id: "entry" }) }),
+  });
+  await sandbox.submitEntry();
+  assert.equal(elements.errorMessage.textContent, "Make exactly 1 pick");
+  assert.equal(elements.submitEntry.disabled, false);
+  refuse = false;
+  await sandbox.submitEntry();
+  assert.equal(entries().length, 2);
+  assert.ok(entries().every(({ body }) => body.id === PAID.entryId && body.ticket_id === PAID.ticketId));
+  assert.equal(tickets().length, 0);
+  assert.equal(elements.submitEntry.textContent, "Entered");
+});
+
+test("a paid ticket under another account's key is not entered from this one", async () => {
+  const { sandbox, elements, tickets, entries } = payingPlayer({ paid: { ...PAID, entryKey: "another" } });
+  await sandbox.submitEntry();
+  assert.equal(entries().length, 0);
+  assert.equal(tickets().length, 0);
+  assert.match(elements.errorMessage.textContent, /another account/);
+});
+
+test("Pay reads Enter while the form shows a paid ticket, and its price otherwise", () => {
+  const { elements, document } = entryPage();
+  const label = "Pay 5,300 sats and enter";
+  Object.assign(elements.submitEntry, { textContent: label, dataset: { payLabel: label } });
+  const sandbox = load({}, document, termsFetch());
+  elements.entryPaid = element({ dataset: { ...PAID } });
+  sandbox.labelPay();
+  assert.equal(elements.submitEntry.textContent, "Enter");
+  // Logged out: the notice is empty again.
+  elements.entryPaid = element();
+  sandbox.labelPay();
+  assert.equal(elements.submitEntry.textContent, label);
+  // A busy or finished button keeps its own.
+  elements.entryPaid = element({ dataset: { ...PAID } });
+  elements.submitEntry.textContent = "Entered";
+  sandbox.labelPay();
+  assert.equal(elements.submitEntry.textContent, "Entered");
 });

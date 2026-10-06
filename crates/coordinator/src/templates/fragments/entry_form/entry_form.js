@@ -676,6 +676,12 @@ function currentPayButton(competitionId) {
 function showEntrySuccess(competitionId) {
   const button = currentPayButton(competitionId);
   if (!button) return;
+  // The paid ticket the form showed is entered now.
+  const paidNotice = document.getElementById("entryPaid");
+  if (paidNotice?.dataset.ticketId) {
+    delete paidNotice.dataset.ticketId;
+    paidNotice.replaceChildren?.();
+  }
   document.getElementById("errorMessage")?.classList.add("hidden");
   document.getElementById("successMessage")?.classList.remove("hidden");
   button.textContent = "Entered";
@@ -771,9 +777,14 @@ async function submitEntry() {
 
   try {
     let currentEntry = pending;
+    const paid = currentEntry ? null : paidTicket(competitionId);
     if (currentEntry) {
       // Paid, but the entry didn't go through: enter it again, never pay again.
       currentEntry.entry.submit = picks;
+    } else if (paid) {
+      // Paid before the page reloaded, never entered: enter it, never pay again.
+      currentEntry = paidEntry(form, picks, paid);
+      pendingEntry = currentEntry;
     } else {
       currentEntry = await newEntry(form, picks, takeUnpaidTicket(competitionId));
       pendingEntry = currentEntry;
@@ -857,6 +868,45 @@ async function oldestUnpaidTicket(entry) {
     console.error("Unpaid tickets could not be listed:", error);
     return null;
   }
+}
+
+// The paid ticket the form says the player holds (the `entryPaid` notice, rendered for the
+// signed-in player): paid for, but its entry never went in, as when the page reloaded first.
+// Entering it pays nothing: the entry goes in under the ticket's entry id with the key it was
+// paid with, and the coordinator uses the Keymeld registration sent before paying. Once taken,
+// a failed entry is retried as the pending one.
+function paidTicket(competitionId) {
+  const notice = document.getElementById("entryPaid");
+  const { ticketId, entryId, entryKey } = notice?.dataset ?? {};
+  if (!ticketId || !entryId || document.getElementById("entryForm")?.dataset.competitionId !== competitionId) return null;
+  return { ticket_id: ticketId, entry_id: entryId, ephemeral_pubkey: entryKey };
+}
+
+// The entry for `paid`, the player's paid ticket, with `picks`. The wallet derives the entry key
+// from the entry id; a key other than the one the ticket was paid with is another wallet's.
+function paidEntry(form, picks, paid) {
+  const { ephemeral_pubkey, payout_hash } = session.dlcWallet.entryRegistration(paid.entry_id);
+  if (paid.ephemeral_pubkey && ephemeral_pubkey !== paid.ephemeral_pubkey) {
+    throw new Error("This entry was paid for from another account; log in with that account to finish it");
+  }
+  const body = document.body;
+  const entry = new Entry(body.dataset.apiBase || "", body.dataset.oracleBase || "", {
+    id: form.dataset.competitionId,
+  });
+  entry.entry = { id: paid.entry_id, competition_id: entry.competition.id, submit: picks, payout_hash, ephemeral_pubkey };
+  entry.ticket = { id: paid.ticket_id };
+  entry.paid = true;
+  entry.preparedRegistration = null;
+  return entry;
+}
+
+// Pay's label: "Enter" while the form shows a paid ticket to enter, the price otherwise. A busy
+// or finished button keeps its own.
+function labelPay() {
+  const button = document.getElementById("submitEntry");
+  const label = button?.dataset.payLabel;
+  if (!label || button.disabled || ![label, "Enter"].includes(button.textContent.trim())) return;
+  button.textContent = document.getElementById("entryPaid")?.dataset.ticketId ? "Enter" : label;
 }
 
 // A new entry for `picks`, checked against the terms the form showed, with its payout address.
@@ -1007,6 +1057,8 @@ function setupEntryForm() {
     }
   });
   document.addEventListener("keydown", unpickWithSpace);
+  // The paid notice comes and goes with a log-in or log-out.
+  document.addEventListener("htmx:after:swap", labelPay);
   // Arrow keys move a pick within its row without a click.
   document.addEventListener("change", (event) => {
     if (event.target?.matches?.(PICK)) showPicksLeft(event.target.form);

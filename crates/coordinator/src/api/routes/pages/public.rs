@@ -29,7 +29,7 @@ use crate::{
     api::extractors::NostrAuth,
     domain::{
         leaderboard::{Leaderboard, Phase, FIRST_READ_WAIT},
-        Competition, Error, LedgerTotals, RefundProgress, Returned, UnpaidTicket,
+        Competition, Error, LedgerTotals, PaidTicket, RefundProgress, Returned, UnpaidTicket,
     },
     infra::refresh_cache::Cached,
     startup::AppState,
@@ -39,8 +39,8 @@ use crate::{
         fragments::{
             entries_paused_banner,
             entry_form::{
-                edit_picks, entry_form, forecast_choices, forecasts_url, payout_line, picked,
-                picks_locked, ticket_status, unpaid_notice, Forecasts, NetworkFee,
+                edit_picks, entry_form, forecast_choices, forecasts_url, paid_notice, payout_line,
+                picked, picks_locked, ticket_status, unpaid_notice, Forecasts, NetworkFee,
                 PayoutDestination, TicketProgress,
             },
             leaderboard::{
@@ -54,7 +54,8 @@ use crate::{
         pages::{
             competitions::{competitions_page, shown_ids, CompetitionView, ListOptions, Tab},
             entries::{
-                entries_page, older_entries, sign_in_required, EntryRow, UnpaidRow, PAGE_SIZE,
+                entries_page, older_entries, sign_in_required, EntryRow, PaidRow, UnpaidRow,
+                PAGE_SIZE,
             },
             help::help_page,
             payouts::payouts_page,
@@ -409,13 +410,17 @@ pub async fn entries_fragment(
     };
     let now = now();
     let pubkey = pubkey.to_hex();
-    let (ledger, mut competitions, unpaid) = tokio::join!(
+    let (ledger, mut competitions, unpaid, paid) = tokio::join!(
         state.coordinator.player_ledger(&pubkey),
         competition_views(&state, now),
         state.coordinator.unpaid_tickets(&pubkey, None),
+        state.coordinator.paid_tickets(&pubkey, None),
     );
     let unpaid = unpaid
         .inspect_err(|error| warn!("failed to load unpaid tickets: {error}"))
+        .unwrap_or_default();
+    let paid = paid
+        .inspect_err(|error| warn!("failed to load paid tickets: {error}"))
         .unwrap_or_default();
     let ledger = ledger
         .inspect_err(|error| error!("failed to load entries: {error}"))
@@ -483,11 +488,32 @@ pub async fn entries_fragment(
             })
         })
         .collect();
+    // Paid tickets whose entry never went in, in competitions still taking entries.
+    let paid_rows: Vec<PaidRow> = paid
+        .iter()
+        .filter_map(|ticket| {
+            let competition = views
+                .get(ticket.competition_id.to_string().as_str())
+                .copied()?;
+            (competition.phase == Phase::Upcoming).then_some(PaidRow {
+                ticket,
+                competition,
+            })
+        })
+        .collect();
     page(
         &headers,
         &state,
         title,
-        entries_page(&rows, &totals, ledger.len(), open, explorers, &unpaid_rows),
+        entries_page(
+            &rows,
+            &totals,
+            ledger.len(),
+            open,
+            explorers,
+            &unpaid_rows,
+            &paid_rows,
+        ),
         Caching::Private,
     )
 }
@@ -663,7 +689,10 @@ pub async fn entry_form_fragment(
         }
     };
     let view = competition_view(&state, &competition, now()).await;
-    if !view.can_enter {
+    // A player who paid and has not entered yet finishes the entry here, even with every seat
+    // taken.
+    let paid = paid_ticket(&state, auth.as_ref(), competition_id).await;
+    if !view.can_enter && paid.is_none() {
         // Entries are closed; the leaderboard is what there is to see.
         return leaderboard_response(&state, &headers, &view);
     }
@@ -695,6 +724,7 @@ pub async fn entry_form_fragment(
         &destination,
         network_fee,
         unpaid.as_ref(),
+        paid.as_ref(),
     );
     page(
         &headers,
@@ -778,6 +808,38 @@ pub async fn entry_unpaid_fragment(
     let unpaid = unpaid_ticket(&state, auth.as_ref(), competition_id).await;
     fragment(
         unpaid_notice(&competition_id.to_string(), unpaid.as_ref(), now()),
+        Caching::Private,
+    )
+}
+
+/// The player's first paid ticket in the competition whose entry never went in, which the entry
+/// form's Pay enters without paying again; none when signed out, when entries are closed, or
+/// when it cannot be read.
+async fn paid_ticket(
+    state: &AppState,
+    auth: Option<&NostrAuth>,
+    competition_id: Uuid,
+) -> Option<PaidTicket> {
+    let pubkey = auth?.pubkey.to_hex();
+    state
+        .coordinator
+        .paid_tickets(&pubkey, Some(competition_id))
+        .await
+        .inspect_err(|error| warn!("paid tickets in {competition_id}: {error}"))
+        .ok()?
+        .into_iter()
+        .next()
+}
+
+/// The entry form's paid-entry notice, reloaded when the player logs in or out.
+pub async fn entry_paid_fragment(
+    State(state): State<Arc<AppState>>,
+    Path(competition_id): Path<Uuid>,
+    MaybeAuth(auth): MaybeAuth,
+) -> Response {
+    let paid = paid_ticket(&state, auth.as_ref(), competition_id).await;
+    fragment(
+        paid_notice(&competition_id.to_string(), paid.as_ref()),
         Caching::Private,
     )
 }
