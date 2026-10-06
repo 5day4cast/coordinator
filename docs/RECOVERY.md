@@ -87,3 +87,61 @@ The outbox table is additive: an older coordinator running beside a newer one ig
 - The wallet blob is the one the browser stored at sign-up, encrypted to the player's nsec. Publishing it adds no exposure beyond a relay seeing a second ciphertext of it.
 - Competition events are public data the API already serves; the contract names entry keys but no Nostr identities.
 - A relay can drop or withhold events. Several relays and the downloadable file cover that. A relay cannot forge an event: every event is signed by the recovery key, whose public key the tool takes from the file or `/api/v1/recovery/info`.
+
+## Recovering without the coordinator
+
+With only their nsec, or the recovery file and their nsec, a player can find every entry and move its money without the coordinator, its database or Keymeld. Two tools share one core (`crates/coordinator-recover`):
+
+- **The recovery page**: served by the coordinator at `/recover`, and released as static files that work anywhere once the coordinator is gone (below).
+- **The CLI**, `coordinator-recover`, released for Linux (x86_64, aarch64) and macOS. It also handles Arkade escrows, which the page cannot.
+
+### What it reads
+
+1. The player's records: kind 30078 events by the coordinator's recovery key, tagged `["b", blind]`, from the relays the recovery file names (or `--relays`, or a few public relays). `blind = sha256("coordinator-recovery/v1" || coordinator_pubkey || user_pubkey)`. The recovery file holds the same ciphertexts.
+2. The wallet seed: the record is NIP-44 from the recovery key to the player; inside it, the browser wallet's backup is NIP-44 from the player to themselves. Entry keys and payout preimages are derived from the seed, the network and the entry id, exactly as the browser wallet derives them.
+3. Each competition's contract (tag `["c", id]`), whole, gzipped, or as a manifest and parts.
+4. The oracle's attestation: from the competition record, the oracle's Nostr record (kind 30078, `d` = `oracle:<event id>`, see noaa-oracle's `docs/NOSTR.md`), or the oracle's API (`--oracle`). Any value is accepted only if it opens one of the contract's locking points, so where it came from does not matter.
+5. Chain state from any Esplora API: mempool.space on mainnet and Mutinynet's on signet by default (`--esplora`).
+
+Nothing is signed for an entry unless the key derived from the seed is the key its record names, and the contract has that key as a player with this wallet's payout hash. Every contract signature this player relies on is verified before it is used.
+
+### The CLI
+
+```sh
+coordinator-recover --kit coordinator-recovery-npub1….json inspect
+coordinator-recover --network signet --coordinator-pubkey <hex> inspect   # nsec only
+coordinator-recover claim --to bc1q… [--fee-rate 5] [--ticket-preimage <hex>] [--dry-run]
+coordinator-recover refund-escrow --entry <id> --to <ark address> [--dry-run]
+coordinator-recover unroll --entry <id> [--to bc1q…] [--dry-run]
+```
+
+The nsec comes from `--nsec`, `COORDINATOR_RECOVER_NSEC`, or a prompt that does not echo it. It is never printed. Without the recovery file, the coordinator's recovery pubkey is needed (`--coordinator-pubkey`); `GET /api/v1/recovery/info` serves it while the coordinator is up.
+
+- **`inspect`**: per entry, where the money is (escrow VTXO, funding output, outcome or split output, spent), what can be done now, and when the next step opens, by block height or time. It warns when the market maker's reclaim (`2·delta` blocks after an outcome or split transaction confirms) is near or open.
+- **`claim`**: broadcasts, skipping what is already on chain, the outcome transaction (the attestation adapts its signature) or, past the event's expiry, the expiry transaction (equal shares); then the split transaction with the player's ticket preimage; then, `delta` blocks after the split confirms, the win transaction, signed with the entry key, to `--to`. Run it again as each step confirms. `--dry-run` prints the raw transactions instead.
+- **`refund-escrow`**: from the refund locktime `T` on, moves the whole escrow through its refund leaf with the Arkade server's signature to the player's Ark address. If the VTXO has expired and been swept, it registers a recovery intent instead and signs the batch that pays it.
+- **`unroll`**: without the Arkade server's cooperation, puts the escrow on chain and then sweeps it through the player's own leaf once its delay has passed.
+
+#### What the CLI cannot do yet
+
+- **Fee bumping.** dlctix 0.1's outcome, expiry and split transactions pay the fee rate fixed at signing and have no anchor output; nobody can bump them, and the tool says so for each one. The win and unroll sweep transactions are the player's own and can be signed again at a higher `--fee-rate`. `crates/coordinator-recover/src/fees.rs` detects pay-to-anchor outputs and defines the `AnchorBumper` hook for when contracts carry them.
+- **On-chain refunds of a live escrow.** A live VTXO is refunded offchain to an Ark address; leaving Arkade from there is any Arkade wallet's offboard. (Offboarding directly needs a forfeit through the refund leaf in a batch, which is not built.)
+- **Unroll without arkd.** The escrow's virtual transactions come from arkd's indexer; the records do not carry them. With arkd down, an escrow can be unrolled only if its ancestry was saved elsewhere.
+- **Unroll fees.** Each virtual transaction pays no fee and needs a child spending its anchor, broadcast with it as a package. The tool prints each transaction and its anchor; the child comes from the player's own wallet (for example `bitcoin-cli submitpackage`) until an `AnchorBumper` is built in.
+
+### The recovery page
+
+The page does the DLC flows of the CLI (find records, inspect, build and broadcast the outcome or expiry, split and win transactions) in the browser. Escrow refunds and unrolls need arkd's gRPC API and stay in the CLI. The page's script only fetches what the WASM module asks for and shows its answers; the nsec goes into the module and the form field is cleared.
+
+On the coordinator, `/recover` is a server-rendered shell around `templates/static/recover.js` and the WASM package the site already serves. Its Content-Security-Policy is the public pages' own, except that it may connect to any `https:` or `wss:` origin, for the relays and Esplora the player chooses.
+
+#### Hosting it anywhere
+
+Each release has `coordinator-recover-page-<version>.tar.gz`: `index.html`, `recover.js`, `recover.css`, Bulma and the WASM package in `pkg/`, with checksums. To build it from source:
+
+```sh
+scripts/build-recover-page.sh out/recover            # builds the WASM package too
+scripts/build-recover-page.sh out/recover wasm-pkg   # or reuses one
+```
+
+Serve the directory from any static host: GitHub Pages, IPFS, an S3 bucket, or `python3 -m http.server` on the player's own machine. Browsers will not load the module from a `file://` page. The page sets its own Content-Security-Policy in a `<meta>` tag, so no server configuration is needed.

@@ -220,6 +220,34 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing or empty release asset"):
             release.package_synth(self.root, VERSION, SOURCE, TARGET, self.root / "release")
 
+    def test_recover_archive_contains_the_cli_and_provenance(self):
+        self.put(f"target/{TARGET}/release/coordinator-recover", "binary fixture").chmod(0o755)
+        destination = release.package_recover(self.root, VERSION, SOURCE, TARGET, self.root / "release")
+        with tarfile.open(destination) as archive:
+            prefix = f"coordinator-recover-{VERSION}-{TARGET}/"
+            for name in ("bin/coordinator-recover", "RELEASE.json", "README.txt", "SHA256SUMS"):
+                self.assertIn(prefix + name, archive.getnames())
+            self.assertEqual(archive.getmember(prefix + "bin/coordinator-recover").mode, 0o755)
+
+    def test_recover_binary_is_required(self):
+        with self.assertRaisesRegex(ValueError, "missing or empty release asset"):
+            release.package_recover(self.root, VERSION, SOURCE, TARGET, self.root / "release")
+
+    def test_recover_page_is_the_static_page_and_the_wasm(self):
+        for path in release.RECOVER_PAGE_FILES.values():
+            self.put(path, "page fixture")
+        self.put("wasm/coordinator_wasm.js", "export default function init() {}")
+        self.put("wasm/coordinator_wasm_bg.wasm", "wasm fixture")
+        self.put("wasm/coordinator_wasm_bg.wasm.br", "compressed copy")
+        destination = release.package_recover_page(self.root, VERSION, SOURCE, self.root / "wasm", self.root / "release")
+        with tarfile.open(destination) as archive:
+            prefix = f"coordinator-recover-page-{VERSION}/"
+            names = archive.getnames()
+            for name in ("index.html", "recover.js", "recover.css", "bulma.min.css",
+                         "pkg/coordinator_wasm.js", "pkg/coordinator_wasm_bg.wasm", "RELEASE.json", "SHA256SUMS"):
+                self.assertIn(prefix + name, names)
+            self.assertNotIn(prefix + "pkg/coordinator_wasm_bg.wasm.br", names)
+
     def test_wasm_binary_is_required(self):
         self.put("wasm/coordinator_wasm.js", "binding fixture")
         with self.assertRaisesRegex(ValueError, "missing or empty release asset"):

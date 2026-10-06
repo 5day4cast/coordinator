@@ -160,7 +160,10 @@ jobs:
         env:
           VERSION: ${{ needs.prepare-release.outputs.version }}
           SOURCE: ${{ needs.prepare-release.outputs.source }}
-        run: python3 scripts/release.py wasm --version "$VERSION" --source "$SOURCE" --wasm wasm-pkg
+        run: |
+          python3 scripts/release.py wasm --version "$VERSION" --source "$SOURCE" --wasm wasm-pkg
+          # The recovery page as static files, for hosting once the coordinator is gone.
+          python3 scripts/release.py recover-page --version "$VERSION" --source "$SOURCE" --wasm wasm-pkg
       - uses: actions/upload-artifact@v4
         with:
           name: release-wasm
@@ -234,7 +237,22 @@ jobs:
       - name: Build locked native binaries and UI
         env:
           TARGET: ${{ matrix.target }}
-        run: cargo build --release --locked --target "$TARGET" -p coordinator
+        run: cargo build --release --locked --target "$TARGET" -p coordinator -p coordinator-recover
+      # Players run it on their own machines, so it ships for every target.
+      - name: Package coordinator-recover, the player's recovery CLI
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          SOURCE: ${{ needs.prepare-release.outputs.source }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          python3 scripts/release.py recover --version "$VERSION" --source "$SOURCE" \
+            --target "$TARGET" --output release-recover
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-recover-${{ matrix.target }}
+          path: release-recover/*
+          if-no-files-found: error
+          retention-days: 14
       - name: Build the verifier enclave, LNURL relay, ark-swapd, and synth (Linux)
         if: runner.os == 'Linux'
         env:

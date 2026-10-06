@@ -1,0 +1,25 @@
+/* The recovery page: one column, and each entry's report as preformatted text. */
+
+.recover-page {
+  max-width: 48rem;
+}
+
+.recover-page .recover-settings {
+  margin: 1rem 0;
+}
+
+.recover-entry pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 0.85rem;
+}
+
+.recover-claim {
+  margin-top: 1rem;
+  display: grid;
+  gap: 0.75rem;
+}
+
+.recover-output:empty {
+  display: none;
+}

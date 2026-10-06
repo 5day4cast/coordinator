@@ -12,6 +12,8 @@ mod late_results;
 mod leaderboard_tests;
 mod oracle_view;
 mod public;
+mod recover;
 
 pub use admin::*;
 pub use public::*;
+pub use recover::*;
