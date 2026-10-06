@@ -44,6 +44,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         max_players: 25,
         entries: Some(6),
         max_entries: None,
+        held: None,
         pools: vec![],
     });
     let live = competition("live", Phase::Live, now - Duration::hours(2), 6);

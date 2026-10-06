@@ -88,6 +88,13 @@ impl Coordinator {
             info!("Auto-cancelled failed competition {competition_id}");
             return Ok(Step::Finished);
         }
+        if self
+            .cancel_unstarted_for_settle_only(&competition, lease)
+            .await
+            .map_err(|e| anyhow!("Cannot cancel unstarted competition {competition_id}: {e:#}"))?
+        {
+            return Ok(Step::Finished);
+        }
         if competition.unfilled_admission_expired(now) {
             let cancelled = self
                 .competition_store
@@ -737,6 +744,170 @@ mod tests {
         assert!(unfunded.is_cancelled());
         let mut settled = store.get_competition(settled.id).await.unwrap();
         assert!(!settled.resume_stranded_settlement());
+        database.close().await.unwrap();
+    }
+
+    /// A competition still taking entries, that nobody has entered yet.
+    fn open_competition() -> Competition {
+        let now = OffsetDateTime::now_utc();
+        Competition::new(&CreateEvent {
+            id: Uuid::now_v7(),
+            signing_date: now + time::Duration::hours(30),
+            start_observation_date: now + time::Duration::hours(6),
+            end_observation_date: now + time::Duration::hours(24),
+            locations: vec!["KDEN".into()],
+            number_of_values_per_entry: 1,
+            number_of_places_win: 1,
+            total_allowed_entries: 3,
+            entry_fee: 5_000,
+            coordinator_fee: crate::domain::CoordinatorFee::whole_percent(5),
+            total_competition_pool: 15_000,
+            relative_locktime_block_delta: Some(72),
+            unlisted: false,
+            scoring_rules: None,
+            scoring_fields: None,
+            max_entries_per_player: 1,
+        })
+    }
+
+    async fn lease(coordinator: &Coordinator, competition_id: Uuid) -> Lease {
+        coordinator
+            .competition_store
+            .acquire_lease(
+                &Lease::competition_resource(competition_id),
+                "settle-only-test",
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .expect("a free lease")
+    }
+
+    /// In settle-only mode nothing takes new money: no competition is created, no ticket issued
+    /// and no entry accepted. Without it the same requests get past the mode.
+    #[tokio::test]
+    async fn settle_only_mode_refuses_competitions_tickets_and_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let (coordinator, database) = test_coordinator(directory.path()).await;
+        let coordinator =
+            coordinator.with_settle_only(true, crate::config::SettleOnlyUnstarted::Refund);
+        assert!(coordinator.settle_only());
+        let open = open_competition();
+        coordinator
+            .competition_store
+            .add_competition_with_tickets(open.clone(), vec![])
+            .await
+            .unwrap();
+
+        let created = coordinator
+            .create_competition(open_competition().event_submission)
+            .await;
+        assert!(matches!(created, Err(Error::SettleOnly)), "{created:?}");
+        let btc_pubkey: BitcoinPublicKey =
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                .parse()
+                .unwrap();
+        let ticket = coordinator
+            .request_ticket("player".into(), open.id, btc_pubkey)
+            .await;
+        assert!(matches!(ticket, Err(Error::SettleOnly)));
+        let entry = coordinator
+            .add_entry(
+                "player".into(),
+                AddEntry {
+                    id: Uuid::now_v7(),
+                    ticket_id: Uuid::now_v7(),
+                    ephemeral_pubkey: btc_pubkey.to_string(),
+                    payout_hash: hex::encode([1; 32]),
+                    event_id: open.id,
+                    expected_observations: vec![],
+                    encrypted_keymeld_private_key: None,
+                    keymeld_auth_pubkey: None,
+                    keymeld_registration_context: None,
+                    keymeld_escrow_policy: None,
+                },
+            )
+            .await;
+        assert!(matches!(entry, Err(Error::SettleOnly)));
+        assert_eq!(Error::SettleOnly.to_string(), "Entries are paused");
+        database.close().await.unwrap();
+
+        let directory = tempfile::tempdir().unwrap();
+        let (coordinator, database) = test_coordinator(directory.path()).await;
+        assert!(!coordinator.settle_only());
+        let ticket = coordinator
+            .request_ticket("player".into(), Uuid::now_v7(), btc_pubkey)
+            .await;
+        assert!(!matches!(ticket, Err(Error::SettleOnly)));
+        database.close().await.unwrap();
+    }
+
+    /// In settle-only mode a competition that has not kicked off is cancelled, so cleanup
+    /// refunds it, while one whose contract is funded keeps settling. With unstarted
+    /// competitions kicked off instead, an open one is left to run.
+    #[tokio::test]
+    async fn settle_only_mode_refunds_unstarted_competitions_and_settles_the_rest() {
+        let directory = tempfile::tempdir().unwrap();
+        let (coordinator, database) = test_coordinator(directory.path()).await;
+        let coordinator =
+            coordinator.with_settle_only(true, crate::config::SettleOnlyUnstarted::Refund);
+        let store = &coordinator.competition_store;
+        let open = open_competition();
+        let funded = funded_competition();
+        assert!(!super::super::settle_only::has_kicked_off(&open));
+        assert!(super::super::settle_only::has_kicked_off(&funded));
+        for competition in [&open, &funded] {
+            store
+                .add_competition_with_tickets(competition.clone(), vec![])
+                .await
+                .unwrap();
+        }
+        store
+            .update_competitions(vec![funded.clone()])
+            .await
+            .unwrap();
+
+        let pacing = Pacing::default();
+        let step = coordinator
+            .advance_competition(open.id, &lease(&coordinator, open.id).await, &pacing)
+            .await
+            .unwrap();
+        assert!(matches!(step, Step::Finished));
+        assert!(store.get_competition(open.id).await.unwrap().is_cancelled());
+
+        let step = coordinator
+            .advance_competition(funded.id, &lease(&coordinator, funded.id).await, &pacing)
+            .await;
+        assert!(!matches!(step, Ok(Step::Finished)));
+        let funded = store.get_competition(funded.id).await.unwrap();
+        assert!(!funded.is_cancelled() && funded.failed_at.is_none());
+        database.close().await.unwrap();
+
+        let directory = tempfile::tempdir().unwrap();
+        let (coordinator, database) = test_coordinator(directory.path()).await;
+        let coordinator =
+            coordinator.with_settle_only(true, crate::config::SettleOnlyUnstarted::Kickoff);
+        let open = open_competition();
+        coordinator
+            .competition_store
+            .add_competition_with_tickets(open.clone(), vec![])
+            .await
+            .unwrap();
+        let step = coordinator
+            .advance_competition(
+                open.id,
+                &lease(&coordinator, open.id).await,
+                &Pacing::default(),
+            )
+            .await
+            .unwrap();
+        assert!(!matches!(step, Step::Finished));
+        assert!(!coordinator
+            .competition_store
+            .get_competition(open.id)
+            .await
+            .unwrap()
+            .is_cancelled());
         database.close().await.unwrap();
     }
 }

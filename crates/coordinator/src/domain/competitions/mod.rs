@@ -798,14 +798,12 @@ impl CreateEvent {
         if !(2..=25).contains(&entries) {
             return Err("total_allowed_entries must be between 2 and 25");
         }
-        if !(1..=5).contains(&places) || places >= entries {
-            return Err("number_of_places_win must be between 1 and 5 and fewer than entries");
-        }
-        let outcomes = (entries - places + 1..=entries)
-            .try_fold(1usize, |count, factor| count.checked_mul(factor))
-            .and_then(|count| count.checked_add(1));
-        if !outcomes.is_some_and(|count| count <= 20_000) {
-            return Err("entries and winning places must produce at most 20,000 oracle outcomes");
+        // One place for up to 25 entries, or two for up to 20: the shapes the game offers.
+        if places >= entries || !coordinator_escrow::capacity::supported_shape(entries, places) {
+            return Err(
+                "a competition pays one winning place, or two winning places with at most 20 \
+                 entries, and fewer places than entries",
+            );
         }
         if !(1..=50).contains(&self.locations.len()) {
             return Err("an event must contain between 1 and 50 locations");
@@ -956,13 +954,17 @@ mod oracle_event_validation_tests {
             }),
             ("zero places", |event| event.number_of_places_win = 0),
             ("all entries win", |event| event.number_of_places_win = 2),
-            ("too many places", |event| {
+            ("three places", |event| {
                 event.total_allowed_entries = 10;
-                event.number_of_places_win = 6;
+                event.number_of_places_win = 3;
             }),
-            ("too many outcomes", |event| {
+            ("two places over 21 entries", |event| {
+                event.total_allowed_entries = 21;
+                event.number_of_places_win = 2;
+            }),
+            ("two places over 25 entries", |event| {
                 event.total_allowed_entries = 25;
-                event.number_of_places_win = 4;
+                event.number_of_places_win = 2;
             }),
             ("empty window", |event| {
                 event.start_observation_date = event.end_observation_date
@@ -1008,7 +1010,7 @@ mod oracle_event_validation_tests {
 
     #[test]
     fn accepts_oracle_boundary_configurations() {
-        for (entries, places) in [(2, 1), (25, 3), (9, 5)] {
+        for (entries, places) in [(2, 1), (25, 1), (3, 2), (20, 2)] {
             let mut candidate = event();
             candidate.total_allowed_entries = entries;
             candidate.number_of_places_win = places;
@@ -1414,8 +1416,8 @@ impl Competition {
     }
 
     /// Whether the public lists show it. An unlisted competition is reached by its link, and
-    /// is in the API. A queued competition's reference event is always off the oracle's list,
-    /// and its pools copy it, so for them the flag says nothing: they are listed.
+    /// is in the API. A queued competition's reference event is always off the oracle's list
+    /// and its pools are on it, so for them the flag says nothing: they are listed.
     pub fn is_listed(&self) -> bool {
         self.kind != CompetitionKind::Single || !self.event_submission.unlisted
     }

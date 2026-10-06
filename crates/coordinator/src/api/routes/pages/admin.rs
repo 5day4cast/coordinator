@@ -264,6 +264,15 @@ pub async fn admin_create_competition_handler(
     State(state): State<Arc<AppState>>,
     Form(form): Form<CreateCompetitionForm>,
 ) -> Html<String> {
+    if state.coordinator.settle_only() {
+        return Html(
+            competition_error(
+                "The coordinator is in settle-only mode: it creates no competition until the \
+                 mode is turned off",
+            )
+            .into_string(),
+        );
+    }
     // Parse dates
     let signing_date = match OffsetDateTime::parse(
         &form.signing_date,
@@ -344,7 +353,7 @@ pub async fn admin_create_competition_handler(
         .as_deref()
         .is_some_and(|queued| !queued.is_empty() && queued != "false")
     {
-        // Pools score lines and pay one winner; the seat count comes from demand.
+        // Pools score lines; pools of ten or more pay the places asked for, smaller ones one.
         let request = crate::domain::CreateQueuedCompetition {
             id: form.id,
             signing_date,
@@ -363,6 +372,7 @@ pub async fn admin_create_competition_handler(
                 .unwrap_or(coordinator_escrow::pools::MAX_POOL_PLAYERS),
             max_entries: form.max_entries,
             max_entries_per_player,
+            number_of_places_win: form.number_of_places_win,
         };
         return match state.coordinator.create_queued_competition(request).await {
             Ok(competition) => {

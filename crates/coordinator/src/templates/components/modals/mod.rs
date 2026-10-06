@@ -47,11 +47,11 @@ fn auth_tabs(username_panel: &str, extension_panel: &str) -> Markup {
     }
 }
 
-/// Keys are held only in this tab's memory, so say what that means.
+/// Logins are remembered in this browser (see remembered_login.js), so say for how long.
 fn session_note() -> Markup {
     html! {
         p class="help session-note mb-3" {
-            "For safety your key stays in this tab's memory only: reloading the page or opening a new tab signs you out."
+            "You stay logged in on this browser, in every tab, until you log out or 30 days pass without a visit."
         }
     }
 }

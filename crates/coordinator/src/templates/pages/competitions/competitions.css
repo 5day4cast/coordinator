@@ -184,6 +184,12 @@
   color: var(--competition-muted);
 }
 
+/* Under the prize: how the places share the pot, and what small pools pay. */
+.prize-note {
+  display: block;
+  font-weight: 400;
+}
+
 /* Under a competition that didn't run: where its entry fees stand. */
 .refund-line {
   display: block;

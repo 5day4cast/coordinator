@@ -675,6 +675,7 @@ impl Coordinator {
         {
             if entry.paid_out_at.is_some()
                 || self.competition_store.has_live_payout_job(entry.id).await?
+                || self.competition_store.payout_held(entry.id).await?
             {
                 continue;
             }

@@ -65,7 +65,8 @@ export default async function globalSetup() {
   // About $5: large enough that the network fee is under the 10% share that pauses entries.
   formData.append("entry_fee", "5000");
   formData.append("coordinator_fee_percentage", "10");
-  formData.append("number_of_places_win", "3");
+  // Two places: 70% and 30%. Three or more are no longer offered.
+  formData.append("number_of_places_win", "2");
   formData.append("locations", "KORD");
   formData.append("locations", "KJFK");
   formData.append("locations", "KLAX");

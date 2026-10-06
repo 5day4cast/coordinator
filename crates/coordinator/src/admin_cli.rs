@@ -16,7 +16,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     api::routes::{OperatorCompetition, WriteOffRequest},
-    domain::{CoordinatorFee, CreateEvent, CreateQueuedCompetition, WriteOffReport},
+    domain::{CoordinatorFee, CreateEvent, CreateQueuedCompetition, PayoutHold, WriteOffReport},
     infra::oracle::ScoringRules,
 };
 
@@ -56,6 +56,29 @@ pub enum AdminCommand {
     /// never sent a registration. Cleanup stops trying them and the pages stop counting them as
     /// owed; the escrow itself is not touched.
     WriteOffRefund(WriteOffArgs),
+    /// Lightning payouts held after a restore, because LND made a payment the database does
+    /// not know for an amount the entry could be owed.
+    PayoutHolds {
+        #[command(subcommand)]
+        action: PayoutHoldCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PayoutHoldCommand {
+    /// List the held payouts; with --all, released ones too.
+    List {
+        #[arg(long)]
+        all: bool,
+    },
+    /// Release an entry's held payout, once LND's payment is known not to be this entry's: the
+    /// coordinator then pays it as usual.
+    Release {
+        entry_id: Uuid,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -147,8 +170,9 @@ pub struct CreateArgs {
     pub scoring_rules: ScoringRules,
     /// Make a single competition with a fixed seat count (--max-entries) instead. By default
     /// a competition queues entries without a seat count and splits them into pools when
-    /// observation starts; each pool pays one winner and scores lines, so --max-entries,
-    /// --places-win and --scoring-rules apply to single competitions only.
+    /// observation starts; each pool scores lines, so --max-entries and --scoring-rules apply to
+    /// single competitions only. A queued competition's pools of ten or more pay --places-win
+    /// places (two only in pools of at most 20); smaller pools pay one.
     #[arg(long)]
     pub single: bool,
     /// A queued competition's smallest pool.
@@ -295,6 +319,7 @@ impl CreateArgs {
             max_pool_size: self.max_pool_size,
             max_entries: self.entry_cap,
             max_entries_per_player: self.max_entries_per_player,
+            number_of_places_win: self.places_win,
         })
     }
 }
@@ -409,6 +434,33 @@ impl AdminClient {
             .await
             .context("reach the operator listener")?;
         Ok(checked(response).await?.json().await?)
+    }
+
+    /// The held Lightning payouts; with `all`, released ones too.
+    pub async fn payout_holds(&self, all: bool) -> Result<Vec<PayoutHold>> {
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                &format!("/api/v1/admin/payout-holds?all={all}"),
+            )
+            .send()
+            .await
+            .context("reach the operator listener")?;
+        Ok(checked(response).await?.json().await?)
+    }
+
+    /// Release the holds on an entry's Lightning payout.
+    pub async fn release_payout_hold(&self, entry_id: Uuid) -> Result<()> {
+        let response = self
+            .request(
+                reqwest::Method::POST,
+                &format!("/api/v1/admin/payout-holds/{entry_id}/release"),
+            )
+            .send()
+            .await
+            .context("reach the operator listener")?;
+        checked(response).await?;
+        Ok(())
     }
 
     pub async fn delete(&self, id: Uuid) -> Result<()> {
@@ -568,8 +620,57 @@ pub async fn run(args: AdminArgs) -> Result<()> {
                 bail!("no refund was written off");
             }
         }
+        AdminCommand::PayoutHolds { action } => match action {
+            PayoutHoldCommand::List { all } => {
+                let holds = client.payout_holds(all).await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&holds)?);
+                } else {
+                    print!("{}", payout_holds_text(&holds));
+                }
+            }
+            PayoutHoldCommand::Release { entry_id, yes } => {
+                confirm(
+                    &format!(
+                        "Release the held Lightning payout of entry {entry_id}, so the \
+                         coordinator pays it"
+                    ),
+                    yes,
+                )?;
+                client.release_payout_hold(entry_id).await?;
+                if json {
+                    println!("{}", serde_json::json!({ "released": entry_id }));
+                } else {
+                    println!("Released the held payout of entry {entry_id}");
+                }
+            }
+        },
     }
     Ok(())
+}
+
+/// The held payouts, one line each.
+pub fn payout_holds_text(holds: &[PayoutHold]) -> String {
+    let mut out = String::new();
+    if holds.is_empty() {
+        out.push_str("No Lightning payout is held\n");
+    }
+    for hold in holds {
+        let _ = writeln!(
+            out,
+            "Entry {}: {} sats, payment {}, held {}{}: {}",
+            hold.entry_id,
+            hold.amount_sats,
+            hold.payment_hash,
+            hold.held_at,
+            hold.released_at
+                .as_deref()
+                .map(|at| format!(", released {at}"))
+                .unwrap_or_default(),
+            hold.reason
+        );
+    }
+    out
 }
 
 /// What a write-off did, one line per ticket.

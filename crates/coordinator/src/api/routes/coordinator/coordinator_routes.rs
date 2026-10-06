@@ -500,10 +500,13 @@ pub async fn submit_invoice_fallback(
 
 /// The network fee a ticket issued now would carry, for display before a ticket is requested.
 /// A ticket's own fee is fixed when it is issued and comes with it. 503 while the fee estimate
-/// is unavailable, when no ticket can be issued either.
+/// is unavailable, or in settle-only mode, when no ticket can be issued either.
 pub async fn get_network_fee(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<crate::domain::NetworkFeeQuote>, ApiError> {
+    if state.coordinator.settle_only() {
+        return Err(crate::domain::Error::SettleOnly.into());
+    }
     state
         .coordinator
         .network_fee_quote()
@@ -578,6 +581,7 @@ mod min_players_now_tests {
             pool_rules: PoolRules::new(min_players, 25).unwrap(),
             entries: 1,
             max_entries: 100,
+            held: 1,
             stake_sats: 1_000,
             terms_digest: String::new(),
             pools: Vec::new(),

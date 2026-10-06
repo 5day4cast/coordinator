@@ -17,10 +17,10 @@ use crate::{
         get_estimated_fee_rates, get_next_address, get_outputs, get_ticket_refund,
         get_ticket_status, health, leaderboard_fragment, leaderboard_rows_fragment, login,
         login_username, not_found, operator_competition, operator_competitions,
-        operator_delete_competition, operator_write_off_refunds, payouts_fragment,
-        public_page_handler, register, register_ticket, register_username,
-        request_competition_ticket, send_to_address, set_lightning_address,
-        submit_final_signatures, submit_public_nonces, submit_ticket_payout,
+        operator_delete_competition, operator_payout_holds, operator_release_payout_hold,
+        operator_write_off_refunds, payouts_fragment, public_page_handler, register,
+        register_ticket, register_username, request_competition_ticket, send_to_address,
+        set_lightning_address, submit_final_signatures, submit_public_nonces, submit_ticket_payout,
         ticket_status_fragment,
     },
     config::Settings,
@@ -537,7 +537,11 @@ pub async fn build_app(
     .with_ark(arkade(&config.ark_settings).await?)?
     .with_arkade_outage_secs(config.ark_settings.arkade_outage_secs)
     .with_network_fee(config.network_fee_settings.clone())?
-    .with_kickoff_check(config.kickoff_check_settings.clone())?;
+    .with_kickoff_check(config.kickoff_check_settings.clone())?
+    .with_settle_only(
+        config.coordinator_settings.settle_only,
+        config.coordinator_settings.settle_only_unstarted,
+    );
     let (wakes, wake_requests) = CompetitionWakes::new();
     let coordinator = Arc::new(
         coordinator
@@ -574,6 +578,26 @@ pub async fn build_app(
         },
     );
     threads.insert("database integrity".to_string(), integrity_task);
+    // Compare the payouts the database knows with what LND sent, once, before anything is paid:
+    // a database restored from a backup may be behind it (`restore_reconcile.rs`). It retries
+    // until LND answers, and payouts wait for it. It is not a supervised thread, since it ends.
+    let reconcile_coordinator = coordinator.clone();
+    let reconcile_cancel = cancel_token.clone();
+    tracker.spawn(async move {
+        loop {
+            match reconcile_coordinator.reconcile_after_restore().await {
+                Ok(_) => {
+                    reconcile_coordinator.reconciled().finish();
+                    return;
+                }
+                Err(e) => error!("Restore reconciliation failed; payouts wait for it: {e:#}"),
+            }
+            tokio::select! {
+                () = reconcile_cancel.cancelled() => return,
+                () = tokio::time::sleep(Duration::from_secs(30)) => {}
+            }
+        }
+    });
     let runners = CompetitionRunners::new(
         coordinator.clone(),
         coordinator.competition_store.clone(),
@@ -654,11 +678,19 @@ pub async fn build_app(
         Duration::from_secs(config.ln_settings.payout_watch_interval_subscribed),
     );
 
+    let payout_reconciled = coordinator.reconciled();
+    let payout_cancel = cancel_token.clone();
     let payout_watcher_handle = spawn_supervised(
         &tracker,
         "payout watcher",
         cancel_token.clone(),
-        async move { payout_watcher.watch().await },
+        async move {
+            tokio::select! {
+                () = payout_reconciled.wait() => {}
+                () = payout_cancel.cancelled() => return Ok(()),
+            }
+            payout_watcher.watch().await
+        },
     );
 
     threads.insert("payout_watcher".to_string(), payout_watcher_handle);
@@ -670,6 +702,10 @@ pub async fn build_app(
         "automatic payouts",
         cancel_token.clone(),
         async move {
+            tokio::select! {
+                () = automatic_coordinator.reconciled().wait() => {}
+                () = automatic_cancel.cancelled() => return Ok(()),
+            }
             loop {
                 tokio::select! {
                     _ = automatic_cancel.cancelled() => break,
@@ -1132,6 +1168,11 @@ pub fn admin_app(app_state: Arc<AppState>, access: Arc<AdminAccess>, network: Ne
             "/api/v1/admin/refunds/write-off",
             post(operator_write_off_refunds),
         )
+        .route("/api/v1/admin/payout-holds", get(operator_payout_holds))
+        .route(
+            "/api/v1/admin/payout-holds/{entry_id}/release",
+            post(operator_release_payout_hold),
+        )
         .route_layer(middleware::from_fn_with_state(
             access.clone(),
             require_operator,
@@ -1320,6 +1361,8 @@ mod startup_tests {
     const SETTLE_PATH: &str = "/admin/api/test/settle-invoice/0190b7a4-0000-7000-8000-000000000000";
     const COMPETITION_PATH: &str =
         "/api/v1/admin/competitions/0190b7a4-0000-7000-8000-000000000000";
+    const PAYOUT_HOLD_RELEASE_PATH: &str =
+        "/api/v1/admin/payout-holds/0190b7a4-0000-7000-8000-000000000000/release";
 
     /// Every operator route, including the sign-in form, as (method, path).
     const OPERATOR_ROUTES: &[(&str, &str)] = &[
@@ -1357,6 +1400,8 @@ mod startup_tests {
         ("GET", COMPETITION_PATH),
         ("DELETE", COMPETITION_PATH),
         ("POST", "/api/v1/admin/refunds/write-off"),
+        ("GET", "/api/v1/admin/payout-holds"),
+        ("POST", PAYOUT_HOLD_RELEASE_PATH),
     ];
 
     fn protected_routes() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
@@ -1376,6 +1421,10 @@ mod startup_tests {
 
     impl TestState {
         async fn start() -> Self {
+            Self::start_with(|_| {}).await
+        }
+
+        async fn start_with(configure: impl FnOnce(&mut Settings)) -> Self {
             let data = tempfile::tempdir().unwrap();
             let mut settings = Settings::default();
             settings.db_settings.data_folder = data.path().display().to_string();
@@ -1383,6 +1432,7 @@ mod startup_tests {
             settings.ln_settings.mock_enabled = true;
             settings.coordinator_settings.mock_oracle = true;
             settings.coordinator_settings.oracle_url = String::from("mock://oracle");
+            configure(&mut settings);
             let (state, tasks, cancel, databases) = build_app(settings).await.unwrap();
             Self {
                 state: Arc::new(state),
@@ -1564,6 +1614,44 @@ mod startup_tests {
         test.stop().await;
     }
 
+    /// In settle-only mode the health check says so, no ticket can be priced, the public pages
+    /// show only that entries are paused, and the reconciliation at start lets payouts run.
+    #[tokio::test]
+    async fn settle_only_mode_takes_no_new_money_and_says_so() {
+        let test = TestState::start_with(|settings| {
+            settings.coordinator_settings.settle_only = true;
+        })
+        .await;
+        let public = test.public();
+        let (status, _, body) =
+            send(&public, request("GET", "/api/v1/health_check", &[], "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#""settle_only":true"#), "{body}");
+        let (status, _, body) = send(&public, request("GET", "/api/v1/network-fee", &[], "")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("Entries are paused"), "{body}");
+        let (status, _, body) = send(&public, request("GET", "/competitions", &[], "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#"id="entriesPausedBanner""#), "{body}");
+        assert!(!body.to_lowercase().contains("settle-only"), "{body}");
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            test.state.coordinator.reconciled().wait(),
+        )
+        .await
+        .expect("the reconciliation at start finishes against mock LND");
+        test.stop().await;
+
+        let test = TestState::start().await;
+        let (_, _, body) = send(
+            &test.public(),
+            request("GET", "/api/v1/health_check", &[], ""),
+        )
+        .await;
+        assert!(body.contains(r#""settle_only":false"#), "{body}");
+        test.stop().await;
+    }
+
     #[tokio::test]
     async fn unknown_public_paths_get_a_not_found_page() {
         let test = TestState::start().await;
@@ -1621,7 +1709,8 @@ mod startup_tests {
                 .contains(&status)
                     && (status != StatusCode::NOT_FOUND
                         || path == &SETTLE_PATH
-                        || path == &COMPETITION_PATH),
+                        || path == &COMPETITION_PATH
+                        || path == &PAYOUT_HOLD_RELEASE_PATH),
                 "{method} {path} with bearer returned {status}: {body}"
             );
         }

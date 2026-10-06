@@ -34,8 +34,6 @@ use uuid::Uuid;
 const MAX_REFERENCE_EVENT_BYTES: usize = 1024 * 1024;
 /// Most bytes of a ticket invoice the wallet parses.
 const MAX_INVOICE_BYTES: usize = 16 * 1024;
-/// Each pool of a queued competition pays one winner.
-const PLACES: u32 = 1;
 
 /// The player's choices and what the entry form showed, collected before the ticket's invoice is
 /// displayed.
@@ -185,8 +183,9 @@ pub(super) fn validate_registration(
         && terms.observation.same_as(&event.observation())
         && terms.signing_date == event.signing_date.unix_timestamp()
         && event.event_announcement.expiry == Some(terms.expiry)
-        && terms.number_of_places_win == PLACES
-        && event.number_of_places_win == PLACES;
+        // The places its larger pools pay, from the oracle's event. The terms state the place
+        // rule for smaller pools, which their validation accepts only as the game's own.
+        && terms.number_of_places_win == event.number_of_places_win;
     // What the form showed.
     let shown = terms.stake_sats == consent.entry_fee_sats
         && terms.pool_rules == consent.pool_rules

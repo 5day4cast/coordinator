@@ -6,11 +6,12 @@ use maud::{html, Markup};
 
 use crate::domain::{
     leaderboard::{Metric, Rule},
-    PayoutTermsQuote, TicketStatus, ARKADE_UNAVAILABLE, ENTRIES_PAUSED,
+    PayoutTermsQuote, TicketStatus, ARKADE_UNAVAILABLE, ENTRIES_PAUSED, SETTLE_ONLY_PAUSED,
 };
 use crate::templates::{
     components::{tip, tip_start},
     format::{self, city_name, sats, MetricText, TimeStyle},
+    fragments::entries_paused_banner,
     fragments::loading::{placeholder, Pending},
     pages::competitions::CompetitionView,
     shared_map::{station_map, StationPin},
@@ -60,6 +61,8 @@ pub enum NetworkFee {
     ArkadeUnavailable(u64),
     /// No fee estimate, so no ticket either.
     Unavailable,
+    /// The coordinator takes no new entries (settle-only mode).
+    SettleOnly,
 }
 
 impl NetworkFee {
@@ -68,7 +71,7 @@ impl NetworkFee {
             NetworkFee::Estimate(fee)
             | NetworkFee::Paused(fee)
             | NetworkFee::ArkadeUnavailable(fee) => Some(fee),
-            NetworkFee::Unavailable => None,
+            NetworkFee::Unavailable | NetworkFee::SettleOnly => None,
         }
     }
 }
@@ -87,8 +90,11 @@ pub fn entry_form(
             "{ENTRIES_PAUSED}. Entries already taken are unaffected; check back later."
         )),
         NetworkFee::ArkadeUnavailable(_) => Some(format!("{ARKADE_UNAVAILABLE}.")),
+        NetworkFee::SettleOnly => Some(format!("{SETTLE_ONLY_PAUSED}.")),
         NetworkFee::Estimate(_) | NetworkFee::Unavailable => None,
     };
+    // Settle-only mode says so in a banner at the top instead of beside the button.
+    let banner = network_fee == NetworkFee::SettleOnly;
     let picks_allowed = competition.number_of_values_per_entry;
     let queue = competition.queue.queued();
     html! {
@@ -96,6 +102,7 @@ pub fn entry_form(
             a class="back-link" href="/competitions" hx-get="/competitions"
               hx-target="#main-content" hx-push-url="true" { "← All competitions" }
             h1 class="title is-4" { "Enter this competition" }
+            @if banner { (entries_paused_banner()) }
 
             dl class="entry-facts" {
                 div {
@@ -115,8 +122,11 @@ pub fn entry_form(
                     }
                     dd {
                         (competition.win())
-                        @if queue.is_none() && competition.paid_places > 1 {
-                            span class="fact-note" { "for 1st; top " (competition.paid_places) " paid" }
+                        @if let Some(split) = competition.prize_split() {
+                            span class="fact-note prize-note" { (split) }
+                        }
+                        @if let Some(rule) = competition.prize_rule() {
+                            span class="fact-note prize-note" { (rule) }
                         }
                     }
                 }
@@ -200,7 +210,7 @@ pub fn entry_form(
             }
 
             div class="entry-submit" {
-                @if let Some(reason) = &paused {
+                @if let (Some(reason), false) = (&paused, banner) {
                     div id="entriesPaused" class="notification is-warning" { (reason) }
                 }
                 button type="button" id="submitEntry" class="button is-primary is-medium"
@@ -543,7 +553,34 @@ mod tests {
             NetworkFee::Estimate(50),
         )
         .into_string();
-        assert!(html.contains("10,500 sats") && html.contains("for 1st; top 2 paid"));
+        assert!(html.contains("10,500 sats") && html.contains("1st 70% · 2nd 30%"));
+        assert!(!html.contains("winner takes all"));
+    }
+
+    /// The default competition: one pool of 20 seats paying two places from ten players.
+    #[test]
+    fn a_one_pool_queue_shows_its_seats_and_how_the_prizes_split() {
+        let mut competition = crate::templates::pages::competitions::tests::queued("q", 3);
+        competition.paid_places = 2;
+        if let crate::templates::pages::competitions::Queue::Queued(queue) = &mut competition.queue
+        {
+            queue.max_players = 20;
+            queue.max_entries = Some(20);
+        }
+        let html = entry_form(
+            &competition,
+            &Forecasts::Pending(Pending::Loading),
+            None,
+            &PayoutDestination::LoggedOut,
+            NetworkFee::Estimate(50),
+        )
+        .into_string();
+        assert!(html.contains("20 seats · 17 left"), "{html}");
+        assert!(html.contains("1st 70% · 2nd 30%"));
+        assert!(html.contains("Under 10 players: winner takes all"));
+        assert!(html.contains("Up to 20 players, all in one pool"));
+        // Three players so far: first place takes their whole pot.
+        assert!(html.contains("<dd>15,000 sats"));
     }
 
     #[test]
@@ -594,6 +631,26 @@ mod tests {
         assert!(html.contains(ENTRIES_PAUSED));
         assert!(html.contains(r#"id="submitEntry" class="button is-primary is-medium" disabled"#));
         assert!(html.contains("Entries paused"));
+        assert!(!html.contains("and enter"));
+    }
+
+    /// In settle-only mode the form shows the plain banner at the top, no other notice, and
+    /// cannot be submitted.
+    #[test]
+    fn entry_form_shows_the_banner_while_entries_are_paused_for_settlement() {
+        let html = entry_form(
+            &view("c1", Phase::Upcoming, 60),
+            &Forecasts::Pending(Pending::Loading),
+            Some(&terms(true)),
+            &PayoutDestination::LoggedOut,
+            NetworkFee::SettleOnly,
+        )
+        .into_string();
+        assert!(html.contains(r#"id="entriesPausedBanner""#));
+        assert!(html.contains("Entries are paused."));
+        assert!(!html.contains(r#"id="entriesPaused" "#));
+        assert!(!html.contains(ENTRIES_PAUSED));
+        assert!(html.contains(r#"id="submitEntry" class="button is-primary is-medium" disabled"#));
         assert!(!html.contains("and enter"));
     }
 

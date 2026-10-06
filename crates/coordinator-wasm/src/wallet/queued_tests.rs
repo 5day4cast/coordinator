@@ -126,6 +126,7 @@ fn terms(competition_id: Uuid) -> queued::QueuedTerms {
             ],
         },
         number_of_places_win: 1,
+        multi_place_min_players: None,
         pool_rules: PoolRules::new(2, 25).unwrap(),
         stake_sats: ENTRY_FEE,
         relative_locktime_block_delta: 72,
@@ -308,6 +309,23 @@ fn an_entry_matching_the_competition_its_oracle_and_the_ticket_is_accepted() {
     assert!(fixture.consent.reference_event.contains("\"upper\":-0.0"));
 }
 
+/// The default competition: pools of up to 20 that pay two places from ten players.
+#[test]
+fn an_entry_in_a_competition_paying_two_places_is_accepted() {
+    let mut fixture = Fixture::generated()
+        .with_terms(|t| {
+            t.number_of_places_win = 2;
+            t.multi_place_min_players = Some(queued::MULTI_PLACE_MIN_PLAYERS);
+            t.pool_rules = PoolRules::new(2, 20).unwrap();
+        })
+        .with_event(|e| e["number_of_places_win"] = json!(2));
+    fixture.consent.pool_rules = PoolRules::new(2, 20).unwrap();
+    fixture.check().unwrap();
+    // The oracle's event pays one place: refused.
+    let one = fixture.with_event(|e| e["number_of_places_win"] = json!(1));
+    assert!(one.check().is_err());
+}
+
 #[test]
 fn every_term_differing_from_the_oracle_or_the_form_is_refused() {
     let terms: &[Change<queued::QueuedTerms>] = &[
@@ -340,9 +358,13 @@ fn every_term_differing_from_the_oracle_or_the_form_is_refused() {
         ("line window", |t| t.observation.lines[0].window_hours = 48),
         ("line order", |t| t.observation.lines.reverse()),
         ("missing line", |t| t.observation.lines.truncate(2)),
+        // Two places, stated with their rule, where the oracle's event pays one.
         ("winners", |t| {
             t.number_of_places_win = 2;
-            t.pool_rules = PoolRules::new(3, 25).unwrap();
+            t.multi_place_min_players = Some(queued::MULTI_PLACE_MIN_PLAYERS);
+        }),
+        ("two places without their rule", |t| {
+            t.number_of_places_win = 2;
         }),
         ("pool rules", |t| {
             t.pool_rules = PoolRules::new(3, 25).unwrap()
