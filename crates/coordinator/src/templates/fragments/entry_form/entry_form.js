@@ -338,20 +338,62 @@ class Entry {
   }
 
   buildExpectedObservations(submit) {
-    return Object.entries(submit).map(([station_id, choices]) => ({
-      stations: station_id,
-      ...Object.entries(choices).reduce((acc, [weather_type, selected_val]) => {
-        acc[weather_type] = this.convertSelectVal(selected_val);
-        return acc;
-      }, {}),
-    }));
+    return expectedObservations(submit);
   }
+}
 
-  convertSelectVal(raw_select) {
-    const valueMap = { par: "Par", over: "Over", under: "Under" };
-    if (!(raw_select in valueMap))
-      throw new Error(`Invalid selection: ${raw_select}`);
-    return valueMap[raw_select];
+// Picks by station (`collectPicks`) as an entry carries them: one object per station, each
+// metric's pick named as the oracle names it.
+function expectedObservations(submit) {
+  const valueMap = { par: "Par", over: "Over", under: "Under" };
+  return Object.entries(submit).map(([station_id, choices]) => ({
+    stations: station_id,
+    ...Object.entries(choices).reduce((acc, [weather_type, selected_val]) => {
+      if (!(selected_val in valueMap)) throw new Error(`Invalid selection: ${selected_val}`);
+      acc[weather_type] = valueMap[selected_val];
+      return acc;
+    }, {}),
+  }));
+}
+
+// Save on the picks dialog's edit screen (`edit_picks` in mod.rs): the picks checked there
+// replace the entry's, through the same checks as a new entry's. The coordinator refuses once
+// entries have closed and says why.
+async function savePicks() {
+  const form = document.getElementById("editPicksForm");
+  const button = document.getElementById("savePicks");
+  const message = document.getElementById("editPicksMessage");
+  if (!form || !button || !message) return;
+  const say = (text, ok) => {
+    message.textContent = text;
+    message.classList.remove("hidden", "is-danger", "is-success");
+    message.classList.add(ok ? "is-success" : "is-danger");
+  };
+  const picks = collectPicks(form);
+  const made = Object.values(picks).reduce((n, station) => n + Object.keys(station).length, 0);
+  const need = parseInt(form.dataset.maxValues, 10) || 1;
+  if (made !== need) {
+    say(`Make exactly ${need} ${need === 1 ? "pick" : "picks"}; you made ${made}.`, false);
+    return;
+  }
+  if (!isLoggedIn() || !session.nostrClient) {
+    showLogin();
+    return;
+  }
+  const base = document.body.dataset.apiBase || "";
+  const client = new AuthorizedClient(session.nostrClient, base);
+  setBusy(button, true);
+  try {
+    await client.post(`${base}/api/v1/entries/${form.dataset.entryId}/picks`, {
+      expected_observations: expectedObservations(picks),
+    });
+    say("Picks saved.", true);
+  } catch (caught) {
+    const error = caught?.response ? await requestFailure(caught) : caught;
+    const detail = typeof error?.message === "string" ? error.message : "";
+    say(unreachable(detail) ? UNREACHABLE : detail || "Your picks could not be saved; try again", false);
+  } finally {
+    setBusy(button, false);
   }
 }
 
@@ -567,7 +609,8 @@ function picksLeft(made, need, rows) {
 }
 
 function showPicksLeft(form) {
-  const counter = document.getElementById("picksLeft");
+  // The edit screen names its own counter; the entry form's is `picksLeft`.
+  const counter = document.getElementById(form?.dataset?.counter || "picksLeft");
   if (!counter || !form) return;
   const need = parseInt(form.dataset.maxValues, 10) || 1;
   const rows = parseInt(form.dataset.pickRows, 10) || need;
@@ -956,6 +999,7 @@ function unpickWithSpace(event) {
 function setupEntryForm() {
   document.addEventListener("click", (event) => {
     if (event.target.closest?.("#submitEntry")) submitEntry();
+    if (event.target.closest?.("#savePicks")) savePicks();
     if (event.target instanceof HTMLInputElement && event.target.matches(PICK)) {
       togglePick(event.target);
       hidePicksMessage();

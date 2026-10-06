@@ -242,7 +242,7 @@ fn walkthrough() -> Markup {
                     }
                     fieldset class="station-picks" {
                         legend { "Chicago, IL " span class="station-code" { "KORD" } (callout(4)) }
-                        (pick_row("KORD", Metric::TempHigh, Some(77.0), Some(band)))
+                        (pick_row("KORD", Metric::TempHigh, Some(77.0), Some(band), None))
                         p class="help-pointer" { "↑ " (callout(5)) }
                     }
                     button type="button" class="button is-primary" { "Pay 5,687 sats and enter" (callout(6)) }
