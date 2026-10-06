@@ -252,7 +252,7 @@ impl RecoveryPublisher {
                 "SELECT nostr_pubkey, encrypted_bitcoin_private_key FROM user
                  WHERE nostr_pubkey > ? ORDER BY nostr_pubkey LIMIT ?",
             )
-            .bind(&after)
+            .bind(after)
             .bind(PASS_WALLETS_PER_TICK)
             .fetch_all(database.read())
             .await?;

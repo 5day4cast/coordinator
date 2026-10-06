@@ -40,12 +40,13 @@ pub async fn get_recovery_kit(
         return Err(ApiError::Status(StatusCode::NOT_FOUND));
     };
     let npub = pubkey.to_bech32().unwrap_or_else(|never| match never {});
+    let user_pubkey = pubkey.to_hex();
     let (user, events) = tokio::join!(
         state.users_info.login(npub.clone()),
         state
             .coordinator
             .competition_store
-            .recovery_kit_events(&pubkey.to_hex()),
+            .recovery_kit_events(&user_pubkey),
     );
     let wallet_blob = user.ok().map(|user| user.encrypted_bitcoin_private_key);
     let events = events.map_err(domain::Error::from)?;
