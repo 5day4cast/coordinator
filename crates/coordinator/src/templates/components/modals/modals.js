@@ -765,7 +765,15 @@ class AuthManager {
     );
   }
 
-  handleLogout() {
+  // Logs out here and in this site's other tabs. A logout another tab sent
+  // has already forgotten the remembered login.
+  // The record is gone before the page shows the logout, so a reload right
+  // after cannot log back in.
+  async handleLogout({ fromOtherTab = false } = {}) {
+    if (!fromOtherTab) {
+      await forgetLogin().catch((error) => console.warn("Could not forget the login:", error));
+      sessionChannel?.postMessage("logout");
+    }
     // free() drops the WASM objects, which erases the keys they hold.
     session.dlcWallet?.free();
     session.dlcWallet = null;
@@ -786,7 +794,9 @@ class AuthManager {
     document.querySelector('[hx-get="/competitions"]')?.click();
   }
 
-  onLoginSuccess() {
+  // `remember` is false for a login restored from the remembered one.
+  onLoginSuccess({ remember = true } = {}) {
+    if (remember) this.rememberSigner();
     document.getElementById("authButtons")?.classList.add("is-hidden");
     document.getElementById("logoutContainer")?.classList.remove("is-hidden");
     closeAllModals();
@@ -798,6 +808,74 @@ class AuthManager {
       ?.getPublicKey?.()
       .then((npub) => setOwnerTag(npub))
       .catch(() => {});
+  }
+
+  // Keeps this login for reloads and other tabs, then tells those tabs.
+  async rememberSigner() {
+    let nsec = null;
+    try {
+      nsec = session.nostrClient.recoveryKey();
+    } catch (_) {
+      // An extension signs; it keeps the key.
+    }
+    try {
+      await rememberLogin(nsec);
+      sessionChannel?.postMessage("login");
+    } catch (error) {
+      // Private windows may refuse storage; the login still works in this tab.
+      console.warn("Could not remember the login:", error);
+    }
+  }
+
+  // Logs back in with the remembered login, if there is one. Resolves to
+  // whether someone is logged in. Concurrent calls share one attempt.
+  restoreLogin() {
+    loginRestoring ??= this.loginFromRemembered().finally(() => {
+      loginRestoring = null;
+    });
+    return loginRestoring;
+  }
+
+  async loginFromRemembered() {
+    if (isLoggedIn()) return true;
+    let remembered;
+    try {
+      remembered = await recallLogin();
+    } catch (error) {
+      console.warn("Could not read the remembered login:", error);
+      return false;
+    }
+    if (!remembered) return false;
+    try {
+      await initWasm();
+      if (remembered.kind === "key") {
+        session.nostrClient.initialize(session.wasm.SignerType.PrivateKey, remembered.nsec);
+      } else {
+        if (!(await nostrExtensionReady())) throw new Error("No NIP-07 extension");
+        await session.nostrClient.initialize(session.wasm.SignerType.NIP07, null);
+      }
+      this.authorizedClient = new AuthorizedClient(session.nostrClient, this.apiBase);
+      await this.loadWallet();
+      this.onLoginSuccess({ remember: false });
+      return true;
+    } catch (error) {
+      console.warn("Could not restore the remembered login:", error);
+      // The server no longer knows this key: forget it rather than retry.
+      if (error.message === "UNAUTHORIZED") forgetLogin().catch(() => {});
+      if (session.wasm) {
+        session.nostrClient?.free();
+        session.nostrClient = new session.wasm.NostrClientWrapper();
+      }
+      return false;
+    }
+  }
+
+  // Logins and logouts in this site's other tabs apply here too.
+  followOtherTabs() {
+    sessionChannel?.addEventListener("message", (event) => {
+      if (event.data === "logout" && isLoggedIn()) this.handleLogout({ fromOtherTab: true });
+      if (event.data === "login" && !isLoggedIn()) this.restoreLogin();
+    });
   }
 
   switchLoginTab(tab) {

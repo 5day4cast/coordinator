@@ -145,6 +145,33 @@ test.describe("Username/Password Authentication", () => {
     await expect(page.locator("#logoutContainer")).toBeVisible();
   });
 
+  test("a login lasts across reloads and tabs until logout", async ({
+    page,
+    context,
+  }) => {
+    const username = uniqueUsername();
+    await registerWithUsername(page, username, "testPassword123!");
+
+    await page.reload();
+    await expect(page.locator("#logoutContainer")).toBeVisible({ timeout: 10000 });
+
+    const tab = await context.newPage();
+    await tab.goto("/entries");
+    await expect(tab.locator("#logoutContainer")).toBeVisible({ timeout: 10000 });
+    await expect(tab.locator(".sign-in-required")).toHaveCount(0, { timeout: 10000 });
+    await expect(tab.locator("#loginModal")).not.toHaveClass(/is-active/);
+
+    // Logging out in one tab logs out the others and is not undone by a reload.
+    await logout(page);
+    await expect(tab.locator("#authButtons")).toBeVisible({ timeout: 10000 });
+    // Logging out leaves the account page, so come back to it after the reload.
+    await tab.reload();
+    await expect(tab.locator("#authButtons")).toBeVisible();
+    await tab.goto("/entries");
+    await expect(tab.locator(".sign-in-required")).toBeVisible();
+    await expect(tab.locator("#logoutContainer")).toBeHidden();
+  });
+
   test("rejects login with wrong password", async ({ page }) => {
     const username = uniqueUsername();
     const password = "correctPassword123!";
