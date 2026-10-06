@@ -94,7 +94,7 @@ fn lightning_address_panel(lightning_address: Option<&str>) -> Markup {
             @match lightning_address {
                 Some(address) => {
                     p id="payoutAddress" {
-                        "Default address for new entries: " strong { (address) } ". "
+                        "Default address for new entries: " strong { (address) } " "
                         button type="button" class="button is-text is-small" data-payout-action="edit-address" aria-controls="lightningAddressForm" aria-expanded="false" { "Change" }
                     }
                 }

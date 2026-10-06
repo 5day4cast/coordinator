@@ -138,7 +138,7 @@ pub(crate) async fn check_lightning_address(
         Ok(Ok(_invoice)) => Ok(address),
         Ok(Err(message)) => Err(message),
         Err(_) => Err(format!(
-            "{domain} took too long to answer for {address}. Check the address, or try again shortly."
+            "{domain} took too long to answer for {address} — check the address, or try again shortly."
         )),
     }
 }
@@ -147,12 +147,12 @@ pub(crate) async fn check_lightning_address(
 fn unresolved(address: &LightningAddress, error: LnurlError) -> String {
     let domain = address.domain();
     match error {
-        LnurlError::Status(404) => format!("{domain} has no Lightning Address {address}."),
+        LnurlError::Status(404) => format!("{domain} has no Lightning Address {address}"),
         LnurlError::NotPublic(_)
         | LnurlError::Request(_)
         | LnurlError::Timeout
         | LnurlError::Status(_) => format!(
-            "Could not reach {domain} to check {address}. Check the address, or try again shortly."
+            "Could not reach {domain} to check {address} — check the address, or try again shortly."
         ),
         LnurlError::Provider(reason) => {
             format!("{domain} says {address} cannot receive payments: {reason}")
@@ -178,7 +178,7 @@ fn no_invoice(address: &LightningAddress, network: &str, error: LnurlError) -> S
         | LnurlError::Request(_)
         | LnurlError::Timeout
         | LnurlError::Status(_) => format!(
-            "{domain} did not return an invoice for {address}. Try again shortly, or use another address."
+            "{domain} did not return an invoice for {address} — try again shortly, or use another address."
         ),
         LnurlError::Provider(reason) => {
             format!("{domain} would not make an invoice for {address}: {reason}")
@@ -727,7 +727,7 @@ mod address_check_tests {
             ),
             (
                 "unknown@mock-wallet.dev",
-                "mock-wallet.dev has no Lightning Address unknown@mock-wallet.dev.",
+                "mock-wallet.dev has no Lightning Address unknown@mock-wallet.dev",
             ),
             (
                 "no-invoice@mock-wallet.dev",
