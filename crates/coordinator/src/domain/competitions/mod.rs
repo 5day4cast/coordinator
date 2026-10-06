@@ -1414,8 +1414,8 @@ impl Competition {
     }
 
     /// Whether the public lists show it. An unlisted competition is reached by its link, and
-    /// is in the API. A queued competition's reference event is always off the oracle's list,
-    /// and its pools copy it, so for them the flag says nothing: they are listed.
+    /// is in the API. A queued competition's reference event is always off the oracle's list
+    /// and its pools are on it, so for them the flag says nothing: they are listed.
     pub fn is_listed(&self) -> bool {
         self.kind != CompetitionKind::Single || !self.event_submission.unlisted
     }
