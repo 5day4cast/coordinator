@@ -475,8 +475,9 @@ pub struct Ticket {
     pub id: Uuid,
     pub competition_id: Uuid,
     pub entry_id: Option<Uuid>,
-    /// The `encrypted_preimage` column: the preimage as plaintext hex, despite the column's
-    /// name, kept for older releases. Read the preimage with `Ticket::preimage`, never from here.
+    /// The `encrypted_preimage` column: empty once the preimage is sealed, else the preimage as
+    /// plaintext hex, despite the column's name. Read the preimage with `Ticket::preimage`, never
+    /// from here.
     /// It settles the ticket's HODL invoice, so it must not reach logs or responses.
     pub legacy_preimage_hex: String,
     /// The preimage sealed with the coordinator's ticket key; see `ticket_preimage.rs`.

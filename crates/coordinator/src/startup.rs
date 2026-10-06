@@ -753,8 +753,8 @@ pub async fn build_app(
     );
     threads.insert("automatic_payouts".to_string(), automatic_handle);
 
-    // Seal the preimages of tickets an older release stored only in plaintext. During a
-    // blue/green deploy the older release keeps writing such tickets, so this repeats.
+    // Seal the preimages of tickets still stored in plaintext, and clear the plaintext. During a
+    // blue/green deploy the previous release keeps writing it, so this repeats.
     let preimage_coordinator = coordinator.clone();
     let preimage_cancel = cancel_token.clone();
     let preimage_handle = spawn_supervised(
