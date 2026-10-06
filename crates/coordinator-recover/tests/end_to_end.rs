@@ -110,6 +110,8 @@ fn world() -> World {
         fee_rate: FeeRate::from_sat_per_vb(10).unwrap(),
         funding_value: Amount::from_sat(200_000),
         relative_locktime_block_delta: DELTA,
+        anchor: None,
+        outcome_bound_splits: false,
     };
     let funding = OutPoint::new(Txid::from_byte_array([7; 32]), 0);
     let dlc = TicketedDLC::new(params, funding).unwrap();

@@ -344,6 +344,8 @@ fn contract_for(
             fee_rate: FeeRate::from_sat_per_vb_u32(1),
             funding_value: first.funding_value,
             relative_locktime_block_delta: first.relative_locktime_block_delta,
+            anchor: None,
+            outcome_bound_splits: true,
         },
         funding_outpoint: OutPoint::null(),
     }
@@ -1049,6 +1051,8 @@ mod capacity_bounds {
                 fee_rate: FeeRate::from_sat_per_vb_u32(1),
                 funding_value: first.funding_value,
                 relative_locktime_block_delta: first.relative_locktime_block_delta,
+                anchor: None,
+                outcome_bound_splits: true,
             },
             funding_outpoint: OutPoint::null(),
         };

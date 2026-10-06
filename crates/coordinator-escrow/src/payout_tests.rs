@@ -39,6 +39,8 @@ pub(crate) fn fixture() -> (ContractCommitment, ContractAuthorization) {
         fee_rate: FeeRate::from_sat_per_vb_u32(1),
         funding_value: Amount::from_sat(100_000),
         relative_locktime_block_delta: 72,
+        anchor: None,
+        outcome_bound_splits: false,
     };
     let terms = ContractAuthorization {
         competition_id: Uuid::from_u128(1),
@@ -473,4 +475,24 @@ fn verified_contracts_remember_only_successes_within_their_bound() {
     assert!(verified.recall(&key(0)));
     assert!(!verified.recall(&key(1)));
     assert!(verified.recall(&key(MAX_VERIFIED_CONTRACTS)));
+}
+
+/// The anchor and split binding are not part of the authorized economics, so a contract with or
+/// without them binds, but an anchor out of bounds does not.
+#[test]
+fn contract_options_are_bounded_rather_than_fixed() {
+    use crate::contract_options::{ContractOptions, MAX_ANCHOR_VALUE};
+    let (contract, terms) = fixture();
+    let key = contract.contract_parameters.players[0].pubkey.serialize();
+    let mut anchored = contract.clone();
+    ContractOptions::NEW.apply(&mut anchored.contract_parameters);
+    terms.verify_contract(&anchored, &key).unwrap();
+    anchored.contract_parameters.anchor = Some(dlctix::AnchorParams {
+        value: MAX_ANCHOR_VALUE,
+    });
+    terms.verify_contract(&anchored, &key).unwrap();
+    anchored.contract_parameters.anchor = Some(dlctix::AnchorParams {
+        value: MAX_ANCHOR_VALUE + Amount::ONE_SAT,
+    });
+    assert!(terms.verify_contract(&anchored, &key).is_err());
 }

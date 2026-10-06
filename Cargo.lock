@@ -2274,9 +2274,9 @@ dependencies = [
 
 [[package]]
 name = "dlctix"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "623c50081195a8a1ca7e214bb9f7517820d37e4e7e54312fc77eda19572184e8"
+checksum = "206fb7e6901075ea180c74d873d9f91386f25d01bb5b8851ff184a45494ec567"
 dependencies = [
  "bitcoin",
  "hex",
@@ -3601,7 +3601,7 @@ dependencies = [
 [[package]]
 name = "keymeld-core"
 version = "0.9.0"
-source = "git+https://github.com/tee8z/keymeld?rev=69db916f33953a4ec228a5aed36942be39134795#69db916f33953a4ec228a5aed36942be39134795"
+source = "git+https://github.com/tee8z/keymeld?rev=fbc3c30094be986af5b37ca03482bece09e5dafb#fbc3c30094be986af5b37ca03482bece09e5dafb"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3641,7 +3641,7 @@ dependencies = [
 [[package]]
 name = "keymeld-enclave"
 version = "0.9.0"
-source = "git+https://github.com/tee8z/keymeld?rev=69db916f33953a4ec228a5aed36942be39134795#69db916f33953a4ec228a5aed36942be39134795"
+source = "git+https://github.com/tee8z/keymeld?rev=fbc3c30094be986af5b37ca03482bece09e5dafb#fbc3c30094be986af5b37ca03482bece09e5dafb"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3679,7 +3679,7 @@ dependencies = [
 [[package]]
 name = "keymeld-sdk"
 version = "0.9.0"
-source = "git+https://github.com/tee8z/keymeld?rev=69db916f33953a4ec228a5aed36942be39134795#69db916f33953a4ec228a5aed36942be39134795"
+source = "git+https://github.com/tee8z/keymeld?rev=fbc3c30094be986af5b37ca03482bece09e5dafb#fbc3c30094be986af5b37ca03482bece09e5dafb"
 dependencies = [
  "dlctix",
  "flate2",

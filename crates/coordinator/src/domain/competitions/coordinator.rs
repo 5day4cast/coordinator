@@ -35,9 +35,9 @@ use super::{
     states::CompetitionStatus,
     store::{EntryAdmission, ReservedTicket, TicketReservation},
     verify_entry_key, verify_payout_preimage, winner_payout_sats, AddEntry, CompetitionError,
-    CompetitionStore, FundedContract, KeymeldSigningInfo, PayoutClaimInfo, PayoutClaimReceipt,
-    PayoutInfo, PayoutRejection, RegistrationStored, SearchBy, Ticket, TicketRegistration,
-    TicketStatus, UserEntry, UserEntryView,
+    CompetitionStore, ContractOptions, FundedContract, KeymeldSigningInfo, PayoutClaimInfo,
+    PayoutClaimReceipt, PayoutInfo, PayoutRejection, RegistrationStored, SearchBy, Ticket,
+    TicketRegistration, TicketStatus, UserEntry, UserEntryView,
 };
 use crate::{
     api::routes::FinalSignatures,
@@ -1637,23 +1637,41 @@ impl Coordinator {
 
         let contract_amount_sats = competition.event_submission.total_competition_pool;
 
+        // A contract is built once, with the options its competition was created with, and
+        // stored: it is never rebuilt with other options, which would change its transactions.
         let contract_params = match competition.contract_parameters.clone() {
             Some(params) => params,
-            None => ContractParameters {
-                market_maker: dlctix::MarketMaker {
-                    pubkey: self.public_key,
-                },
-                players,
-                event: event_announcement.clone(),
-                outcome_payouts,
-                // An Arkade competition's is the rate its kickoff check passed at.
-                fee_rate: self.checked_contract_fee_rate(competition).await?,
-                funding_value: Amount::from_sat(contract_amount_sats as u64),
-                relative_locktime_block_delta: competition
+            None => {
+                let mut params = ContractParameters {
+                    market_maker: dlctix::MarketMaker {
+                        pubkey: self.public_key,
+                    },
+                    players,
+                    event: event_announcement.clone(),
+                    outcome_payouts,
+                    // An Arkade competition's is the rate its kickoff check passed at.
+                    fee_rate: self.checked_contract_fee_rate(competition).await?,
+                    funding_value: Amount::from_sat(contract_amount_sats as u64),
+                    relative_locktime_block_delta: competition
+                        .event_submission
+                        .relative_locktime_block_delta
+                        .unwrap_or(self.relative_locktime_block_delta as u16),
+                    anchor: None,
+                    outcome_bound_splits: false,
+                };
+                competition
                     .event_submission
-                    .relative_locktime_block_delta
-                    .unwrap_or(self.relative_locktime_block_delta as u16),
-            },
+                    .contract_options()
+                    .apply(&mut params);
+                // A competition created before the options that pays more than one place still
+                // needs its splits bound to their outcome: nothing is signed yet.
+                if !params.outcome_bound_splits
+                    && coordinator_escrow::contract_options::outcomes_share_winners(&params)
+                {
+                    params.outcome_bound_splits = true;
+                }
+                params
+            }
         };
         competition.contract_parameters = Some(contract_params.clone());
 
@@ -3361,6 +3379,13 @@ impl Coordinator {
         create_event
             .scoring_rules
             .get_or_insert(crate::infra::oracle::ScoringRules::Lines);
+        // New competitions bind splits to their outcome and carry anchors unless they ask
+        // otherwise. The options are fixed now, so the contract is built with them later.
+        create_event
+            .contract_options
+            .get_or_insert(ContractOptions::NEW)
+            .check_for_places(create_event.number_of_places_win)
+            .map_err(|reason| Error::BadRequest(reason.to_string()))?;
         // The oracle attests full days and day or night halves; the window sets the metrics.
         create_event
             .fix_window_metrics()
@@ -5540,6 +5565,7 @@ mod oracle_payout_order_tests {
             scoring_rules: None,
             scoring_fields: None,
             max_entries_per_player: 1,
+            contract_options: None,
         });
         let entry_ids = [Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()];
         let tickets = [Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()];
@@ -5622,6 +5648,7 @@ mod funding_lifecycle_tests {
             scoring_rules: None,
             scoring_fields: None,
             max_entries_per_player: 1,
+            contract_options: None,
         });
         assert_eq!(
             competition.funding_reservation_deadline(now).unwrap(),
@@ -6016,6 +6043,8 @@ mod tests {
             fee_rate: dlctix::bitcoin::FeeRate::from_sat_per_vb_u32(1),
             funding_value: Amount::from_sat(100_000),
             relative_locktime_block_delta: 72,
+            anchor: None,
+            outcome_bound_splits: false,
         }
     }
 
@@ -6106,6 +6135,7 @@ mod required_pick_tests {
             scoring_rules: None,
             scoring_fields: None,
             max_entries_per_player: 1,
+            contract_options: None,
         };
         let choice = |station: &str| WeatherChoices {
             stations: station.into(),

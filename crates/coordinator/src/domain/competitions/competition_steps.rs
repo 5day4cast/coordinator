@@ -292,6 +292,8 @@ mod tests {
             fee_rate: FeeRate::from_sat_per_vb_u32(1),
             funding_value: Amount::from_sat(100_000),
             relative_locktime_block_delta: 72,
+            anchor: None,
+            outcome_bound_splits: false,
         }
     }
 
@@ -348,6 +350,7 @@ mod tests {
             scoring_rules: None,
             scoring_fields: None,
             max_entries_per_player: 1,
+            contract_options: None,
         });
         competition.total_entries = 2;
         competition.total_paid_entries = 2;
@@ -462,6 +465,7 @@ mod tests {
             scoring_rules: None,
             scoring_fields: None,
             max_entries_per_player: 1,
+            contract_options: None,
         });
         competition.total_entries = 2;
         competition.total_paid_entries = 2;
@@ -544,6 +548,7 @@ mod tests {
             scoring_rules: None,
             scoring_fields: None,
             max_entries_per_player: 1,
+            contract_options: None,
         });
         competition.total_entries = 2;
         competition.total_paid_entries = 2;
@@ -767,6 +772,7 @@ mod tests {
             scoring_rules: None,
             scoring_fields: None,
             max_entries_per_player: 1,
+            contract_options: None,
         })
     }
 

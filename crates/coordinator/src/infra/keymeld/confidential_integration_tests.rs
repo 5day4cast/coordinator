@@ -212,6 +212,8 @@ fn parameters() -> ContractParameters {
         fee_rate: FeeRate::from_sat_per_vb_u32(1),
         funding_value: Amount::from_sat(100_000),
         relative_locktime_block_delta: 72,
+        anchor: None,
+        outcome_bound_splits: false,
     }
 }
 fn invoice(preimage: [u8; 32]) -> String {
@@ -609,6 +611,8 @@ fn pool_parameters(count: usize) -> ContractParameters {
         fee_rate: FeeRate::from_sat_per_vb_u32(2),
         funding_value: Amount::from_sat(20_000 * count as u64),
         relative_locktime_block_delta: 144,
+        anchor: None,
+        outcome_bound_splits: false,
     }
 }
 

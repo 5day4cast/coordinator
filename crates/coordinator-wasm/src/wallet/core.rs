@@ -8,8 +8,8 @@ use crate::nostr::{CustomSigner, NostrClientCore};
 use ::nostr::NostrSigner;
 use coordinator_core::{
     keymeld::{
-        ark, payout, payout_protocol, prepare_payout_registration, prepare_registration,
-        PayoutPolicy, PreparedRegistration,
+        ark, contract_options, payout, payout_protocol, prepare_payout_registration,
+        prepare_registration, PayoutPolicy, PreparedRegistration,
     },
     RegistrationAssignment,
 };
@@ -421,6 +421,9 @@ impl DlcWalletCore {
                 "player payout hash does not match this entry".into(),
             ));
         }
+        // A sane anchor, and splits bound to their outcome whenever outcomes share winners.
+        contract_options::check_contract_options(&params)
+            .map_err(|e| WalletError::Contract(e.to_string()))?;
 
         let params_digest = json_digest(&params)?;
         let dlc = TicketedDLC::new(params, funding_outpoint)
@@ -813,6 +816,8 @@ mod tests {
             fee_rate: FeeRate::from_sat_per_vb_u32(1),
             funding_value: Amount::from_sat(100_000),
             relative_locktime_block_delta: 72,
+            anchor: None,
+            outcome_bound_splits: false,
         };
         Fixture {
             wallet,

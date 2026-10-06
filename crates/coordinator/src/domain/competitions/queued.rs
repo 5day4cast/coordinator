@@ -29,7 +29,7 @@ use sqlx::{sqlite::SqliteRow, Row};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
-use super::{CoordinatorFee, CreateEvent};
+use super::{ContractOptions, CoordinatorFee, CreateEvent};
 use crate::infra::{
     bitcoin::BlockSummary,
     oracle::{OracleEventTerms, ScoringRules},
@@ -224,6 +224,9 @@ impl CreateQueuedCompetition {
             scoring_fields: None,
             // Pools copy it, so the limit holds in every pool as it did in the queue.
             max_entries_per_player: self.max_entries_per_player,
+            // Pools copy it, so every pool's contract is built with the options new competitions
+            // use.
+            contract_options: Some(ContractOptions::NEW),
         };
         // Pools copy the reference event, so every pool scores the metrics its window holds.
         event.fix_window_metrics()?;

@@ -381,6 +381,7 @@ impl Fixture {
             scoring_rules: None,
             scoring_fields: None,
             max_entries_per_player: 1,
+            contract_options: None,
         });
         coordinator
             .competition_store
@@ -665,6 +666,8 @@ fn parameters(market_maker: Scalar) -> ContractParameters {
         fee_rate: FeeRate::from_sat_per_vb_u32(1),
         funding_value: Amount::from_sat(100_000),
         relative_locktime_block_delta: 72,
+        anchor: None,
+        outcome_bound_splits: false,
     }
 }
 
@@ -1041,6 +1044,7 @@ fn event(places: usize, players: usize) -> CreateEvent {
         scoring_rules: None,
         scoring_fields: None,
         max_entries_per_player: 1,
+        contract_options: None,
     }
 }
 
@@ -1333,6 +1337,7 @@ impl TicketFixture {
             scoring_rules: None,
             scoring_fields: None,
             max_entries_per_player: 1,
+            contract_options: None,
         });
         let event_id = competition.id;
         let store = &coordinator.competition_store;

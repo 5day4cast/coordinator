@@ -2065,6 +2065,7 @@ mod startup_tests {
             scoring_rules: None,
             scoring_fields: None,
             max_entries_per_player: 1,
+            contract_options: None,
         };
         let id = client.create(&event).await.unwrap();
         assert_eq!(id, event.id);

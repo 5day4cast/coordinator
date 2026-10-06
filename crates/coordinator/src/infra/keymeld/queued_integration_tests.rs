@@ -447,6 +447,8 @@ async fn a_queued_pool_registers_deposits_binds_its_statement_and_signs() {
         fee_rate: first.max_fee_rate,
         funding_value: first.funding_value,
         relative_locktime_block_delta: first.relative_locktime_block_delta,
+        anchor: None,
+        outcome_bound_splits: true,
     };
     assert_eq!(
         params.funding_value.to_sat(),

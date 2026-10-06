@@ -86,6 +86,8 @@ fn fixture_with(automatic: bool, ark_escrow: Option<ArkEscrowPolicy>) -> Fixture
         fee_rate: FeeRate::from_sat_per_vb_u32(1),
         funding_value: Amount::from_sat(100_000),
         relative_locktime_block_delta: 72,
+        anchor: None,
+        outcome_bound_splits: false,
     };
     let terms = ContractAuthorization {
         competition_id: Uuid::now_v7(),

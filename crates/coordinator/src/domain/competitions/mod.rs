@@ -50,6 +50,7 @@ pub use ark_kickoff::*;
 pub use ark_store::*;
 pub use automatic_store::*;
 pub use coordinator::*;
+pub use coordinator_escrow::contract_options::ContractOptions;
 pub use coordinator_fee::*;
 use dlctix::{
     bitcoin::{hex::DisplayHex, OutPoint, Transaction},
@@ -681,6 +682,13 @@ pub struct CreateEvent {
     /// rule, and any that don't set it, allow one.
     #[serde(default = "one_entry_per_player")]
     pub max_entries_per_player: u32,
+    /// The dlctix options the competition's contract is built with: outcome-bound splits and
+    /// P2A anchors for competitions created since dlctix 0.2.0 ([`ContractOptions::NEW`], set
+    /// by [`crate::domain::Coordinator::create_competition`] when the request leaves them out).
+    /// Competitions stored before have none and build their contracts as dlctix 0.1.0 did; see
+    /// [`Self::contract_options`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_options: Option<ContractOptions>,
 }
 
 /// Unless a competition says otherwise, each player enters it once.
@@ -691,6 +699,12 @@ fn one_entry_per_player() -> u32 {
 }
 
 impl CreateEvent {
+    /// The options the competition's contract is built with: none for a competition stored
+    /// before contract options existed.
+    pub fn contract_options(&self) -> ContractOptions {
+        self.contract_options.unwrap_or(ContractOptions::LEGACY)
+    }
+
     /// The rules the oracle scores this competition's picks with.
     pub fn scoring_rules(&self) -> ScoringRules {
         self.scoring_rules.unwrap_or_default()
@@ -872,7 +886,25 @@ mod oracle_event_validation_tests {
             scoring_rules: None,
             scoring_fields: None,
             max_entries_per_player: 1,
+            contract_options: None,
         }
+    }
+
+    /// Events stored before contract options load without them and build dlctix 0.1.0
+    /// contracts; options set at creation survive a round trip.
+    #[test]
+    fn stored_events_keep_their_contract_options() {
+        let stored = serde_json::to_value(event()).unwrap();
+        assert!(stored.get("contract_options").is_none());
+        let loaded: CreateEvent = serde_json::from_value(stored).unwrap();
+        assert_eq!(loaded.contract_options(), ContractOptions::LEGACY);
+        let new = CreateEvent {
+            contract_options: Some(ContractOptions::NEW),
+            ..event()
+        };
+        let loaded: CreateEvent =
+            serde_json::from_value(serde_json::to_value(&new).unwrap()).unwrap();
+        assert_eq!(loaded.contract_options(), ContractOptions::NEW);
     }
 
     #[test]
@@ -1079,6 +1111,8 @@ mod oracle_event_validation_tests {
             fee_rate: FeeRate::from_sat_per_vb_u32(1),
             funding_value: Amount::from_sat(2_000),
             relative_locktime_block_delta: 72,
+            anchor: None,
+            outcome_bound_splits: false,
         };
         let mut competition = Competition::new(&event());
         assert!(!competition.refunds_every_entry(), "no contract yet");

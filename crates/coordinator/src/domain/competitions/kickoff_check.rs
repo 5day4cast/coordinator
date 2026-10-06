@@ -78,6 +78,10 @@ pub struct KickoffPool {
     pub paid_sats: u64,
     /// The fewest players its terms allow; more are needed while fees are not low.
     pub template_min_players: u64,
+    /// The anchor output its contract's outcome transaction carries, in vbytes: zero for a
+    /// contract without anchors. Its value is priced into every ticket's network fee for the
+    /// priced pool size, and, like the rest of a smaller pool's shortfall, is not checked here.
+    pub anchor_vbytes: u64,
 }
 
 impl KickoffCheck {
@@ -94,6 +98,7 @@ impl KickoffCheck {
             .players
             .checked_mul(weights.vbytes_per_player)
             .and_then(|v| v.checked_add(weights.base_vbytes))
+            .and_then(|v| v.checked_add(pool.anchor_vbytes))
             .ok_or_else(overflow)?;
         let chain_cost_sats = rate.fee_vb(chain_vbytes).ok_or_else(overflow)?.to_sat();
         let routing_and_liquidity_sats = u64::try_from(
@@ -262,6 +267,11 @@ impl Coordinator {
             pot_sats,
             paid_sats,
             template_min_players,
+            anchor_vbytes: competition
+                .event_submission
+                .contract_options()
+                .outcome_anchor_cost()
+                .vbytes,
         };
         let rate = self.contract_fee_rate().await?;
         let now = OffsetDateTime::now_utc();
@@ -473,6 +483,7 @@ mod tests {
             pot_sats: 125_000,
             paid_sats: 25 * (150 + network),
             template_min_players: 2,
+            anchor_vbytes: 0,
         }
     }
 
@@ -553,6 +564,7 @@ mod tests {
             pot_sats: 25_001,
             paid_sats: 0,
             template_min_players: 2,
+            anchor_vbytes: 0,
         };
         let check = KickoffCheck::evaluate(
             &NetworkFeeSettings::default(),
@@ -582,6 +594,8 @@ mod tests {
             pot_sats: players * 5_000,
             paid_sats: players * (150 + network),
             template_min_players: 2,
+            // Priced for, and built with, an anchor.
+            anchor_vbytes: ContractOptions::NEW.outcome_anchor_cost().vbytes,
         };
         // LND's floor, 1.012 sat/vB: priced and built at 2.
         assert!(check_at(pool(2, fee_at(2.0)), 2).passed);
@@ -600,6 +614,7 @@ mod tests {
             pot_sats: players * 5_000,
             paid_sats: 1_000_000,
             template_min_players: 2,
+            anchor_vbytes: 0,
         };
         let low = check_at(small(3), 1);
         assert_eq!(low.min_players, 2);

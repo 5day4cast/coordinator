@@ -5,7 +5,7 @@ use crate::RegistrationAssignment;
 pub use coordinator_escrow::{
     ark,
     authorization::{ArkEscrowPolicy, PayoutPolicy},
-    capacity,
+    capacity, contract_options,
     escrow::SignedEscrowPolicy,
     oracle_statement, payout, payout_protocol, pools, queued,
 };

@@ -133,6 +133,7 @@ impl Fixture {
             scoring_rules: None,
             scoring_fields: None,
             max_entries_per_player: 1,
+            contract_options: None,
         });
         let tickets = (1..=2u8)
             .map(|byte| Ticket {

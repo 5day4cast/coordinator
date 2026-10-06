@@ -5,7 +5,7 @@
 use crate::payout::dlctix::{
     bitcoin::{Amount, FeeRate, Network, OutPoint},
     secp::{Point, Scalar},
-    ContractParameters, EventLockingConditions, MarketMaker, Outcome, Player,
+    AnchorParams, ContractParameters, EventLockingConditions, MarketMaker, Outcome, Player,
 };
 use crate::{
     ark::ArkFunding,
@@ -308,6 +308,11 @@ pub fn validate_competition_capacity(
         fee_rate: FeeRate::from_sat_per_kwu(u64::MAX),
         funding_value: Amount::from_sat(u64::MAX),
         relative_locktime_block_delta: u16::MAX,
+        // Both options on, the anchor at its longest encoding: they add to every contract.
+        anchor: Some(AnchorParams {
+            value: Amount::from_sat(u64::MAX),
+        }),
+        outcome_bound_splits: true,
     };
     let terms = ContractAuthorization {
         competition_id: id,

@@ -50,15 +50,15 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 
 # Keymeld: released SDK and services on the published dlctix crate.
 # keymeld-sdk and the coordinator must resolve dlctix from the same source.
-# Pinned to Keymeld 0.9.0 for two-place signing batches.
+# Pinned to Keymeld's dlctix 0.2.0 branch head; repin to its merge commit before merging.
 # Every crate that names Keymeld pins the same rev.
-keymeld-sdk = { git = "https://github.com/tee8z/keymeld", rev = "69db916f33953a4ec228a5aed36942be39134795", default-features = false, features = ["escrow", "dlctix"] }
-keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "69db916f33953a4ec228a5aed36942be39134795", default-features = false, features = ["escrow"] }
+keymeld-sdk = { git = "https://github.com/tee8z/keymeld", rev = "fbc3c30094be986af5b37ca03482bece09e5dafb", default-features = false, features = ["escrow", "dlctix"] }
+keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "fbc3c30094be986af5b37ca03482bece09e5dafb", default-features = false, features = ["escrow"] }
 
 # Bitcoin
 bitcoin = { version = "0.32", features = ["serde", "base64", "rand-std"] }
 electrum-client = "0.21"
-dlctix = "0.1.0"
+dlctix = "0.2.0"
 miniscript = "12.3.2"
 
 # Web

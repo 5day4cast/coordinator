@@ -192,6 +192,9 @@ fn contract(
         fee_rate: FeeRate::from_sat_per_vb_u32(2),
         funding_value,
         relative_locktime_block_delta: 2,
+        // As new competitions build them: P2A anchors and outcome-bound splits.
+        anchor: Some(dlctix::AnchorParams::default()),
+        outcome_bound_splits: true,
     })
 }
 

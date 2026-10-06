@@ -148,6 +148,10 @@ impl ContractAuthorization {
         let p = &commitment.contract_parameters;
         p.validate()
             .map_err(|e| PayoutError::ContractMismatch(e.to_string()))?;
+        // The anchor and split binding are not part of the authorized economics: a stored
+        // contract keeps the options it was built with. Bound them instead.
+        crate::contract_options::check_contract_options(p)
+            .map_err(|e| PayoutError::ContractMismatch(e.to_string()))?;
         if p.market_maker != self.market_maker
             || p.event != self.event
             || p.outcome_payouts != self.outcome_payouts

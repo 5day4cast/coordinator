@@ -171,6 +171,7 @@ fn funds_preview(out: &std::path::Path, tx: &bitcoin::Transaction) -> anyhow::Re
         scoring_rules: None,
         scoring_fields: None,
         max_entries_per_player: 1,
+        contract_options: None,
     });
     c.funding_transaction = Some(tx.clone());
     c.funding_outpoint = Some(bitcoin::OutPoint::new(tx.compute_txid(), 0));

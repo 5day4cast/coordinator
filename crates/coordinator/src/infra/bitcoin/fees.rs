@@ -151,6 +151,7 @@ mod tests {
                 pot_sats: 15_000,
                 paid_sats: 1794,
                 template_min_players: 2,
+                anchor_vbytes: 0,
             },
             contract_rate,
             bitcoin::FeeRate::from_sat_per_vb_u32(100),

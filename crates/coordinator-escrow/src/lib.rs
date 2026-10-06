@@ -3,6 +3,7 @@ pub use keymeld_core::{escrow, EnclaveId, KeyMeldError, SessionId, UserId};
 pub mod ark;
 pub mod authorization;
 pub mod capacity;
+pub mod contract_options;
 pub mod escrow_lightning;
 pub mod generic;
 #[cfg(feature = "networking")]

@@ -57,6 +57,8 @@ fn signed_contract_expiring(
         fee_rate: FeeRate::from_sat_per_vb_u32(1),
         funding_value,
         relative_locktime_block_delta: 72,
+        anchor: None,
+        outcome_bound_splits: false,
     };
     let dlc = TicketedDLC::new(params, OutPoint::null()).unwrap();
     let mut rng = ChaCha20Rng::from_seed([42; 32]);
@@ -454,6 +456,7 @@ impl UnpaidWinners {
             scoring_rules: None,
             scoring_fields: None,
             max_entries_per_player: 1,
+            contract_options: None,
         });
         coordinator
             .competition_store
@@ -969,6 +972,7 @@ fn attested(contract: &SignedContract) -> Competition {
         scoring_rules: None,
         scoring_fields: None,
         max_entries_per_player: 1,
+        contract_options: None,
     });
     competition.event_announcement = Some(contract.params().event.clone());
     competition.attestation = Some(Scalar::from_slice(&[10; 32]).unwrap().into());
