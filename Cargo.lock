@@ -1681,6 +1681,7 @@ dependencies = [
 name = "coordinator-ark-swap"
 version = "2.18.5"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "ark-client",
  "ark-core",

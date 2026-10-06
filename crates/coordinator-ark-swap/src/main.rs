@@ -11,6 +11,7 @@ mod electrum;
 mod invoices;
 mod lnd;
 mod onchain_wallet;
+mod preimages;
 mod refund;
 mod store;
 mod swap;
@@ -27,6 +28,7 @@ use clap::Parser;
 
 use crate::config::Config;
 use crate::lnd::Lnd;
+use crate::preimages::PreimageKey;
 use crate::store::Store;
 use crate::swap::Swapper;
 use crate::wallet::ArkWallet;
@@ -50,6 +52,11 @@ const BOARD_EVERY: Duration = Duration::from_secs(60);
 /// How often settled swaps whose escrow VTXO is unknown are checked for lookups that are due.
 /// Each swap waits out its own backoff; see `Swapper::lookup_tick`.
 const LOOKUP_EVERY: Duration = Duration::from_secs(10);
+
+/// How often preimages an older release stored only in plaintext are sealed, and how many rows
+/// at a time. Every write seals its preimage, so this finds rows only after a rollback.
+const SEAL_EVERY: Duration = Duration::from_secs(600);
+const SEAL_BATCH: u32 = 100;
 
 /// How long the worker lease outlives its holder. Another instance takes over a stopped one's
 /// swaps after this, or at once when it shuts down cleanly.
@@ -77,8 +84,28 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("create {}", config.data_dir.display()))?;
     let token = config.api_token()?;
 
+    // Preimages are sealed under a key derived from the wallet key, which survives redeploys and
+    // is already backed up with the wallet.
+    let preimages = PreimageKey::from_wallet_secret(
+        &wallet::load_or_create_key(&config.data_dir.join("wallet.key"))?.secret_bytes(),
+    );
+    let store = Store::open(&config.data_dir.join("swaps.sqlite"), preimages).await?;
+    {
+        let store = store.clone();
+        tokio::spawn(async move {
+            loop {
+                match store.seal_plaintext_preimages(SEAL_BATCH).await {
+                    Ok(0) => {}
+                    Ok(sealed) => log::info!("sealed {sealed} stored preimages"),
+                    Err(error) => log::warn!("cannot seal stored preimages: {error:#}"),
+                }
+                tokio::time::sleep(SEAL_EVERY).await;
+            }
+        });
+    }
+
     let swapper = Arc::new(Swapper {
-        store: Store::open(&config.data_dir.join("swaps.sqlite")).await?,
+        store,
         lnd: Lnd::new(&config.lnd)?,
         wallet: ArkWallet::open(&config).await?,
         invoice_expiry_secs: config.invoice_expiry_secs,

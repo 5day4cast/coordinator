@@ -601,7 +601,7 @@ impl ArkWallet {
 }
 
 /// The wallet's secret key, created on first start with owner-only permissions.
-fn load_or_create_key(path: &Path) -> anyhow::Result<Keypair> {
+pub fn load_or_create_key(path: &Path) -> anyhow::Result<Keypair> {
     let secp = Secp256k1::new();
     if path.exists() {
         let hex_key = std::fs::read_to_string(path)?;

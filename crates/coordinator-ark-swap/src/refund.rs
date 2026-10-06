@@ -288,9 +288,12 @@ mod tests {
     #[tokio::test]
     async fn a_paid_refund_is_recorded_while_a_boarding_holds_the_wallet() {
         let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(&directory.path().join("swaps.sqlite"))
-            .await
-            .unwrap();
+        let store = Store::open(
+            &directory.path().join("swaps.sqlite"),
+            crate::preimages::PreimageKey::from_wallet_secret(&[1u8; 32]),
+        )
+        .await
+        .unwrap();
         let preimage = [7u8; 32];
         let refund = minted(Sha256::digest(preimage).into());
         store.insert_refund(&refund).await.unwrap();

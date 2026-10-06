@@ -57,7 +57,7 @@ on Arkade (section 5).
 
 ```sql
 SELECT id, state, amount_sat, swap_address, swap_vtxo, error,
-       preimage IS NOT NULL AS player_was_paid,
+       (preimage IS NOT NULL OR preimage_ciphertext IS NOT NULL) AS player_was_paid,
        datetime(deadline, 'unixepoch') AS deadline
 FROM refunds
 WHERE state IN ('minted', 'paid', 'reclaimable')
