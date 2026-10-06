@@ -185,7 +185,7 @@ impl Session {
         // The wallet: the relay's newest backup, then the recovery files'.
         let wallets: Vec<String> = newest
             .iter()
-            .filter(|(d, event)| ours(*d, *event) && **d == spec::wallet_d(&blind))
+            .filter(|(d, event)| ours(d, event) && **d == spec::wallet_d(&blind))
             .map(|(_, event)| event.content.clone())
             .chain(self.kits.iter().filter_map(|kit| kit.wallet.clone()))
             .collect();
@@ -205,7 +205,7 @@ impl Session {
         let prefix = spec::entry_d_prefix(&blind);
         let ciphertexts: Vec<String> = newest
             .iter()
-            .filter(|(d, event)| ours(*d, *event) && d.starts_with(&prefix))
+            .filter(|(d, event)| ours(d, event) && d.starts_with(&prefix))
             .map(|(_, event)| event.content.clone())
             .chain(self.kits.iter().flat_map(|kit| kit.entries.clone()))
             .collect();
