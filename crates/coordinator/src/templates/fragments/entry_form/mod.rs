@@ -745,7 +745,9 @@ mod tests {
         let html = form(PayoutDestination::Address("freya@lnurl.example".into()));
         assert!(!html.contains(r#"type="checkbox""#));
         assert!(!html.contains("I authorize"));
-        assert!(html.contains("Winnings and refunds go to <strong>freya@lnurl.example</strong></p>"));
+        assert!(
+            html.contains("Winnings and refunds go to <strong>freya@lnurl.example</strong></p>")
+        );
         assert_eq!(html.matches("refund").count(), 1, "one line about refunds");
     }
 
