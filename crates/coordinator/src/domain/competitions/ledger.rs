@@ -3,7 +3,7 @@
 //!
 //! Read in one query from the tables that already record it: the ticket (its price and when it
 //! was paid, and whether its hold invoice settled or was cancelled), its Arkade escrow and that
-//! escrow's refund, the entry's latest payout, and the transaction that funded the contract.
+//! escrow's refund, the entry's latest payout, and the outpoint that funded the contract.
 
 use sqlx::{sqlite::SqliteRow, Row};
 use time::OffsetDateTime;
@@ -75,18 +75,15 @@ pub struct EscrowRefund {
 pub struct ContractFunding {
     pub txid: String,
     pub vout: u32,
-    /// The output's amount, when the funding transaction is recorded.
-    pub sats: Option<u64>,
 }
 
 impl ContractFunding {
     /// From an outpoint as the competitions table stores it, `txid:vout`.
-    pub fn parse(outpoint: &str, sats: Option<u64>) -> Option<Self> {
+    pub fn parse(outpoint: &str) -> Option<Self> {
         let (txid, vout) = outpoint.split_once(':')?;
         Some(Self {
             txid: txid.to_owned(),
             vout: vout.parse().ok()?,
-            sats,
         })
     }
 
@@ -346,14 +343,7 @@ impl CompetitionStore {
                    unixepoch(p.succeed_at) AS payout_settled_at,
                    p.failed_at IS NOT NULL AS payout_failed,
                    CASE WHEN c.funding_broadcasted_at IS NOT NULL
-                       THEN json_extract(c.funding_outpoint, '$') END AS funding_outpoint,
-                   -- The funding output's amount, from the transaction's JSON: `txid:vout`
-                   -- puts the vout after the 64-character txid and its colon.
-                   CASE WHEN c.funding_broadcasted_at IS NOT NULL THEN json_extract(
-                       c.funding_transaction,
-                       '$.output[' || CAST(substr(json_extract(c.funding_outpoint, '$'), 66)
-                           AS INTEGER) || '].value'
-                   ) END AS funding_sats
+                       THEN json_extract(c.funding_outpoint, '$') END AS funding_outpoint
             FROM entries e
             JOIN competitions c ON c.id = e.event_id
             JOIN tickets t ON t.id = e.ticket_id
@@ -484,10 +474,10 @@ fn ledger_entry(row: &SqliteRow) -> Result<LedgerEntry, sqlx::Error> {
         lightning_released_at: unix(row, "released_at")?,
         escrow,
         payout,
-        funding: match row.try_get::<Option<String>, _>("funding_outpoint")? {
-            Some(outpoint) => ContractFunding::parse(&outpoint, sats(row, "funding_sats")?),
-            None => None,
-        },
+        funding: row
+            .try_get::<Option<String>, _>("funding_outpoint")?
+            .as_deref()
+            .and_then(ContractFunding::parse),
     })
 }
 
@@ -827,32 +817,15 @@ mod tests {
 
     #[tokio::test]
     async fn an_entry_carries_its_contract_funding_once_broadcast() {
-        use bitcoin::{
-            absolute::LockTime, transaction::Version, Amount, OutPoint, ScriptBuf, Transaction,
-            TxOut,
-        };
         let (store, database, _directory) = store().await;
         let event = competition(&store, 1).await;
         entry(&database, event, PLAYER).await;
-        let output = |sats| TxOut {
-            value: Amount::from_sat(sats),
-            script_pubkey: ScriptBuf::new(),
-        };
-        let commitment = Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![],
-            output: vec![output(330), output(15_000)],
-        };
-        let funding = OutPoint::new(commitment.compute_txid(), 1);
+        let txid: bitcoin::Txid = "f".repeat(64).parse().unwrap();
+        let funding = bitcoin::OutPoint::new(txid, 1);
         run(
             &database,
-            "UPDATE competitions SET funding_outpoint = ?, funding_transaction = ? WHERE id = ?",
-            vec![
-                serde_json::to_string(&funding).unwrap(),
-                serde_json::to_string(&commitment).unwrap(),
-                event.to_string(),
-            ],
+            "UPDATE competitions SET funding_outpoint = ? WHERE id = ?",
+            vec![serde_json::to_string(&funding).unwrap(), event.to_string()],
         )
         .await;
         // Not shown before the funding is broadcast.
@@ -872,9 +845,8 @@ mod tests {
         assert_eq!(
             funding_read,
             ContractFunding {
-                txid: commitment.compute_txid().to_string(),
+                txid: txid.to_string(),
                 vout: 1,
-                sats: Some(15_000),
             }
         );
         assert_eq!(funding_read.outpoint(), funding.to_string());

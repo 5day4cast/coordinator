@@ -172,7 +172,7 @@ async fn only_the_owner_sees_their_escrow_and_everyone_the_contract_funding() {
         absolute::LockTime, transaction::Version, Amount, OutPoint, ScriptBuf, Transaction, TxOut,
     };
     let coordinator = Coordinator::start_with("http://127.0.0.1:9".into(), |settings| {
-        settings.bitcoin_settings.explorer_url = Some("https://mempool.example".into());
+        settings.bitcoin_settings.explorer_url = Some("https://mutinynet.com".into());
         settings.ark_settings.explorer_url = Some("https://ark.example/".into());
     })
     .await;
@@ -254,8 +254,8 @@ async fn only_the_owner_sees_their_escrow_and_everyone_the_contract_funding() {
         .2
         .contains("Contract funding"));
 
-    // Kicked off: the contract's funding output, public on the leaderboard and on the
-    // entries page, linked to the chain's explorer.
+    // Kicked off: the contract's funding outpoint, public on the leaderboard and on the
+    // entries page, linked to the chain's explorer; its amount isn't shown.
     let commitment = Transaction {
         version: Version::TWO,
         lock_time: LockTime::ZERO,
@@ -293,17 +293,18 @@ async fn only_the_owner_sees_their_escrow_and_everyone_the_contract_funding() {
         .await
         .unwrap();
     let link = format!(
-        r#"href="https://mempool.example/tx/{}""#,
+        r#"href="https://mutinynet.com/tx/{}""#,
         commitment.compute_txid()
     );
     let (_, _, body) = get(&coordinator, &leaderboard, true, None).await;
     assert!(body.contains("Contract funding"));
     assert!(body.contains(&format!(r#"data-copy="{funding}""#)));
     assert!(body.contains(&link));
+    assert!(!body.contains("12,680"));
     for keys in [&owner, &other] {
         let (_, _, body) = get(&coordinator, "/entries", true, Some(keys)).await;
         assert!(body.contains("Contract funding") && body.contains(&link));
-        assert!(body.contains("12,680 sats"));
+        assert!(!body.contains("12,680"));
     }
 
     coordinator.stop().await;

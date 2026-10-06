@@ -355,9 +355,6 @@ fn details(row: &EntryRow, explorers: Explorers) -> Markup {
                         dt { "Contract funding" }
                         dd {
                             (format::chain_id(&funding.outpoint(), tx_url(explorers.chain, &funding.txid)))
-                            @if let Some(amount) = funding.sats {
-                                span class="ledger-amount" { (sats(amount)) }
-                            }
                         }
                     }
                 }
@@ -682,7 +679,6 @@ mod tests {
         escrowed.funding = Some(crate::domain::ContractFunding {
             txid: "f".repeat(64),
             vout: 2,
-            sats: Some(15_900),
         });
         let html = one_row_with(&escrowed, &view("c1", Phase::Live, -5), explorers);
         let details = details_of(&html);
@@ -693,7 +689,7 @@ mod tests {
             r#"href="https://mempool.example/tx/{}""#,
             "f".repeat(64)
         )));
-        assert!(details.contains("15,900 sats"));
+        assert!(!details.contains("15,900"));
 
         // Refunded: the Arkade transaction that moved the escrow out.
         let mut refunded = LedgerEntry {
