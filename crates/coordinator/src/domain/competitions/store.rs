@@ -16,8 +16,10 @@ use crate::{
 };
 
 use super::{
-    admission::before_deadline, ticket_preimage::stored_preimage, Competition, EntryStatus,
-    SearchBy, Ticket, TicketCipher, UserEntry,
+    admission::{before_deadline, within_entry_window},
+    ticket_preimage::stored_preimage,
+    ticket_registration::lapsed_ticket_ids,
+    Competition, EntryStatus, SearchBy, Ticket, TicketCipher, UserEntry,
 };
 
 /// A ticket reserved for a caller. When a stale reservation was taken over,
@@ -37,6 +39,8 @@ pub enum EntryAdmission {
     Closed,
     /// The player already has as many entries as the competition allows one player.
     EntryLimit,
+    /// The hour its entry id allows passed: its ticket has lapsed (see [`super::LapsedTicket`]).
+    Lapsed,
 }
 
 impl EntryAdmission {
@@ -44,7 +48,7 @@ impl EntryAdmission {
     pub fn added(self) -> Option<UserEntry> {
         match self {
             EntryAdmission::Added(entry) => Some(*entry),
-            EntryAdmission::Closed | EntryAdmission::EntryLimit => None,
+            EntryAdmission::Closed | EntryAdmission::EntryLimit | EntryAdmission::Lapsed => None,
         }
     }
 }
@@ -68,10 +72,28 @@ impl TicketReservation {
     }
 }
 
-/// How many tickets `reserved_by` has paid for in `event_id`, entered or not: what the
-/// competition's entries-per-player limit counts.
-pub(super) const PAID_TICKETS_OF_PLAYER: &str =
+/// How many tickets `reserved_by` has paid for in `event_id`, entered or not. Less the lapsed ones
+/// (see [`paid_entries_of_player`]), it is what the competition's entries-per-player limit counts.
+const PAID_TICKETS_OF_PLAYER: &str =
     "SELECT COUNT(*) FROM tickets WHERE event_id = ? AND reserved_by = ? AND paid_at IS NOT NULL";
+
+/// How many of the entries competition `event_id` allows one player `player` has taken at `now`:
+/// a paid ticket takes one, entered or with its entry on its way, unless it lapsed (see
+/// [`super::LapsedTicket`]). Read inside the write that issues a ticket.
+pub(super) async fn paid_entries_of_player(
+    connection: &mut sqlx::SqliteConnection,
+    event_id: &str,
+    player: &str,
+    now: OffsetDateTime,
+) -> Result<i64, sqlx::Error> {
+    let paid: i64 = sqlx::query_scalar(PAID_TICKETS_OF_PLAYER)
+        .bind(event_id)
+        .bind(player)
+        .fetch_one(&mut *connection)
+        .await?;
+    let lapsed = lapsed_ticket_ids(&mut *connection, event_id, Some(player), now).await?;
+    Ok(paid - lapsed.len() as i64)
+}
 
 #[derive(Debug, Clone)]
 pub struct CompetitionStore {
@@ -149,7 +171,7 @@ impl CompetitionStore {
         // Unbounded callers are internal storage operations; HTTP admission uses the
         // deadline-bearing variant so queueing cannot admit a late entry.
         match self
-            .insert_entry(entry, ticket_id, payout_policy, None, u32::MAX)
+            .insert_entry(entry, ticket_id, payout_policy, None, None, u32::MAX)
             .await?
         {
             EntryAdmission::Added(entry) => Ok(*entry),
@@ -157,14 +179,16 @@ impl CompetitionStore {
         }
     }
 
-    /// Saves the entry unless the deadline passed or its player already has
-    /// `max_per_player` entries in the competition.
+    /// Saves the entry unless the deadline passed, the hour its entry id allows ended at
+    /// `finish_by` (when it has one: a competition with automatic payouts), or its player already
+    /// has `max_per_player` entries in the competition.
     pub(super) async fn add_entry_with_policy_before(
         &self,
         entry: UserEntry,
         ticket_id: Uuid,
         payout_policy: Option<String>,
         deadline: OffsetDateTime,
+        finish_by: Option<OffsetDateTime>,
         max_per_player: u32,
     ) -> Result<EntryAdmission, DatabaseWriteError> {
         self.insert_entry(
@@ -172,6 +196,7 @@ impl CompetitionStore {
             ticket_id,
             payout_policy,
             Some(deadline),
+            finish_by,
             max_per_player,
         )
         .await
@@ -183,6 +208,7 @@ impl CompetitionStore {
         ticket_id: Uuid,
         payout_policy: Option<String>,
         deadline: Option<OffsetDateTime>,
+        finish_by: Option<OffsetDateTime>,
         max_per_player: u32,
     ) -> Result<EntryAdmission, DatabaseWriteError> {
         debug!("adding entry {} for ticket {}", entry.id, ticket_id);
@@ -212,13 +238,21 @@ impl CompetitionStore {
             .transpose()
             .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
 
-        let admitted = self
+        // The refusal, if the write refused the entry.
+        let refused = self
             .db_connection
             .execute_write(move |pool| async move {
                 let mut tx = pool.begin().await?;
                 if !before_deadline(deadline) {
                     tx.rollback().await?;
-                    return Ok(Some(false));
+                    return Ok(Some(EntryAdmission::Closed));
+                }
+                // Once its hour has passed the ticket has lapsed: it no longer counts against
+                // the competition's places or its player's entries, so another may have taken
+                // its place. Checked here, where writes are serialized, as well as before.
+                if !within_entry_window(finish_by) {
+                    tx.rollback().await?;
+                    return Ok(Some(EntryAdmission::Lapsed));
                 }
                 // Tickets bound the entries a player gets; this catches tickets paid at once.
                 // Another entry for this same ticket is left to the unique index, which the
@@ -233,7 +267,7 @@ impl CompetitionStore {
                 .await?;
                 if entered >= i64::from(max_per_player) {
                     tx.rollback().await?;
-                    return Ok(None);
+                    return Ok(Some(EntryAdmission::EntryLimit));
                 }
                 sqlx::query(
                     "INSERT INTO entries (
@@ -274,17 +308,20 @@ impl CompetitionStore {
                 }
                 if !before_deadline(deadline) {
                     tx.rollback().await?;
-                    return Ok(Some(false));
+                    return Ok(Some(EntryAdmission::Closed));
+                }
+                if !within_entry_window(finish_by) {
+                    tx.rollback().await?;
+                    return Ok(Some(EntryAdmission::Lapsed));
                 }
                 tx.commit().await?;
-                Ok(Some(true))
+                Ok(None)
             })
             .await?;
 
-        Ok(match admitted {
-            Some(true) => EntryAdmission::Added(Box::new(entry)),
-            Some(false) => EntryAdmission::Closed,
-            None => EntryAdmission::EntryLimit,
+        Ok(match refused {
+            Some(refusal) => refusal,
+            None => EntryAdmission::Added(Box::new(entry)),
         })
     }
 
@@ -1807,8 +1844,9 @@ impl CompetitionStore {
         }
     }
 
-    /// A ticket for `pubkey`: the one it already holds and hasn't entered with, if any;
-    /// otherwise a free one, unless it has paid for `max_per_player` tickets already.
+    /// A ticket for `pubkey`: the one it already holds and hasn't entered with, if any, unless
+    /// that ticket lapsed (see [`super::LapsedTicket`]); otherwise a free one, unless it has paid
+    /// for `max_per_player` tickets already that did not lapse.
     pub(super) async fn get_and_reserve_ticket_before(
         &self,
         competition_id: Uuid,
@@ -1844,6 +1882,16 @@ impl CompetitionStore {
                     tx.rollback().await?;
                     return Ok(TicketReservation::Closed);
                 }
+                // A paid ticket that lapsed, its entry no longer possible, is neither handed back
+                // nor counted against the player: it is refunded. Its seat stays with it, as the
+                // competition's contract terms and Keymeld session name every seat's ticket.
+                let lapsed = lapsed_ticket_ids(
+                    &mut *tx,
+                    &competition_id_str,
+                    Some(pubkey_owned.as_str()),
+                    OffsetDateTime::now_utc(),
+                )
+                .await?;
 
                 // First, check if this user already has a reserved ticket for this competition
                 // (that hasn't been used for an entry yet)
@@ -1869,13 +1917,14 @@ impl CompetitionStore {
                          AND tickets.reserved_by = ?
                          AND (paid_at IS NOT NULL OR payment_request IS NULL
                               OR invoice_expires_at > datetime('now'))
-                         AND entries.id IS NULL
-                       LIMIT 1"#,
+                         AND entries.id IS NULL"#,
                 )
                 .bind(&competition_id_str)
                 .bind(&pubkey_owned)
-                .fetch_optional(&mut *tx)
-                .await?;
+                .fetch_all(&mut *tx)
+                .await?
+                .into_iter()
+                .find(|ticket| !lapsed.contains(&ticket.id));
 
                 if let Some(ticket) = existing_ticket {
                     debug!("Found existing reserved ticket {} for user", ticket.id);
@@ -1890,13 +1939,14 @@ impl CompetitionStore {
                     })));
                 }
 
-                // Every ticket it paid for has an entry: a new one only while under the limit.
+                // Every ticket it paid for has an entry or lapsed: a new one only while under the
+                // limit.
                 let paid: i64 = sqlx::query_scalar(PAID_TICKETS_OF_PLAYER)
                     .bind(&competition_id_str)
                     .bind(&pubkey_owned)
                     .fetch_one(&mut *tx)
                     .await?;
-                if paid >= i64::from(max_per_player) {
+                if paid - lapsed.len() as i64 >= i64::from(max_per_player) {
                     tx.rollback().await?;
                     return Ok(TicketReservation::EntryLimit);
                 }

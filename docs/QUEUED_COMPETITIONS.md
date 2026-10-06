@@ -401,6 +401,7 @@ Each pool runs the lifecycle of [In the coordinator](#in-the-coordinator) from e
    The coordinator has the enclave validate the deposit before it shows the invoice.
    The ticket's id is the entry id the wallet made when the player started the entry.
    A ticket is issued, or an unpaid one handed back, only while that id is at most 45 minutes old, and the entry is made within the hour: later, it is refused and the paid ticket is refunded.
+   A paid ticket past the hour without its entry has lapsed: it no longer counts against the entry cap or its player's entries, so the player can enter again under a new id.
    An unpaid ticket past 45 minutes is released when the player asks for another, and the entry form starts the entry again under a new id.
    Picks cannot change once entered.
 3. **Kickoff.**
@@ -719,7 +720,7 @@ So the kickoff collects at most the lowest cap times the number of players, the 
 | An escrow's VTXO expires before its refund | The refund waits for the server to sweep it, then recovers it in a batch into the same swap. |
 | Kickoff keeps failing | The pool fails, and every escrow is refunded after `T`. |
 | A ticket is paid with a coin that expires before `T` plus the margin | The ticket is not counted, and never reaches a pool. Its escrow needs an operator. |
-| A paid ticket's entry comes over an hour after its entry id was made | The entry is refused; the ticket never reaches a pool and is refunded with the others no pool took. |
+| A paid ticket's entry comes over an hour after its entry id was made | The entry is refused; the ticket never reaches a pool and is refunded with the others no pool took. It stops counting against the cap and its player's entries once the hour passes, and the entry's own write checks the hour, so the ticket is never both refunded and entered. |
 | A pool fails its kickoff check | The pool waits up to an hour for fees to fall, then is cancelled and every escrow refunded. |
 | A pool cannot be signed within a batch | Kickoff retries in the next batch. Repeated failures refund that pool. |
 | Ark operator unavailable before kickoff | Kickoff waits. Players can unroll and exit alone, no earlier than `T` plus the exit delay. |

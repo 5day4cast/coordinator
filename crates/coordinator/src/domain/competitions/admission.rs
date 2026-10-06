@@ -32,6 +32,12 @@ pub(super) fn before_deadline(deadline: Option<OffsetDateTime>) -> bool {
     deadline.is_none_or(|deadline| OffsetDateTime::now_utc() < deadline)
 }
 
+/// Whether an entry whose id's hour ends at `finish_by`, if it has one, may still be made now: up
+/// to that instant, as `queued::check_entry_id` allows it.
+pub(super) fn within_entry_window(finish_by: Option<OffsetDateTime>) -> bool {
+    finish_by.is_none_or(|finish_by| OffsetDateTime::now_utc() <= finish_by)
+}
+
 impl Competition {
     pub(super) fn unfilled_admission_expired(&self, now: OffsetDateTime) -> bool {
         matches!(self.get_state(), CompetitionState::Created)

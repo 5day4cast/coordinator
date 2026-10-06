@@ -879,6 +879,159 @@ async fn a_player_who_paid_for_their_entries_gets_no_more_tickets() {
     ));
 }
 
+/// A paid ticket left without its entry past the hour its entry id allows has lapsed: it no
+/// longer counts as its player's entry, nor takes one of the queue's places, so its player can
+/// enter again under a new id and the place can go to someone. Within the hour it still counts.
+/// Its own entry is refused, at the write too, so it never both plays and is refunded.
+#[tokio::test]
+async fn a_lapsed_paid_ticket_frees_its_player_and_its_place() {
+    let start = OffsetDateTime::now_utc() + Duration::hours(3);
+    let queue = Queue::new(start, PoolRules::new(2, 3).unwrap(), 3).await;
+    let store = queue.store();
+    let id = queue.competition.id;
+    let deadline = queue.competition.ticket_deadline();
+    let reserve = |player: &'static str| {
+        let store = store.clone();
+        async move {
+            store
+                .reserve_queued_ticket(id, Uuid::now_v7(), player, 3, 1, deadline)
+                .await
+                .unwrap()
+        }
+    };
+    let coordinator = &queue.coordinator;
+    let held = move || async move {
+        let json = serde_json::to_value(coordinator.get_competition(id).await.unwrap()).unwrap();
+        (json["held"].clone(), json["entries"].clone())
+    };
+    let now = OffsetDateTime::now_utc();
+    queue.ticket("bob", true).await;
+    // Paid 55 minutes after alice started the entry, which is not in yet.
+    queue
+        .ticket_with_id("alice", false, entry_id_at(now - Duration::minutes(55)))
+        .await;
+    // Paid, and the hour since dave started the entry passed without it.
+    let lapsed = queue
+        .ticket_with_id("dave", false, entry_id_at(now - Duration::minutes(61)))
+        .await;
+    assert_eq!(
+        held().await,
+        (serde_json::json!(2), serde_json::json!(1)),
+        "bob's entry and alice's paid ticket take places; dave's lapsed ticket does not"
+    );
+
+    assert!(
+        matches!(reserve("alice").await, QueuedReservation::EntryLimit),
+        "within its hour, alice's paid ticket is her entry on its way"
+    );
+    assert!(
+        matches!(reserve("dave").await, QueuedReservation::Reserved(_)),
+        "dave's lapsed ticket is no longer his entry"
+    );
+    assert_eq!(held().await, (serde_json::json!(3), serde_json::json!(1)));
+    assert!(
+        matches!(reserve("carol").await, QueuedReservation::Full),
+        "bob, alice and dave's new entry take the three places"
+    );
+
+    // The lapsed ticket's entry is refused where it is written, whatever checked it before.
+    let entry = AddEntry {
+        id: lapsed,
+        ticket_id: lapsed,
+        ephemeral_pubkey: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+            .into(),
+        payout_hash: hex::encode(dlctix::hashlock::sha256(lapsed.as_bytes())),
+        event_id: id,
+        expected_observations: vec![],
+        encrypted_keymeld_private_key: None,
+        keymeld_auth_pubkey: None,
+        keymeld_registration_context: None,
+        keymeld_escrow_policy: None,
+    }
+    .into_user_entry("dave".into());
+    let refused = store
+        .add_entry_with_policy_before(
+            entry,
+            lapsed,
+            None,
+            start,
+            Some(queued::entry_finish_by(lapsed).unwrap()),
+            1,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(&refused, EntryAdmission::Lapsed), "{refused:?}");
+    assert_eq!(store.get_ticket(lapsed).await.unwrap().entry_id, None);
+    assert_eq!(held().await, (serde_json::json!(3), serde_json::json!(1)));
+}
+
+/// A lapsed ticket never reaches a pool, though its player entered again: the kickoff takes the
+/// complete tickets, and the lapsed one stays with the queue, the one escrow the queue's refunds
+/// pay back.
+#[tokio::test]
+async fn a_lapsed_ticket_is_left_out_of_the_pools_and_refunded_alone() {
+    let start = OffsetDateTime::now_utc() - Duration::minutes(10);
+    let queue = Queue::new(start, PoolRules::new(2, 3).unwrap(), 3).await;
+    queue.chain_closing_at(20, 30);
+    let lapsed = queue
+        .ticket_with_id(
+            "dave",
+            false,
+            entry_id_at(OffsetDateTime::now_utc() - Duration::minutes(61)),
+        )
+        .await;
+    let mut complete = Vec::new();
+    for player in ["dave", "bob", "carol"] {
+        complete.push(queue.ticket(player, true).await);
+    }
+    complete.sort_unstable();
+    assert_eq!(
+        queue
+            .store()
+            .complete_queued_tickets(queue.competition.id)
+            .await
+            .unwrap(),
+        complete
+    );
+
+    assert_eq!(queue.advance().await, Step::Finished);
+    let records = queue
+        .store()
+        .competition_pools(queue.competition.id)
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].members, complete);
+    assert_eq!(
+        records[0].tickets, complete,
+        "the lapsed ticket was not placed"
+    );
+    assert_eq!(
+        queue.event_of(lapsed).await,
+        (queue.competition.id, None),
+        "it stays with the queue, without an entry"
+    );
+    let refunded: Vec<Uuid> = queue
+        .store()
+        .refundable_ark_escrows(queue.competition.id)
+        .await
+        .unwrap()
+        .iter()
+        .map(|escrow| escrow.ticket_id)
+        .collect();
+    assert_eq!(
+        refunded,
+        vec![lapsed],
+        "its escrow alone is the queue's to refund"
+    );
+    assert!(queue
+        .store()
+        .get_competitions_pending_cleanup(false)
+        .await
+        .unwrap()
+        .contains(&queue.competition.id));
+}
+
 #[tokio::test]
 async fn kickoff_forms_pools_from_the_seed_and_moves_their_tickets() {
     let start = OffsetDateTime::now_utc() - Duration::minutes(10);
@@ -1641,6 +1794,28 @@ async fn a_player_s_paid_tickets_without_an_entry_are_listed_while_entries_are_o
     let json = serde_json::to_value(&listed[0]).unwrap();
     assert_eq!(json["entry_id"], paid.to_string());
     assert!(json["finish_by"].is_string());
+    // The one whose hour passed is listed apart: it lapsed, and its fee is refunded.
+    let unentered = queue
+        .coordinator
+        .unentered_tickets("alice", Some(id))
+        .await
+        .unwrap();
+    assert_eq!(unentered.paid, listed);
+    assert_eq!(
+        unentered.lapsed,
+        vec![LapsedTicket {
+            ticket_id: late,
+            competition_id: id,
+        }]
+    );
+    assert_eq!(
+        queue
+            .coordinator
+            .unentered_tickets("alice", None)
+            .await
+            .unwrap(),
+        unentered
+    );
 
     // Once the pools formed, its entries are closed: there is nothing to finish here.
     let competition = id.to_string();
@@ -1664,4 +1839,12 @@ async fn a_player_s_paid_tickets_without_an_entry_are_listed_while_entries_are_o
         .await
         .unwrap()
         .is_empty());
+    assert_eq!(
+        queue
+            .coordinator
+            .unentered_tickets("alice", Some(id))
+            .await
+            .unwrap(),
+        UnenteredTickets::default()
+    );
 }

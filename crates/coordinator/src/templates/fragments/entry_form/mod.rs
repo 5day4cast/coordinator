@@ -77,9 +77,23 @@ impl NetworkFee {
     }
 }
 
+/// What the entry form says of the logged-in player's paid tickets in the competition whose entry
+/// never went in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PaidNotice<'a> {
+    /// The first they can still enter, which Pay enters without paying again (`entry_form.js`).
+    pub ticket: Option<&'a PaidTicket>,
+    /// One was not entered within the hour its entry id allows: its fee is refunded, and Pay
+    /// starts a new entry.
+    pub lapsed: bool,
+}
+
+/// What the entry form says, once, to a player whose paid ticket lapsed.
+pub const LAPSED_ENTRY: &str =
+    "Your earlier entry wasn't finished in time; its fee is being refunded";
+
 /// Entry form for a competition. `unpaid` is the logged-in player's oldest unpaid ticket in it,
-/// which Pay resumes, and `paid` their first paid ticket whose entry never went in, which Pay
-/// enters without paying again (`entry_form.js`).
+/// which Pay resumes, and `paid` what to say of their paid tickets whose entry never went in.
 pub fn entry_form(
     competition: &CompetitionView,
     forecasts: &Forecasts,
@@ -87,7 +101,7 @@ pub fn entry_form(
     destination: &PayoutDestination,
     network_fee: NetworkFee,
     unpaid: Option<&UnpaidTicket>,
-    paid: Option<&PaidTicket>,
+    paid: PaidNotice<'_>,
 ) -> Markup {
     // Why no ticket is issued now, in the one sentence the player sees.
     let paused = match network_fee {
@@ -239,9 +253,9 @@ pub fn entry_form(
                 // relabels the button when the paid notice comes or goes with a log-in; while
                 // entries are paused there is no price to go back to.
                 button type="button" id="submitEntry" class="button is-primary is-medium"
-                       disabled[paused.is_some() && paid.is_none()]
+                       disabled[paused.is_some() && paid.ticket.is_none()]
                        data-pay-label=[paused.is_none().then_some(&pay_label)] {
-                    @if paid.is_some() {
+                    @if paid.ticket.is_some() {
                         (FINISH_LABEL)
                     } @else if paused.is_some() {
                         "Entries paused"
@@ -269,24 +283,29 @@ pub fn paid_url(competition_id: &str) -> String {
 
 /// The player's paid ticket in this competition whose entry never went in (their page reloaded
 /// before it did), if they hold one, and how long is left to finish it: Pay enters the picks on
-/// the form under it, without paying again. Empty otherwise, and reloaded on log-in and log-out
-/// without touching the picks.
+/// the form under it, without paying again. Below it, one line however many there are, for paid
+/// entries not finished in time: their fees are refunded, and Pay starts a new entry. Empty
+/// otherwise, and reloaded on log-in and log-out without touching the picks.
 pub fn paid_notice(
     competition_id: &str,
-    paid: Option<&PaidTicket>,
+    paid: PaidNotice<'_>,
     now: time::OffsetDateTime,
 ) -> Markup {
+    let ticket = paid.ticket;
     html! {
         div id="entryPaid" hx-get=(paid_url(competition_id))
             hx-trigger="fw:login from:body, fw:logout from:body" hx-swap="outerHTML"
-            data-ticket-id=[paid.map(|ticket| ticket.ticket_id)]
-            data-entry-id=[paid.map(|ticket| ticket.entry_id)]
-            data-entry-key=[paid.and_then(|ticket| ticket.ephemeral_pubkey.as_deref())] {
-            @if let Some(ticket) = paid {
+            data-ticket-id=[ticket.map(|ticket| ticket.ticket_id)]
+            data-entry-id=[ticket.map(|ticket| ticket.entry_id)]
+            data-entry-key=[ticket.and_then(|ticket| ticket.ephemeral_pubkey.as_deref())] {
+            @if let Some(ticket) = ticket {
                 p class="notification is-info paid-entry" {
                     "Paid — make your picks to finish entering; "
                     (format::duration(ticket.finish_by - now)) " left."
                 }
+            }
+            @if paid.lapsed {
+                p class="notification is-info lapsed-entry" { (LAPSED_ENTRY) }
             }
         }
     }
@@ -593,7 +612,7 @@ mod tests {
             &PayoutDestination::Address("thor@lnurl.5day4cast.com".into()),
             NetworkFee::Estimate(50),
             Some(&ticket),
-            None,
+            PaidNotice::default(),
         )
         .into_string();
         let notice = html.find("You have an unpaid entry").unwrap();
@@ -611,7 +630,15 @@ mod tests {
             ephemeral_pubkey: Some("02aa".into()),
             finish_by: now + time::Duration::minutes(42),
         };
-        let html = paid_notice("c1", Some(&ticket), now).into_string();
+        let html = paid_notice(
+            "c1",
+            PaidNotice {
+                ticket: Some(&ticket),
+                lapsed: false,
+            },
+            now,
+        )
+        .into_string();
         assert!(html.contains(r#"id="entryPaid""#));
         assert!(html.contains(&format!(r#"data-ticket-id="{}""#, ticket.ticket_id)));
         assert!(html.contains(&format!(r#"data-entry-id="{}""#, ticket.entry_id)));
@@ -620,7 +647,7 @@ mod tests {
         // Reloaded on log-in and log-out, signed (htmx_auth.js), without touching the picks.
         assert!(html.contains(r#"hx-get="/competitions/c1/entry-form/paid""#));
         assert!(html.contains(r#"hx-trigger="fw:login from:body, fw:logout from:body""#));
-        let none = paid_notice("c1", None, now).into_string();
+        let none = paid_notice("c1", PaidNotice::default(), now).into_string();
         assert!(
             none.contains(r#"id="entryPaid""#),
             "kept for the log-in reload"
@@ -640,7 +667,10 @@ mod tests {
                 &PayoutDestination::Address("thor@lnurl.5day4cast.com".into()),
                 fee,
                 None,
-                paid,
+                PaidNotice {
+                    ticket: paid,
+                    lapsed: false,
+                },
             )
             .into_string()
         };
@@ -665,6 +695,70 @@ mod tests {
         let unpaid = form(None, NetworkFee::Estimate(50));
         assert!(!unpaid.contains("Paid — make"));
         assert!(unpaid.contains(" and enter</button>"));
+    }
+
+    /// A player whose paid ticket lapsed is told so once, however many lapsed, beside the usual
+    /// Pay, which starts a new entry: the notice carries no ticket for Pay to enter.
+    #[test]
+    fn a_lapsed_paid_ticket_is_mentioned_once_and_pay_starts_a_new_entry() {
+        let now = time::macros::datetime!(2026-10-06 12:00 UTC);
+        let lapsed = PaidNotice {
+            ticket: None,
+            lapsed: true,
+        };
+        let html = paid_notice("c1", lapsed, now).into_string();
+        assert_eq!(html.matches(LAPSED_ENTRY).count(), 1);
+        assert!(
+            html.contains("Your earlier entry wasn't finished in time; its fee is being refunded")
+        );
+        assert!(!html.contains("data-ticket-id") && !html.contains("Paid —"));
+        // Reloaded on log-in and log-out with the rest of the notice.
+        assert!(html.contains(r#"hx-get="/competitions/c1/entry-form/paid""#));
+
+        let form = entry_form(
+            &view("c1", Phase::Upcoming, 60),
+            &Forecasts::Ready {
+                stations: vec![station()],
+                pins: vec![],
+            },
+            Some(&terms(true)),
+            &PayoutDestination::Address("thor@lnurl.5day4cast.com".into()),
+            NetworkFee::Estimate(50),
+            None,
+            lapsed,
+        )
+        .into_string();
+        let notice = form.find(LAPSED_ENTRY).unwrap();
+        let button = form.find(r#"id="submitEntry""#).unwrap();
+        assert!(notice < button);
+        assert_eq!(form.matches(LAPSED_ENTRY).count(), 1);
+        assert!(
+            form[button..].contains(" and enter</button>"),
+            "Pay pays for a new entry"
+        );
+        assert!(!form.contains(r#"type="checkbox""#), "no extra consent");
+
+        // Beside a paid ticket still to enter, both are said, and Pay enters that ticket.
+        let ticket = PaidTicket {
+            ticket_id: uuid::Uuid::from_u128(7),
+            competition_id: uuid::Uuid::from_u128(1),
+            entry_id: uuid::Uuid::from_u128(8),
+            ephemeral_pubkey: None,
+            finish_by: now + time::Duration::minutes(42),
+        };
+        let both = paid_notice(
+            "c1",
+            PaidNotice {
+                ticket: Some(&ticket),
+                lapsed: true,
+            },
+            now,
+        )
+        .into_string();
+        assert!(both.contains(&format!(r#"data-ticket-id="{}""#, ticket.ticket_id)));
+        assert!(both.contains("42 min left."));
+        assert_eq!(both.matches(LAPSED_ENTRY).count(), 1);
+        assert!(both.find("Paid —").unwrap() < both.find(LAPSED_ENTRY).unwrap());
     }
 
     #[test]
@@ -728,7 +822,7 @@ mod tests {
             &destination,
             NetworkFee::Estimate(50),
             None,
-            None,
+            PaidNotice::default(),
         )
         .into_string()
     }
@@ -756,7 +850,7 @@ mod tests {
             &PayoutDestination::LoggedOut,
             NetworkFee::Unavailable,
             None,
-            None,
+            PaidNotice::default(),
         )
         .into_string();
         assert!(unavailable.contains(r#"<span id="ticketTotal">Unavailable right now</span>"#));
@@ -781,7 +875,7 @@ mod tests {
             &PayoutDestination::LoggedOut,
             NetworkFee::Estimate(50),
             None,
-            None,
+            PaidNotice::default(),
         )
         .into_string();
         assert!(html.contains("10,500 sats") && html.contains("1st 70% · 2nd 30%"));
@@ -805,7 +899,7 @@ mod tests {
             &PayoutDestination::LoggedOut,
             NetworkFee::Estimate(50),
             None,
-            None,
+            PaidNotice::default(),
         )
         .into_string();
         assert!(html.contains("20 seats · 17 left"), "{html}");
@@ -830,7 +924,7 @@ mod tests {
             &PayoutDestination::LoggedOut,
             NetworkFee::Estimate(50),
             None,
-            None,
+            PaidNotice::default(),
         )
         .into_string();
         assert!(
@@ -848,7 +942,7 @@ mod tests {
             &PayoutDestination::LoggedOut,
             NetworkFee::Estimate(50),
             None,
-            None,
+            PaidNotice::default(),
         )
         .into_string();
         assert!(all.contains("<dt>Picks required</dt><dd>12</dd>"));
@@ -868,7 +962,7 @@ mod tests {
             &PayoutDestination::LoggedOut,
             NetworkFee::Estimate(50),
             None,
-            None,
+            PaidNotice::default(),
         )
         .into_string();
         assert!(html.contains("up to 3 entries"));
@@ -902,7 +996,7 @@ mod tests {
             &PayoutDestination::LoggedOut,
             NetworkFee::Paused(600),
             None,
-            None,
+            PaidNotice::default(),
         )
         .into_string();
         assert!(html.contains(ENTRIES_PAUSED));
@@ -922,7 +1016,7 @@ mod tests {
             &PayoutDestination::LoggedOut,
             NetworkFee::SettleOnly,
             None,
-            None,
+            PaidNotice::default(),
         )
         .into_string();
         assert!(html.contains(r#"id="entriesPausedBanner""#));
@@ -944,7 +1038,7 @@ mod tests {
             &PayoutDestination::LoggedOut,
             NetworkFee::ArkadeUnavailable(50),
             None,
-            None,
+            PaidNotice::default(),
         )
         .into_string();
         assert!(html.contains(
@@ -992,7 +1086,7 @@ mod tests {
             &PayoutDestination::Address("freya@lnurl.example".into()),
             NetworkFee::Estimate(50),
             None,
-            None,
+            PaidNotice::default(),
         )
         .into_string();
         assert!(html.contains("40 entered"));
@@ -1064,7 +1158,7 @@ mod tests {
             &PayoutDestination::LoggedOut,
             NetworkFee::Estimate(50),
             None,
-            None,
+            PaidNotice::default(),
         )
         .into_string();
         let under = html.find("&lt; 67.4°F").expect("under button");
@@ -1096,7 +1190,7 @@ mod tests {
             &PayoutDestination::LoggedOut,
             NetworkFee::Estimate(50),
             None,
-            None,
+            PaidNotice::default(),
         )
         .into_string();
         assert!(html.contains("KPWM_temp_high") && html.contains("KPWM_wind_speed"));
@@ -1121,7 +1215,7 @@ mod tests {
             &PayoutDestination::LoggedOut,
             NetworkFee::Estimate(50),
             None,
-            None,
+            PaidNotice::default(),
         )
         .into_string();
         assert!(html.contains("no forecast yet"));

@@ -9,9 +9,13 @@
 //! took the ticket over. Only a paid ticket's registration is ever given to Keymeld, and all of a
 //! competition's are deleted once it ends and has no refund left to sign.
 
-use super::{admission::before_deadline, CompetitionStore};
+use super::{
+    admission::before_deadline, queued::entry_window_passed, CompetitionKind, CompetitionStore,
+};
 use crate::infra::db::DatabaseWriteError;
-use coordinator_escrow::escrow::SignedEscrowPolicy;
+use coordinator_escrow::{
+    authorization::PayoutPolicy, escrow::SignedEscrowPolicy, queued::EntryConsent,
+};
 use keymeld_sdk::types::RegistrationContext;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -72,6 +76,83 @@ pub struct PaidUnenteredTicket {
     pub payout_policy: Option<String>,
     /// Whether the player sent the ticket's Keymeld registration before paying.
     pub registered: bool,
+    /// The id of the entry the ticket pays for, when one is fixed (see `ticket_entry_id`).
+    pub entry_id: Option<Uuid>,
+}
+
+/// A ticket the player paid for whose entry was not made within the hour its entry id allows
+/// (see [`super::queued::entry_window_passed`]): it has lapsed. Its entry is refused, and it is
+/// refunded like any paid ticket left without an entry. It no longer counts as its player's entry,
+/// so the player may enter again under a new entry id, nor, in a queued competition, takes a
+/// place. A single competition's seat stays with it: its payout terms and Keymeld session name
+/// every seat's ticket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LapsedTicket {
+    pub ticket_id: Uuid,
+    pub competition_id: Uuid,
+}
+
+/// A player's paid tickets that have no entry, in competitions still taking entries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnenteredTickets {
+    /// Those the player can still enter, without paying again (see [`PaidTicket`]).
+    pub paid: Vec<PaidTicket>,
+    /// Those that lapsed, whose entry fees are refunded.
+    pub lapsed: Vec<LapsedTicket>,
+}
+
+/// The id of the entry a paid ticket pays for: a queued ticket's own id, or the one named by the
+/// payout authorization the player accepted before paying. None without such an authorization,
+/// as in a competition without automatic payouts, whose entries are not held to their id's hour.
+pub(super) fn ticket_entry_id(kind: &str, ticket_id: Uuid, policy: Option<&str>) -> Option<Uuid> {
+    if kind == CompetitionKind::Queued.as_str() {
+        return Some(ticket_id);
+    }
+    let policy: PayoutPolicy = serde_json::from_str(policy?).ok()?;
+    Some(EntryConsent::from_policy(&policy).ok()?.entry_id())
+}
+
+/// The paid tickets of competition `event_id` that have lapsed at `now` (see [`LapsedTicket`]),
+/// `player`'s alone when given.
+///
+/// The writes that count a competition's places and a player's entries read this inside their
+/// transaction. An entry's write checks the same hour before it commits (see
+/// `store::EntryAdmission::Lapsed`), and writes are serialized, so a ticket stops counting only
+/// once its entry can no longer be made.
+pub(super) async fn lapsed_ticket_ids<'c, E>(
+    executor: E,
+    event_id: &str,
+    player: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<Vec<Uuid>, sqlx::Error>
+where
+    E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
+{
+    let rows = sqlx::query(
+        "SELECT t.id, c.kind, p.policy_json
+         FROM tickets t
+         JOIN competitions c ON c.id = t.event_id
+         LEFT JOIN ticket_payout_policies p ON p.ticket_id = t.id AND p.ticket_hash = t.hash
+         WHERE t.event_id = ?1 AND (?2 IS NULL OR t.reserved_by = ?2) AND t.paid_at IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM entries e WHERE e.ticket_id = t.id)",
+    )
+    .bind(event_id.to_string())
+    .bind(player.map(str::to_string))
+    .fetch_all(executor)
+    .await?;
+    let mut lapsed = Vec::new();
+    for row in &rows {
+        let ticket_id = Uuid::parse_str(&row.try_get::<String, _>("id")?)
+            .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+        let kind: String = row.try_get("kind")?;
+        let policy: Option<String> = row.try_get("policy_json")?;
+        if ticket_entry_id(&kind, ticket_id, policy.as_deref())
+            .is_some_and(|entry_id| entry_window_passed(entry_id, now))
+        {
+            lapsed.push(ticket_id);
+        }
+    }
+    Ok(lapsed)
 }
 
 /// A ticket the player paid for and has not entered yet, while its competition takes entries and
@@ -103,8 +184,9 @@ impl CompetitionStore {
     ) -> Result<Vec<PaidUnenteredTicket>, sqlx::Error> {
         sqlx::query(
             "SELECT t.id, t.event_id, COALESCE(p.entry_pubkey, t.ephemeral_pubkey) AS entry_pubkey,
-                    p.policy_json, r.ticket_id IS NOT NULL AS registered
+                    p.policy_json, r.ticket_id IS NOT NULL AS registered, c.kind
              FROM tickets t
+             JOIN competitions c ON c.id = t.event_id
              LEFT JOIN ticket_payout_policies p ON p.ticket_id = t.id AND p.ticket_hash = t.hash
              LEFT JOIN ticket_keymeld_registrations r
                     ON r.ticket_id = t.id AND r.ticket_hash = t.hash
@@ -123,11 +205,15 @@ impl CompetitionStore {
                 Uuid::parse_str(&row.try_get::<String, _>(column)?)
                     .map_err(|e| sqlx::Error::Decode(Box::new(e)))
             };
+            let ticket_id = uuid("id")?;
+            let payout_policy: Option<String> = row.try_get("policy_json")?;
+            let kind: String = row.try_get("kind")?;
             Ok(PaidUnenteredTicket {
-                ticket_id: uuid("id")?,
+                ticket_id,
                 competition_id: uuid("event_id")?,
                 entry_pubkey: row.try_get("entry_pubkey")?,
-                payout_policy: row.try_get("policy_json")?,
+                entry_id: ticket_entry_id(&kind, ticket_id, payout_policy.as_deref()),
+                payout_policy,
                 registered: row.try_get("registered")?,
             })
         })

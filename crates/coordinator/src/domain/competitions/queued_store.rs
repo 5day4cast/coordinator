@@ -10,7 +10,8 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
 
 use super::{
-    admission::before_deadline, queued::MAX_UNPAID_TICKETS_PER_PLAYER, Competition,
+    admission::before_deadline, queued::MAX_UNPAID_TICKETS_PER_PLAYER,
+    store::paid_entries_of_player, ticket_registration::lapsed_ticket_ids, Competition,
     CompetitionStore, CreateEvent, Lease, ReservedTicket, Ticket,
 };
 use crate::infra::{db::DatabaseWriteError, oracle::AddEventEntry};
@@ -97,12 +98,31 @@ const TICKET_COLUMNS: &str = "tickets.id as id,
     escrow_transaction";
 
 /// A ticket that holds, or may soon hold, a buy-in: paid, reserved in the last ten minutes, or
-/// with an invoice that can still be paid.
+/// with an invoice that can still be paid. A paid ticket that lapsed is live too, but takes no
+/// place: the counts leave it out (see [`queued_places_taken`]).
 const LIVE_TICKET: &str = "(paid_at IS NOT NULL
     OR (reserved_by IS NOT NULL
         AND (reserved_at > datetime('now', '-10 minutes')
              OR (payment_request IS NOT NULL AND invoice_cancelled_at IS NULL
                  AND invoice_expires_at > datetime('now')))))";
+
+/// How many of queued competition `event_id`'s places are taken at `now`, as its entry cap counts
+/// them: its live tickets, less the paid ones that lapsed (see [`super::LapsedTicket`]). A lapsed
+/// ticket is refunded with the tickets no pool takes, so it takes no place.
+async fn queued_places_taken(
+    connection: &mut sqlx::SqliteConnection,
+    event_id: &str,
+    now: OffsetDateTime,
+) -> Result<i64, sqlx::Error> {
+    let live: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM tickets WHERE event_id = ? AND {LIVE_TICKET}"
+    ))
+    .bind(event_id)
+    .fetch_one(&mut *connection)
+    .await?;
+    let lapsed = lapsed_ticket_ids(&mut *connection, event_id, None, now).await?;
+    Ok(live - lapsed.len() as i64)
+}
 
 fn uuid(text: &str) -> Result<Uuid, sqlx::Error> {
     Uuid::parse_str(text).map_err(|error| sqlx::Error::Decode(Box::new(error)))
@@ -296,15 +316,9 @@ impl CompetitionStore {
                 .await?;
                 let mut superseded_payment_hash = None;
                 // A ticket it already holds is its own to pay; a new or released one counts
-                // against the entries it may make.
-                let paid_by_player = || {
-                    sqlx::query_scalar::<_, i64>(super::store::PAID_TICKETS_OF_PLAYER)
-                        .bind(&competition)
-                        .bind(&player)
-                };
-                let count_live = |extra: &'static str| {
-                    format!("SELECT COUNT(*) FROM tickets WHERE event_id = ? {extra} AND {LIVE_TICKET}")
-                };
+                // against the entries it may make, and takes one of the queue's places. A paid
+                // ticket that lapsed counts for neither: it is refunded.
+                let now = OffsetDateTime::now_utc();
                 match existing {
                     Some(row) => {
                         let event_id: String = row.try_get("event_id")?;
@@ -320,16 +334,16 @@ impl CompetitionStore {
                         let paid: bool = row.try_get("paid")?;
                         let expired: bool = row.try_get("expired")?;
                         if holder.is_none() {
-                            if paid_by_player().fetch_one(&mut *tx).await? >= i64::from(max_per_player) {
+                            if paid_entries_of_player(&mut tx, &competition, &player, now).await?
+                                >= i64::from(max_per_player)
+                            {
                                 tx.rollback().await?;
                                 return Ok(QueuedReservation::EntryLimit);
                             }
                             // Released unpaid; it counts toward the cap again once reserved.
-                            let live: i64 = sqlx::query_scalar(&count_live(""))
-                                .bind(&competition)
-                                .fetch_one(&mut *tx)
-                                .await?;
-                            if live >= i64::from(max_entries) {
+                            if queued_places_taken(&mut tx, &competition, now).await?
+                                >= i64::from(max_entries)
+                            {
                                 tx.rollback().await?;
                                 return Ok(QueuedReservation::Full);
                             }
@@ -345,11 +359,9 @@ impl CompetitionStore {
                             // Its hold lapsed, so it stopped counting toward the cap and others
                             // may have filled the queue since: it is held again only if there is
                             // still room.
-                            let live: i64 = sqlx::query_scalar(&count_live(""))
-                                .bind(&competition)
-                                .fetch_one(&mut *tx)
-                                .await?;
-                            if live >= i64::from(max_entries) {
+                            if queued_places_taken(&mut tx, &competition, now).await?
+                                >= i64::from(max_entries)
+                            {
                                 tx.rollback().await?;
                                 return Ok(QueuedReservation::Full);
                             }
@@ -383,20 +395,22 @@ impl CompetitionStore {
                         }
                     }
                     None => {
-                        if paid_by_player().fetch_one(&mut *tx).await? >= i64::from(max_per_player) {
+                        if paid_entries_of_player(&mut tx, &competition, &player, now).await?
+                            >= i64::from(max_per_player)
+                        {
                             tx.rollback().await?;
                             return Ok(QueuedReservation::EntryLimit);
                         }
-                        let live: i64 = sqlx::query_scalar(&count_live(""))
-                            .bind(&competition)
-                            .fetch_one(&mut *tx)
-                            .await?;
-                        if live >= i64::from(max_entries) {
+                        if queued_places_taken(&mut tx, &competition, now).await?
+                            >= i64::from(max_entries)
+                        {
                             tx.rollback().await?;
                             return Ok(QueuedReservation::Full);
                         }
-                        let unpaid: i64 = sqlx::query_scalar(&count_live(
-                            "AND reserved_by = ? AND paid_at IS NULL",
+                        let unpaid: i64 = sqlx::query_scalar(&format!(
+                            "SELECT COUNT(*) FROM tickets
+                             WHERE event_id = ? AND reserved_by = ? AND paid_at IS NULL
+                               AND {LIVE_TICKET}"
                         ))
                         .bind(&competition)
                         .bind(&player)
@@ -480,19 +494,22 @@ impl CompetitionStore {
         .await
     }
 
-    /// Paid entries of a queued competition, in the queue and in the pools it formed.
     /// The tickets that count against a queued competition's entry cap: paid, or held for an
-    /// unexpired invoice, as [`Self::reserve_queued_ticket`] counts them.
+    /// unexpired invoice, as [`Self::reserve_queued_ticket`] counts them, so not the paid ones
+    /// that lapsed.
     pub async fn queued_held_count(&self, competition_id: Uuid) -> Result<u64, sqlx::Error> {
-        let count: i64 = sqlx::query_scalar(&format!(
-            "SELECT COUNT(*) FROM tickets WHERE event_id = ? AND {LIVE_TICKET}"
-        ))
-        .bind(competition_id.to_string())
-        .fetch_one(self.db_connection.read())
+        let mut connection = self.db_connection.read().acquire().await?;
+        let taken = queued_places_taken(
+            &mut connection,
+            &competition_id.to_string(),
+            OffsetDateTime::now_utc(),
+        )
         .await?;
-        u64::try_from(count).map_err(|error| sqlx::Error::Decode(Box::new(error)))
+        // Its two reads share no transaction, so it is held at zero rather than trusted to be.
+        u64::try_from(taken.max(0)).map_err(|error| sqlx::Error::Decode(Box::new(error)))
     }
 
+    /// Paid entries of a queued competition, in the queue and in the pools it formed.
     pub async fn queued_entry_count(&self, competition_id: Uuid) -> Result<u64, sqlx::Error> {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM entries e JOIN tickets t ON t.id = e.ticket_id

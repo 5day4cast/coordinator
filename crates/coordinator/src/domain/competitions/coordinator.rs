@@ -4068,16 +4068,20 @@ impl Coordinator {
 
         // With automatic payouts the entry id is the one the ticket's payout authorization
         // names (checked below), made when the player started the entry. The entry is finished
-        // within the window that id allows; a paid ticket left past it is refunded, as any paid
-        // ticket left without an entry.
-        if self
+        // within the window that id allows; a paid ticket left past it has lapsed and is
+        // refunded, as any paid ticket left without an entry. Its write checks the window again.
+        let finish_by = if self
             .competition_store
             .has_automatic_payouts(entry.event_id)
             .await?
-            && super::queued::check_entry_id(entry.id, OffsetDateTime::now_utc()).is_err()
         {
-            return Err(Error::BadRequest(super::queued::ENTRY_WINDOW_PASSED.into()));
-        }
+            if super::queued::check_entry_id(entry.id, OffsetDateTime::now_utc()).is_err() {
+                return Err(Error::BadRequest(super::queued::ENTRY_WINDOW_PASSED.into()));
+            }
+            Some(super::queued::entry_finish_by(entry.id).map_err(Error::BadRequest)?)
+        } else {
+            None
+        };
 
         if self.is_keymeld_enabled() {
             self.use_ticket_registration(&mut entry, &ticket).await?;
@@ -4164,6 +4168,7 @@ impl Coordinator {
                 ticket.id,
                 policy,
                 entry_deadline,
+                finish_by,
                 max_per_player,
             )
             .await
@@ -4173,6 +4178,9 @@ impl Coordinator {
                 return Err(Error::BadRequest(super::admission::ENTRIES_CLOSED.into()))
             }
             Ok(EntryAdmission::EntryLimit) => return Err(entry_limit_error(max_per_player)),
+            Ok(EntryAdmission::Lapsed) => {
+                return Err(Error::BadRequest(super::queued::ENTRY_WINDOW_PASSED.into()))
+            }
             Err(error) => {
                 let unique_conflict = matches!(&error,
                     DatabaseWriteError::Sqlx(sqlx::Error::Database(error)) if error.is_unique_violation());
@@ -4248,6 +4256,20 @@ impl Coordinator {
         pubkey: &str,
         competition_id: Option<Uuid>,
     ) -> Result<Vec<super::PaidTicket>, Error> {
+        Ok(self.unentered_tickets(pubkey, competition_id).await?.paid)
+    }
+
+    /// The tickets `pubkey` paid for and has not entered: those it can still enter (see
+    /// [`Self::paid_tickets`]), and those that lapsed, whose entry fees are refunded (see
+    /// [`super::LapsedTicket`]).
+    ///
+    /// For one competition: only while it takes entries. For all of them, the caller keeps the
+    /// ones whose competitions still do.
+    pub async fn unentered_tickets(
+        &self,
+        pubkey: &str,
+        competition_id: Option<Uuid>,
+    ) -> Result<super::UnenteredTickets, Error> {
         let now = OffsetDateTime::now_utc();
         if let Some(competition_id) = competition_id {
             let competition = self
@@ -4259,34 +4281,55 @@ impl Coordinator {
                     e => Error::from(e),
                 })?;
             if competition.require_entry_admission(now).is_err() {
-                return Ok(Vec::new());
+                return Ok(super::UnenteredTickets::default());
             }
         }
         let keymeld = self.is_keymeld_enabled();
-        Ok(self
+        let mut unentered = super::UnenteredTickets::default();
+        for ticket in self
             .competition_store
             .paid_unentered_tickets(pubkey, competition_id)
             .await?
-            .into_iter()
-            .filter(|ticket| ticket.registered || !keymeld)
-            .filter_map(|ticket| {
-                // The entry id names the entry key; without a payout authorization naming it, a
-                // page cannot finish the entry.
-                let policy: coordinator_escrow::authorization::PayoutPolicy =
-                    serde_json::from_str(ticket.payout_policy.as_deref()?).ok()?;
-                let consent =
-                    coordinator_escrow::queued::EntryConsent::from_policy(&policy).ok()?;
-                let entry_id = consent.entry_id();
-                super::queued::check_entry_id(entry_id, now).ok()?;
-                Some(super::PaidTicket {
+        {
+            if ticket
+                .entry_id
+                .is_some_and(|entry_id| super::queued::entry_window_passed(entry_id, now))
+            {
+                unentered.lapsed.push(super::LapsedTicket {
                     ticket_id: ticket.ticket_id,
                     competition_id: ticket.competition_id,
-                    entry_id,
-                    ephemeral_pubkey: ticket.entry_pubkey,
-                    finish_by: super::queued::entry_finish_by(entry_id).ok()?,
-                })
-            })
-            .collect())
+                });
+            } else if let Some(paid) = Self::enterable(ticket, keymeld, now) {
+                unentered.paid.push(paid);
+            }
+        }
+        Ok(unentered)
+    }
+
+    /// A paid ticket without an entry, as a page finishes its entry, if it can be (see
+    /// [`Self::paid_tickets`]).
+    fn enterable(
+        ticket: super::PaidUnenteredTicket,
+        keymeld: bool,
+        now: OffsetDateTime,
+    ) -> Option<super::PaidTicket> {
+        if keymeld && !ticket.registered {
+            return None;
+        }
+        // The entry id names the entry key; without a payout authorization naming it, a page
+        // cannot finish the entry.
+        let policy: coordinator_escrow::authorization::PayoutPolicy =
+            serde_json::from_str(ticket.payout_policy.as_deref()?).ok()?;
+        let consent = coordinator_escrow::queued::EntryConsent::from_policy(&policy).ok()?;
+        let entry_id = consent.entry_id();
+        super::queued::check_entry_id(entry_id, now).ok()?;
+        Some(super::PaidTicket {
+            ticket_id: ticket.ticket_id,
+            competition_id: ticket.competition_id,
+            entry_id,
+            ephemeral_pubkey: ticket.entry_pubkey,
+            finish_by: super::queued::entry_finish_by(entry_id).ok()?,
+        })
     }
 
     /// Keep the Keymeld registration a player sends for their ticket before paying for it.

@@ -11,7 +11,7 @@ use crate::domain::{
 use crate::templates::{
     components::tip,
     format::{self, sats, thousands, tx_url, Explorers, TimeStyle},
-    fragments::picks::detail_url,
+    fragments::{entry_form::LAPSED_ENTRY, picks::detail_url},
     pages::competitions::{phase_badge, CompetitionView, Queue},
 };
 
@@ -31,9 +31,10 @@ pub struct UnpaidRow<'a> {
     pub competition: &'a CompetitionView,
 }
 
-/// A paid ticket whose entry never went in, in a competition still taking entries.
+/// A paid ticket whose entry never went in, in a competition still taking entries: `ticket`
+/// while it can still be entered, `None` once it lapsed and its fee is being refunded.
 pub struct PaidRow<'a> {
-    pub ticket: &'a PaidTicket,
+    pub ticket: Option<&'a PaidTicket>,
     pub competition: &'a CompetitionView,
 }
 
@@ -81,20 +82,27 @@ pub fn entries_page(
 }
 
 /// Tickets paid for whose entry never went in, and how long is left to finish each: each links to
-/// its competition's entry form, whose Pay enters the picks made there without paying again.
-/// Nothing when there are none.
+/// its competition's entry form, whose Pay enters the picks made there without paying again. One
+/// that lapsed says its fee is being refunded instead. Nothing when there are none.
 pub fn paid_entries(paid: &[PaidRow], now: OffsetDateTime) -> Markup {
     html! {
         @if !paid.is_empty() {
             div id="paidEntries" class="notification is-info paid-entries" {
-                p { strong { "Paid — make your picks to finish entering" } }
+                @if paid.iter().any(|row| row.ticket.is_some()) {
+                    p { strong { "Paid — make your picks to finish entering" } }
+                }
                 ul {
                     @for row in paid {
                         li {
                             (format::window(row.competition.start, row.competition.end))
-                            " · " (format::duration(row.ticket.finish_by - now)) " left "
-                            a href=(row.competition.url()) hx-get=(row.competition.url())
-                              hx-target="#main-content" hx-push-url="true" { "Make picks" }
+                            @match row.ticket {
+                                Some(ticket) => {
+                                    " · " (format::duration(ticket.finish_by - now)) " left "
+                                    a href=(row.competition.url()) hx-get=(row.competition.url())
+                                      hx-target="#main-content" hx-push-url="true" { "Make picks" }
+                                }
+                                None => { " · " (LAPSED_ENTRY) }
+                            }
                         }
                     }
                 }
@@ -939,7 +947,7 @@ mod tests {
             finish_by: now + time::Duration::minutes(42),
         };
         let rows = [PaidRow {
-            ticket: &ticket,
+            ticket: Some(&ticket),
             competition: &competition,
         }];
         let html = paid_entries(&rows, now).into_string();
@@ -963,6 +971,42 @@ mod tests {
         .into_string();
         assert!(page.contains(r#"id="paidEntries""#));
         assert!(page.contains("You haven't entered a competition yet."));
+    }
+
+    /// A paid ticket that lapsed keeps its row, which says its fee is being refunded, with
+    /// nothing to pick or pay.
+    #[test]
+    fn a_lapsed_paid_ticket_says_its_fee_is_being_refunded() {
+        let competition = view("c1", Phase::Upcoming, 90);
+        let now = OffsetDateTime::now_utc();
+        let lapsed = PaidRow {
+            ticket: None,
+            competition: &competition,
+        };
+        let html = paid_entries(std::slice::from_ref(&lapsed), now).into_string();
+        assert!(html.contains(&format!(" · {LAPSED_ENTRY}")), "{html}");
+        assert!(!html.contains("Make picks") && !html.contains("make your picks"));
+        assert!(!html.contains("Pay"));
+
+        // Beside a ticket still to enter, the heading is that ticket's.
+        let ticket = PaidTicket {
+            ticket_id: uuid::Uuid::from_u128(7),
+            competition_id: uuid::Uuid::from_u128(1),
+            entry_id: uuid::Uuid::from_u128(8),
+            ephemeral_pubkey: None,
+            finish_by: now + time::Duration::minutes(42),
+        };
+        let rows = [
+            PaidRow {
+                ticket: Some(&ticket),
+                competition: &competition,
+            },
+            lapsed,
+        ];
+        let html = paid_entries(&rows, now).into_string();
+        assert!(html.contains("Paid — make your picks to finish entering"));
+        assert_eq!(html.matches("Make picks").count(), 1);
+        assert_eq!(html.matches(LAPSED_ENTRY).count(), 1);
     }
 
     #[test]
