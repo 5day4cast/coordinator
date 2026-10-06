@@ -318,7 +318,7 @@ pub fn payout_line(
                 (_, PayoutDestination::Address(address)) => {
                     "Winnings"
                     @if refunds { " and refunds" }
-                    " go to " strong { (address) } "."
+                    " go to " strong { (address) }
                 }
                 (_, PayoutDestination::NoAddress) => {
                     "No Lightning Address on your account: "
@@ -745,7 +745,7 @@ mod tests {
         let html = form(PayoutDestination::Address("freya@lnurl.example".into()));
         assert!(!html.contains(r#"type="checkbox""#));
         assert!(!html.contains("I authorize"));
-        assert!(html.contains("Winnings and refunds go to <strong>freya@lnurl.example</strong>."));
+        assert!(html.contains("Winnings and refunds go to <strong>freya@lnurl.example</strong></p>"));
         assert_eq!(html.matches("refund").count(), 1, "one line about refunds");
     }
 
