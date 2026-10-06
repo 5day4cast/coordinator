@@ -5,7 +5,8 @@
 //! assembles external escrow inputs and accounts for their witness fees, while
 //! preserving LND's input leases in the funding PSBT. Chain lookups
 //! that LND cannot answer for transactions it does not own (escrow and
-//! outcome transactions) go to an electrs server over the Electrum protocol.
+//! outcome transactions) and fee estimates use the configured electrs server.
+//! Fee estimates use its long-target historical estimate, current mempool, and relay minimum.
 //! The coordinator's own key (the seed file) is still used for DLC escrow
 //! signatures, which no wallet can produce on its behalf.
 use crate::{
@@ -30,7 +31,6 @@ use bitcoin::{
 };
 use dlctix::{bitcoin::FeeRate, secp::Scalar};
 use electrum_client::{Client as ElectrumClient, ConfigBuilder, ElectrumApi};
-use futures::future::join_all;
 use log::{debug, error, info, warn};
 use reqwest::{Certificate, Client, Url};
 use secrecy::{ExposeSecret, SecretString};
@@ -41,6 +41,7 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
+mod fees;
 mod funding;
 
 // Needs to be over half of the last 10 blocks block time passed
@@ -50,7 +51,7 @@ pub const REQUIRED_CONFIRMATIONS_FOR_TIME: usize = 6;
 /// Confirmation targets (in blocks) offered by `get_estimated_fee_rates`.
 const FEE_TARGETS: [u16; 12] = [1, 2, 3, 4, 5, 6, 10, 12, 24, 144, 504, 1008];
 
-/// Confirmation target (in blocks) for sweeps with no deadline: about a day.
+/// Historical baseline and sweep target: about a day on Bitcoin, 72 minutes on Mutinynet.
 pub const ECONOMY_FEE_TARGET: u16 = 144;
 
 /// LND's fee rate floor, 253 sat/kWU: the 1 sat/vB relay minimum with room for rounding.
@@ -86,14 +87,14 @@ impl WalletBalance {
     }
 }
 
-/// The fee rate for confirmation within `conf_target` blocks from LND's estimates, with the
+/// The local fee policy for `conf_target` blocks, with the
 /// margin of [`fee_rate_from_estimate`].
 pub fn fee_rate_for_target(
     fee_rates: &std::collections::HashMap<u16, f64>,
     conf_target: u16,
 ) -> Result<FeeRate, anyhow::Error> {
     let estimate = fee_rates.get(&conf_target).ok_or_else(|| {
-        anyhow!("LND returned no fee estimate for a {conf_target}-block confirmation target")
+        anyhow!("No local fee estimate for a {conf_target}-block confirmation target")
     })?;
     fee_rate_from_estimate(*estimate)
 }
@@ -104,7 +105,7 @@ pub const FEE_MARGIN_PERCENT: u64 = 10;
 /// 0.25 sat/vB.
 pub const FEE_MARGIN_MIN_SAT_PER_KWU: u64 = 63;
 
-/// The rate for a time-critical transaction from an LND estimate: the estimate plus the larger of
+/// The rate for a time-critical transaction from a local estimate: the estimate plus the larger of
 /// [`FEE_MARGIN_PERCENT`] and 0.25 sat/vB, at LND's sat/kWU precision, never below LND's floor.
 /// The contract's outcome and closing transactions confirm a day or more after it is built, so
 /// the margin covers some rise in fees. Rounding up to whole sat/vB instead doubled the rate at
@@ -125,11 +126,11 @@ pub fn fee_rate_from_estimate(sat_per_vb: f64) -> Result<FeeRate, anyhow::Error>
     Ok(FeeRate::from_sat_per_kwu(estimate + margin).max(LND_FEE_RATE_FLOOR))
 }
 
-/// The fee rate for a sweep with no deadline: LND's estimate for [`ECONOMY_FEE_TARGET`] blocks,
+/// The fee rate for a sweep with no deadline: the local estimate for [`ECONOMY_FEE_TARGET`] blocks,
 /// or its next-block estimate if it has none, never below LND's floor.
 ///
-/// Unlike [`fee_rate_for_target`] this keeps the estimate's precision. LND estimates in whole
-/// sat/kWU, and its floor of 253 sat/kWU is 1.012 sat/vB, which rounding up to whole sat/vB
+/// Unlike [`fee_rate_for_target`] this keeps the estimate's precision. LND's wallet minimum
+/// of 253 sat/kWU is 1.012 sat/vB, which rounding up to whole sat/vB
 /// doubles. On an output of a few hundred sats that is the difference between a sweep and dust.
 pub fn economy_fee_rate(
     fee_rates: &std::collections::HashMap<u16, f64>,
@@ -140,7 +141,7 @@ pub fn economy_fee_rate(
         .copied()
         .ok_or_else(|| {
             anyhow!(
-                "LND returned no fee estimate for a {ECONOMY_FEE_TARGET}-block or next-block \
+                "No local fee estimate for a {ECONOMY_FEE_TARGET}-block or next-block \
                  confirmation target"
             )
         })?;
@@ -218,7 +219,8 @@ pub trait Bitcoin: Send + Sync {
     async fn get_current_height(&self) -> Result<u32, anyhow::Error>;
     async fn get_confirmed_blockchain_time(&self, blocks: usize) -> Result<u64, anyhow::Error>;
     async fn get_estimated_fee_rates(&self) -> Result<HashMap<u16, f64>, anyhow::Error>;
-    /// LND's fee rate estimate in sat/vB for confirmation within `conf_target` blocks.
+    /// Local electrs historical baseline with a mempool adjustment for `conf_target` blocks.
+    /// Returns sat/vB; confirmation targets remain estimates.
     async fn estimate_fee(&self, conf_target: u16) -> Result<f64, anyhow::Error>;
     async fn get_tx_confirmation_height(&self, txid: &Txid) -> Result<Option<u32>, anyhow::Error>;
     /// Includes mempool spends; wallet-owned UTXO lists are insufficient for DLC outputs.
@@ -548,15 +550,6 @@ impl LndWallet {
             .await?;
         Txid::from_str(response["txid"].as_str().unwrap_or_default())
             .map_err(|e| anyhow!("LND returned no txid: {}", e))
-    }
-
-    /// Fee rate in sat/vB for a confirmation target.
-    async fn estimate_fee(&self, conf_target: u16) -> Result<f64, anyhow::Error> {
-        let response: Value = self
-            .get(&format!("v2/wallet/estimatefee/{}", conf_target))
-            .await?;
-        let sat_per_kw = json_u64(&response["sat_per_kw"])? as f64;
-        Ok(sat_per_kw * 4.0 / 1000.0)
     }
 }
 
@@ -1204,31 +1197,20 @@ impl Bitcoin for BitcoinClient {
             .ok_or_else(|| anyhow!("Missing confirmed block time"))
     }
 
-    /// Fee rates in sat/vB keyed by confirmation target in blocks.
+    /// Local historical and mempool fee rates in sat/vB, keyed by target in blocks.
     async fn get_estimated_fee_rates(&self) -> Result<HashMap<u16, f64>, anyhow::Error> {
-        let estimates = join_all(
-            FEE_TARGETS
-                .iter()
-                .map(|target| async move { (*target, self.lnd.estimate_fee(*target).await) }),
-        )
-        .await;
-        let mut rates = HashMap::new();
-        for (target, estimate) in estimates {
-            match estimate {
-                Ok(rate) => {
-                    rates.insert(target, rate.max(1.0));
-                }
-                Err(e) => warn!("No fee estimate for {} blocks: {}", target, e),
-            }
-        }
-        if rates.is_empty() {
-            return Err(anyhow!("LND returned no fee estimates"));
-        }
-        Ok(rates)
+        let electrum = Arc::clone(&self.electrum);
+        tokio::task::spawn_blocking(move || fees::estimates(&electrum, &FEE_TARGETS)).await?
     }
 
     async fn estimate_fee(&self, conf_target: u16) -> Result<f64, anyhow::Error> {
-        self.lnd.estimate_fee(conf_target).await
+        let electrum = Arc::clone(&self.electrum);
+        let rates = tokio::task::spawn_blocking(move || fees::estimates(&electrum, &[conf_target]))
+            .await??;
+        rates
+            .get(&conf_target)
+            .copied()
+            .ok_or_else(|| anyhow!("No local fee estimate for {conf_target} blocks"))
     }
 
     async fn broadcast(&self, transaction: &Transaction) -> Result<(), anyhow::Error> {
