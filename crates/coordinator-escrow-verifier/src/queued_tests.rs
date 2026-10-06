@@ -1273,6 +1273,30 @@ mod capacity_bounds {
     }
 
     /// What each request of `players` paying `places` really takes, against the model.
+    /// The pool funded in an Arkade batch, whose commitment transaction fixes its outpoint.
+    fn ark_funded(f: &Fixture) -> (ArkFunding, ContractCommitment) {
+        let commitment = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([7; 32]), 0),
+                ..Default::default()
+            }],
+            output: vec![
+                funding_output(f),
+                TxOut {
+                    value: Amount::from_sat(330),
+                    script_pubkey: p2tr(31),
+                },
+            ],
+        };
+        let funded = ContractCommitment {
+            contract_parameters: f.contract.contract_parameters.clone(),
+            funding_outpoint: OutPoint::new(commitment.compute_txid(), 0),
+        };
+        (ArkFunding::new(&commitment, 0), funded)
+    }
+
     async fn measure(players: usize, places: u32) {
         let model: CompetitionCapacity =
             capacity::validate_competition_capacity(players, places as usize).unwrap();
@@ -1325,28 +1349,21 @@ mod capacity_bounds {
 
         // Contract signing: the compact scope first, the full one to an older verifier, and a
         // retry after a lost nonce round carrying the previous preparation.
-        // The pool is funded in an Arkade batch, whose commitment transaction fixes its outpoint.
-        let commitment = Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint::new(Txid::from_byte_array([7; 32]), 0),
-                ..Default::default()
-            }],
-            output: vec![
-                funding_output(f),
-                TxOut {
-                    value: Amount::from_sat(330),
-                    script_pubkey: p2tr(31),
-                },
-            ],
-        };
-        let ark_funding = ArkFunding::new(&commitment, 0);
-        let funded = ContractCommitment {
-            contract_parameters: f.contract.contract_parameters.clone(),
-            funding_outpoint: OutPoint::new(commitment.compute_txid(), 0),
-        };
+        let (ark_funding, funded) = ark_funded(f);
         let scope = pool.scope(&funded);
+        // With two places, outcomes ranking the same winners in either order share one outcome
+        // transaction: the player signs its message once per outcome, under each adaptor point.
+        let digests: std::collections::BTreeSet<_> =
+            scope.batch.iter().map(|i| i.message_digest).collect();
+        let repeated = scope.batch.len() - digests.len();
+        assert_eq!(
+            repeated,
+            if places == 2 {
+                players * (players - 1) / 2
+            } else {
+                0
+            }
+        );
         let attempt = ActionAttempt {
             attempt_id: Uuid::now_v7(),
             signing_session_id: Some(SessionId::new_v7()),
@@ -1509,6 +1526,286 @@ mod capacity_bounds {
             );
             assert!(modelled <= escrow::MAX_PAYLOAD_BYTES, "{name}: {modelled}");
         }
+    }
+
+    /// A pool bound by its first player's verifier and funded in an Arkade batch.
+    struct Funded {
+        pool: LargePool,
+        verifier: CoordinatorVerifier,
+        bound: Payload,
+        ark_funding: ArkFunding,
+        contract: ContractCommitment,
+    }
+
+    fn funded_pool(players: usize, places: u32) -> Funded {
+        let pool = large_pool(players, places);
+        let verifier = CoordinatorVerifier::default().with_test_ledger();
+        let f = &pool.f;
+        let bound = verifier
+            .bind(
+                BindView {
+                    manifest: &f.manifest,
+                    policy: &f.policy,
+                    participant_policies: &f.policies,
+                    participant_public_keys: &f.keys,
+                },
+                &Payload::encode(&ContractBinding {
+                    contract: f.contract.clone(),
+                    statement: Some(pool.statement.clone()),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let (ark_funding, contract) = ark_funded(f);
+        Funded {
+            pool,
+            verifier,
+            bound,
+            ark_funding,
+            contract,
+        }
+    }
+
+    impl Funded {
+        /// The first player's scope, as the Coordinator asks its enclave to permit it.
+        fn scope(&self) -> SigningScope {
+            self.pool.scope(&self.contract)
+        }
+
+        async fn prepare(
+            &self,
+            parameters: ActionParameters,
+        ) -> Result<PreparedAction, VerificationError> {
+            let attempt = ActionAttempt {
+                attempt_id: Uuid::now_v7(),
+                signing_session_id: Some(SessionId::new_v7()),
+            };
+            let prior = BTreeMap::new();
+            self.verifier
+                .prepare(
+                    self.pool
+                        .f
+                        .prepare_view(&self.bound, &attempt, SIGN_CONTRACT, &prior),
+                    &Payload::encode(&parameters).unwrap(),
+                )
+                .await
+        }
+
+        async fn full(&self, scope: &SigningScope) -> Result<PreparedAction, VerificationError> {
+            self.prepare(ActionParameters::SignContract {
+                scope: scope.clone(),
+                ark_funding: Some(self.ark_funding.clone()),
+            })
+            .await
+        }
+
+        async fn compact(
+            &self,
+            items: Vec<ContractItem>,
+        ) -> Result<PreparedAction, VerificationError> {
+            self.prepare(ActionParameters::SignContractCompact {
+                items,
+                ark_funding: Some(self.ark_funding.clone()),
+            })
+            .await
+        }
+
+        /// The digest of the expiry outcome transaction's message.
+        fn expiry_digest(&self) -> [u8; 32] {
+            let data = TicketedDLC::new(
+                self.contract.contract_parameters.clone(),
+                self.contract.funding_outpoint,
+            )
+            .unwrap()
+            .signing_data()
+            .unwrap();
+            escrow::sha256(&data.outcome_sighashes[&Outcome::Expiry])
+        }
+    }
+
+    const OUTSIDE: &str = "duplicated or outside the authorized DLC";
+    const OMITTED: &str = "omits required participant DLC messages";
+
+    /// `item` again under a fresh id, as an extra copy of its message.
+    fn copy(item: &escrow::SigningItem) -> escrow::SigningItem {
+        let mut copy = item.clone();
+        copy.item_id = Uuid::now_v7();
+        if let AdaptorContext::Single { adaptor_id, .. } = &mut copy.adaptor {
+            *adaptor_id = Uuid::now_v7();
+        }
+        copy
+    }
+
+    fn point(item: &escrow::SigningItem) -> PublicKeyBytes {
+        match &item.adaptor {
+            AdaptorContext::Single { point, .. } => point.clone(),
+            AdaptorContext::None => panic!("an outcome message is signed with an adaptor"),
+        }
+    }
+
+    /// With two places, the outcomes ranking the same two winners in either order share one
+    /// outcome transaction. The verifier permits its message once under each outcome's adaptor
+    /// point, and refuses an extra copy, a copy under any other point, and a missing copy.
+    #[tokio::test]
+    async fn a_shared_outcome_message_is_permitted_once_under_each_of_its_points() {
+        let pool = funded_pool(10, 2);
+        let scope = pool.scope();
+        let mut seen = BTreeMap::new();
+        let (first, second) = scope
+            .batch
+            .iter()
+            .enumerate()
+            .find_map(|(index, item)| {
+                seen.insert(item.message_digest, index)
+                    .map(|first| (first, index))
+            })
+            .expect("two outcomes share an outcome transaction");
+        let shared = scope.batch[first].message_digest;
+        assert_ne!(point(&scope.batch[first]), point(&scope.batch[second]));
+        assert_eq!(
+            scope
+                .batch
+                .iter()
+                .filter(|item| item.message_digest == shared)
+                .count(),
+            2
+        );
+        for prepared in [
+            pool.full(&scope).await.unwrap(),
+            pool.compact(ContractItem::compact(&scope)).await.unwrap(),
+        ] {
+            assert_eq!(
+                prepared.action,
+                Action::Sign {
+                    scope: scope.clone()
+                }
+            );
+        }
+
+        // An extra copy, under either point.
+        for source in [first, second] {
+            let mut bad = scope.clone();
+            bad.batch.push(copy(&scope.batch[source]));
+            refused(pool.full(&bad).await, OUTSIDE);
+            refused(pool.compact(ContractItem::compact(&bad)).await, OUTSIDE);
+        }
+        // Both copies under one of the two points.
+        let mut bad = scope.clone();
+        bad.batch[second].adaptor = AdaptorContext::Single {
+            adaptor_id: Uuid::now_v7(),
+            point: point(&scope.batch[first]),
+        };
+        refused(pool.full(&bad).await, OUTSIDE);
+        // A copy under the point of an outcome with other winners.
+        let other = scope
+            .batch
+            .iter()
+            .find(|item| {
+                item.message_digest != shared
+                    && matches!(item.adaptor, AdaptorContext::Single { .. })
+            })
+            .map(point)
+            .unwrap();
+        let mut bad = scope.clone();
+        bad.batch[first].adaptor = AdaptorContext::Single {
+            adaptor_id: Uuid::now_v7(),
+            point: other,
+        };
+        refused(pool.full(&bad).await, OUTSIDE);
+        // A missing copy.
+        for missing in [first, second] {
+            let mut bad = scope.clone();
+            bad.batch.remove(missing);
+            refused(pool.full(&bad).await, OMITTED);
+            refused(pool.compact(ContractItem::compact(&bad)).await, OMITTED);
+        }
+        // The compact form names no outcome, so it pairs a shared message's copies with their
+        // points in batch order. Reordered copies still name only the contract's messages, each
+        // under its own point once, but the permitted scope is no longer the one the Coordinator
+        // asked for, so its digest fails the Coordinator's and the signing enclave's checks.
+        let mut reordered = ContractItem::compact(&scope);
+        reordered.swap(first, second);
+        let prepared = pool.compact(reordered).await.unwrap();
+        let Action::Sign { scope: permitted } = &prepared.action else {
+            panic!("contract signing permits a signing scope");
+        };
+        assert_ne!(permitted, &scope);
+        assert_eq!(point(&permitted.batch[first]), point(&scope.batch[first]));
+        assert_eq!(permitted.batch[first].item_id, scope.batch[second].item_id);
+    }
+
+    /// The expiry outcome transaction is signed without an adaptor; naming one is refused.
+    #[tokio::test]
+    async fn the_expiry_message_is_refused_under_any_adaptor() {
+        for places in [1, 2] {
+            let pool = funded_pool(10, places);
+            let scope = pool.scope();
+            let expiry = pool.expiry_digest();
+            let index = scope
+                .batch
+                .iter()
+                .position(|item| item.message_digest == expiry)
+                .unwrap();
+            assert_eq!(scope.batch[index].adaptor, AdaptorContext::None);
+            let points: Vec<_> = scope
+                .batch
+                .iter()
+                .filter(|item| matches!(item.adaptor, AdaptorContext::Single { .. }))
+                .map(point)
+                .take(2)
+                .collect();
+            for point in points {
+                let mut bad = scope.clone();
+                bad.batch[index].adaptor = AdaptorContext::Single {
+                    adaptor_id: Uuid::now_v7(),
+                    point,
+                };
+                refused(pool.full(&bad).await, OUTSIDE);
+            }
+            let mut items = ContractItem::compact(&scope);
+            items[index].adaptor_id = Some(Uuid::now_v7());
+            refused(
+                pool.compact(items).await,
+                "Adaptor differs from the authorized oracle outcome",
+            );
+        }
+    }
+
+    /// A one-place pool signs every message once, as before: no message repeats, and an extra
+    /// copy of any one is refused.
+    #[tokio::test]
+    async fn a_one_place_pool_signs_each_message_once() {
+        let pool = funded_pool(10, 1);
+        let scope = pool.scope();
+        let digests: std::collections::BTreeSet<_> =
+            scope.batch.iter().map(|item| item.message_digest).collect();
+        assert_eq!(digests.len(), scope.batch.len());
+        for prepared in [
+            pool.full(&scope).await.unwrap(),
+            pool.compact(ContractItem::compact(&scope)).await.unwrap(),
+        ] {
+            assert_eq!(
+                prepared.action,
+                Action::Sign {
+                    scope: scope.clone()
+                }
+            );
+        }
+        let adaptor = scope
+            .batch
+            .iter()
+            .position(|item| matches!(item.adaptor, AdaptorContext::Single { .. }))
+            .unwrap();
+        for source in [adaptor, scope.batch.len() - 1] {
+            let mut bad = scope.clone();
+            bad.batch.push(copy(&scope.batch[source]));
+            refused(pool.full(&bad).await, OUTSIDE);
+            refused(pool.compact(ContractItem::compact(&bad)).await, OUTSIDE);
+        }
+        let mut bad = scope.clone();
+        bad.batch.remove(adaptor);
+        refused(pool.full(&bad).await, OMITTED);
+        refused(pool.compact(ContractItem::compact(&bad)).await, OMITTED);
     }
 
     #[tokio::test]

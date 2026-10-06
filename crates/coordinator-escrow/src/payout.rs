@@ -328,9 +328,15 @@ pub struct SigningRequirement {
     pub signers: Vec<[u8; 33]>,
     pub adaptor_point: Option<[u8; 33]>,
 }
+/// Every contract signature as `(sighash, requirement)`, in the order the Keymeld SDK batches
+/// them: outcome transactions by outcome, then splits by win condition.
+///
+/// A sighash can repeat. In a contract paying more than one place, outcomes that rank the same
+/// winners in a different order share one outcome transaction, so its sighash is signed once
+/// under each outcome's adaptor point.
 pub fn signing_requirements(
     commitment: &ContractCommitment,
-) -> Result<BTreeMap<[u8; 32], SigningRequirement>, PayoutError> {
+) -> Result<Vec<([u8; 32], SigningRequirement)>, PayoutError> {
     let dlc = TicketedDLC::new(
         commitment.contract_parameters.clone(),
         commitment.funding_outpoint,
@@ -339,22 +345,22 @@ pub fn signing_requirements(
     let data = dlc
         .signing_data()
         .map_err(|e| PayoutError::ContractMismatch(e.to_string()))?;
-    let mut result = BTreeMap::new();
+    let mut result = Vec::new();
     for (outcome, sighash) in &data.outcome_sighashes {
         let adaptor_point = match outcome {
             Outcome::Attestation(index) => Some(data.adaptor_points[index].serialize()),
             Outcome::Expiry => None,
         };
-        result.insert(
+        result.push((
             *sighash,
             SigningRequirement {
                 signers: data.funding_signers.iter().map(|p| p.serialize()).collect(),
                 adaptor_point,
             },
-        );
+        ));
     }
     for (win, sighash) in &data.split_sighashes {
-        result.insert(
+        result.push((
             *sighash,
             SigningRequirement {
                 signers: data.split_signers[&win.outcome]
@@ -363,50 +369,39 @@ pub fn signing_requirements(
                     .collect(),
                 adaptor_point: None,
             },
-        );
+        ));
     }
     Ok(result)
 }
 
-/// Every sighash the contract's outcome and split transactions need.
-pub fn contract_sighashes(
-    commitment: &ContractCommitment,
-) -> Result<BTreeSet<[u8; 32]>, PayoutError> {
-    let dlc = TicketedDLC::new(
-        commitment.contract_parameters.clone(),
-        commitment.funding_outpoint,
-    )
-    .map_err(|e| PayoutError::ContractMismatch(e.to_string()))?;
-    let signing_data = dlc
-        .signing_data()
-        .map_err(|e| PayoutError::ContractMismatch(e.to_string()))?;
-    Ok(signing_data
-        .outcome_sighashes
-        .values()
-        .chain(signing_data.split_sighashes.values())
-        .copied()
-        .collect())
+/// Every sighash the contract's outcome and split transactions need, sorted, with a sighash
+/// that is signed more than once (see [`signing_requirements`]) repeated as often.
+pub fn contract_sighashes(commitment: &ContractCommitment) -> Result<Vec<[u8; 32]>, PayoutError> {
+    let mut sighashes: Vec<_> = signing_requirements(commitment)?
+        .into_iter()
+        .map(|(sighash, _)| sighash)
+        .collect();
+    sighashes.sort_unstable();
+    Ok(sighashes)
 }
 
 /// The claimed contract is the one that was signed iff the signed messages
-/// are exactly its sighashes. Any other message in the batch, or any missing
-/// sighash, means the market maker signed something else.
+/// are exactly its sighashes, each as often as the contract signs it. Any other message in the
+/// batch, any extra copy, or any missing sighash, means the market maker signed something else.
 pub fn verify_contract_binding(
     commitment: &ContractCommitment,
     signed_messages: &[[u8; 32]],
 ) -> Result<(), PayoutError> {
     let expected = contract_sighashes(commitment)?;
-    let signed: BTreeSet<[u8; 32]> = signed_messages.iter().copied().collect();
-    if signed_messages.len() != signed.len() {
-        return Err(PayoutError::ContractMismatch(
-            "signed batch contains duplicate messages".into(),
-        ));
-    }
+    let mut signed = signed_messages.to_vec();
+    signed.sort_unstable();
     if expected != signed {
+        let expected_set: BTreeSet<_> = expected.iter().collect();
         return Err(PayoutError::ContractMismatch(format!(
-            "contract needs {} signatures, batch signed {} matching messages",
+            "contract needs {} signatures, batch signed {} messages of which {} match",
             expected.len(),
-            expected.intersection(&signed).count()
+            signed.len(),
+            signed.iter().filter(|m| expected_set.contains(m)).count()
         )));
     }
     Ok(())
