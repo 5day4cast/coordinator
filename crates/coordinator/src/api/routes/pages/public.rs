@@ -445,7 +445,11 @@ pub async fn payouts_fragment(
         .inspect_err(|error| error!("failed to load payouts: {error}"))
         .unwrap_or_default();
     let lightning_address = user.ok().and_then(|user| user.lightning_address);
-    let content = payouts_page(&payouts, lightning_address.as_deref());
+    let content = payouts_page(
+        &payouts,
+        lightning_address.as_deref(),
+        state.recovery.is_some(),
+    );
     page(&headers, &state, title, content, Caching::Private)
 }
 

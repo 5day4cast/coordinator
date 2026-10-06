@@ -57,6 +57,56 @@ pub struct Settings {
     pub network_fee_settings: NetworkFeeSettings,
     #[serde(default)]
     pub kickoff_check_settings: KickoffCheckSettings,
+    #[serde(default, rename = "recovery")]
+    pub recovery_settings: RecoverySettings,
+}
+
+/// Recovery records published to Nostr relays, and the recovery file players download. Off by
+/// default. See docs/RECOVERY.md.
+///
+/// The key in `key_file` signs and encrypts the records and is used for nothing else. It is
+/// created on first start. Every coordinator of one deployment must use the same file:
+/// players find their records by this key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecoverySettings {
+    pub enabled: bool,
+    /// `wss://` relays the records go to. Empty keeps them for the recovery file only.
+    pub relays: Vec<String>,
+    pub key_file: String,
+}
+
+impl Default for RecoverySettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            relays: Vec::new(),
+            key_file: String::from("./creds/coordinator_recovery_key.pem"),
+        }
+    }
+}
+
+impl RecoverySettings {
+    pub fn validate(&self, coordinator: &CoordinatorSettings) -> Result<(), anyhow::Error> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.key_file == coordinator.private_key_file {
+            return Err(anyhow!(
+                "recovery.key_file must be its own key, not coordinator_settings.private_key_file"
+            ));
+        }
+        for relay in &self.relays {
+            let url = nostr::Url::parse(relay)
+                .map_err(|e| anyhow!("recovery relay {relay} is not a URL: {e}"))?;
+            if !matches!(url.scheme(), "wss" | "ws") || url.host_str().is_none() {
+                return Err(anyhow!(
+                    "recovery relay {relay} must be a ws:// or wss:// URL"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Environment variable that sets `metrics_settings.listen_addr`, overriding the file.
@@ -587,6 +637,8 @@ impl Settings {
         self.ark_settings.validate(&self.keymeld_settings)?;
         self.network_fee_settings.validate()?;
         self.kickoff_check_settings.validate()?;
+        self.recovery_settings
+            .validate(&self.coordinator_settings)?;
         self.keymeld_settings.validate(network)
     }
 }

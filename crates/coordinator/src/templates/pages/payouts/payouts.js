@@ -427,6 +427,31 @@ async function saveLightningAddress() {
   }
 }
 
+// The recovery file needs the player's signature, so it is fetched here and
+// handed to the browser as a download.
+async function downloadRecoveryFile() {
+  if (!payoutsInstance) {
+    showPayoutsError("Please log in again.");
+    return;
+  }
+  try {
+    const response = await payoutsInstance.client.get(
+      `${payoutsInstance.coordinator_url}/api/v1/recovery/kit`,
+    );
+    const disposition = response.headers.get("Content-Disposition") || "";
+    const name = /filename="([^"]+)"/.exec(disposition)?.[1] || "coordinator-recovery.json";
+    const url = URL.createObjectURL(await response.blob());
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = name;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) {
+    console.error("Recovery file download failed:", error);
+    showPayoutsError(await requestErrorMessage(error, "Could not download the recovery file"));
+  }
+}
+
 /**
  * Set up the payout dialog, and the payouts page's buttons. The page is
  * swapped in by htmx, so its buttons are handled by one listener here.
@@ -455,6 +480,9 @@ function setupPayoutModal() {
         break;
       case "save-address":
         saveLightningAddress();
+        break;
+      case "recovery-file":
+        downloadRecoveryFile();
         break;
     }
   });
