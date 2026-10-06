@@ -1762,6 +1762,7 @@ dependencies = [
  "hyper-util",
  "keymeld-core",
  "keymeld-enclave",
+ "miniz_oxide 0.9.1",
  "rand 0.9.5",
  "rcgen",
  "rustls",
@@ -3599,8 +3600,8 @@ dependencies = [
 
 [[package]]
 name = "keymeld-core"
-version = "0.8.4"
-source = "git+https://github.com/tee8z/keymeld?rev=9caa57575c1f0eed3d001235a1ce8121cce9474f#9caa57575c1f0eed3d001235a1ce8121cce9474f"
+version = "0.9.0"
+source = "git+https://github.com/tee8z/keymeld?rev=69db916f33953a4ec228a5aed36942be39134795#69db916f33953a4ec228a5aed36942be39134795"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3639,8 +3640,8 @@ dependencies = [
 
 [[package]]
 name = "keymeld-enclave"
-version = "0.8.4"
-source = "git+https://github.com/tee8z/keymeld?rev=9caa57575c1f0eed3d001235a1ce8121cce9474f#9caa57575c1f0eed3d001235a1ce8121cce9474f"
+version = "0.9.0"
+source = "git+https://github.com/tee8z/keymeld?rev=69db916f33953a4ec228a5aed36942be39134795#69db916f33953a4ec228a5aed36942be39134795"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3677,8 +3678,8 @@ dependencies = [
 
 [[package]]
 name = "keymeld-sdk"
-version = "0.8.4"
-source = "git+https://github.com/tee8z/keymeld?rev=9caa57575c1f0eed3d001235a1ce8121cce9474f#9caa57575c1f0eed3d001235a1ce8121cce9474f"
+version = "0.9.0"
+source = "git+https://github.com/tee8z/keymeld?rev=69db916f33953a4ec228a5aed36942be39134795#69db916f33953a4ec228a5aed36942be39134795"
 dependencies = [
  "dlctix",
  "flate2",

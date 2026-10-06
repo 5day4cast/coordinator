@@ -10,9 +10,9 @@
     };
     crane.url = "github:ipetkov/crane";
 
-    # Match the SDK and verifier to the Keymeld 0.8.4 release.
+    # Match the SDK and verifier to the Keymeld 0.9.0 release.
     keymeld = {
-      url = "github:tee8z/keymeld/9caa57575c1f0eed3d001235a1ce8121cce9474f";
+      url = "github:tee8z/keymeld/69db916f33953a4ec228a5aed36942be39134795";
     };
   };
 

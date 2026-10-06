@@ -241,7 +241,9 @@ The competition's pool rules set the minimum and maximum pool size.
   A pool of fewer than 10 players pays one place whatever its competition pays, so a pool's places follow from its size when it forms.
   The terms state that rule, the oracle event of each pool carries the places its size pays, and the enclave refuses a statement with any other count.
   A pool must have more players than places, so the minimum is at least 2.
-- Two places need Keymeld to sign 1,182 items for a pool of 20, so they need its larger signing batch; until then the capacity check refuses them at creation.
+- Two places need Keymeld to sign 1,182 items for a pool of 20, within its batch of 1,536.
+  Each player's enclave permits only the 498 items that player signs: the 422 that every signer signs, and the two splits of each of the 38 outcomes the player places in, signed by the market maker and that outcome's two winners.
+  The capacity check sizes each request from that scope, and must fit every request in one 8 MiB Keymeld payload.
 - The default competition is one pool: at most 20 entries and pools of up to 20, so it kicks off with whoever entered and never splits.
 
 A pool holds at most 25 players, for three reasons:

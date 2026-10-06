@@ -1,13 +1,14 @@
 //! Conservative admission bounds before an event accepts entries or funds.
-//! These account for the full policy roster, signing scope, and two predecessor
-//! receipts used by a renewed key-release preparation. The synthetic values are
-//! size models, never registration or signing inputs.
+//! These account for the full policy roster, the largest player's signing scope, and the
+//! predecessor receipts a renewed preparation carries. The synthetic values are size models,
+//! never registration or signing inputs.
 use crate::payout::dlctix::{
     bitcoin::{Amount, FeeRate, Network, OutPoint},
     secp::{Point, Scalar},
     ContractParameters, EventLockingConditions, MarketMaker, Outcome, Player,
 };
 use crate::{
+    ark::ArkFunding,
     authorization::{ArkEscrowPolicy, PayoutPolicy},
     generic,
     oracle_statement::{
@@ -63,13 +64,28 @@ pub const MAX_QUEUED_NAME_BYTES: usize = 32;
 /// Longer than an Arkade escrow's tap tree and checkpoint exit script in hex.
 const MODELED_TAP_TREE_HEX_CHARS: usize = 4096;
 const MODELED_EXIT_SCRIPT_HEX_CHARS: usize = 512;
+/// An Arkade-funded pool's signing and settlement requests name its batch's commitment
+/// transaction. Bitcoin relays no transaction over 400,000 weight units, so an unsigned one
+/// serializes to at most 100,000 bytes.
+const MODELED_COMMITMENT_TX_HEX_CHARS: usize = 2 * 100_000;
+
+/// Keymeld's sealed-state context: it deflates a state's JSON, then encrypts it.
+const SEALED_STATE: &str = "escrow_state_v2";
+/// Deflate never adds more than a five-byte header per stored block of up to this many bytes.
+const DEFLATE_STORED_BLOCK_BYTES: usize = 65_535;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompetitionCapacity {
+    /// The whole contract's items, which the signing session's batch carries.
     pub signing_items: usize,
+    /// The items one player's enclave permits: the ones the player signs.
+    pub participant_signing_items: usize,
+    /// This and the next two are requests encrypted, as Keymeld's escrow command carries them.
     pub bind_request_bytes: usize,
     pub signing_request_bytes: usize,
     pub settlement_request_bytes: usize,
+    /// The largest state's JSON before it is sealed. Keymeld refuses to seal more than one
+    /// payload.
     pub largest_receipt_bytes: usize,
 }
 fn invalid(message: impl Into<String>) -> KeyMeldError {
@@ -91,6 +107,34 @@ fn check(name: &str, size: usize) -> Result<usize, KeyMeldError> {
 }
 fn payload(size: usize) -> Result<Payload, KeyMeldError> {
     Payload::new(vec![255; check("payload", size)?])
+}
+/// A sealed receipt's bytes, from the JSON of the state it seals. Keymeld refuses a state whose
+/// JSON exceeds one payload, then deflates and encrypts it. How far a state compresses depends
+/// on its keys and digests, so this charges deflate's worst case: stored blocks, at five bytes
+/// each over the JSON.
+fn sealed(name: &str, json: usize) -> Result<usize, KeyMeldError> {
+    let json = check(name, json)?;
+    let deflated = json + 5 * (json / DEFLATE_STORED_BLOCK_BYTES + 1);
+    check(name, encrypted_size(deflated, SEALED_STATE)?)
+}
+/// The signing items one player's enclave permits, as `(full, split)`. The verifier permits
+/// exactly the contract's messages that the player signs. Every outcome transaction, and the
+/// splits of the refund-all and expiry outcomes, are signed by every player and the market
+/// maker: those are `full`. A ranked outcome's splits are signed by the market maker and that
+/// outcome's winners only, so a player signs the `split` items of the outcomes they place in.
+fn participant_items(
+    players: usize,
+    winning_places: usize,
+    permutations: usize,
+) -> Option<(usize, usize)> {
+    let full = permutations
+        .checked_add(2)?
+        .checked_add(players.checked_mul(2)?)?;
+    // A player places in k·P(n-1, k-1) of the ranked outcomes, each with k splits.
+    let placed = (1..winning_places).try_fold(winning_places, |count, index| {
+        count.checked_mul(players - index)
+    })?;
+    Some((full, placed.checked_mul(winning_places)?))
 }
 fn encrypted_size(size: usize, purpose: &str) -> Result<usize, KeyMeldError> {
     // AES-GCM tag plus the protocol's existing compact context/nonce framing.
@@ -194,8 +238,9 @@ fn modeled_queued_entry(market_maker: MarketMaker) -> Result<String, KeyMeldErro
 
 /// Bound a Coordinator ranking event independently of its future participant
 /// keys, invoices, and oracle points. Values use the largest accepted address,
-/// invoice, numeric fields and encoded hash/signature bytes. Scope sizing uses
-/// every participant for every item, which deliberately overestimates subsets.
+/// invoice, numeric fields and encoded hash/signature bytes. A player's signing scope
+/// holds the items that player signs, each with its real signer count, and every item
+/// carries a subset and an adaptor point whether or not the real one does.
 pub fn validate_competition_capacity(
     players: usize,
     winning_places: usize,
@@ -221,6 +266,9 @@ pub fn validate_competition_capacity(
             escrow::MAX_BATCH_ITEMS
         )));
     }
+    let (full_items, split_items) = participant_items(players, winning_places, permutations)
+        .ok_or_else(|| invalid("Competition signing count overflow"))?;
+    let participant_signing_items = full_items + split_items;
     let point = Scalar::from_slice(&[18; 32])
         .expect("fixed valid sizing scalar")
         .base_point_mul();
@@ -369,10 +417,7 @@ pub fn validate_competition_capacity(
     // Extra metadata budget covers envelope tags and future fixed context fields.
     // No user-controlled unbounded value is charged to this reserve.
     const METADATA_RESERVE: usize = 2048;
-    let binding_receipt = check(
-        "binding receipt",
-        encrypted_size(bytes(&binding)? + METADATA_RESERVE, "escrow_state_v1")?,
-    )?;
+    let binding_receipt = sealed("binding receipt", bytes(&binding)? + METADATA_RESERVE)?;
     let signers: Vec<_> = keys
         .iter()
         .map(|(user_id, public_key)| ScopeSigner {
@@ -380,46 +425,54 @@ pub fn validate_competition_capacity(
             public_key: public_key.clone(),
         })
         .collect();
+    // The market maker and one ranked outcome's winners.
+    let winners = &signers[..winning_places + 1];
+    let item = |index: usize, signers: &[ScopeSigner]| SigningItem {
+        item_id: Uuid::from_u128(index as u128 + 1),
+        message_digest: [255; 32],
+        subset_id: Some(id),
+        signers: signers.to_vec(),
+        tweak: KeyTweak::None,
+        adaptor: AdaptorContext::Single {
+            adaptor_id: id,
+            point: key.clone(),
+        },
+    };
     let scope = SigningScope {
         session_tweak: KeyTweak::None,
-        batch: (0..signing_items)
-            .map(|index| SigningItem {
-                item_id: Uuid::from_u128(index as u128 + 1),
-                message_digest: [255; 32],
-                subset_id: Some(id),
-                signers: signers.clone(),
-                tweak: KeyTweak::None,
-                adaptor: AdaptorContext::Single {
-                    adaptor_id: id,
-                    point: key.clone(),
-                },
-            })
+        batch: (0..full_items)
+            .map(|index| item(index, &signers))
+            .chain((full_items..participant_signing_items).map(|index| item(index, winners)))
             .collect(),
     };
     let sign_action = worst(&Action::Sign {
         scope: scope.clone(),
     })?;
+    let ark_funding = ArkFunding {
+        commitment_tx: "f".repeat(MODELED_COMMITMENT_TX_HEX_CHARS),
+        vout: u32::MAX,
+    };
+    // The Coordinator first sends the compact scope, and the full one only to a verifier that
+    // predates it, so the full one bounds both.
     let sign_parameters = worst(&generic::ActionParameters::SignContract {
         scope,
-        ark_funding: None,
+        ark_funding: Some(ark_funding.clone()),
     })?;
-    let signing_receipt = check(
-        "signing receipt",
-        encrypted_size(
-            bytes(&binding)? + bytes(&sign_action)? + METADATA_RESERVE,
-            "escrow_state_v1",
-        )?,
-    )?;
+    // The verifier keeps the commitment in the prepared state.
+    let signing_application_state = Payload::encode(&json!({
+        "kind": "contract_signing",
+        "ark_funding": ark_funding,
+    }))?;
+    let signing_state = bytes(&binding)?
+        + bytes(&sign_action)?
+        + bytes(&signing_application_state)?
+        + METADATA_RESERVE;
+    let signing_receipt = sealed("signing receipt", signing_state)?;
     // An invoice occurs in both authenticated application_state and public output.
     // Both are bounded Payloads; reserve full allowed invoice plus fixed fields.
     let settlement_state = payload(MAX_INVOICE_BYTES + 2048)?;
-    let settlement_receipt = check(
-        "settlement receipt",
-        encrypted_size(
-            bytes(&binding)? + 2 * bytes(&settlement_state)? + METADATA_RESERVE,
-            "escrow_state_v1",
-        )?,
-    )?;
+    let settlement_state = bytes(&binding)? + 2 * bytes(&settlement_state)? + METADATA_RESERVE;
+    let settlement_receipt = sealed("settlement receipt", settlement_state)?;
     let attempt = ActionAttempt {
         attempt_id: id,
         signing_session_id: None,
@@ -442,7 +495,9 @@ pub fn validate_competition_capacity(
     )?;
     // At most one <=65-byte signature per DLC item plus bounded map keys/tags.
     // Double 256 bytes per item also covers quoting JSON signatures inside JSON.
-    let parameters = payload(2 * (signing_items * 256 + 1024) + MAX_INVOICE_BYTES + 4096)?;
+    let parameters = payload(
+        2 * (signing_items * 256 + 1024) + MAX_INVOICE_BYTES + bytes(&ark_funding)? + 4096,
+    )?;
     let settlement_request = PrepareEscrowRequest {
         schema_version: escrow::SCHEMA_VERSION,
         binding_receipt: payload(binding_receipt)?,
@@ -459,12 +514,14 @@ pub fn validate_competition_capacity(
         "invoice renewal request",
         encrypted_size(bytes(&settlement_request)?, "escrow-request-v1")?,
     )?;
+    // An executed state adds its fixed-size output to the prepared one.
     let largest_receipt_bytes = check(
         "execution receipt",
-        signing_receipt.max(settlement_receipt) + METADATA_RESERVE,
+        signing_state.max(settlement_state) + METADATA_RESERVE,
     )?;
     Ok(CompetitionCapacity {
         signing_items,
+        participant_signing_items,
         bind_request_bytes,
         signing_request_bytes,
         settlement_request_bytes,
@@ -495,6 +552,8 @@ mod tests {
         for players in [2, 3, 7] {
             let capacity = validate_competition_capacity(players, 1).unwrap();
             assert_eq!(capacity.signing_items, 4 * players + 2);
+            // Every item but the other players' win splits.
+            assert_eq!(capacity.participant_signing_items, 3 * players + 3);
             // A pool's bind request carries its oracle statement at the largest terms, so it
             // may outgrow the settlement request; each still fits one payload.
             assert!(capacity.bind_request_bytes <= escrow::MAX_PAYLOAD_BYTES);
@@ -508,9 +567,8 @@ mod tests {
 #[cfg(test)]
 mod supported_sizes {
     //! The admitted envelope is capped explicitly rather than discovered from
-    //! byte limits: one place up to 25 players, two places up to 20. Two places
-    //! need Keymeld's larger signing batch; until it ships, the item count refuses
-    //! them, so nothing is admitted that Keymeld cannot sign.
+    //! byte limits: one place up to 25 players, two places up to 20. Both must fit
+    //! Keymeld's signing batch and one payload per request.
     use super::{
         supported_shape, validate_competition_capacity, MAX_COMPETITION_PLAYERS,
         MAX_COMPETITION_WINNING_PLACES, MAX_TWO_PLACE_PLAYERS,
@@ -532,6 +590,7 @@ mod supported_sizes {
     fn the_capped_one_place_shape_is_admitted_with_headroom() {
         let capacity = validate_competition_capacity(MAX_COMPETITION_PLAYERS, 1)
             .expect("25 players over one place must be admitted");
+        println!("25 players over one place: {capacity:?}");
         assert!(
             capacity.signing_items < MAX_BATCH_ITEMS,
             "item count should not be the binding limit at the cap"
@@ -540,19 +599,19 @@ mod supported_sizes {
     }
 
     #[test]
-    fn twenty_players_over_two_places_need_keymelds_larger_batch() {
+    fn twenty_players_over_two_places_fit_one_batch_and_one_payload_per_request() {
         // P(20, 2) ranked outcomes with three signatures each, plus refund-all and expiry.
         let items = 20 * 19 * 3 + 2 * 20 + 2;
         assert_eq!(items, 1_182);
-        let twenty = validate_competition_capacity(MAX_TWO_PLACE_PLAYERS, 2);
-        if MAX_BATCH_ITEMS >= items {
-            let capacity = twenty.expect("20 players over two places must be admitted");
-            assert_eq!(capacity.signing_items, items);
-            fits_payloads(&capacity);
-        } else {
-            let error = twenty.expect_err("refused until Keymeld signs larger batches");
-            assert!(error.to_string().contains("signing items"), "{error}");
-        }
+        assert!(items <= MAX_BATCH_ITEMS);
+        let capacity = validate_competition_capacity(MAX_TWO_PLACE_PLAYERS, 2)
+            .expect("20 players over two places must be admitted");
+        assert_eq!(capacity.signing_items, items);
+        // A player signs the 422 items every signer signs, and the two splits of each of the
+        // 38 outcomes they place in.
+        assert_eq!(capacity.participant_signing_items, 422 + 76);
+        fits_payloads(&capacity);
+        println!("20 players over two places: {capacity:?}");
     }
 
     #[test]

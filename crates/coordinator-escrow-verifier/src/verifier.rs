@@ -28,7 +28,7 @@ use keymeld_enclave::escrow_verifier::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -716,20 +716,41 @@ fn validate_signing_scope(
     if scope.session_tweak != KeyTweak::None {
         return Err(invalid("DLC contract signing cannot use a key tweak"));
     }
-    let mut expected = payout::signing_requirements(contract)
-        .map_err(invalid)?
-        .into_iter()
-        .filter(|(_, item)| {
-            item.signers
-                .iter()
-                .any(|key| key.as_slice() == signed.policy.participant_public_key.as_bytes())
-        })
-        .map(|(message, item)| (escrow::sha256(&message), item))
-        .collect::<BTreeMap<_, _>>();
+    // A message signed under several adaptor points is one requirement per point. The contract
+    // never needs one message twice under the same point (or twice without one); if it did, the
+    // requirements could not be told apart, so it is refused rather than signed once.
+    let mut expected = BTreeMap::new();
+    for (message, item) in payout::signing_requirements(contract).map_err(invalid)? {
+        if !item
+            .signers
+            .iter()
+            .any(|key| key.as_slice() == signed.policy.participant_public_key.as_bytes())
+        {
+            continue;
+        }
+        if expected
+            .insert((escrow::sha256(&message), item.adaptor_point), item)
+            .is_some()
+        {
+            return Err(invalid(
+                "Contract repeats a signing message under one adaptor",
+            ));
+        }
+    }
     for item in &scope.batch {
-        let requirement = expected.remove(&item.message_digest).ok_or_else(|| {
-            invalid("Signing message is duplicated or outside the authorized DLC")
-        })?;
+        let point = match &item.adaptor {
+            AdaptorContext::None => None,
+            AdaptorContext::Single { point, .. } => {
+                Some(<[u8; 33]>::try_from(point.as_bytes()).map_err(|_| {
+                    invalid("Adaptor point differs from the authorized oracle outcome")
+                })?)
+            }
+        };
+        let requirement = expected
+            .remove(&(item.message_digest, point))
+            .ok_or_else(|| {
+                invalid("Signing message is duplicated or outside the authorized DLC")
+            })?;
         if item.tweak != KeyTweak::None
             || item
                 .signers
@@ -804,11 +825,18 @@ fn expand_signing_scope(
     contract: &ContractCommitment,
     items: &[ContractItem],
 ) -> Result<SigningScope, VerificationError> {
-    let adaptor_points = payout::signing_requirements(contract)
-        .map_err(invalid)?
-        .into_iter()
-        .map(|(message, item)| (escrow::sha256(&message), item.adaptor_point))
-        .collect::<BTreeMap<_, _>>();
+    // A message signed under several adaptor points (see `payout::signing_requirements`) takes
+    // them in the order the SDK batches them, which is the contract's outcome order. The compact
+    // item names no outcome, so order is the only pairing it carries. Any other order still names
+    // only points the contract pairs with the message, each once; it changes the permitted scope,
+    // whose digest the Coordinator and the signing enclave then fail to match.
+    let mut adaptor_points = BTreeMap::<_, VecDeque<_>>::new();
+    for (message, item) in payout::signing_requirements(contract).map_err(invalid)? {
+        adaptor_points
+            .entry(escrow::sha256(&message))
+            .or_default()
+            .push_back(item.adaptor_point);
+    }
     let batch = items
         .iter()
         .map(|item| {
@@ -839,13 +867,16 @@ fn expand_signing_scope(
                 .collect::<Result<Vec<_>, VerificationError>>()?;
             signers.sort_by(|a, b| a.public_key.cmp(&b.public_key));
             let point = adaptor_points
-                .get(&item.message_digest)
-                .ok_or_else(|| invalid("Signing message is outside the authorized DLC"))?;
+                .get_mut(&item.message_digest)
+                .and_then(VecDeque::pop_front)
+                .ok_or_else(|| {
+                    invalid("Signing message is duplicated or outside the authorized DLC")
+                })?;
             let adaptor = match (item.adaptor_id, point) {
                 (None, None) => AdaptorContext::None,
                 (Some(adaptor_id), Some(point)) => AdaptorContext::Single {
                     adaptor_id,
-                    point: PublicKeyBytes::new(point).map_err(invalid)?,
+                    point: PublicKeyBytes::new(&point).map_err(invalid)?,
                 },
                 _ => {
                     return Err(invalid(

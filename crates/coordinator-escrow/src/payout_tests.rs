@@ -314,15 +314,19 @@ fn signing_context_covers_expiry_and_all_adaptor_and_subset_requirements() {
     .unwrap();
     let data = dlc.signing_data().unwrap();
     assert_eq!(requirements.len(), data.total_signature_count());
+    let requirement = |outcome| {
+        &requirements
+            .iter()
+            .find(|(sighash, _)| *sighash == data.outcome_sighashes[&outcome])
+            .unwrap()
+            .1
+    };
+    assert_eq!(requirement(Outcome::Expiry).adaptor_point, None);
     assert_eq!(
-        requirements[&data.outcome_sighashes[&Outcome::Expiry]].adaptor_point,
-        None
-    );
-    assert_eq!(
-        requirements[&data.outcome_sighashes[&Outcome::Attestation(0)]].adaptor_point,
+        requirement(Outcome::Attestation(0)).adaptor_point,
         Some(data.adaptor_points[&0].serialize())
     );
-    let hashes: Vec<_> = requirements.keys().copied().collect();
+    let hashes: Vec<_> = requirements.iter().map(|(sighash, _)| *sighash).collect();
     verify_contract_binding(&contract, &hashes).unwrap();
     assert!(verify_contract_binding(&contract, &hashes[1..]).is_err());
     let mut repeated = hashes;
@@ -349,6 +353,71 @@ fn signing_context_covers_expiry_and_all_adaptor_and_subset_requirements() {
         &contract.contract_parameters.players[1].pubkey.serialize()
     )
     .is_err());
+}
+
+/// Two outcomes ranking the same two winners in either order build one outcome transaction, so
+/// the contract signs its sighash once under each outcome's adaptor point: no more, no fewer.
+/// Split transactions differ by payout, so their sighashes never repeat.
+#[test]
+fn a_shared_outcome_transaction_is_signed_once_per_outcome() {
+    let (mut contract, _) = fixture();
+    let params = &mut contract.contract_parameters;
+    params.event.locking_points.push(MaybePoint::Valid(
+        Scalar::from_slice(&[9; 32]).unwrap().base_point_mul(),
+    ));
+    params.outcome_payouts = BTreeMap::from([
+        (Outcome::Attestation(0), BTreeMap::from([(0, 70), (1, 30)])),
+        (Outcome::Attestation(1), BTreeMap::from([(0, 30), (1, 70)])),
+        (Outcome::Expiry, BTreeMap::from([(0, 50), (1, 50)])),
+    ]);
+    let data = TicketedDLC::new(params.clone(), contract.funding_outpoint)
+        .unwrap()
+        .signing_data()
+        .unwrap();
+    let shared = data.outcome_sighashes[&Outcome::Attestation(0)];
+    assert_eq!(data.outcome_sighashes[&Outcome::Attestation(1)], shared);
+    assert_ne!(data.outcome_sighashes[&Outcome::Expiry], shared);
+
+    let requirements = signing_requirements(&contract).unwrap();
+    assert_eq!(requirements.len(), data.total_signature_count());
+    let points: Vec<_> = requirements
+        .iter()
+        .filter(|(sighash, _)| *sighash == shared)
+        .map(|(_, requirement)| requirement.adaptor_point)
+        .collect();
+    assert_eq!(
+        points,
+        [0, 1].map(|index| Some(data.adaptor_points[&index].serialize()))
+    );
+    let splits: BTreeSet<_> = data.split_sighashes.values().collect();
+    assert_eq!(splits.len(), data.split_sighashes.len());
+
+    let hashes: Vec<_> = requirements.iter().map(|(sighash, _)| *sighash).collect();
+    assert_eq!(contract_sighashes(&contract).unwrap().len(), hashes.len());
+    verify_contract_binding(&contract, &hashes).unwrap();
+    let mut reversed = hashes.clone();
+    reversed.reverse();
+    verify_contract_binding(&contract, &reversed).unwrap();
+    // One signature of the shared transaction is not both outcomes'.
+    let first = hashes
+        .iter()
+        .position(|sighash| *sighash == shared)
+        .unwrap();
+    let once: Vec<_> = hashes
+        .iter()
+        .enumerate()
+        .filter(|(index, sighash)| **sighash != shared || *index == first)
+        .map(|(_, sighash)| *sighash)
+        .collect();
+    assert_eq!(once.len(), hashes.len() - 1);
+    assert!(verify_contract_binding(&contract, &once).is_err());
+    // Nor is a third copy, or a copy of a split, signed in place of a missing message.
+    let mut third = hashes.clone();
+    third.push(shared);
+    assert!(verify_contract_binding(&contract, &third).is_err());
+    let mut swapped = hashes.clone();
+    *swapped.last_mut().unwrap() = shared;
+    assert!(verify_contract_binding(&contract, &swapped).is_err());
 }
 
 /// With no attestation a payout settles on the expiry outcome, but only once the contract
