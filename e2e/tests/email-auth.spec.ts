@@ -164,7 +164,10 @@ test.describe("Username/Password Authentication", () => {
     // Logging out in one tab logs out the others and is not undone by a reload.
     await logout(page);
     await expect(tab.locator("#authButtons")).toBeVisible({ timeout: 10000 });
+    // Logging out leaves the account page, so come back to it after the reload.
     await tab.reload();
+    await expect(tab.locator("#authButtons")).toBeVisible();
+    await tab.goto("/entries");
     await expect(tab.locator(".sign-in-required")).toBeVisible();
     await expect(tab.locator("#logoutContainer")).toBeHidden();
   });
