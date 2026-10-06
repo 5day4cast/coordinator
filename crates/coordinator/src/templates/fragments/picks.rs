@@ -607,7 +607,7 @@ mod tests {
             "e",
             &views(&picks),
             NOW,
-            Some("Picks in this competition are locked once entered"),
+            Some("Entries have closed, so these picks are locked"),
         )
         .into_string();
         assert!(own.contains("Your picks"));
@@ -617,7 +617,7 @@ mod tests {
             "nothing is due before the window"
         );
         assert!(!own.contains("hx-"));
-        assert!(own.contains("Picks in this competition are locked once entered."));
+        assert!(own.contains("Entries have closed, so these picks are locked."));
         assert!(!own.contains("Edit picks"));
         // While the competition takes picks, the owner can edit them in the same dialog.
         let editable = own_picks_detail("e", &views(&picks), NOW, None).into_string();
