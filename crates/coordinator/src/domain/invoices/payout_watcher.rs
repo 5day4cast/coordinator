@@ -534,8 +534,10 @@ async fn send_eligibility(
                 .map(|signed| signed.params())
         })
         .ok_or_else(|| anyhow::anyhow!("Payout has no persisted contract parameters"))?;
-    let [output] = outcome.output.as_slice() else {
-        return Err(anyhow::anyhow!("DLC outcome must have exactly one output"));
+    let Some(output) = outcome_contract_output(outcome) else {
+        return Err(anyhow::anyhow!(
+            "DLC outcome must have one contract output and at most one anchor"
+        ));
     };
     let status = tokio::time::timeout(
         Duration::from_secs(20),
@@ -553,6 +555,16 @@ async fn send_eligibility(
         params.relative_locktime_block_delta,
         invoice.min_final_cltv_expiry_delta(),
     ))
+}
+
+/// The contract output of an outcome or expiry transaction: its first output. A contract built
+/// with anchors has one pay-to-anchor output after it.
+fn outcome_contract_output(outcome: &bitcoin::Transaction) -> Option<&bitcoin::TxOut> {
+    match outcome.output.as_slice() {
+        [output] => Some(output),
+        [output, anchor] if dlctix::anchor::is_anchor_script(&anchor.script_pubkey) => Some(output),
+        _ => None,
+    }
 }
 
 #[derive(Debug)]
@@ -609,6 +621,30 @@ mod tests {
         Mutex,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn the_contract_output_is_first_with_or_without_an_anchor() {
+        let contract = bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(100_000),
+            script_pubkey: bitcoin::ScriptBuf::new(),
+        };
+        let mut outcome = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![contract.clone()],
+        };
+        assert_eq!(outcome_contract_output(&outcome), Some(&contract));
+        outcome
+            .output
+            .push(dlctix::AnchorParams::default().output());
+        assert_eq!(outcome_contract_output(&outcome), Some(&contract));
+        // A second output that is not an anchor is not a DLC outcome.
+        outcome.output[1] = contract.clone();
+        assert_eq!(outcome_contract_output(&outcome), None);
+        outcome.output.clear();
+        assert_eq!(outcome_contract_output(&outcome), None);
+    }
 
     #[test]
     fn new_payments_require_confirmed_unspent_outcome_and_enough_cltv() {
@@ -717,6 +753,7 @@ mod tests {
             funding_value: bitcoin::Amount::from_sat(100_000),
             fee_rate: bitcoin::FeeRate::from_sat_per_vb_u32(1),
             relative_locktime_block_delta: 72,
+            anchor: None,
         };
         let params = serde_json::to_vec(&params).unwrap();
         let outcome = serde_json::to_vec(&bitcoin::Transaction {

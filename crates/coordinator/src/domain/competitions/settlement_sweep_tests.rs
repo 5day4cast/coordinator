@@ -28,6 +28,15 @@ fn signed_contract_expiring(
     funding_value: Amount,
     expiry: Option<u32>,
 ) -> (SignedContract, Scalar, [Scalar; 3]) {
+    signed_contract_with(funding_value, expiry, None)
+}
+
+/// As [`signed_contract_expiring`], built with or without anchor outputs.
+fn signed_contract_with(
+    funding_value: Amount,
+    expiry: Option<u32>,
+    anchor: Option<dlctix::AnchorParams>,
+) -> (SignedContract, Scalar, [Scalar; 3]) {
     let market_maker = Scalar::from_slice(&[7; 32]).unwrap();
     let players = [1, 3, 5].map(|key| Scalar::from_slice(&[key; 32]).unwrap());
     let params = ContractParameters {
@@ -57,6 +66,7 @@ fn signed_contract_expiring(
         fee_rate: FeeRate::from_sat_per_vb_u32(1),
         funding_value,
         relative_locktime_block_delta: 72,
+        anchor,
     };
     let dlc = TicketedDLC::new(params, OutPoint::null()).unwrap();
     let mut rng = ChaCha20Rng::from_seed([42; 32]);
@@ -96,7 +106,18 @@ fn signed_contract_expiring(
 
 #[test]
 fn split_reclaims_sign_the_sweep_input_for_every_parent_output() {
-    let (contract, market_maker, players) = signed_contract();
+    split_reclaims_sign_every_parent_output(signed_contract());
+    // An anchor is the split transaction's last output; the winners' outputs keep their vouts.
+    split_reclaims_sign_every_parent_output(signed_contract_with(
+        Amount::from_sat(100_000),
+        None,
+        Some(dlctix::AnchorParams::default()),
+    ));
+}
+
+fn split_reclaims_sign_every_parent_output(
+    (contract, market_maker, players): (SignedContract, Scalar, [Scalar; 3]),
+) {
     let mut spent_vouts = std::collections::BTreeSet::new();
     for player_index in 0..players.len() {
         let win_condition = WinCondition {
@@ -381,12 +402,23 @@ impl UnpaidWinners {
     }
 
     async fn with_contract(
-        (contract, market_maker, players): (SignedContract, Scalar, [Scalar; 3]),
+        contract: (SignedContract, Scalar, [Scalar; 3]),
         funding_value: Amount,
         fee_rates: HashMap<u16, f64>,
     ) -> Self {
+        Self::with_chain(contract, funding_value, fee_rates, |_| {}).await
+    }
+
+    /// As [`Self::with_contract`], with more expectations on the chain from `chain_setup`.
+    async fn with_chain(
+        (contract, market_maker, players): (SignedContract, Scalar, [Scalar; 3]),
+        funding_value: Amount,
+        fee_rates: HashMap<u16, f64>,
+        chain_setup: impl FnOnce(&mut MockChain),
+    ) -> Self {
         let broadcasts = Arc::new(Mutex::new(Vec::new()));
         let mut chain = MockChain::new();
+        chain_setup(&mut chain);
         chain
             .expect_get_derived_private_key()
             .returning(move || Ok(market_maker));
@@ -1202,4 +1234,117 @@ async fn a_failed_payout_lnd_paid_is_marked_paid() {
         RestoreReconciliation::default()
     );
     settlement.database.close().await.unwrap();
+}
+
+/// A wallet coin the mock LND wallet spends into CPFP children.
+fn wallet_coin() -> WalletUtxo {
+    let key = Scalar::from_slice(&[40; 32]).unwrap().base_point_mul();
+    let script_pubkey = ScriptBuf::new_p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(
+        dlctix::convert_point(key),
+    ));
+    WalletUtxo {
+        outpoint: OutPoint::new(Txid::from_byte_array([41; 32]), 2),
+        txout: TxOut {
+            value: Amount::from_sat(1_000_000),
+            script_pubkey,
+        },
+        address: String::new(),
+        confirmations: 6,
+    }
+}
+
+/// An anchored outcome transaction that has waited without confirming, at 1 sat/vB while the
+/// estimate is 20, is bumped once from the wallet: a child spending its anchor and one coin.
+#[tokio::test]
+async fn an_unconfirmed_anchored_outcome_is_bumped_from_the_wallet() {
+    let change = bitcoin::Address::p2tr_tweaked(
+        TweakedPublicKey::dangerous_assume_tweaked(dlctix::convert_point(
+            Scalar::from_slice(&[42; 32]).unwrap().base_point_mul(),
+        )),
+        bitcoin::Network::Regtest,
+    );
+    let change_script = change.script_pubkey();
+    let settlement = UnpaidWinners::with_chain(
+        signed_contract_with(
+            Amount::from_sat(100_000),
+            None,
+            Some(dlctix::AnchorParams::default()),
+        ),
+        Amount::from_sat(100_000),
+        HashMap::from([(1, 20.0)]),
+        move |chain| {
+            chain.expect_estimate_fee().returning(|_| Ok(20.0));
+            chain
+                .expect_get_spendable_utxo()
+                .returning(|_| Ok(wallet_coin()));
+            chain
+                .expect_get_next_address()
+                .returning(move || Ok(change.clone()));
+            // LND signs and finalizes only its own coin, input 1.
+            chain.expect_sign_psbt().returning(|psbt| {
+                assert!(psbt.inputs[0].final_script_witness.is_some());
+                assert!(psbt.inputs[0].witness_utxo.is_some());
+                psbt.inputs[1].final_script_witness =
+                    Some(bitcoin::Witness::from_slice(&[[7; 64]]));
+                Ok(true)
+            });
+        },
+    )
+    .await;
+    let coordinator = settlement
+        .coordinator
+        .with_dlc_anchors(crate::config::DlcAnchorSettings::default());
+    let contract = &settlement.contract;
+    let outcome_tx = contract
+        .signed_outcome_tx(0, Scalar::from_slice(&[10; 32]).unwrap())
+        .unwrap();
+    let (anchor_outpoint, anchor_output) = dlctix::anchor::find_anchor(&outcome_tx).unwrap();
+    let id = settlement.competition.id;
+
+    // Broadcast a minute ago: too early to bump.
+    let now = OffsetDateTime::now_utc();
+    coordinator
+        .bump_unconfirmed_presigned_tx(id, contract, &outcome_tx, now - time::Duration::minutes(1))
+        .await;
+    assert!(settlement.broadcasts.lock().unwrap().is_empty());
+
+    let broadcast_at = now - time::Duration::hours(1);
+    coordinator
+        .bump_unconfirmed_presigned_tx(id, contract, &outcome_tx, broadcast_at)
+        .await;
+    let broadcasts = settlement.broadcasts.lock().unwrap().clone();
+    let [child] = broadcasts.as_slice() else {
+        panic!("expected one CPFP child, got {broadcasts:?}");
+    };
+    assert_eq!(child.input[0].previous_output, anchor_outpoint);
+    assert!(child.input[0].witness.is_empty());
+    assert_eq!(child.input[1].previous_output, wallet_coin().outpoint);
+    assert_eq!(child.output.len(), 1);
+    assert_eq!(child.output[0].script_pubkey, change_script);
+    // Parent and child together pay at least the estimate.
+    let parent_fee = contract.presigned_tx_fee(&outcome_tx).unwrap();
+    let child_fee = anchor_output.value + wallet_coin().txout.value - child.output[0].value;
+    let package_vsize = outcome_tx.weight().to_vbytes_ceil() + child.weight().to_vbytes_ceil();
+    assert!(
+        parent_fee + child_fee
+            >= FeeRate::from_sat_per_vb_u32(20)
+                .fee_vb(package_vsize)
+                .unwrap()
+    );
+
+    // The same estimate does not bump it again.
+    coordinator
+        .bump_unconfirmed_presigned_tx(id, contract, &outcome_tx, broadcast_at)
+        .await;
+    assert_eq!(settlement.broadcasts.lock().unwrap().len(), 1);
+
+    // A contract without anchors is left alone.
+    let (plain, _, _) = signed_contract();
+    let plain_outcome = plain
+        .signed_outcome_tx(0, Scalar::from_slice(&[10; 32]).unwrap())
+        .unwrap();
+    coordinator
+        .bump_unconfirmed_presigned_tx(id, &plain, &plain_outcome, broadcast_at)
+        .await;
+    assert_eq!(settlement.broadcasts.lock().unwrap().len(), 1);
 }

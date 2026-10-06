@@ -3,7 +3,10 @@ use crate::infra::db::DBConnection;
 use async_trait::async_trait;
 use coordinator_core::RegistrationAssignment;
 use coordinator_escrow::authorization::PayoutPolicy;
-use dlctix::{Outcome, OutcomeIndex, PayoutWeights};
+use dlctix::{
+    musig2::{AdaptorSignature, CompactSignature},
+    ContractParameters, Outcome, OutcomeIndex, PayoutWeights, SigningData, WinCondition,
+};
 use keymeld_core::authorization::EnclaveRecipientAuthorization;
 use keymeld_core::crypto::SessionSecret;
 use keymeld_core::escrow::SignedEscrowPolicy;
@@ -24,10 +27,7 @@ pub use coordinator_escrow::{
 };
 pub use keymeld_sdk::types::SubsetDefinition;
 use keymeld_sdk::{
-    dlctix::{
-        dlctix::{ContractParameters, SigningData},
-        DlcBatchBuilder, DlcSignatureResults,
-    },
+    dlctix::{DlcBatchBuilder, DlcSignatureResults as SdkDlcSignatureResults},
     prelude::*,
     types::{RegistrationAuthorization, RegistrationContext, SignedRoster, SignedSessionManifest},
     PollingConfig,
@@ -63,6 +63,64 @@ pub enum KeymeldError {
     /// Keymeld was already sent the session's roster, so this participant cannot join it.
     #[error("Keymeld was already sent this session's roster without participant {0}")]
     RosterFixed(String),
+}
+
+/// The signatures Keymeld produced for a DLC contract.
+pub struct DlcSignatureResults {
+    pub outcome_signatures: BTreeMap<OutcomeIndex, AdaptorSignature>,
+    pub split_signatures: BTreeMap<WinCondition, CompactSignature>,
+    pub expiry_signature: Option<CompactSignature>,
+}
+
+/// keymeld-sdk still builds on dlctix 0.1.0, while the coordinator builds on the release with
+/// anchor outputs. Keymeld reads only plain data from these types (sighashes, adaptor points,
+/// signer sets, payout maps), which both versions encode the same way, so they are converted
+/// here. Drop this once keymeld-sdk depends on the same dlctix.
+pub(crate) mod sdk_dlctix {
+    use super::*;
+    use keymeld_sdk::dlctix::dlctix as sdk;
+
+    fn convert<T: Serialize, U: serde::de::DeserializeOwned>(value: &T) -> Result<U, KeymeldError> {
+        serde_json::to_value(value)
+            .and_then(serde_json::from_value)
+            .map_err(|e| KeymeldError::Signing(format!("Cannot convert DLC data for Keymeld: {e}")))
+    }
+
+    pub(crate) fn signing_data(data: &SigningData) -> Result<sdk::SigningData, KeymeldError> {
+        convert(data)
+    }
+
+    /// Keymeld's view of the parameters has no anchor; it reads only the players and payouts.
+    pub(crate) fn contract_parameters(
+        params: &ContractParameters,
+    ) -> Result<sdk::ContractParameters, KeymeldError> {
+        convert(params)
+    }
+
+    fn outcome(outcome: sdk::Outcome) -> Outcome {
+        match outcome {
+            sdk::Outcome::Attestation(index) => Outcome::Attestation(index),
+            sdk::Outcome::Expiry => Outcome::Expiry,
+        }
+    }
+
+    pub(crate) fn signature_results(results: SdkDlcSignatureResults) -> DlcSignatureResults {
+        DlcSignatureResults {
+            outcome_signatures: results.outcome_signatures,
+            split_signatures: results
+                .split_signatures
+                .into_iter()
+                .map(|(condition, signature)| {
+                    let condition = WinCondition {
+                        outcome: outcome(condition.outcome),
+                        player_index: condition.player_index,
+                    };
+                    (condition, signature)
+                })
+                .collect(),
+            expiry_signature: results.expiry_signature,
+        }
+    }
 }
 
 /// Status of a keygen session for polling

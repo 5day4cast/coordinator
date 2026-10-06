@@ -86,6 +86,7 @@ fn fixture_with(automatic: bool, ark_escrow: Option<ArkEscrowPolicy>) -> Fixture
         fee_rate: FeeRate::from_sat_per_vb_u32(1),
         funding_value: Amount::from_sat(100_000),
         relative_locktime_block_delta: 72,
+        anchor: None,
     };
     let terms = ContractAuthorization {
         competition_id: Uuid::now_v7(),
@@ -619,6 +620,68 @@ async fn signing_derives_messages_keys_subsets_tweaks_and_adaptors_from_bound_co
             &params
         )
         .await
+        .is_err());
+}
+
+/// A contract built with anchor outputs binds and signs like one built without; its anchor is
+/// bounded by the P2A dust limit, since its value comes out of the funding value.
+#[tokio::test]
+async fn an_anchored_contract_binds_and_signs_within_the_anchor_bound() {
+    let verifier = CoordinatorVerifier::default().with_test_ledger();
+    let mut f = fixture(false);
+    let plain_scope = f.scope();
+    f.contract.contract_parameters.anchor = Some(dlctix::AnchorParams::default());
+    let scope = f.scope();
+    assert_eq!(scope.batch.len(), plain_scope.batch.len());
+    assert_ne!(
+        scope.batch[0].message_digest, plain_scope.batch[0].message_digest,
+        "the anchor output is part of every signed transaction"
+    );
+    let bound = f.bind(&verifier);
+    let attempt = ActionAttempt {
+        attempt_id: Uuid::now_v7(),
+        signing_session_id: Some(SessionId::new_v7()),
+    };
+    let prior = BTreeMap::new();
+    let params = Payload::encode(&ActionParameters::SignContract {
+        scope,
+        ark_funding: None,
+    })
+    .unwrap();
+    let prepared = verifier
+        .prepare(
+            f.prepare_view(&bound, &attempt, SIGN_CONTRACT, &prior),
+            &params,
+        )
+        .await
+        .unwrap();
+    verifier
+        .verify_execution(
+            f.execute_view(&bound, &attempt, SIGN_CONTRACT),
+            &prepared,
+            &Payload::default(),
+        )
+        .await
+        .unwrap();
+
+    let mut larger = f.contract.clone();
+    larger.contract_parameters.anchor = Some(dlctix::AnchorParams {
+        value: payout::MAX_ANCHOR_VALUE + Amount::from_sat(1),
+    });
+    assert!(verifier
+        .bind(
+            BindView {
+                manifest: &f.manifest,
+                policy: &f.policy,
+                participant_policies: &f.policies,
+                participant_public_keys: &f.keys
+            },
+            &Payload::encode(&ContractBinding {
+                contract: larger,
+                statement: None
+            })
+            .unwrap()
+        )
         .is_err());
 }
 

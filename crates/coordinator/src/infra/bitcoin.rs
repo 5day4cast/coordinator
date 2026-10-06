@@ -1116,8 +1116,13 @@ impl Bitcoin for BitcoinClient {
                     Err(electrum_client::Error::Protocol(_)) => return Ok(None),
                     Err(e) => return Err(e),
                 };
-                // Any output script's history lists this transaction with its height.
+                // Any output script's history lists this transaction with its height. The
+                // pay-to-anchor script is shared by every anchor on the network, so its
+                // history is never read.
                 for output in &tx.output {
+                    if dlctix::anchor::is_anchor_script(&output.script_pubkey) {
+                        continue;
+                    }
                     let history = client.script_get_history(&output.script_pubkey)?;
                     if let Some(entry) = history.iter().find(|entry| entry.tx_hash == txid) {
                         return Ok(Some(entry.height));
@@ -1214,7 +1219,7 @@ impl Bitcoin for BitcoinClient {
     }
 
     async fn broadcast(&self, transaction: &Transaction) -> Result<(), anyhow::Error> {
-        //TODO: add child-pays-for-parent if fees are too low
+        // Anchored contract transactions are fee-bumped by settlement (`anchor_bump.rs`).
         self.lnd.publish(transaction, "coordinator").await
     }
 

@@ -59,6 +59,8 @@ pub struct Settings {
     pub kickoff_check_settings: KickoffCheckSettings,
     #[serde(default, rename = "recovery")]
     pub recovery_settings: RecoverySettings,
+    #[serde(default)]
+    pub dlc_anchor_settings: DlcAnchorSettings,
 }
 
 /// Recovery records published to Nostr relays, and the recovery file players download. Off by
@@ -190,7 +192,9 @@ mod metrics_settings_tests {
 
 /// Each ticket's share of the Bitcoin network fees, added to its price as its own line.
 ///
-/// A game's chain cost is `base_vbytes + vbytes_per_player × players` vbytes. Each entry pays
+/// A game's chain cost is `base_vbytes + vbytes_per_player × players` vbytes. The default base
+/// counts the two 13 vB pay-to-anchor outputs of an anchored contract's outcome and split
+/// transactions (`dlc_anchor_settings`); without anchors it is 342. Each entry pays
 /// its share of that for a pool of `pool_players`, at the current estimate for `conf_target`
 /// blocks (at least `min_sat_per_vb`) times `multiplier_percent`. The fee is fixed on a ticket
 /// when it is issued; the coordinator keeps any surplus and absorbs any shortfall. While the fee
@@ -214,7 +218,7 @@ impl Default for NetworkFeeSettings {
             enabled: true,
             pool_players: 5,
             multiplier_percent: 150,
-            base_vbytes: 342,
+            base_vbytes: 368,
             vbytes_per_player: 26,
             conf_target: 2,
             min_sat_per_vb: 1,
@@ -255,6 +259,33 @@ impl NetworkFeeSettings {
             && self.pause_above_entry_bps > 0
             && u128::from(network_fee_sats) * 10_000
                 > u128::from(entry_fee_sats) * u128::from(self.pause_above_entry_bps)
+    }
+}
+
+/// Pay-to-anchor outputs on the outcome, expiry and split transactions of new contracts, so
+/// anyone can fee-bump them with CPFP: the coordinator here, or a player recovering their entry
+/// without it. Contracts built before keep their stored parameters and transactions.
+///
+/// With `cpfp_enabled`, an anchored transaction the coordinator broadcast that has waited
+/// `cpfp_after_secs` without confirming, and pays less than the estimate for
+/// `cpfp_conf_target` blocks, is bumped from the LND wallet; the coordinator absorbs the cost.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DlcAnchorSettings {
+    pub enabled: bool,
+    pub cpfp_enabled: bool,
+    pub cpfp_after_secs: u64,
+    pub cpfp_conf_target: u16,
+}
+
+impl Default for DlcAnchorSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cpfp_enabled: true,
+            cpfp_after_secs: 1_800,
+            cpfp_conf_target: 2,
+        }
     }
 }
 

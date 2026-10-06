@@ -274,23 +274,23 @@ mod tests {
     #[test]
     fn a_five_player_share_at_one_and_a_half_times_the_rate() {
         let settings = NetworkFeeSettings::default();
-        // (342 + 26 × 5) / 5 = 94.4 vB, × 1.5 = 141.6 sats at 1 sat/vB.
-        assert_eq!(fee(&settings, 1.0), 142);
-        assert_eq!(fee(&settings, 2.0), 284); // 283.2
-        assert_eq!(fee(&settings, 3.0), 425); // 424.8
+        // (368 + 26 × 5) / 5 = 99.6 vB, × 1.5 = 149.4 sats at 1 sat/vB.
+        assert_eq!(fee(&settings, 1.0), 150);
+        assert_eq!(fee(&settings, 2.0), 299); // 298.8
+        assert_eq!(fee(&settings, 3.0), 449); // 448.2
     }
 
     #[test]
     fn rounds_up_to_the_next_sat() {
         let settings = NetworkFeeSettings::default();
-        // 253 sat/kw, LND's floor, is 1.012 sat/vB: 143.3 sats.
-        assert_eq!(fee(&settings, 1.012), 144);
-        assert_eq!(fee(&settings, 10.0), 1_416);
+        // 253 sat/kw, LND's floor, is 1.012 sat/vB: 151.2 sats.
+        assert_eq!(fee(&settings, 1.012), 152);
+        assert_eq!(fee(&settings, 10.0), 1_494);
         let exact = NetworkFeeSettings {
             multiplier_percent: 125,
             ..NetworkFeeSettings::default()
         };
-        assert_eq!(fee(&exact, 2.0), 236); // 236.0 exactly: no rounding
+        assert_eq!(fee(&exact, 2.0), 249); // 249.0 exactly: no rounding
     }
 
     /// Tickets are priced at the rate contracts are built at, so a kickoff at the same estimate
@@ -299,7 +299,7 @@ mod tests {
     fn priced_at_the_contract_rate() {
         // LND's floor, 253 sat/kWU, is 1.012 sat/vB; contracts are built at it plus 0.25.
         assert_eq!(priced_sat_per_vb(1.012, 1).unwrap(), 1.264);
-        assert_eq!(fee(&NetworkFeeSettings::default(), 1.264), 179);
+        assert_eq!(fee(&NetworkFeeSettings::default(), 1.264), 189);
         assert_eq!(priced_sat_per_vb(2.2, 1).unwrap(), 2.452);
         assert_eq!(priced_sat_per_vb(3.0, 1).unwrap(), 3.3);
         assert_eq!(priced_sat_per_vb(0.25, 1).unwrap(), 1.012);
@@ -310,14 +310,14 @@ mod tests {
     #[test]
     fn the_rate_is_floored() {
         let settings = NetworkFeeSettings::default();
-        assert_eq!(fee(&settings, 0.0), 142);
-        assert_eq!(fee(&settings, 0.25), 142);
+        assert_eq!(fee(&settings, 0.0), 150);
+        assert_eq!(fee(&settings, 0.25), 150);
         let floor = NetworkFeeSettings {
             min_sat_per_vb: 4,
             ..NetworkFeeSettings::default()
         };
         assert_eq!(fee(&floor, 1.0), fee(&settings, 4.0));
-        assert_eq!(fee(&floor, 10.0), 1_416);
+        assert_eq!(fee(&floor, 10.0), 1_494);
     }
 
     #[test]
@@ -327,14 +327,14 @@ mod tests {
             multiplier_percent: 125,
             ..NetworkFeeSettings::default()
         };
-        // (342 + 26 × 25) / 25 × 1.25 = 49.6 and 496 sats.
-        assert_eq!(fee(&full_pool, 1.0), 50);
-        assert_eq!(fee(&full_pool, 10.0), 496);
+        // (368 + 26 × 25) / 25 × 1.25 = 50.9 and 509 sats.
+        assert_eq!(fee(&full_pool, 1.0), 51);
+        assert_eq!(fee(&full_pool, 10.0), 509);
         let at_rate = NetworkFeeSettings {
             multiplier_percent: 100,
             ..NetworkFeeSettings::default()
         };
-        assert_eq!(fee(&at_rate, 1.0), 95); // 94.4
+        assert_eq!(fee(&at_rate, 1.0), 100); // 99.6
         let weights = NetworkFeeSettings {
             base_vbytes: 100,
             vbytes_per_player: 0,
@@ -359,16 +359,16 @@ mod tests {
     }
 
     /// A $5 entry is about 5,914 sats (BTC at $84,547), so entries pause once its network fee is
-    /// more than 591.4 sats: from about 4.18 sat/vB.
+    /// more than 591.4 sats: from about 3.96 sat/vB.
     #[test]
     fn entries_pause_above_ten_percent_of_the_entry() {
         let settings = NetworkFeeSettings::default();
         const ENTRY: u64 = 5_914;
         assert!(!settings.pauses(591, ENTRY));
         assert!(settings.pauses(592, ENTRY));
-        assert_eq!(fee(&settings, 4.17), 591);
-        assert_eq!(fee(&settings, 4.18), 592);
-        assert!(!settings.pauses(fee(&settings, 4.0), ENTRY));
+        assert_eq!(fee(&settings, 3.95), 591);
+        assert_eq!(fee(&settings, 3.96), 592);
+        assert!(!settings.pauses(fee(&settings, 3.0), ENTRY));
         assert!(settings.pauses(fee(&settings, 5.0), ENTRY));
         // Exactly 10% is not above it.
         assert!(!settings.pauses(500, 5_000));
@@ -381,7 +381,7 @@ mod tests {
         let quote = NetworkFeeQuote {
             enabled: true,
             network_fee_sats: 592,
-            sat_per_vb: 4.18,
+            sat_per_vb: 3.96,
             conf_target: 2,
             pool_players: 5,
             multiplier_percent: 150,
@@ -401,7 +401,7 @@ mod tests {
                 enabled: true,
                 pool_players: 5,
                 multiplier_percent: 150,
-                base_vbytes: 342,
+                base_vbytes: 368,
                 vbytes_per_player: 26,
                 conf_target: 2,
                 min_sat_per_vb: 1,

@@ -155,6 +155,8 @@ impl ContractAuthorization {
             || p.relative_locktime_block_delta != self.relative_locktime_block_delta
             || p.players.len() != self.player_count
             || p.fee_rate > self.max_fee_rate
+            || p.anchor
+                .is_some_and(|anchor| anchor.value > MAX_ANCHOR_VALUE)
         {
             return Err(PayoutError::ContractMismatch(
                 "Contract differs from authorized economics".into(),
@@ -175,6 +177,11 @@ impl ContractAuthorization {
         Ok(())
     }
 }
+
+/// The largest anchor output an authorized contract may carry: the P2A dust limit. Anchors let
+/// anyone fee-bump the outcome, expiry and split transactions; their value comes out of the
+/// funding value, so the authorization bounds it like the fee rate.
+pub const MAX_ANCHOR_VALUE: Amount = dlctix::anchor::P2A_DUST_VALUE;
 
 pub fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()

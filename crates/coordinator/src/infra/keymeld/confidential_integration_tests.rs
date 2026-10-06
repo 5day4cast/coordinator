@@ -212,6 +212,7 @@ fn parameters() -> ContractParameters {
         fee_rate: FeeRate::from_sat_per_vb_u32(1),
         funding_value: Amount::from_sat(100_000),
         relative_locktime_block_delta: 72,
+        anchor: None,
     }
 }
 fn invoice(preimage: [u8; 32]) -> String {
@@ -340,7 +341,8 @@ async fn coordinator_service_executes_confidential_dlc_and_recovers_late_paid_ca
     assert!(capabilities.payout);
     assert!(!capabilities.lnurl);
     let params = parameters();
-    let subsets = DlcSubsetBuilder::new(&params, UserId::from(maker), vec![player.clone()])
+    let sdk_params = sdk_dlctix::contract_parameters(&params).unwrap();
+    let subsets = DlcSubsetBuilder::new(&sdk_params, UserId::from(maker), vec![player.clone()])
         .build()
         .unwrap();
     let session = service
@@ -609,6 +611,7 @@ fn pool_parameters(count: usize) -> ContractParameters {
         fee_rate: FeeRate::from_sat_per_vb_u32(2),
         funding_value: Amount::from_sat(20_000 * count as u64),
         relative_locktime_block_delta: 144,
+        anchor: Some(dlctix::AnchorParams::default()),
     }
 }
 
@@ -731,7 +734,8 @@ impl PoolHarness {
         let service = create_keymeld_service(settings, maker, &[18; 32], db.clone()).unwrap();
         let competition = Uuid::now_v7();
         let players: Vec<UserId> = (0..count).map(|_| UserId::new_v7()).collect();
-        let subsets = DlcSubsetBuilder::new(&params, UserId::from(maker), players.clone())
+        let sdk_params = sdk_dlctix::contract_parameters(&params).unwrap();
+        let subsets = DlcSubsetBuilder::new(&sdk_params, UserId::from(maker), players.clone())
             .build()
             .unwrap();
         let session = service

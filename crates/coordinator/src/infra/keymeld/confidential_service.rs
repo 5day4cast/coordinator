@@ -1495,7 +1495,8 @@ impl KeymeldService {
             &session.authorization_manifest.manifest.coordinator_user_id,
             &session.authorization_manifest.manifest.subset_definitions,
         )?;
-        let candidate = DlcBatchBuilder::new(signing_data)
+        let sdk_signing_data = sdk_dlctix::signing_data(signing_data)?;
+        let candidate = DlcBatchBuilder::new(&sdk_signing_data)
             .with_outcome_subsets(&subsets)
             .build()?;
         let semantics: Vec<_> = candidate
@@ -1628,7 +1629,7 @@ impl KeymeldService {
             state.journal = journal;
             checkpoint.finish(state).await?;
         }
-        Ok(signatures)
+        Ok(sdk_dlctix::signature_results(signatures))
     }
 }
 
@@ -1670,7 +1671,7 @@ async fn finish_signing_batch(
     mut driver: ConfidentialSession<'_>,
     plan: &SigningPlan,
     expiry_secs: u64,
-) -> Result<DlcSignatureResults, KeymeldError> {
+) -> Result<SdkDlcSignatureResults, KeymeldError> {
     let encrypted = driver
         .sign_prepared_batch(&plan.session_id, expiry_secs, &[])
         .await?;
@@ -1719,7 +1720,7 @@ impl EscrowPhase<'_, '_> {
         plan: &SigningPlan,
         ark_funding: &Option<coordinator_escrow::ark::ArkFunding>,
         expiry_secs: u64,
-    ) -> Result<DlcSignatureResults, KeymeldError> {
+    ) -> Result<SdkDlcSignatureResults, KeymeldError> {
         let (session, state, credentials) = (self.session, self.state, self.credentials);
         self.driver
             .prepare_signing_batch(&plan.session_id, &plan.batch.items)

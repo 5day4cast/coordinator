@@ -2099,6 +2099,7 @@ pub(crate) mod tests {
             fee_rate: FeeRate::from_sat_per_vb_u32(1),
             funding_value: Amount::from_sat(3_000),
             relative_locktime_block_delta: 72,
+            anchor: None,
         });
         let historical = CompetitionView::new(&competition, NOW);
         assert!(historical.pot_refunded);

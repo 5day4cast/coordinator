@@ -49,7 +49,8 @@ tonic-prost = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 # Keymeld: released SDK and services on the published dlctix crate.
-# keymeld-sdk and the coordinator must resolve dlctix from the same source.
+# keymeld-sdk still resolves dlctix 0.1.0 while the coordinator builds on the
+# dlctix anchor branch; infra/keymeld.rs converts between the two at the SDK boundary.
 # Pinned to Keymeld 0.8.4 for idle enclave session cleanup.
 # Every crate that names Keymeld pins the same rev.
 keymeld-sdk = { git = "https://github.com/tee8z/keymeld", rev = "9caa57575c1f0eed3d001235a1ce8121cce9474f", default-features = false, features = ["escrow", "dlctix"] }
@@ -58,7 +59,8 @@ keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "9caa57575c1f0e
 # Bitcoin
 bitcoin = { version = "0.32", features = ["serde", "base64", "rand-std"] }
 electrum-client = "0.21"
-dlctix = "0.1.0"
+# Anchor outputs, unreleased: replace with the dlctix 0.2.0 release before merging.
+dlctix = { git = "https://github.com/tee8z/dlctix", branch = "feat/anchor-outputs" }
 miniscript = "12.3.2"
 
 # Web

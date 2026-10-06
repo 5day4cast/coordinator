@@ -490,13 +490,13 @@ mod tests {
 
     #[test]
     fn a_full_pool_with_the_network_fee_passes_at_1_sat_per_vb() {
-        let check = check(full_pool(142), 1, 100);
-        assert_eq!(check.chain_vbytes, 992);
-        assert_eq!(check.chain_cost_sats, 992);
+        let check = check(full_pool(150), 1, 100);
+        assert_eq!(check.chain_vbytes, 1_018);
+        assert_eq!(check.chain_cost_sats, 1_018);
         // 0.5% of the 125,000 sat pot.
         assert_eq!(check.routing_and_liquidity_sats, 625);
-        assert_eq!(check.paid_sats, 25 * 292);
-        assert_eq!(check.margin_sats, 25 * 292 - 992 - 625);
+        assert_eq!(check.paid_sats, 25 * 300);
+        assert_eq!(check.margin_sats, 25 * 300 - 1_018 - 625);
         assert!(check.passed && check.within_ceiling);
         assert_eq!(check.fee_rate().unwrap(), rate(1));
     }
@@ -504,7 +504,7 @@ mod tests {
     #[test]
     fn a_spiked_rate_fails() {
         let check = check(full_pool(50), 10, 100);
-        assert_eq!(check.chain_cost_sats, 9_920);
+        assert_eq!(check.chain_cost_sats, 10_180);
         assert!(check.margin_sats < 0);
         assert!(!check.passed);
         // Without a network fee, the service fee alone covers less.
@@ -518,13 +518,13 @@ mod tests {
 
     #[test]
     fn the_boundary_is_exact() {
-        // At 4 sat/vB a full pool costs 3,968 + 625 = 4,593 sats.
+        // At 4 sat/vB a full pool costs 4,072 + 625 = 4,697 sats.
         let mut pool = full_pool(50);
-        pool.paid_sats = 4_593;
+        pool.paid_sats = 4_697;
         let at = check_at(pool, 4);
         assert_eq!(at.margin_sats, 0);
         assert!(at.passed);
-        pool.paid_sats = 4_592;
+        pool.paid_sats = 4_696;
         let below = check_at(pool, 4);
         assert_eq!(below.margin_sats, -1);
         assert!(!below.passed);
@@ -563,11 +563,11 @@ mod tests {
             NOW,
         )
         .unwrap();
-        assert_eq!(check.chain_vbytes, 342 + 26 * 5);
-        assert_eq!(check.chain_cost_sats, 944);
+        assert_eq!(check.chain_vbytes, 368 + 26 * 5);
+        assert_eq!(check.chain_cost_sats, 996);
         // 1% of 25,001 rounds up.
         assert_eq!(check.routing_and_liquidity_sats, 251);
-        assert_eq!(check.margin_sats, -(944 + 251));
+        assert_eq!(check.margin_sats, -(996 + 251));
     }
 
     /// Priced and checked at the same rounded-up rate, a small pool passes at LND's floor, and a
@@ -623,7 +623,7 @@ mod tests {
         let exact = KickoffCheck::evaluate(
             &NetworkFeeSettings::default(),
             &KickoffCheckSettings::default(),
-            full_pool(142),
+            full_pool(150),
             FeeRate::from_sat_per_kwu(316),
             rate(100),
             NOW,
@@ -654,7 +654,7 @@ mod tests {
             "the wait is over"
         );
         assert_eq!(
-            check_at(full_pool(142), 1).fee_wait(&settings, closed, NOW),
+            check_at(full_pool(150), 1).fee_wait(&settings, closed, NOW),
             None
         );
         let no_wait = KickoffCheckSettings {

@@ -1,3 +1,5 @@
+#[path = "anchor_bump.rs"]
+mod anchor_bump;
 #[path = "ark_coordinator.rs"]
 mod ark_coordinator;
 #[path = "automatic_coordinator.rs"]
@@ -265,6 +267,11 @@ pub struct Coordinator {
     /// The check an Arkade pool passes before its contract is built; off until
     /// `with_kickoff_check`.
     kickoff_check: crate::config::KickoffCheckSettings,
+    /// Anchor outputs on new contracts, and fee-bumping through them; off until
+    /// `with_dlc_anchors`.
+    dlc_anchors: crate::config::DlcAnchorSettings,
+    /// The rate each unconfirmed pre-signed transaction was last bumped to, by txid.
+    cpfp_bumps: std::sync::Mutex<HashMap<Txid, FeeRate>>,
     ark: Option<Arc<super::Arkade>>,
     /// Whether the Arkade server is failing batch steps, which pauses entries to Arkade
     /// competitions.
@@ -341,6 +348,12 @@ impl Coordinator {
                 enabled: false,
                 ..Default::default()
             },
+            dlc_anchors: crate::config::DlcAnchorSettings {
+                enabled: false,
+                cpfp_enabled: false,
+                ..Default::default()
+            },
+            cpfp_bumps: std::sync::Mutex::default(),
             ark: None,
             arkade_health: Arc::default(),
             wakes: super::CompetitionWakes::default(),
@@ -1626,6 +1639,8 @@ impl Coordinator {
                     .event_submission
                     .relative_locktime_block_delta
                     .unwrap_or(self.relative_locktime_block_delta as u16),
+                // Contracts built before anchors keep their stored parameters above.
+                anchor: self.dlc_anchors.enabled.then(dlctix::AnchorParams::default),
             },
         };
         competition.contract_parameters = Some(contract_params.clone());
@@ -2546,6 +2561,15 @@ impl Coordinator {
                 "Outcome transaction not confirmed yet for competition {}",
                 competition.id
             );
+            if let Some(broadcast_at) = competition.outcome_broadcasted_at {
+                self.bump_unconfirmed_presigned_tx(
+                    competition.id,
+                    signed_contract,
+                    outcome_transaction,
+                    broadcast_at,
+                )
+                .await;
+            }
             return Ok(competition);
         };
 
@@ -2874,6 +2898,8 @@ impl Coordinator {
                     "Competition {} split TX already broadcast, processing individual closes",
                     competition.id
                 );
+                self.bump_unconfirmed_split_tx(competition, signed_contract, &outcome)
+                    .await;
             }
 
             // Handle individual cooperative closes for paid winners
@@ -3111,6 +3137,8 @@ impl Coordinator {
                             "Competition {} split tx {} is not confirmed yet; reclaiming later",
                             competition.id, split_txid
                         );
+                        self.bump_unconfirmed_split_tx(competition, signed_contract, &outcome)
+                            .await;
                         return Ok(competition);
                     }
                     ReclaimReadiness::Wait { blocks } => {
@@ -5984,6 +6012,7 @@ mod tests {
             fee_rate: dlctix::bitcoin::FeeRate::from_sat_per_vb_u32(1),
             funding_value: Amount::from_sat(100_000),
             relative_locktime_block_delta: 72,
+            anchor: None,
         }
     }
 

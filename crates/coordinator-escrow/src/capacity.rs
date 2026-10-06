@@ -260,6 +260,10 @@ pub fn validate_competition_capacity(
         fee_rate: FeeRate::from_sat_per_kwu(u64::MAX),
         funding_value: Amount::from_sat(u64::MAX),
         relative_locktime_block_delta: u16::MAX,
+        // An anchored contract serializes one more field; size the larger one.
+        anchor: Some(dlctix::AnchorParams {
+            value: Amount::from_sat(u64::MAX),
+        }),
     };
     let terms = ContractAuthorization {
         competition_id: id,

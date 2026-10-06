@@ -813,6 +813,7 @@ mod tests {
             fee_rate: FeeRate::from_sat_per_vb_u32(1),
             funding_value: Amount::from_sat(100_000),
             relative_locktime_block_delta: 72,
+            anchor: None,
         };
         Fixture {
             wallet,
@@ -887,7 +888,18 @@ mod tests {
 
     #[test]
     fn partial_signatures_verify_after_wallet_reload() {
-        let f = fixture();
+        partial_signatures_verify_after_reload(fixture());
+    }
+
+    /// A contract built with anchor outputs is accepted and signed like one built without.
+    #[test]
+    fn anchored_contract_signatures_verify_after_wallet_reload() {
+        let mut f = fixture();
+        f.params.anchor = Some(dlctix::AnchorParams::default());
+        partial_signatures_verify_after_reload(f);
+    }
+
+    fn partial_signatures_verify_after_reload(f: Fixture) {
         let psbt = funding_psbt(&f, our_key(&f));
         let mut f = accepted(f, &psbt);
         let id = f.entry_id;
@@ -942,9 +954,15 @@ mod tests {
         let mut changed = f.params.clone();
         changed.fee_rate = FeeRate::from_sat_per_vb_u32(2);
         let outpoint = OutPoint::new(psbt.unsigned_tx.compute_txid(), 0);
-        f.wallet.add_contract(id, changed, outpoint).unwrap();
+        f.wallet
+            .add_contract(id, changed.clone(), outpoint)
+            .unwrap();
+        let after = f.wallet.generate_public_nonces(id).unwrap();
+        assert_ne!(after, before);
 
-        assert_ne!(f.wallet.generate_public_nonces(id).unwrap(), before);
+        changed.anchor = Some(dlctix::AnchorParams::default());
+        f.wallet.add_contract(id, changed, outpoint).unwrap();
+        assert_ne!(f.wallet.generate_public_nonces(id).unwrap(), after);
     }
 
     #[test]

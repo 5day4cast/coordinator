@@ -2,6 +2,7 @@
 //! ticket, and how the escrows of a competition that died are refunded.
 
 use super::*;
+use crate::infra::keymeld::DlcSignatureResults;
 use crate::infra::{
     ark_swap::{
         BoardFailure, EscrowSwaps, RefundSwap as MintedRefund, Swap, SwapState, SwapWallet,
@@ -27,8 +28,8 @@ use coordinator_ark_escrow::{EntryEscrow, RefundSwap, SwapTerms};
 use coordinator_core::RegistrationAssignment;
 use coordinator_escrow::ark::ArkEscrowSpend;
 use coordinator_escrow::authorization::{ArkEscrowPolicy, PayoutPolicy};
+use dlctix::SigningData;
 use keymeld_core::authorization::EnclaveRecipientAuthorization;
-use keymeld_sdk::dlctix::{dlctix::SigningData, DlcSignatureResults};
 use keymeld_sdk::prelude::UserId;
 use keymeld_sdk::types::{EnclaveId, SessionAuthorizationManifest, SignedRoster};
 use keymeld_sdk::{AuthorizationCredentials, SessionCredentials, SessionId};

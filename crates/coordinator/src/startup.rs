@@ -565,7 +565,8 @@ pub async fn build_app(
     .with_settle_only(
         config.coordinator_settings.settle_only,
         config.coordinator_settings.settle_only_unstarted,
-    );
+    )
+    .with_dlc_anchors(config.dlc_anchor_settings.clone());
     let (wakes, wake_requests) = CompetitionWakes::new();
     let coordinator = Arc::new(
         coordinator

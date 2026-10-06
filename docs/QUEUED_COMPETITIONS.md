@@ -655,7 +655,8 @@ Pending: whether the closing sweep can board back into Arkade.
 ### Network fee
 
 Each ticket carries its share of the pool's chain cost, as its own line next to the entry and service fees.
-It is priced for the smallest pool the game runs, five players, with a 50% margin: `ceil((342 + 26 × 5) / 5 × rate × 1.5)` sats.
+It is priced for the smallest pool the game runs, five players, with a 50% margin: `ceil((368 + 26 × 5) / 5 × rate × 1.5)` sats.
+The 368 vbytes include the two 13 vB pay-to-anchor outputs on the outcome and split transactions (see [Anchors](#anchors)).
 
 The configured electrs server supplies a historical baseline through `blockchain.estimatefee(144)`.
 This is a 144-block confirmation target, about 72 minutes on Mutinynet or one day on Bitcoin.
@@ -675,7 +676,7 @@ The coordinator does not fall back to LND estimates or a public explorer.
 The contract rate adds the larger of 10% and 0.25 sat/vB after the next-block mempool adjustment.
 Ticket pricing uses the two-block mempool adjustment with the same baseline and margin.
 For a quiet mempool and a historical estimate of 1.029 sat/vB, the contract rate is 1.280 sat/vB at wallet precision.
-At LND's floor of 1.012 sat/vB, the contract rate is 1.264 sat/vB and the ticket's network fee is 179 sats.
+At LND's floor of 1.012 sat/vB, the contract rate is 1.264 sat/vB and the ticket's network fee is 189 sats.
 
 The fee is fixed on the ticket's invoice when the ticket is issued and does not change for that payment hash.
 It is refunded with the escrow.
@@ -689,7 +690,7 @@ At kickoff the coordinator knows the pool's size and the rate it will pay, so it
 A pool is checked when it forms, before its oracle event, and every Arkade competition again just before its contract is built.
 It passes only if all of these hold:
 
-- what the entries paid beyond the pot, as the kickoff can collect it, covers `(342 + 26 × players)` vbytes at the kickoff rate plus 0.5% of the pot for paying the winner over Lightning and keeping channels balanced;
+- what the entries paid beyond the pot, as the kickoff can collect it, covers `(368 + 26 × players)` vbytes at the kickoff rate plus 0.5% of the pot for paying the winner over Lightning and keeping channels balanced;
 - the kickoff rate is within the fee ceiling in the terms;
 - the pool has enough players for the rate: its terms' minimum while the rate is at most 2 sat/vB, and at least five above that.
 
@@ -702,6 +703,19 @@ The thresholds are `kickoff_check_settings`.
 
 Tickets bought at different rates carry different network fees, and the verifier signs an escrow into a batch only if the fee output is at most that escrow's `max_fee_sats` times the escrows in the batch.
 So the kickoff collects at most the lowest cap times the number of players, the rest goes to the Arkade server, and the check counts only what the kickoff collects.
+
+### Anchors
+
+New contracts carry a pay-to-anchor output (`OP_1 <0x4e73>`, 240 sats) as the last output of every outcome, expiry and split transaction (`dlc_anchor_settings.enabled`).
+Anyone can spend it, so a stuck transaction can be fee-bumped with a child (CPFP) by the coordinator or, without the coordinator, by a player recovering their entry.
+The transactions still pay the contract rate themselves, so they relay without the child.
+Contracts built before keep their stored parameters and transactions.
+
+The anchor value comes out of the funding value, so the coordinator, which closes the outputs back to itself after paying the winners over Lightning, pays for it out of its fee.
+The verifier only signs a contract whose anchor is at most 240 sats.
+
+When an outcome, expiry or split transaction the coordinator broadcast has waited `cpfp_after_secs` (30 minutes) without confirming and pays less than the estimate for `cpfp_conf_target` blocks, the coordinator spends its anchor and one confirmed coin of the LND wallet in a child that brings the pair to the estimate.
+It bumps again only once the estimate has risen by a quarter; the coordinator pays the child's fee.
 
 ## Failure paths
 

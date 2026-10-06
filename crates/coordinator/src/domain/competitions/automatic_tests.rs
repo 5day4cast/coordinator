@@ -2,6 +2,7 @@
 //! No browser request is made after the initial entry fixtures are stored.
 use super::*;
 use crate::domain::competitions::CompetitionState;
+use crate::infra::keymeld::DlcSignatureResults;
 use crate::infra::{
     bitcoin_mock::MockBitcoinClient,
     db::{DBConnection, DatabasePoolConfig, DatabaseType},
@@ -12,9 +13,9 @@ use crate::infra::{
 };
 use async_trait::async_trait;
 use bitcoin::{hashes::Hash, Network};
+use dlctix::SigningData;
 use keymeld_core::authorization::EnclaveRecipientAuthorization;
 use keymeld_sdk::{
-    dlctix::{dlctix::SigningData, DlcSignatureResults},
     types::{EnclaveId, SessionAuthorizationManifest, SignedSessionManifest},
     AuthorizationCredentials, SessionCredentials, SessionId,
 };
@@ -665,6 +666,7 @@ fn parameters(market_maker: Scalar) -> ContractParameters {
         fee_rate: FeeRate::from_sat_per_vb_u32(1),
         funding_value: Amount::from_sat(100_000),
         relative_locktime_block_delta: 72,
+        anchor: None,
     }
 }
 

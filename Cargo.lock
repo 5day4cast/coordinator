@@ -1584,7 +1584,7 @@ dependencies = [
  "coordinator-escrow",
  "coordinator-escrow-verifier",
  "dashmap",
- "dlctix",
+ "dlctix 0.2.0",
  "electrum-client",
  "env_logger",
  "fern",
@@ -1650,7 +1650,7 @@ dependencies = [
  "coordinator-ark",
  "coordinator-ark-escrow",
  "coordinator-escrow",
- "dlctix",
+ "dlctix 0.2.0",
  "electrum-client",
  "futures",
  "hex",
@@ -1730,7 +1730,7 @@ version = "2.18.5"
 dependencies = [
  "anyhow",
  "coordinator-ark-escrow",
- "dlctix",
+ "dlctix 0.2.0",
  "hex",
  "hmac 0.12.1",
  "keymeld-core",
@@ -1815,7 +1815,7 @@ dependencies = [
  "clap",
  "coordinator-ark",
  "coordinator-ark-escrow",
- "dlctix",
+ "dlctix 0.2.0",
  "flate2",
  "futures",
  "hex",
@@ -1848,7 +1848,7 @@ dependencies = [
  "coordinator-ark-escrow",
  "coordinator-core",
  "dashmap",
- "dlctix",
+ "dlctix 0.2.0",
  "fern",
  "futures",
  "hex",
@@ -1901,7 +1901,7 @@ dependencies = [
  "coordinator-ark-escrow",
  "coordinator-core",
  "coordinator-recover",
- "dlctix",
+ "dlctix 0.2.0",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
  "hex",
@@ -2274,6 +2274,21 @@ name = "dlctix"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "623c50081195a8a1ca7e214bb9f7517820d37e4e7e54312fc77eda19572184e8"
+dependencies = [
+ "bitcoin",
+ "hex",
+ "musig2",
+ "rand 0.9.5",
+ "secp",
+ "serde",
+ "serdect 0.4.3",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "dlctix"
+version = "0.2.0"
+source = "git+https://github.com/tee8z/dlctix?branch=feat%2Fanchor-outputs#e9a0ae9d447f813b30fadc7225a89fc00ae3d42e"
 dependencies = [
  "bitcoin",
  "hex",
@@ -3678,7 +3693,7 @@ name = "keymeld-sdk"
 version = "0.8.4"
 source = "git+https://github.com/tee8z/keymeld?rev=9caa57575c1f0eed3d001235a1ce8121cce9474f#9caa57575c1f0eed3d001235a1ce8121cce9474f"
 dependencies = [
- "dlctix",
+ "dlctix 0.1.0",
  "flate2",
  "getrandom 0.2.17",
  "getrandom 0.3.4",

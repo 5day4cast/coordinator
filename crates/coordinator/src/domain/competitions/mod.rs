@@ -1073,6 +1073,7 @@ mod oracle_event_validation_tests {
             fee_rate: FeeRate::from_sat_per_vb_u32(1),
             funding_value: Amount::from_sat(2_000),
             relative_locktime_block_delta: 72,
+            anchor: None,
         };
         let mut competition = Competition::new(&event());
         assert!(!competition.refunds_every_entry(), "no contract yet");

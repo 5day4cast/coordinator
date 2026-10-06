@@ -64,6 +64,7 @@ fn pot_return_contract() -> (ContractParameters, EventLockingConditions, MaybeSc
         fee_rate: FeeRate::from_sat_per_vb_u32(1),
         funding_value: Amount::from_sat(3_000),
         relative_locktime_block_delta: 72,
+        anchor: None,
     };
     (params, event, attestation.into())
 }
