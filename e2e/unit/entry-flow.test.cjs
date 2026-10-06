@@ -1235,3 +1235,19 @@ test("Pay reads Enter while the form shows a paid ticket, and its price otherwis
   sandbox.labelPay();
   assert.equal(elements.submitEntry.textContent, "Entered");
 });
+
+test("Pay is hidden while the notice says no ticket would be issued, and back without it", () => {
+  const { elements, document } = entryPage();
+  const label = "Pay 5,300 sats and enter";
+  Object.assign(elements.submitEntry, { textContent: label, dataset: { payLabel: label } });
+  const sandbox = load({}, document, termsFetch());
+  // A single competition's player whose paid entry lapsed: it still counts as their entry.
+  elements.entryPaid = element({ dataset: { payRefused: "true" } });
+  sandbox.labelPay();
+  assert.ok(elements.submitEntry.classList.contains("is-hidden"));
+  // Logged out, or logged in as someone else: the notice says nothing, and Pay is back.
+  elements.entryPaid = element();
+  sandbox.labelPay();
+  assert.ok(!elements.submitEntry.classList.contains("is-hidden"));
+  assert.equal(elements.submitEntry.textContent, label);
+});

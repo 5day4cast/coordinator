@@ -1808,6 +1808,10 @@ async fn a_player_s_paid_tickets_without_an_entry_are_listed_while_entries_are_o
             competition_id: id,
         }]
     );
+    assert!(
+        !unentered.pay_refused,
+        "in a queue a lapsed ticket is not an entry, so Pay starts a new one"
+    );
     assert_eq!(
         queue
             .coordinator

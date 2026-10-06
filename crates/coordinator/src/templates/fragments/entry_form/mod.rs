@@ -6,8 +6,8 @@ use maud::{html, Markup};
 
 use crate::domain::{
     leaderboard::{Metric, Rule},
-    PaidTicket, PayoutTermsQuote, TicketStatus, UnpaidTicket, ARKADE_UNAVAILABLE, ENTRIES_PAUSED,
-    SETTLE_ONLY_PAUSED,
+    PaidTicket, PayoutTermsQuote, TicketStatus, UnenteredTickets, UnpaidTicket, ARKADE_UNAVAILABLE,
+    ENTRIES_PAUSED, LAPSED_ENTRY, SETTLE_ONLY_PAUSED,
 };
 use crate::templates::{
     components::{tip, tip_start},
@@ -83,14 +83,28 @@ impl NetworkFee {
 pub struct PaidNotice<'a> {
     /// The first they can still enter, which Pay enters without paying again (`entry_form.js`).
     pub ticket: Option<&'a PaidTicket>,
-    /// One was not entered within the hour its entry id allows: its fee is refunded, and Pay
-    /// starts a new entry.
+    /// One was not entered within the hour its entry id allows: its fee is refunded.
     pub lapsed: bool,
+    /// That lapsed ticket keeps the player from paying for another seat, as in a single
+    /// competition, where it still counts as their entry. Otherwise Pay starts a new entry.
+    pub pay_refused: bool,
 }
 
-/// What the entry form says, once, to a player whose paid ticket lapsed.
-pub const LAPSED_ENTRY: &str =
-    "Your earlier entry wasn't finished in time; its fee is being refunded";
+impl<'a> PaidNotice<'a> {
+    /// What to say of `tickets`, the player's paid tickets without an entry in one competition.
+    pub fn of(tickets: &'a UnenteredTickets) -> Self {
+        Self {
+            ticket: tickets.paid.first(),
+            lapsed: !tickets.lapsed.is_empty(),
+            pay_refused: tickets.pay_refused,
+        }
+    }
+
+    /// Whether Pay is hidden: no paid ticket is left to enter, and no new one would be issued.
+    fn hides_pay(&self) -> bool {
+        self.pay_refused && self.ticket.is_none()
+    }
+}
 
 /// Entry form for a competition. `unpaid` is the logged-in player's oldest unpaid ticket in it,
 /// which Pay resumes, and `paid` what to say of their paid tickets whose entry never went in.
@@ -249,10 +263,16 @@ pub fn entry_form(
                     Some(fee) => format!("Pay {} and enter", sats(competition.ticket_price + fee)),
                     None => "Pay and enter".to_string(),
                 };
+                @let pay_class = if paid.hides_pay() {
+                    "button is-primary is-medium is-hidden"
+                } else {
+                    "button is-primary is-medium"
+                };
                 // A paid ticket is entered without paying again, paused or not. `entry_form.js`
-                // relabels the button when the paid notice comes or goes with a log-in; while
-                // entries are paused there is no price to go back to.
-                button type="button" id="submitEntry" class="button is-primary is-medium"
+                // relabels the button when the paid notice comes or goes with a log-in, and hides
+                // it while the notice says no ticket would be issued; while entries are paused
+                // there is no price to go back to.
+                button type="button" id="submitEntry" class=(pay_class)
                        disabled[paused.is_some() && paid.ticket.is_none()]
                        data-pay-label=[paused.is_none().then_some(&pay_label)] {
                     @if paid.ticket.is_some() {
@@ -284,8 +304,10 @@ pub fn paid_url(competition_id: &str) -> String {
 /// The player's paid ticket in this competition whose entry never went in (their page reloaded
 /// before it did), if they hold one, and how long is left to finish it: Pay enters the picks on
 /// the form under it, without paying again. Below it, one line however many there are, for paid
-/// entries not finished in time: their fees are refunded, and Pay starts a new entry. Empty
-/// otherwise, and reloaded on log-in and log-out without touching the picks.
+/// entries not finished in time: their fees are refunded, and Pay starts a new entry, unless such
+/// a ticket still counts as the player's entry, as in a single competition. Then the notice says
+/// no ticket would be issued (`data-pay-refused`), and Pay is hidden. Empty otherwise, and
+/// reloaded on log-in and log-out without touching the picks.
 pub fn paid_notice(
     competition_id: &str,
     paid: PaidNotice<'_>,
@@ -295,6 +317,7 @@ pub fn paid_notice(
     html! {
         div id="entryPaid" hx-get=(paid_url(competition_id))
             hx-trigger="fw:login from:body, fw:logout from:body" hx-swap="outerHTML"
+            data-pay-refused=[paid.hides_pay().then_some("true")]
             data-ticket-id=[ticket.map(|ticket| ticket.ticket_id)]
             data-entry-id=[ticket.map(|ticket| ticket.entry_id)]
             data-entry-key=[ticket.and_then(|ticket| ticket.ephemeral_pubkey.as_deref())] {
@@ -634,7 +657,7 @@ mod tests {
             "c1",
             PaidNotice {
                 ticket: Some(&ticket),
-                lapsed: false,
+                ..PaidNotice::default()
             },
             now,
         )
@@ -669,7 +692,7 @@ mod tests {
                 None,
                 PaidNotice {
                     ticket: paid,
-                    lapsed: false,
+                    ..PaidNotice::default()
                 },
             )
             .into_string()
@@ -703,8 +726,8 @@ mod tests {
     fn a_lapsed_paid_ticket_is_mentioned_once_and_pay_starts_a_new_entry() {
         let now = time::macros::datetime!(2026-10-06 12:00 UTC);
         let lapsed = PaidNotice {
-            ticket: None,
             lapsed: true,
+            ..PaidNotice::default()
         };
         let html = paid_notice("c1", lapsed, now).into_string();
         assert_eq!(html.matches(LAPSED_ENTRY).count(), 1);
@@ -751,6 +774,7 @@ mod tests {
             PaidNotice {
                 ticket: Some(&ticket),
                 lapsed: true,
+                ..PaidNotice::default()
             },
             now,
         )
@@ -759,6 +783,51 @@ mod tests {
         assert!(both.contains("42 min left."));
         assert_eq!(both.matches(LAPSED_ENTRY).count(), 1);
         assert!(both.find("Paid —").unwrap() < both.find(LAPSED_ENTRY).unwrap());
+    }
+
+    /// In a single competition a lapsed paid ticket still counts as the player's entry: the form
+    /// says so once and shows no Pay, and its notice tells `entry_form.js` to keep it hidden. A
+    /// paid ticket still to enter keeps Enter.
+    #[test]
+    fn a_lapsed_entry_that_still_counts_hides_pay() {
+        let now = time::macros::datetime!(2026-10-06 12:00 UTC);
+        let refused = PaidNotice {
+            lapsed: true,
+            pay_refused: true,
+            ..PaidNotice::default()
+        };
+        let notice = paid_notice("c1", refused, now).into_string();
+        assert!(notice.contains(r#"data-pay-refused="true""#));
+        assert_eq!(notice.matches(LAPSED_ENTRY).count(), 1);
+
+        let html = form_with(refused);
+        assert_eq!(html.matches(LAPSED_ENTRY).count(), 1);
+        assert!(
+            html.contains(r#"id="submitEntry" class="button is-primary is-medium is-hidden""#),
+            "{html}"
+        );
+        // Where the lapsed ticket does not count, Pay starts a new entry.
+        let open = form_with(PaidNotice {
+            lapsed: true,
+            ..PaidNotice::default()
+        });
+        assert!(open.contains(r#"id="submitEntry" class="button is-primary is-medium""#));
+        assert!(!open.contains("data-pay-refused"));
+
+        let ticket = PaidTicket {
+            ticket_id: uuid::Uuid::from_u128(7),
+            competition_id: uuid::Uuid::from_u128(1),
+            entry_id: uuid::Uuid::from_u128(8),
+            ephemeral_pubkey: None,
+            finish_by: time::OffsetDateTime::now_utc() + time::Duration::minutes(42),
+        };
+        let enter = form_with(PaidNotice {
+            ticket: Some(&ticket),
+            ..refused
+        });
+        assert!(enter.contains(r#"id="submitEntry" class="button is-primary is-medium""#));
+        assert!(enter.contains(">Enter</button>"));
+        assert!(!enter.contains("data-pay-refused"));
     }
 
     #[test]
@@ -823,6 +892,23 @@ mod tests {
             NetworkFee::Estimate(50),
             None,
             PaidNotice::default(),
+        )
+        .into_string()
+    }
+
+    /// A logged-in player's form, saying `paid` of their paid tickets without an entry.
+    fn form_with(paid: PaidNotice<'_>) -> String {
+        entry_form(
+            &view("c1", Phase::Upcoming, 60),
+            &Forecasts::Ready {
+                stations: vec![station()],
+                pins: vec![],
+            },
+            Some(&terms(true)),
+            &PayoutDestination::Address("thor@lnurl.5day4cast.com".into()),
+            NetworkFee::Estimate(50),
+            None,
+            paid,
         )
         .into_string()
     }

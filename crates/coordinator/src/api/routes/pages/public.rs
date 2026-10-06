@@ -29,7 +29,7 @@ use crate::{
     api::extractors::NostrAuth,
     domain::{
         leaderboard::{Leaderboard, Phase, FIRST_READ_WAIT},
-        Competition, Error, LedgerTotals, PaidTicket, RefundProgress, Returned, UnpaidTicket,
+        Competition, Error, LedgerTotals, RefundProgress, Returned, UnenteredTickets, UnpaidTicket,
     },
     infra::refresh_cache::Cached,
     startup::AppState,
@@ -698,8 +698,8 @@ pub async fn entry_form_fragment(
     let view = competition_view(&state, &competition, now()).await;
     // A player who paid and has not entered yet finishes the entry here, even with every seat
     // taken.
-    let (paid, lapsed) = paid_tickets(&state, auth.as_ref(), competition_id).await;
-    if !view.can_enter && paid.is_none() {
+    let unentered = unentered_tickets(&state, auth.as_ref(), competition_id).await;
+    if !view.can_enter && unentered.paid.is_empty() {
         // Entries are closed; the leaderboard is what there is to see.
         return leaderboard_response(&state, &headers, &view);
     }
@@ -731,10 +731,7 @@ pub async fn entry_form_fragment(
         &destination,
         network_fee,
         unpaid.as_ref(),
-        PaidNotice {
-            ticket: paid.as_ref(),
-            lapsed,
-        },
+        PaidNotice::of(&unentered),
     );
     page(
         &headers,
@@ -822,32 +819,24 @@ pub async fn entry_unpaid_fragment(
     )
 }
 
-/// The player's first paid ticket in the competition whose entry never went in, which the entry
-/// form's Pay enters without paying again, and whether one lapsed, its entry no longer possible
-/// and its fee refunded. Neither when signed out, when entries are closed, or when they cannot be
+/// The player's paid tickets in the competition whose entry never went in: the one the entry
+/// form's Pay enters without paying again, and any that lapsed, their entries no longer possible
+/// and their fees refunded. None when signed out, when entries are closed, or when they cannot be
 /// read.
-async fn paid_tickets(
+async fn unentered_tickets(
     state: &AppState,
     auth: Option<&NostrAuth>,
     competition_id: Uuid,
-) -> (Option<PaidTicket>, bool) {
+) -> UnenteredTickets {
     let Some(auth) = auth else {
-        return (None, false);
+        return UnenteredTickets::default();
     };
-    match state
+    state
         .coordinator
         .unentered_tickets(&auth.pubkey.to_hex(), Some(competition_id))
         .await
-    {
-        Ok(unentered) => (
-            unentered.paid.into_iter().next(),
-            !unentered.lapsed.is_empty(),
-        ),
-        Err(error) => {
-            warn!("paid tickets in {competition_id}: {error}");
-            (None, false)
-        }
-    }
+        .inspect_err(|error| warn!("paid tickets in {competition_id}: {error}"))
+        .unwrap_or_default()
 }
 
 /// The entry form's paid-entry notice, reloaded when the player logs in or out.
@@ -856,13 +845,13 @@ pub async fn entry_paid_fragment(
     Path(competition_id): Path<Uuid>,
     MaybeAuth(auth): MaybeAuth,
 ) -> Response {
-    let (paid, lapsed) = paid_tickets(&state, auth.as_ref(), competition_id).await;
-    let notice = PaidNotice {
-        ticket: paid.as_ref(),
-        lapsed,
-    };
+    let unentered = unentered_tickets(&state, auth.as_ref(), competition_id).await;
     fragment(
-        paid_notice(&competition_id.to_string(), notice, now()),
+        paid_notice(
+            &competition_id.to_string(),
+            PaidNotice::of(&unentered),
+            now(),
+        ),
         Caching::Private,
     )
 }

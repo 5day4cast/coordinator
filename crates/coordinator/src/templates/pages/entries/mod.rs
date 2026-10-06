@@ -6,12 +6,12 @@ use time::OffsetDateTime;
 
 use crate::domain::{
     leaderboard::Phase, EntryPayment, LedgerEntry, LedgerTotals, PaidTicket, PayoutState, Refund,
-    RefundKind, RefundState, Returned, UnpaidTicket,
+    RefundKind, RefundState, Returned, UnpaidTicket, LAPSED_ENTRY,
 };
 use crate::templates::{
     components::tip,
     format::{self, sats, thousands, tx_url, Explorers, TimeStyle},
-    fragments::{entry_form::LAPSED_ENTRY, picks::detail_url},
+    fragments::picks::detail_url,
     pages::competitions::{phase_badge, CompetitionView, Queue},
 };
 

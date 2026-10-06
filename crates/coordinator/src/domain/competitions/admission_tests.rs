@@ -629,12 +629,13 @@ pub(super) fn contract_terms(competition_id: Uuid, entry_id: Uuid) -> String {
 }
 
 /// A paid ticket whose entry was not made within the hour its entry id allows has lapsed. In a
-/// single competition it is no longer handed back as its player's ticket, nor counts as their
-/// entry, so they can take a seat for a new entry. Its own seat stays with it: every seat's
-/// ticket is named in the competition's payout terms and Keymeld session, so no one else can
-/// have it.
+/// single competition it keeps its seat, as every seat's ticket is named in the competition's
+/// payout terms and Keymeld session, so it still counts as its player's entry. It is no longer
+/// handed back for them to enter, and a player who may make one entry gets no new ticket, which
+/// would only pay for a seat in a competition that can no longer fill: they are told why. One who
+/// may make two can still take a second seat.
 #[tokio::test]
-async fn a_lapsed_paid_ticket_is_not_its_players_entry_in_a_single_competition() {
+async fn a_lapsed_paid_ticket_still_counts_as_its_players_entry_in_a_single_competition() {
     use super::store::TicketReservation;
     let (_dir, db, store, competition, _) =
         fixture(OffsetDateTime::now_utc() + Duration::hours(1), 3).await;
@@ -650,13 +651,18 @@ async fn a_lapsed_paid_ticket_is_not_its_players_entry_in_a_single_competition()
     .await
     .unwrap();
     let deadline = competition.ticket_deadline();
-    let reserve = |player: &'static str| {
+    let reserve = |player: &'static str, max: u32| {
         let store = store.clone();
-        async move { bounded(store.get_and_reserve_ticket_before(id, player, deadline, 1)).await }
+        async move { bounded(store.get_and_reserve_ticket_before(id, player, deadline, max)).await }
     };
 
     // Alice pays for a seat, having accepted the payout terms for the entry she started.
-    let paid = reserve("alice").await.unwrap().reserved().unwrap().ticket;
+    let paid = reserve("alice", 1)
+        .await
+        .unwrap()
+        .reserved()
+        .unwrap()
+        .ticket;
     assert!(bounded(store.mark_ticket_paid(&paid.hash, id))
         .await
         .unwrap());
@@ -693,7 +699,7 @@ async fn a_lapsed_paid_ticket_is_not_its_players_entry_in_a_single_competition()
     started(55).await;
     // Within the hour the paid ticket is hers to enter, and her one entry.
     assert_eq!(
-        reserve("alice")
+        reserve("alice", 1)
             .await
             .unwrap()
             .reserved()
@@ -703,24 +709,37 @@ async fn a_lapsed_paid_ticket_is_not_its_players_entry_in_a_single_competition()
         paid.id
     );
 
-    // The hour passes without the entry.
+    // The hour passes without the entry: the ticket is not handed back, and is still her entry.
     started(61).await;
-    let again = reserve("alice").await.unwrap().reserved().unwrap().ticket;
-    assert_ne!(
-        again.id, paid.id,
-        "a seat for a new entry, not the lapsed ticket"
-    );
-    assert!(again.paid_at.is_none());
-    // The lapsed ticket keeps its seat: with bob's, every seat is taken.
-    assert!(reserve("bob").await.unwrap().reserved().is_some());
     assert!(matches!(
-        reserve("carol").await,
+        reserve("alice", 1).await.unwrap(),
+        TicketReservation::Lapsed
+    ));
+    let held: i64 = bounded(
+        sqlx::query_scalar("SELECT count(*) FROM tickets WHERE reserved_by = 'alice'")
+            .fetch_one(db.read()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(held, 1, "no other seat was reserved for her");
+
+    // Where one player may make two entries, the lapsed ticket is one of them.
+    let again = reserve("alice", 2)
+        .await
+        .unwrap()
+        .reserved()
+        .unwrap()
+        .ticket;
+    assert_ne!(again.id, paid.id, "a second seat, not the lapsed ticket");
+    // The lapsed ticket keeps its seat: with bob's, every seat is taken.
+    assert!(reserve("bob", 1).await.unwrap().reserved().is_some());
+    assert!(matches!(
+        reserve("carol", 1).await,
         Err(crate::infra::db::DatabaseWriteError::Sqlx(
             sqlx::Error::RowNotFound
         ))
     ));
-
-    // Paid and entered, the new ticket is her one entry.
+    // Paid and entered, the second seat is her other entry.
     assert!(bounded(store.mark_ticket_paid(&again.hash, id))
         .await
         .unwrap());
@@ -730,15 +749,15 @@ async fn a_lapsed_paid_ticket_is_not_its_players_entry_in_a_single_competition()
         None,
         competition.event_submission.start_observation_date,
         None,
-        1,
+        2,
     ))
     .await
     .unwrap()
     .added()
     .is_some());
     assert!(matches!(
-        reserve("alice").await.unwrap(),
-        TicketReservation::EntryLimit
+        reserve("alice", 2).await.unwrap(),
+        TicketReservation::Lapsed
     ));
     bounded(db.close()).await.unwrap();
 }

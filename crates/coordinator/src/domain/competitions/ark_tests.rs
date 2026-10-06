@@ -1642,9 +1642,10 @@ async fn a_paid_ticket_never_entered_is_refunded_with_the_registration_sent_befo
 }
 
 /// A paid ticket that lapsed, its entry not made within the hour its entry id allows, is
-/// refunded once like any paid ticket never entered, beside the entry its player made again.
+/// refunded once like any paid ticket never entered. In a single competition it keeps its seat
+/// and counts as its player's entry: they are told so rather than sold another seat.
 #[tokio::test]
-async fn a_lapsed_ticket_is_refunded_once_beside_its_players_new_entry() {
+async fn a_lapsed_ticket_counts_as_its_players_entry_and_is_refunded_once() {
     let f = Fixture::new().await;
     let session = f.keymeld_session().await;
     let lapsed = f.funded_after(&session, 23, Sent::Registration).await;
@@ -1689,7 +1690,33 @@ async fn a_lapsed_ticket_is_refunded_once_beside_its_players_new_entry() {
             competition_id: f.competition_id,
         }]
     );
-    // The player entered again, on another seat.
+    assert!(
+        unentered.pay_refused,
+        "its one entry is taken, so the form shows no Pay"
+    );
+    // Another ticket asked for anyway, from a stale page, is refused with the form's sentence.
+    let key: bitcoin::PublicKey =
+        "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+            .parse()
+            .unwrap();
+    let refused = f
+        .coordinator
+        .request_ticket("player".into(), f.competition_id, key)
+        .await
+        .err();
+    assert!(
+        matches!(&refused, Some(Error::BadRequest(reason)) if reason == LAPSED_ENTRY),
+        "{refused:?}"
+    );
+    assert_eq!(
+        f.store()
+            .paid_ticket_count(f.competition_id, "player")
+            .await
+            .unwrap(),
+        1,
+        "no other ticket was paid for"
+    );
+    // The competition's other entry, on another seat.
     let entered = f.funded(&session, 21, true).await;
     f.cancel().await;
 

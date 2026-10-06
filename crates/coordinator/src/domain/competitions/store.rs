@@ -60,6 +60,10 @@ pub enum TicketReservation {
     Closed,
     /// The player already paid for as many entries as the competition allows one player.
     EntryLimit,
+    /// As [`Self::EntryLimit`], with one of those tickets lapsed (see [`super::LapsedTicket`]): a
+    /// single competition's lapsed ticket keeps its seat, so it still counts as the player's
+    /// entry, though it can no longer be entered.
+    Lapsed,
 }
 
 impl TicketReservation {
@@ -67,18 +71,21 @@ impl TicketReservation {
     pub fn reserved(self) -> Option<ReservedTicket> {
         match self {
             TicketReservation::Reserved(reserved) => Some(*reserved),
-            TicketReservation::Closed | TicketReservation::EntryLimit => None,
+            TicketReservation::Closed
+            | TicketReservation::EntryLimit
+            | TicketReservation::Lapsed => None,
         }
     }
 }
 
-/// How many tickets `reserved_by` has paid for in `event_id`, entered or not. Less the lapsed ones
-/// (see [`paid_entries_of_player`]), it is what the competition's entries-per-player limit counts.
+/// How many tickets `reserved_by` has paid for in `event_id`, entered or not, lapsed or not: what a
+/// single competition's entries-per-player limit counts. A queued competition's leaves out the
+/// lapsed ones (see [`paid_entries_of_player`]).
 const PAID_TICKETS_OF_PLAYER: &str =
     "SELECT COUNT(*) FROM tickets WHERE event_id = ? AND reserved_by = ? AND paid_at IS NOT NULL";
 
-/// How many of the entries competition `event_id` allows one player `player` has taken at `now`:
-/// a paid ticket takes one, entered or with its entry on its way, unless it lapsed (see
+/// How many of the entries queued competition `event_id` allows one player `player` has taken at
+/// `now`: a paid ticket takes one, entered or with its entry on its way, unless it lapsed (see
 /// [`super::LapsedTicket`]). Read inside the write that issues a ticket.
 pub(super) async fn paid_entries_of_player(
     connection: &mut sqlx::SqliteConnection,
@@ -1830,6 +1837,21 @@ impl CompetitionStore {
         Ok(competition)
     }
 
+    /// How many tickets `player` paid for in `competition_id`, entered or not, lapsed or not: what
+    /// a single competition's entries-per-player limit counts.
+    pub async fn paid_ticket_count(
+        &self,
+        competition_id: Uuid,
+        player: &str,
+    ) -> Result<u64, sqlx::Error> {
+        let paid: i64 = sqlx::query_scalar(PAID_TICKETS_OF_PLAYER)
+            .bind(competition_id.to_string())
+            .bind(player)
+            .fetch_one(self.db_connection.read())
+            .await?;
+        u64::try_from(paid).map_err(|error| sqlx::Error::Decode(Box::new(error)))
+    }
+
     pub async fn get_and_reserve_ticket(
         &self,
         competition_id: Uuid,
@@ -1846,7 +1868,7 @@ impl CompetitionStore {
 
     /// A ticket for `pubkey`: the one it already holds and hasn't entered with, if any, unless
     /// that ticket lapsed (see [`super::LapsedTicket`]); otherwise a free one, unless it has paid
-    /// for `max_per_player` tickets already that did not lapse.
+    /// for `max_per_player` tickets already, lapsed ones included.
     pub(super) async fn get_and_reserve_ticket_before(
         &self,
         competition_id: Uuid,
@@ -1882,9 +1904,9 @@ impl CompetitionStore {
                     tx.rollback().await?;
                     return Ok(TicketReservation::Closed);
                 }
-                // A paid ticket that lapsed, its entry no longer possible, is neither handed back
-                // nor counted against the player: it is refunded. Its seat stays with it, as the
-                // competition's contract terms and Keymeld session name every seat's ticket.
+                // A paid ticket that lapsed, its entry no longer possible, is not handed back: it
+                // is refunded. It keeps its seat, as the competition's payout terms and Keymeld
+                // session name every seat's ticket, so it still counts as the player's entry.
                 let lapsed = lapsed_ticket_ids(
                     &mut *tx,
                     &competition_id_str,
@@ -1946,9 +1968,13 @@ impl CompetitionStore {
                     .bind(&pubkey_owned)
                     .fetch_one(&mut *tx)
                     .await?;
-                if paid - lapsed.len() as i64 >= i64::from(max_per_player) {
+                if paid >= i64::from(max_per_player) {
                     tx.rollback().await?;
-                    return Ok(TicketReservation::EntryLimit);
+                    return Ok(if lapsed.is_empty() {
+                        TicketReservation::EntryLimit
+                    } else {
+                        TicketReservation::Lapsed
+                    });
                 }
 
                 // No existing ticket, find an available one

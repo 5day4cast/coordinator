@@ -3632,6 +3632,8 @@ impl Coordinator {
                     competition.event_submission.max_entries_per_player,
                 ))
             }
+            // A stale page or another client: the entry form shows this and no Pay.
+            TicketReservation::Lapsed => return Err(Error::BadRequest(super::LAPSED_ENTRY.into())),
         };
         if let Some(old_hash) = superseded_payment_hash {
             self.cancel_superseded_invoice(ticket.id, old_hash).await;
@@ -4261,7 +4263,8 @@ impl Coordinator {
 
     /// The tickets `pubkey` paid for and has not entered: those it can still enter (see
     /// [`Self::paid_tickets`]), and those that lapsed, whose entry fees are refunded (see
-    /// [`super::LapsedTicket`]).
+    /// [`super::LapsedTicket`]). For a single competition, also whether a lapsed ticket keeps the
+    /// player from paying for another seat.
     ///
     /// For one competition: only while it takes entries. For all of them, the caller keeps the
     /// ones whose competitions still do.
@@ -4271,6 +4274,8 @@ impl Coordinator {
         competition_id: Option<Uuid>,
     ) -> Result<super::UnenteredTickets, Error> {
         let now = OffsetDateTime::now_utc();
+        // The single competition asked about, and how many entries it allows one player.
+        let mut single = None;
         if let Some(competition_id) = competition_id {
             let competition = self
                 .competition_store
@@ -4282,6 +4287,12 @@ impl Coordinator {
                 })?;
             if competition.require_entry_admission(now).is_err() {
                 return Ok(super::UnenteredTickets::default());
+            }
+            if competition.kind == super::CompetitionKind::Single {
+                single = Some((
+                    competition_id,
+                    competition.event_submission.max_entries_per_player,
+                ));
             }
         }
         let keymeld = self.is_keymeld_enabled();
@@ -4301,6 +4312,17 @@ impl Coordinator {
                 });
             } else if let Some(paid) = Self::enterable(ticket, keymeld, now) {
                 unentered.paid.push(paid);
+            }
+        }
+        // A single competition's lapsed ticket still counts as the player's entry, so once their
+        // paid tickets reach its limit no new ticket is issued (see `TicketReservation::Lapsed`).
+        if let Some((competition_id, max_per_player)) = single {
+            if !unentered.lapsed.is_empty() {
+                let paid = self
+                    .competition_store
+                    .paid_ticket_count(competition_id, pubkey)
+                    .await?;
+                unentered.pay_refused = paid >= u64::from(max_per_player);
             }
         }
         Ok(unentered)

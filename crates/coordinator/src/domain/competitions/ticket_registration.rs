@@ -82,15 +82,22 @@ pub struct PaidUnenteredTicket {
 
 /// A ticket the player paid for whose entry was not made within the hour its entry id allows
 /// (see [`super::queued::entry_window_passed`]): it has lapsed. Its entry is refused, and it is
-/// refunded like any paid ticket left without an entry. It no longer counts as its player's entry,
-/// so the player may enter again under a new entry id, nor, in a queued competition, takes a
-/// place. A single competition's seat stays with it: its payout terms and Keymeld session name
-/// every seat's ticket.
+/// refunded like any paid ticket left without an entry.
+///
+/// In a queued competition it no longer counts as its player's entry, so the player may enter
+/// again under a new entry id, nor takes a place. A single competition's seat stays with it, as
+/// its payout terms and Keymeld session name every seat's ticket, so there it still counts as the
+/// player's entry: a new ticket would only pay into a competition that can no longer fill.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LapsedTicket {
     pub ticket_id: Uuid,
     pub competition_id: Uuid,
 }
+
+/// What a player whose paid ticket lapsed is told: on the entry form, once, and in a single
+/// competition, where the lapsed ticket still counts as their entry, when they ask for another.
+pub const LAPSED_ENTRY: &str =
+    "Your earlier entry wasn't finished in time; its fee is being refunded";
 
 /// A player's paid tickets that have no entry, in competitions still taking entries.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -99,6 +106,9 @@ pub struct UnenteredTickets {
     pub paid: Vec<PaidTicket>,
     /// Those that lapsed, whose entry fees are refunded.
     pub lapsed: Vec<LapsedTicket>,
+    /// In the single competition asked about, a lapsed ticket keeps the player from paying for
+    /// another seat: it counts as their entry, and they have made as many as one player may.
+    pub pay_refused: bool,
 }
 
 /// The id of the entry a paid ticket pays for: a queued ticket's own id, or the one named by the
