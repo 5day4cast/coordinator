@@ -187,7 +187,7 @@ impl FeeCoin {
                     TapSighashType::Default,
                 )
                 .map_err(|e| e.to_string())?;
-            let tweaked = self.keypair().tap_tweak(&secp, None).to_inner();
+            let tweaked = self.keypair().tap_tweak(&secp, None).to_keypair();
             let signature = taproot::Signature {
                 signature: secp.sign_schnorr_no_aux_rand(&Message::from(sighash), &tweaked),
                 sighash_type: TapSighashType::Default,
