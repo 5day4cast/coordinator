@@ -409,6 +409,38 @@ test.describe("Username/Password Authentication", () => {
     await expect(page.locator("#usernameRegisterStep2")).not.toBeVisible();
   });
 
+  // The server asks the address's provider for an invoice before saving it; the mock's
+  // `wrong-network` user answers with an invoice for another network.
+  test("an address that cannot be paid on this network is refused at sign-up", async ({ page }) => {
+    const username = uniqueUsername();
+    const password = "testPassword123!";
+
+    await page.goto("/");
+    // The wallet loads on demand (normally when a log-in dialog opens).
+    await page.evaluate(() => window.initWasm());
+
+    await page.locator("#registerNavClick").click();
+    await page.locator(".tabs li[data-target='registerUsername']").click();
+
+    await page.locator("#registerUsernameInput").fill(username);
+    await page.locator("#registerPassword").fill(password);
+    await page.locator("#registerPasswordConfirm").fill(password);
+    await page.locator("#registerLightningAddress").fill("wrong-network@mock-wallet.dev");
+    await page.locator("#usernameRegisterStep1Button").click();
+
+    await expect(page.locator("#usernameNsecDisplay")).toHaveValue(/^nsec1/, {
+      timeout: 15000,
+    });
+    await page.locator("#usernameNsecSavedCheckbox").check();
+    await page.locator("#usernameRegisterStep2Button").click();
+
+    await expect(page.locator("#usernameRegisterStep2Error")).toContainText(
+      /different Bitcoin network/i,
+      { timeout: 15000 },
+    );
+    await expect(page.locator("#logoutContainer")).not.toBeVisible();
+  });
+
   test("username validation rejects invalid usernames", async ({ page }) => {
     const password = "testPassword123!";
 

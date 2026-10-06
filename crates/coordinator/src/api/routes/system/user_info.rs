@@ -17,7 +17,7 @@ use crate::{
         self,
         users::{hash_auth_key, verify_auth_key, AuthKey, NewUsernameUser, PasswordError},
     },
-    infra::lnurl::LightningAddress,
+    infra::lnurl::{LightningAddress, LnurlError, LnurlPay},
     startup::AppState,
 };
 
@@ -97,20 +97,94 @@ pub struct RegisterPayload {
     pub lightning_address: String,
 }
 
-/// Parse and resolve a Lightning Address before it is stored, so a typo or a
-/// dead provider fails at signup instead of at payout time.
+/// How long saving a Lightning Address waits for its provider, resolving it and making an
+/// invoice together, so signing up stays quick.
+const ADDRESS_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Parse a Lightning Address and check it can be paid before it is stored, so a typo, a dead
+/// provider or an address on another network fails at signup instead of at payout time.
 async fn checked_lightning_address(
     state: &AppState,
     raw: &str,
 ) -> Result<LightningAddress, ApiError> {
-    let address = LightningAddress::parse(raw)
-        .map_err(|e| ApiError::from(domain::Error::BadRequest(e.to_string())))?;
-    state.lnurl.resolve(&address).await.map_err(|e| {
-        ApiError::from(domain::Error::BadRequest(format!(
-            "Could not resolve Lightning Address {address}: {e}"
-        )))
-    })?;
-    Ok(address)
+    check_lightning_address(state.lnurl.as_ref(), &state.network, raw)
+        .await
+        .map_err(|message| ApiError::from(domain::Error::BadRequest(message)))
+}
+
+/// Resolve `raw` and ask its provider for an invoice of the smallest amount it takes, which must
+/// decode, match that amount and be for `network`, the network payouts are made on (the check
+/// payouts make; see `PayRequest::verify_invoice`). The invoice is never paid. Every failure is
+/// one sentence for the player.
+pub(crate) async fn check_lightning_address(
+    lnurl: &dyn LnurlPay,
+    network: &str,
+    raw: &str,
+) -> Result<LightningAddress, String> {
+    let address = LightningAddress::parse(raw).map_err(|e| e.to_string())?;
+    let domain = address.domain();
+    let checked = tokio::time::timeout(ADDRESS_CHECK_TIMEOUT, async {
+        let request = lnurl
+            .resolve(&address)
+            .await
+            .map_err(|error| unresolved(&address, error))?;
+        lnurl
+            .request_invoice(&request, request.min_sendable_msat())
+            .await
+            .map_err(|error| no_invoice(&address, network, error))
+    })
+    .await;
+    match checked {
+        Ok(Ok(_invoice)) => Ok(address),
+        Ok(Err(message)) => Err(message),
+        Err(_) => Err(format!(
+            "{domain} took too long to answer for {address}. Check the address, or try again shortly."
+        )),
+    }
+}
+
+/// Why `address` did not resolve to an LNURL-pay endpoint.
+fn unresolved(address: &LightningAddress, error: LnurlError) -> String {
+    let domain = address.domain();
+    match error {
+        LnurlError::Status(404) => format!("{domain} has no Lightning Address {address}."),
+        LnurlError::NotPublic(_)
+        | LnurlError::Request(_)
+        | LnurlError::Timeout
+        | LnurlError::Status(_) => format!(
+            "Could not reach {domain} to check {address}. Check the address, or try again shortly."
+        ),
+        LnurlError::Provider(reason) => {
+            format!("{domain} says {address} cannot receive payments: {reason}")
+        }
+        error => format!("{address} is not a Lightning Address this site can pay: {error}."),
+    }
+}
+
+/// Why `address`'s provider gave no invoice payouts on `network` could pay.
+fn no_invoice(address: &LightningAddress, network: &str, error: LnurlError) -> String {
+    let domain = address.domain();
+    match error {
+        LnurlError::InvoiceMismatch("wrong network") => {
+            let network = match network {
+                "bitcoin" => "Bitcoin mainnet",
+                other => other,
+            };
+            format!(
+                "{address} receives on a different Bitcoin network. This site pays out on {network}: use a Lightning Address for {network}."
+            )
+        }
+        LnurlError::NotPublic(_)
+        | LnurlError::Request(_)
+        | LnurlError::Timeout
+        | LnurlError::Status(_) => format!(
+            "{domain} did not return an invoice for {address}. Try again shortly, or use another address."
+        ),
+        LnurlError::Provider(reason) => {
+            format!("{domain} would not make an invoice for {address}: {reason}")
+        }
+        error => format!("{domain} did not return a usable invoice for {address}: {error}."),
+    }
 }
 
 pub async fn register(
@@ -626,5 +700,87 @@ mod reset_tests {
         assert!(!claim_reset_challenge(&challenges, "bob", &first).await);
         assert!(claim_reset_challenge(&challenges, "alice", &first).await);
         assert!(claim_reset_challenge(&challenges, "alice", &second).await);
+    }
+}
+
+#[cfg(test)]
+mod address_check_tests {
+    use super::*;
+    use crate::infra::{lnurl::PayRequest, lnurl_mock::MockLnurlPay};
+    use async_trait::async_trait;
+    use bitcoin::Network;
+    use lightning_invoice::Bolt11Invoice;
+
+    #[tokio::test]
+    async fn an_address_is_kept_only_when_its_provider_makes_an_invoice_for_this_network() {
+        let mock = MockLnurlPay::new(Network::Signet);
+        let address = check_lightning_address(&mock, "signet", " Player@Mock-Wallet.dev ")
+            .await
+            .unwrap();
+        assert_eq!(address.to_string(), "player@mock-wallet.dev");
+
+        for (raw, error) in [
+            ("not an address", "expected user@domain"),
+            (
+                "unreachable@mock-wallet.dev",
+                "Could not reach mock-wallet.dev to check unreachable@mock-wallet.dev",
+            ),
+            (
+                "unknown@mock-wallet.dev",
+                "mock-wallet.dev has no Lightning Address unknown@mock-wallet.dev.",
+            ),
+            (
+                "no-invoice@mock-wallet.dev",
+                "mock-wallet.dev would not make an invoice for no-invoice@mock-wallet.dev",
+            ),
+            (
+                "wrong-network@mock-wallet.dev",
+                "wrong-network@mock-wallet.dev receives on a different Bitcoin network. This site pays out on signet",
+            ),
+        ] {
+            let refused = check_lightning_address(&mock, "signet", raw)
+                .await
+                .unwrap_err();
+            assert!(refused.contains(error), "{raw}: {refused}");
+        }
+
+        // A signet address on a mainnet coordinator is refused the same way.
+        let mainnet = MockLnurlPay::new(Network::Bitcoin);
+        let refused = check_lightning_address(&mainnet, "bitcoin", "wrong-network@mock-wallet.dev")
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("This site pays out on Bitcoin mainnet"),
+            "{refused}"
+        );
+    }
+
+    /// A provider that never answers.
+    struct Silent;
+
+    #[async_trait]
+    impl LnurlPay for Silent {
+        async fn resolve(&self, _: &LightningAddress) -> Result<PayRequest, LnurlError> {
+            std::future::pending().await
+        }
+
+        async fn request_invoice(
+            &self,
+            _: &PayRequest,
+            _: u64,
+        ) -> Result<Bolt11Invoice, LnurlError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_provider_fails_the_check_within_its_timeout() {
+        let refused = check_lightning_address(&Silent, "signet", "slow@mock-wallet.dev")
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("mock-wallet.dev took too long to answer for slow@mock-wallet.dev"),
+            "{refused}"
+        );
     }
 }
