@@ -514,7 +514,9 @@ function setBusy(button, busy) {
 function askForPicks(form, errorMsg) {
   const message = document.getElementById("picksMessage") ?? errorMsg;
   const count = Number(form.dataset.maxValues);
-  message.textContent = `Make exactly ${count} ${count === 1 ? "pick" : "picks"} before paying.`;
+  const rows = Number(form.dataset.pickRows) || count;
+  const any = count < rows ? `, any ${count} of the ${rows} rows,` : "";
+  message.textContent = `Make exactly ${count} ${count === 1 ? "pick" : "picks"}${any} before paying.`;
   message.classList.remove("hidden");
   const first = form.querySelector?.(`${PICK}:not(:disabled)`);
   first?.focus();
@@ -522,6 +524,28 @@ function askForPicks(form, errorMsg) {
 
 function hidePicksMessage() {
   document.getElementById("picksMessage")?.classList.add("hidden");
+}
+
+// The counter above Pay, for `made` picks of the `need` a competition with `rows` rows takes.
+// Before any pick it reads as the server rendered it (`picks_to_make` in mod.rs).
+function picksLeft(made, need, rows) {
+  const picks = (n) => `${n} ${n === 1 ? "pick" : "picks"}`;
+  if (made === 0) {
+    return need < rows ? `${picks(need)} to make: any ${need} of the ${rows} rows.`
+      : `${picks(need)} to make: one in every row.`;
+  }
+  if (made < need) return `${need - made} more to pick: ${made} of ${need} made.`;
+  if (made === need) return `All ${picks(need)} made.`;
+  return `${picks(made - need)} too many: take ${made - need} back to make exactly ${need}.`;
+}
+
+function showPicksLeft(form) {
+  const counter = document.getElementById("picksLeft");
+  if (!counter || !form) return;
+  const need = parseInt(form.dataset.maxValues, 10) || 1;
+  const rows = parseInt(form.dataset.pickRows, 10) || need;
+  const made = Object.values(collectPicks(form)).reduce((n, station) => n + Object.keys(station).length, 0);
+  counter.textContent = picksLeft(made, need, rows);
 }
 
 // The entry every ticket request for a competition carries, by competition id, until it is
@@ -853,6 +877,7 @@ function unpickWithSpace(event) {
   if (event.key !== " " || !input?.matches?.(PICK) || !input.dataset.picked) return;
   event.preventDefault();
   togglePick(input);
+  showPicksLeft(input.form);
 }
 
 function setupEntryForm() {
@@ -861,7 +886,12 @@ function setupEntryForm() {
     if (event.target instanceof HTMLInputElement && event.target.matches(PICK)) {
       togglePick(event.target);
       hidePicksMessage();
+      showPicksLeft(event.target.form);
     }
   });
   document.addEventListener("keydown", unpickWithSpace);
+  // Arrow keys move a pick within its row without a click.
+  document.addEventListener("change", (event) => {
+    if (event.target?.matches?.(PICK)) showPicksLeft(event.target.form);
+  });
 }

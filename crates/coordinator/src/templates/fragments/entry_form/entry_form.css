@@ -311,6 +311,12 @@
   margin-top: 1rem;
 }
 
+/* How many picks are left, right above Pay. */
+.picks-left {
+  margin-bottom: 0.5rem;
+  font-size: 0.9rem;
+}
+
 /* The ticket invoice's QR code, drawn by the server. */
 .payment-qr {
   max-width: 100%;

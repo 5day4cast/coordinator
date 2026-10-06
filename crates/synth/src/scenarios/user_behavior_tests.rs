@@ -983,6 +983,7 @@ fn weather_picks_replay_per_seed_and_user() {
             Some(seed),
             index,
             shape,
+            9,
         ))
         .unwrap()
     };
@@ -1006,6 +1007,50 @@ fn weather_picks_replay_per_seed_and_user() {
             assert!(half[dropped].is_null(), "{shape:?}");
             assert_eq!(half[kept], full[kept]);
             assert_eq!(half["wind_speed"], full["wind_speed"]);
+        }
+    }
+}
+
+/// A competition taking fewer picks than its rows gets exactly that many, each one the pick a
+/// full entry would have made, and the same ones again for the same seed.
+#[test]
+fn fewer_picks_keep_a_seeded_subset_of_the_full_entry() {
+    let stations: Vec<String> = vec!["KDEN".into(), "KORD".into(), "KJFK".into()];
+    let made = |picks| {
+        serde_json::to_value(full_lifecycle::generate_predictions(
+            &stations,
+            Some(7),
+            2,
+            WindowShape::FullDay,
+            picks,
+        ))
+        .unwrap()
+    };
+    let count = |value: &serde_json::Value| {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|choice| {
+                ["wind_speed", "temp_high", "temp_low"].map(move |field| &choice[field])
+            })
+            .filter(|pick| !pick.is_null())
+            .count()
+    };
+    let full = made(9);
+    assert_eq!(count(&full), 9);
+    assert_eq!(made(20), full, "more than the rows is all of them");
+    let some = made(4);
+    assert_eq!(count(&some), 4);
+    assert_eq!(made(4), some);
+    for (choice, full) in some
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(full.as_array().unwrap())
+    {
+        for field in ["wind_speed", "temp_high", "temp_low"] {
+            assert!(choice[field].is_null() || choice[field] == full[field]);
         }
     }
 }

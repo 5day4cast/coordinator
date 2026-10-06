@@ -257,6 +257,28 @@ pub struct CreateCompetitionForm {
     /// How many entries one player may make; one if unset.
     #[serde(default)]
     pub max_entries_per_player: Option<u32>,
+    /// Picks per entry; every metric at every station when empty. Text, so a value that does not
+    /// parse is said plainly rather than refused by the extractor.
+    #[serde(default)]
+    pub number_of_values_per_entry: Option<String>,
+}
+
+/// The picks each entry makes: `value` as typed, or all `stations × metrics` when it is empty.
+fn picks_per_entry(value: Option<&str>, stations: usize, metrics: usize) -> Result<usize, String> {
+    let all = stations * metrics;
+    let picks = match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None => return Ok(all),
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| format!("Picks per entry must be a whole number, not {value:?}"))?,
+    };
+    if !(1..=all).contains(&picks) {
+        return Err(format!(
+            "Picks per entry must be between 1 and {all}: {stations} station{} × {metrics} weather categories",
+            if stations == 1 { "" } else { "s" }
+        ));
+    }
+    Ok(picks)
 }
 
 /// Handle competition creation from HTMX form
@@ -304,7 +326,14 @@ pub async fn admin_create_competition_handler(
     else {
         return Html(competition_error(crate::domain::WindowShape::RULE).into_string());
     };
-    let number_of_values_per_entry = form.locations.len() * shape.metrics().len();
+    let number_of_values_per_entry = match picks_per_entry(
+        form.number_of_values_per_entry.as_deref(),
+        form.locations.len(),
+        shape.metrics().len(),
+    ) {
+        Ok(picks) => picks,
+        Err(error) => return Html(competition_error(&error).into_string()),
+    };
 
     if form.locations.len() > 50 {
         return Html(competition_error("Select no more than 50 stations").into_string());
@@ -549,5 +578,30 @@ pub async fn admin_settle_test_invoice_handler(
                 Json(serde_json::json!({ "error": e.to_string() })),
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::picks_per_entry;
+
+    #[test]
+    fn picks_per_entry_defaults_to_every_pick_and_refuses_what_the_window_cannot_hold() {
+        assert_eq!(picks_per_entry(None, 4, 3), Ok(12));
+        assert_eq!(picks_per_entry(Some(" "), 4, 2), Ok(8));
+        assert_eq!(picks_per_entry(Some("3"), 4, 3), Ok(3));
+        assert_eq!(picks_per_entry(Some("12"), 4, 3), Ok(12));
+        for (value, error) in [
+            ("0", "between 1 and 12: 4 stations × 3 weather categories"),
+            ("13", "between 1 and 12"),
+            ("three", "whole number"),
+            ("-1", "whole number"),
+        ] {
+            let refused = picks_per_entry(Some(value), 4, 3).unwrap_err();
+            assert!(refused.contains(error), "{value}: {refused}");
+        }
+        assert!(picks_per_entry(Some("3"), 1, 2)
+            .unwrap_err()
+            .contains("between 1 and 2: 1 station × 2"));
     }
 }

@@ -264,6 +264,9 @@ pub struct DefaultsConfig {
     /// Max time to wait for a refund to settle, which includes its escrow's locktime.
     #[serde(default = "default_refund_timeout_secs")]
     pub refund_timeout_secs: u64,
+    /// Picks each entry makes; every station and metric the window scores when unset.
+    #[serde(default)]
+    pub picks_per_entry: Option<usize>,
 }
 
 fn default_refund_timeout_secs() -> u64 {
@@ -317,6 +320,7 @@ impl Default for SynthConfig {
                 signing_delay_secs: 60,
                 lightning_address: None,
                 refund_timeout_secs: default_refund_timeout_secs(),
+                picks_per_entry: None,
             },
         }
     }
@@ -342,6 +346,7 @@ impl SynthConfig {
             signing_delay_secs: self.defaults.signing_delay_secs,
             lightning_address: self.defaults.lightning_address.clone(),
             refund_timeout_secs: self.defaults.refund_timeout_secs,
+            picks_per_entry: self.defaults.picks_per_entry,
             lnd: self.lnd.clone(),
             ..Default::default()
         }
@@ -385,6 +390,10 @@ pub fn load_config(path: Option<&str>) -> anyhow::Result<SynthConfig> {
     let config: SynthConfig = builder.build()?.try_deserialize()?;
     validate_windows(config.defaults.observation_windows_secs.values())?;
     config.defaults.players.validate()?;
+    anyhow::ensure!(
+        config.defaults.picks_per_entry != Some(0),
+        "defaults.picks_per_entry must be at least 1"
+    );
     if let Some(refill) = &config.ark_refill {
         refill.validate()?;
     }

@@ -436,6 +436,10 @@ pub struct ScenarioConfig {
     /// otherwise.
     #[serde(default)]
     pub backfill: Option<Backfill>,
+    /// Picks each entry makes, at most every station and metric the window scores; all of them
+    /// when unset.
+    #[serde(default)]
+    pub picks_per_entry: Option<usize>,
 }
 
 /// What an observation window can score, as the oracle attests it: a window of 24 hours or more
@@ -520,6 +524,7 @@ impl Default for ScenarioConfig {
             listed: false,
             stress: None,
             backfill: None,
+            picks_per_entry: None,
         }
     }
 }
@@ -547,9 +552,12 @@ impl ScenarioConfig {
         }
     }
 
-    /// Picks each entry makes: one per station and metric the window scores.
+    /// Picks each entry makes: `picks_per_entry`, or one per station and metric the window
+    /// scores when it is unset or more than that.
     pub fn values_per_entry(&self) -> usize {
-        self.stations.len() * self.window_shape().metrics()
+        let all = self.stations.len() * self.window_shape().metrics();
+        self.picks_per_entry
+            .map_or(all, |picks| picks.clamp(1, all.max(1)))
     }
 
     pub fn resolve_plan(&self, scenario: &str) -> anyhow::Result<Self> {

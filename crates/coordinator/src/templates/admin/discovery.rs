@@ -20,6 +20,9 @@ pub fn discovery(
         .latest
         .as_ref()
         .is_some_and(|latest| latest.age().as_secs() <= 900);
+    // Weather categories scored at each station: what one station adds to the picks.
+    let metrics = crate::domain::WindowShape::of(window.start, window.end)
+        .map_or(3, |shape| shape.metrics().len());
     let block_delta = match network {
         "bitcoin" => 144,
         "signet" => 2880,
@@ -136,7 +139,12 @@ pub fn discovery(
                                 p { "Observation: " (window.start.format(&Rfc3339).unwrap_or_default()) " → " (window.end.format(&Rfc3339).unwrap_or_default()) ". Signing starts one hour later." }
                                 div.form-grid {
                                     label { "Stake per entry (sats)" input type="number" name="entry_fee" value="5000" min="1" required; }
-                                    div { strong { "Required picks" } p.note { "Every weather category for each selected station; calculated from the observation window." } }
+                                    // Empty means every category at every selected station; the admin
+                                    // script keeps the maximum in step with the stations chosen.
+                                    label { "Picks per entry"
+                                        input type="number" name="number_of_values_per_entry" min="1" step="1" placeholder="All" data-metrics=(metrics);
+                                        span.note data-picks-note { "Leave empty for all: " (metrics) " per selected station." }
+                                    }
                                     label { "Entries per player" input type="number" name="max_entries_per_player" value="1" min="1" required; }
                                     label { "Coordinator fee (%)" input type="number" name="coordinator_fee_percentage" value="5" min="0" max="100" step="0.01" required; }
                                     label { "Minimum pool size" input type="number" name="min_players" value="2" min="2" max="13" required; }
@@ -277,6 +285,10 @@ mod tests {
         let html = discovery(&Filters::default(), &window(), &data, "signet").into_string();
         assert!(html.contains("id=\"game-creation\""));
         assert!(html.contains("name=\"locations\" value=\"KPDX\""));
+        // Picks per entry is optional: empty takes every category at every selected station.
+        assert!(html.contains("name=\"number_of_values_per_entry\" min=\"1\""));
+        assert!(html.contains("data-metrics=\"3\""));
+        assert!(html.contains("Leave empty for all: 3 per selected station."));
         assert!(html.contains("Your current station choices stay in place"));
         assert!(!html.contains("every 2s"));
         assert!(html.contains("Refresh results</a>"));

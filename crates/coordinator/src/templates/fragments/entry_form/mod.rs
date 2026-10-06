@@ -90,6 +90,8 @@ pub fn entry_form(
         NetworkFee::Estimate(_) | NetworkFee::Unavailable => None,
     };
     let picks_allowed = competition.number_of_values_per_entry;
+    // A row is one metric at one station; a competition may take fewer picks than it has rows.
+    let rows = (competition.locations.len() * competition.metrics.len()).max(picks_allowed);
     let queue = competition.queue.queued();
     html! {
         div id="entryContainer" class="entry-form" {
@@ -131,7 +133,10 @@ pub fn entry_form(
                 }
                 div {
                     dt { "Picks required" }
-                    dd { (picks_allowed) }
+                    dd {
+                        (picks_allowed)
+                        @if picks_allowed < rows { " of " (rows) }
+                    }
                 }
                 // One entry per player needs no line; only a competition allowing more says so.
                 @if competition.max_entries_per_player > 1 {
@@ -154,6 +159,7 @@ pub fn entry_form(
                  data-total-pool=(competition.total_pool)
                  data-winner-count=(competition.paid_places)
                  data-max-values=(picks_allowed)
+                 data-pick-rows=(rows)
                  data-kind=[queue.map(|_| "queued")]
                  data-pool-min-players=[queue.and_then(|queue| queue.min_players)]
                  data-pool-max-players=[queue.map(|queue| queue.max_players)] {
@@ -200,6 +206,10 @@ pub fn entry_form(
             }
 
             div class="entry-submit" {
+                // How many picks are still to make; `entry_form.js` counts as the player picks.
+                p id="picksLeft" class="picks-left" role="status" aria-live="polite" {
+                    (picks_to_make(picks_allowed, rows))
+                }
                 @if let Some(reason) = &paused {
                     div id="entriesPaused" class="notification is-warning" { (reason) }
                 }
@@ -218,6 +228,16 @@ pub fn entry_form(
                 div id="errorMessage" class="notification is-danger hidden" {}
             }
         }
+    }
+}
+
+/// The counter under the picks before any is made; `picksLeft` in `entry_form.js` says the same.
+fn picks_to_make(picks: usize, rows: usize) -> String {
+    let noun = if picks == 1 { "pick" } else { "picks" };
+    if picks < rows {
+        format!("{picks} {noun} to make: any {picks} of the {rows} rows.")
+    } else {
+        format!("{picks} {noun} to make: one in every row.")
     }
 }
 
@@ -565,6 +585,41 @@ mod tests {
         )
         .into_string();
         assert!(html.contains("10,500 sats") && html.contains("for 1st; top 2 paid"));
+    }
+
+    /// A competition taking fewer picks than it has rows says how many of them, and counts down.
+    #[test]
+    fn the_form_says_how_many_of_the_rows_to_pick() {
+        let mut competition = view("c1", Phase::Upcoming, 60);
+        competition.locations = vec!["KPWM".into(), "KBOS".into(), "KJFK".into(), "KORD".into()];
+        competition.number_of_values_per_entry = 3;
+        let some = entry_form(
+            &competition,
+            &Forecasts::Pending(Pending::Loading),
+            None,
+            &PayoutDestination::LoggedOut,
+            NetworkFee::Estimate(50),
+        )
+        .into_string();
+        assert!(
+            some.contains("<dt>Picks required</dt><dd>3 of 12</dd>"),
+            "{some}"
+        );
+        assert!(some.contains(r#"data-max-values="3" data-pick-rows="12""#));
+        assert!(some.contains("3 picks to make: any 3 of the 12 rows."));
+
+        competition.number_of_values_per_entry = 12;
+        let all = entry_form(
+            &competition,
+            &Forecasts::Pending(Pending::Loading),
+            None,
+            &PayoutDestination::LoggedOut,
+            NetworkFee::Estimate(50),
+        )
+        .into_string();
+        assert!(all.contains("<dt>Picks required</dt><dd>12</dd>"));
+        assert!(all.contains("12 picks to make: one in every row."));
+        assert_eq!(picks_to_make(1, 3), "1 pick to make: any 1 of the 3 rows.");
     }
 
     #[test]
