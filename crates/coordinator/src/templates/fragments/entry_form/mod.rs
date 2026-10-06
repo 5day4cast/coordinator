@@ -6,11 +6,12 @@ use maud::{html, Markup};
 
 use crate::domain::{
     leaderboard::{Metric, Rule},
-    PayoutTermsQuote, TicketStatus, ARKADE_UNAVAILABLE, ENTRIES_PAUSED,
+    PayoutTermsQuote, TicketStatus, ARKADE_UNAVAILABLE, ENTRIES_PAUSED, SETTLE_ONLY_PAUSED,
 };
 use crate::templates::{
     components::{tip, tip_start},
     format::{self, sats, MetricText, TimeStyle},
+    fragments::entries_paused_banner,
     fragments::loading::{placeholder, Pending},
     pages::competitions::CompetitionView,
     shared_map::{station_map, StationPin},
@@ -60,6 +61,8 @@ pub enum NetworkFee {
     ArkadeUnavailable(u64),
     /// No fee estimate, so no ticket either.
     Unavailable,
+    /// The coordinator takes no new entries (settle-only mode).
+    SettleOnly,
 }
 
 impl NetworkFee {
@@ -68,7 +71,7 @@ impl NetworkFee {
             NetworkFee::Estimate(fee)
             | NetworkFee::Paused(fee)
             | NetworkFee::ArkadeUnavailable(fee) => Some(fee),
-            NetworkFee::Unavailable => None,
+            NetworkFee::Unavailable | NetworkFee::SettleOnly => None,
         }
     }
 }
@@ -87,8 +90,11 @@ pub fn entry_form(
             "{ENTRIES_PAUSED}. Entries already taken are unaffected; check back later."
         )),
         NetworkFee::ArkadeUnavailable(_) => Some(format!("{ARKADE_UNAVAILABLE}.")),
+        NetworkFee::SettleOnly => Some(format!("{SETTLE_ONLY_PAUSED}.")),
         NetworkFee::Estimate(_) | NetworkFee::Unavailable => None,
     };
+    // Settle-only mode says so in a banner at the top instead of beside the button.
+    let banner = network_fee == NetworkFee::SettleOnly;
     let picks_allowed = competition.number_of_values_per_entry;
     let queue = competition.queue.queued();
     html! {
@@ -96,6 +102,7 @@ pub fn entry_form(
             a class="back-link" href="/competitions" hx-get="/competitions"
               hx-target="#main-content" hx-push-url="true" { "← All competitions" }
             h1 class="title is-4" { "Enter this competition" }
+            @if banner { (entries_paused_banner()) }
 
             dl class="entry-facts" {
                 div {
@@ -200,7 +207,7 @@ pub fn entry_form(
             }
 
             div class="entry-submit" {
-                @if let Some(reason) = &paused {
+                @if let (Some(reason), false) = (&paused, banner) {
                     div id="entriesPaused" class="notification is-warning" { (reason) }
                 }
                 button type="button" id="submitEntry" class="button is-primary is-medium"
@@ -615,6 +622,26 @@ mod tests {
         assert!(html.contains(ENTRIES_PAUSED));
         assert!(html.contains(r#"id="submitEntry" class="button is-primary is-medium" disabled"#));
         assert!(html.contains("Entries paused"));
+        assert!(!html.contains("and enter"));
+    }
+
+    /// In settle-only mode the form shows the plain banner at the top, no other notice, and
+    /// cannot be submitted.
+    #[test]
+    fn entry_form_shows_the_banner_while_entries_are_paused_for_settlement() {
+        let html = entry_form(
+            &view("c1", Phase::Upcoming, 60),
+            &Forecasts::Pending(Pending::Loading),
+            Some(&terms(true)),
+            &PayoutDestination::LoggedOut,
+            NetworkFee::SettleOnly,
+        )
+        .into_string();
+        assert!(html.contains(r#"id="entriesPausedBanner""#));
+        assert!(html.contains("Entries are paused."));
+        assert!(!html.contains(r#"id="entriesPaused" "#));
+        assert!(!html.contains(ENTRIES_PAUSED));
+        assert!(html.contains(r#"id="submitEntry" class="button is-primary is-medium" disabled"#));
         assert!(!html.contains("and enter"));
     }
 

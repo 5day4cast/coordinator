@@ -35,6 +35,7 @@ use crate::{
         components::menu_toggle,
         format::short_npub,
         fragments::{
+            entries_paused_banner,
             entry_form::{
                 entry_form, forecast_choices, forecasts_url, payout_line, ticket_status, Forecasts,
                 NetworkFee, PayoutDestination, TicketProgress,
@@ -331,6 +332,11 @@ pub async fn competitions_fragment(
     let shown = shown_ids(&competitions, options);
     complete(&state, &mut competitions, &shown).await;
     let content = competitions_page(&competitions, options, now);
+    let content = if state.coordinator.settle_only() {
+        html! { (entries_paused_banner()) (content) }
+    } else {
+        content
+    };
     page(
         &headers,
         &state,
@@ -603,6 +609,7 @@ pub async fn entry_form_fragment(
     // Logged where the estimate failed; the form says it is unavailable.
     let arkade = terms.as_ref().is_some_and(|terms| terms.arkade);
     let network_fee = match network_fee {
+        _ if state.coordinator.settle_only() => NetworkFee::SettleOnly,
         Ok(quote) if arkade && quote.arkade_unavailable => {
             NetworkFee::ArkadeUnavailable(quote.network_fee_sats)
         }

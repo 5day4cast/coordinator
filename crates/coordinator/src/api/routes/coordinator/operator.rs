@@ -1,7 +1,7 @@
 //! Competition views for the operator listener's scripts and command line
 //! (`coordinator admin`): what state each competition is in, how far it has settled, the errors
-//! it kept, and how far its escrow refunds have got; and writing off escrow refunds that can
-//! never finish.
+//! it kept, and how far its escrow refunds have got; writing off escrow refunds that can never
+//! finish; and the Lightning payouts held after a restore.
 
 use axum::{
     body::Bytes,
@@ -18,8 +18,8 @@ use uuid::Uuid;
 use crate::{
     api::routes::ApiError,
     domain::{
-        Competition, CompetitionError, CompetitionKind, CreateEvent, Error, QueueSummary,
-        RefundProgress, RefundWriteOff, WriteOffReport, WriteOffTarget,
+        Competition, CompetitionError, CompetitionKind, CreateEvent, Error, PayoutHold,
+        QueueSummary, RefundProgress, RefundWriteOff, WriteOffReport, WriteOffTarget,
     },
     startup::AppState,
 };
@@ -221,6 +221,36 @@ pub struct WriteOffRequest {
     /// Also write off refunds that are not stuck, such as one in progress.
     #[serde(default)]
     pub force: bool,
+}
+
+/// Lightning payouts held after a restore, as `coordinator admin payout-holds list` shows them:
+/// those not released, or every one with `?all=true`.
+pub async fn operator_payout_holds(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<PayoutHoldsQuery>,
+) -> Result<Json<Vec<PayoutHold>>, ApiError> {
+    Ok(Json(state.coordinator.payout_holds(query.all).await?))
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct PayoutHoldsQuery {
+    #[serde(default)]
+    pub all: bool,
+}
+
+/// Release the holds on an entry's Lightning payout, once an operator found the payment LND made
+/// was not this entry's (`coordinator admin payout-holds release`).
+pub async fn operator_release_payout_hold(
+    State(state): State<Arc<AppState>>,
+    Path(entry_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let released = state.coordinator.release_payout_hold(entry_id).await?;
+    if released == 0 {
+        return Err(Error::NotFound(format!("no payout hold on entry {entry_id}")).into());
+    }
+    Ok(Json(
+        serde_json::json!({ "entry_id": entry_id, "released": released }),
+    ))
 }
 
 /// Write off escrow refunds, as `coordinator admin write-off-refund` does. A ticket's refund that
