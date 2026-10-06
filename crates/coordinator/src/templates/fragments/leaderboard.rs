@@ -595,6 +595,7 @@ mod tests {
             max_players: 25,
             entries: Some(40),
             max_entries: None,
+            held: None,
             pools: [POOL, OTHER]
                 .into_iter()
                 .enumerate()

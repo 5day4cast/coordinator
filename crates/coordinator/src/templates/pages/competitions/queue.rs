@@ -36,6 +36,9 @@ pub struct QueueView {
     pub entries: Option<u64>,
     /// The most entries the queue takes, if it has a cap.
     pub max_entries: Option<u64>,
+    /// What counts against the cap, if the competition says: paid tickets and tickets held for an
+    /// unexpired invoice.
+    pub held: Option<u64>,
     /// Its pools, in order, once they are formed.
     pub pools: Vec<PoolLink>,
 }
@@ -64,6 +67,7 @@ const FIELDS: &[&str] = &[
     "pool_rules",
     "entries",
     "max_entries",
+    "held",
     "pools",
     "parent_id",
     "pool_index",
@@ -88,6 +92,7 @@ impl Queue {
                         .unwrap_or(MAX_POOL_PLAYERS),
                     entries: number(fields.get("entries")),
                     max_entries: number(fields.get("max_entries")),
+                    held: number(fields.get("held")),
                     pools: fields
                         .get("pools")
                         .and_then(Value::as_array)
@@ -124,6 +129,13 @@ impl QueueView {
     /// Its seats, when its entry cap fits one pool: everyone who enters plays together.
     pub fn seats(&self) -> Option<u64> {
         self.max_entries.filter(|cap| *cap <= self.max_players)
+    }
+
+    /// What counts against the entry cap: the held count when the competition gives it, and
+    /// never fewer than the paid entries (`entries`, or `fallback` when it doesn't say).
+    pub fn taken(&self, fallback: u64) -> u64 {
+        let paid = self.entries.unwrap_or(fallback);
+        self.held.map_or(paid, |held| held.max(paid))
     }
 
     /// The note that says how entries are grouped.
@@ -391,6 +403,7 @@ mod tests {
                 max_players: 20,
                 entries: Some(42),
                 max_entries: Some(200),
+                held: None,
                 pools: vec![
                     PoolLink {
                         id: POOL.into(),
@@ -423,6 +436,7 @@ mod tests {
                 max_players: 25,
                 entries: None,
                 max_entries: None,
+                held: None,
                 pools: vec![],
             })
         );

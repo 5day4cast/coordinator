@@ -90,6 +90,10 @@ pub struct QueueSummary {
     pub entries: u64,
     /// The most entries the queue takes.
     pub max_entries: u32,
+    /// What counts against `max_entries`: paid tickets and tickets held for an unexpired
+    /// invoice. When it reaches `max_entries`, no ticket is issued until a hold lapses.
+    #[serde(default)]
+    pub held: u64,
     /// Each player's share of a pool's funding value: the entry fee.
     pub stake_sats: u64,
     /// Hex of the digest of the terms every player consents to; key deposits are sealed under it.

@@ -444,6 +444,18 @@ impl CompetitionStore {
     }
 
     /// Paid entries of a queued competition, in the queue and in the pools it formed.
+    /// The tickets that count against a queued competition's entry cap: paid, or held for an
+    /// unexpired invoice, as [`Self::reserve_queued_ticket`] counts them.
+    pub async fn queued_held_count(&self, competition_id: Uuid) -> Result<u64, sqlx::Error> {
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM tickets WHERE event_id = ? AND {LIVE_TICKET}"
+        ))
+        .bind(competition_id.to_string())
+        .fetch_one(self.db_connection.read())
+        .await?;
+        u64::try_from(count).map_err(|error| sqlx::Error::Decode(Box::new(error)))
+    }
+
     pub async fn queued_entry_count(&self, competition_id: Uuid) -> Result<u64, sqlx::Error> {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM entries e JOIN tickets t ON t.id = e.ticket_id

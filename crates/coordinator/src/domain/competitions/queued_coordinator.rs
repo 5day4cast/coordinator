@@ -156,6 +156,10 @@ impl Coordinator {
                 .competition_store
                 .queued_entry_count(competition.id)
                 .await?;
+            let held = self
+                .competition_store
+                .queued_held_count(competition.id)
+                .await?;
             let pools = self
                 .competition_store
                 .competition_pools(competition.id)
@@ -167,7 +171,9 @@ impl Coordinator {
                     players: pool.members.len(),
                 })
                 .collect();
-            competition.queue = Some(queue_summary(&settings, entries, pools));
+            let mut summary = queue_summary(&settings, entries, pools);
+            summary.held = held;
+            competition.queue = Some(summary);
         }
         Ok(())
     }
@@ -588,6 +594,7 @@ fn queue_summary(settings: &QueueSettings, entries: u64, pools: Vec<PoolSummary>
         pool_rules: settings.pool_rules,
         entries,
         max_entries: settings.max_entries,
+        held: entries,
         stake_sats: settings.stake_sats,
         terms_digest: hex::encode(settings.terms_digest),
         pools,

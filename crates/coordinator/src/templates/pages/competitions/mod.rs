@@ -94,9 +94,9 @@ impl CompetitionView {
                 Queue::Single => competition.total_entries < event.total_allowed_entries as u64,
                 Queue::Queued(queue) => {
                     queue.pools.is_empty()
-                        && queue.max_entries.is_none_or(|max| {
-                            queue.entries.unwrap_or(competition.total_entries) < max
-                        })
+                        && queue
+                            .max_entries
+                            .is_none_or(|max| queue.taken(competition.total_entries) < max)
                 }
                 // A pool's players come from its competition's queue.
                 Queue::Pool(_) => false,
@@ -152,15 +152,16 @@ impl CompetitionView {
     }
 
     /// `3 of 25`, or `40 entered` for a queue, which has no seat count. A queue that plays as
-    /// one pool has seats: `20 seats · 17 left` while it takes entries, `3 of 20` after. It
-    /// counts the entries the page lists; a fee paid for an entry that never arrived is in the
-    /// refund note.
+    /// one pool has seats: `20 seats · 17 left` until it starts, `3 of 20` after. Seats left
+    /// count what the entry cap counts, paid tickets and unexpired invoice holds, so a queue
+    /// whose last seats are held shows `0 left` until a hold lapses. Otherwise it counts the
+    /// entries the page lists; a fee paid for an entry that never arrived is in the refund note.
     pub fn entries(&self) -> String {
         match &self.queue {
             Queue::Queued(queue) => match queue.seats() {
-                Some(seats) if self.can_enter => format!(
+                Some(seats) if self.phase == Phase::Upcoming && queue.pools.is_empty() => format!(
                     "{seats} seats · {} left",
-                    seats.saturating_sub(self.entry_count(queue))
+                    seats.saturating_sub(queue.taken(self.total_entries))
                 ),
                 Some(seats) => format!("{} of {seats}", self.entry_count(queue)),
                 None => format!("{} entered", self.entry_count(queue)),
@@ -178,6 +179,15 @@ impl CompetitionView {
             }
             _ => self.total_entries,
         }
+    }
+
+    /// A queue that plays as one pool and whose seats are all paid for or held.
+    pub fn is_full(&self) -> bool {
+        self.queue.queued().is_some_and(|queue| {
+            queue
+                .seats()
+                .is_some_and(|seats| queue.taken(self.total_entries) >= seats)
+        })
     }
 
     /// A queue's paid entries, those already moved to its pools included.
@@ -461,7 +471,7 @@ fn badge(competition: &CompetitionView, split: bool) -> Markup {
     let queue = competition.queue.queued();
     let (class, label) = match competition.phase {
         _ if split => ("badge badge-quiet", "Split into pools"),
-        Phase::Upcoming if !competition.can_enter && queue.is_some() => {
+        Phase::Upcoming if !competition.can_enter && queue.is_some() && !competition.is_full() => {
             ("badge badge-open", "Entries closed")
         }
         Phase::Upcoming if !competition.can_enter => ("badge badge-open", "Full"),
@@ -987,6 +997,7 @@ pub(crate) mod tests {
             max_players: 25,
             entries: Some(entries),
             max_entries: None,
+            held: None,
             pools: vec![],
         });
         queue
@@ -1503,6 +1514,7 @@ pub(crate) mod tests {
             max_players: 25,
             entries: Some(30),
             max_entries: None,
+            held: None,
             pools: vec![
                 PoolLink {
                     id: POOL.into(),
@@ -1748,12 +1760,68 @@ pub(crate) mod tests {
         assert_eq!(twenty_seats(10).win(), "35,000 sats");
         assert_eq!(twenty_seats(20).win(), "70,000 sats");
         assert_eq!(twenty_seats(20).entries(), "20 seats · 0 left");
-        let mut closed = twenty_seats(12);
-        closed.can_enter = false;
-        assert_eq!(closed.entries(), "12 of 20");
+        let mut started = twenty_seats(12);
+        started.phase = Phase::Live;
+        started.can_enter = false;
+        assert_eq!(started.entries(), "12 of 20");
 
         // A queue that pays one place shows no split.
         assert!(queued("q", 3).prize_split().is_none());
         assert!(queued("q", 3).prize_rule().is_none());
+    }
+
+    /// Seats left count what the entry cap counts: paid tickets and unexpired invoice holds. A
+    /// queue whose last seats are held, not yet paid, is full until a hold lapses.
+    #[test]
+    fn seats_left_count_held_tickets_like_the_entry_cap() {
+        let with_held = |paid: u64, held: u64| {
+            let mut competition = twenty_seats(paid);
+            if let Queue::Queued(queue) = &mut competition.queue {
+                queue.held = Some(held);
+            }
+            // As the page builds it from the API's fields.
+            let queue = competition.queue.queued().unwrap();
+            competition.can_enter = queue.taken(paid) < 20;
+            competition
+        };
+        let some_held = with_held(15, 18);
+        assert_eq!(some_held.entries(), "20 seats · 2 left");
+        assert!(some_held.can_enter && !some_held.is_full());
+
+        // 19 paid and the last seat held for an unpaid invoice: full, never "1 left".
+        let last_held = with_held(19, 20);
+        assert_eq!(last_held.entries(), "20 seats · 0 left");
+        assert!(last_held.is_full() && !last_held.can_enter);
+        let badge = phase_badge(&last_held).into_string();
+        assert!(badge.contains(">Full</span>"), "{badge}");
+        let row = competition_row(&last_held, NOW).into_string();
+        assert!(!row.contains("1 left") && row.contains("Leaderboard"));
+
+        // An older page without the held count falls back to the paid entries.
+        let mut paid_only = twenty_seats(19);
+        if let Queue::Queued(queue) = &mut paid_only.queue {
+            queue.held = None;
+        }
+        assert_eq!(paid_only.entries(), "20 seats · 1 left");
+    }
+
+    /// The API's `held` field reaches the page, and a full queue cannot be entered.
+    #[test]
+    fn a_queue_read_from_the_api_is_full_when_every_seat_is_held() {
+        let fields = serde_json::json!({
+            "kind": "queued",
+            "pool_rules": { "min_players": 2, "max_players": 20 },
+            "entries": 19,
+            "held": 20,
+            "max_entries": 20,
+            "pools": [],
+        });
+        let Queue::Queued(queue) = Queue::from_fields(fields.as_object().unwrap()) else {
+            panic!("a queue");
+        };
+        assert_eq!(
+            (queue.held, queue.taken(0), queue.seats()),
+            (Some(20), 20, Some(20))
+        );
     }
 }

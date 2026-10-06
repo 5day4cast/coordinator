@@ -591,6 +591,7 @@ async fn queued_terms_come_from_the_reference_event_and_are_stored_with_their_di
     assert_eq!(json["kind"], "queued");
     assert_eq!(json["entries"], 0);
     assert_eq!(json["max_entries"], 40);
+    assert_eq!(json["held"], 0);
     assert_eq!(json["stake_sats"], 5_000);
     assert_eq!(
         json["pool_rules"],
@@ -683,6 +684,12 @@ async fn queued_tickets_are_made_on_demand_up_to_the_cap() {
         reserve(Uuid::now_v7(), "carol").await,
         QueuedReservation::Full
     ));
+    // The API counts the held tickets as the cap does, so the page can say the queue is full
+    // while none of them is paid yet.
+    let json = serde_json::to_value(queue.coordinator.get_competition(id).await.unwrap()).unwrap();
+    assert_eq!(json["entries"], 0);
+    assert_eq!(json["held"], 4);
+    assert_eq!(json["max_entries"], 4);
 
     // Tickets stop at the deadline.
     assert!(matches!(
