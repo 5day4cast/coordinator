@@ -189,11 +189,10 @@ pub fn entry_form(
                 summary { "Advanced: how the entry is held and paid" }
                 ul {
                     li {
-                        "Your ticket is locked into a Bitcoin contract with the other entries"
+                        "Your picks and ticket are locked into a Bitcoin contract with the other entries"
                         @if queue.is_some() { " in your pool" }
                         ". "
-                        "A Keymeld enclave signs it for you, so you don't need to stay online. "
-                        "The contract names no picks: you can change yours until entries close."
+                        "A Keymeld enclave signs it for you, so you don't need to stay online."
                     }
                     @if let Some(terms) = terms {
                         li {
@@ -899,15 +898,6 @@ mod tests {
                 (Metric::WindSpeed, Some(7.0), Some(Rule::Fixed)),
             ],
         }
-    }
-
-    #[test]
-    fn the_terms_say_picks_change_until_entries_close() {
-        let html = form(PayoutDestination::LoggedOut);
-        assert!(html.contains("Your ticket is locked into a Bitcoin contract"));
-        assert!(
-            html.contains("The contract names no picks: you can change yours until entries close.")
-        );
     }
 
     fn form(destination: PayoutDestination) -> String {

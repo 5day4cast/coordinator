@@ -325,7 +325,7 @@ impl Coordinator {
         validate_entry(submission.clone(), competition).await?;
         match self
             .competition_store
-            .update_entry_picks_before(pubkey, &submission, deadline)
+            .update_queued_entry_picks(pubkey, &submission, deadline)
             .await?
         {
             PicksUpdate::Updated => Ok(()),

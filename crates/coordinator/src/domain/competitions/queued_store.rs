@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use super::{
     admission::before_deadline, queued::MAX_UNPAID_TICKETS_PER_PLAYER, Competition,
-    CompetitionKind, CompetitionStore, CreateEvent, Lease, ReservedTicket, Ticket,
+    CompetitionStore, CreateEvent, Lease, ReservedTicket, Ticket,
 };
 use crate::infra::{db::DatabaseWriteError, oracle::AddEventEntry};
 
@@ -71,7 +71,7 @@ pub enum PicksUpdate {
     Updated,
     /// The player has no entry with this id.
     NotFound,
-    /// Its competition no longer takes picks: entries closed or went to the oracle, or a pool.
+    /// Its competition no longer takes picks: entries closed, pools formed, or not queued.
     Locked,
 }
 
@@ -462,13 +462,11 @@ impl CompetitionStore {
     }
 
     /// Replace the picks of `player`'s entry `submission.id` with `submission`'s, while its
-    /// queued or single competition still takes picks: before `deadline` (the start), before its
-    /// entries go to the oracle (a queue's when it forms its pools, which copy each entry's
-    /// submission to its pool's oracle event; a single competition's just after the start), and
-    /// while it is not cancelled or failed. The entry's id and competition stay as they are.
-    /// One write, so pool formation either copies the new picks or makes this refuse, and an
-    /// edit that commits does so before the start.
-    pub async fn update_entry_picks_before(
+    /// queued competition still takes entries: before `deadline`, and before it forms its pools
+    /// (which copy each entry's submission to its pool's oracle event), is cancelled or fails.
+    /// The entry's id and competition stay as they are. One write, so pool formation either
+    /// copies the new picks or makes this refuse.
+    pub async fn update_queued_entry_picks(
         &self,
         player: &str,
         submission: &AddEventEntry,
@@ -485,7 +483,6 @@ impl CompetitionStore {
                 let row = sqlx::query(
                     "SELECT entries.event_id AS event_id, competitions.kind AS kind,
                             (competitions.pools_formed_at IS NULL
-                             AND competitions.entries_submitted_at IS NULL
                              AND competitions.cancelled_at IS NULL
                              AND competitions.failed_at IS NULL) AS open
                      FROM entries JOIN competitions ON competitions.id = entries.event_id
@@ -503,7 +500,7 @@ impl CompetitionStore {
                 let kind: String = row.try_get("kind")?;
                 let open: bool = row.try_get("open")?;
                 if !open
-                    || kind == CompetitionKind::Pool.as_str()
+                    || kind != "queued"
                     || stored_event != event_id
                     || !before_deadline(Some(deadline))
                 {

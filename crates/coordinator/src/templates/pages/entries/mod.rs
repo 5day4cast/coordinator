@@ -262,15 +262,11 @@ fn entry_row(row: &EntryRow, explorers: Explorers) -> Markup {
 }
 
 /// Whether an entry in `competition` may still change its picks, as far as the page can tell:
-/// a single or queued competition before entries close. The edit screen itself has the final
-/// say (`Competition::picks_lock`).
+/// a queued competition before entries close. The edit screen itself has the final say
+/// (`Competition::picks_lock`).
 fn picks_editable(competition: &CompetitionView) -> bool {
     competition.phase == Phase::Upcoming
-        && match &competition.queue {
-            Queue::Single => true,
-            Queue::Queued(queue) => queue.pools.is_empty(),
-            Queue::Pool(_) => false,
-        }
+        && matches!(&competition.queue, Queue::Queued(queue) if queue.pools.is_empty())
 }
 
 /// The all-in entry fee, its parts in a tip, and when it was paid.
@@ -910,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn entries_in_a_competition_taking_entries_can_edit_their_picks() {
+    fn entries_in_a_queue_taking_entries_can_edit_their_picks() {
         use crate::templates::pages::competitions::tests::queued;
         let edit = format!(
             r##"hx-get="/entries/{ENTRY}/edit" hx-trigger="click consume" hx-target="#entryValues""##
@@ -918,13 +914,11 @@ mod tests {
         let open = one_row(&entry(), &queued("c1", 3));
         assert!(open.contains(&edit));
         assert!(open.contains("Edit picks"));
-        // A single competition's too, until its start.
-        assert!(one_row(&entry(), &view("c1", Phase::Upcoming, 60)).contains(&edit));
-        // Not once entries close.
+        // Not once entries close, nor in a single competition, whose picks are fixed once entered.
         let mut started = queued("c1", 3);
         started.phase = Phase::Live;
         assert!(!one_row(&entry(), &started).contains("Edit picks"));
-        assert!(!one_row(&entry(), &view("c1", Phase::Live, 60)).contains("Edit picks"));
+        assert!(!one_row(&entry(), &view("c1", Phase::Upcoming, 60)).contains("Edit picks"));
     }
 
     #[test]
