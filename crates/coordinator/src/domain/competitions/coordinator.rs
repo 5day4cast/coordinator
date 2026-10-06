@@ -1512,7 +1512,7 @@ impl Coordinator {
         Ok(competition)
     }
 
-    async fn submit_entries_to_oracle<'a>(
+    pub(super) async fn submit_entries_to_oracle<'a>(
         &self,
         competition: &'a mut Competition,
     ) -> Result<&'a mut Competition, anyhow::Error> {

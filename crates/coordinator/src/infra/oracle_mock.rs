@@ -90,6 +90,16 @@ impl MockOracle {
             .map(|e| e.locking_conditions.clone())
     }
 
+    /// The entries submitted to `event_id`, in the order they were sent.
+    pub fn submitted_entries(&self, event_id: &Uuid) -> Vec<AddEventEntries> {
+        self.events
+            .read()
+            .unwrap()
+            .get(event_id)
+            .map(|event| event.entries.clone())
+            .unwrap_or_default()
+    }
+
     pub fn event_count(&self) -> usize {
         self.events.read().unwrap().len()
     }
