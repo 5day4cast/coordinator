@@ -23,7 +23,8 @@ fn wallet_input_weight(script_pubkey: &ScriptBuf) -> Result<InputWeightPredictio
     } else if script_pubkey.is_p2wpkh() {
         Ok(InputWeightPrediction::P2WPKH_MAX)
     } else if script_pubkey.is_p2sh() {
-        Ok(InputWeightPrediction::NESTED_P2WPKH_MAX)
+        // Nested P2WPKH: a 22-byte redeem script push, then a signature and a key.
+        Ok(InputWeightPrediction::new(23, [72, 33]))
     } else {
         Err(anyhow!("Cannot size a wallet input paying {script_pubkey}"))
     }
