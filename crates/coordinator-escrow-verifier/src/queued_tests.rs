@@ -344,6 +344,8 @@ fn contract_for(
             fee_rate: FeeRate::from_sat_per_vb_u32(1),
             funding_value: first.funding_value,
             relative_locktime_block_delta: first.relative_locktime_block_delta,
+            anchor: None,
+            outcome_bound_splits: true,
         },
         funding_outpoint: OutPoint::null(),
     }
@@ -1049,6 +1051,8 @@ mod capacity_bounds {
                 fee_rate: FeeRate::from_sat_per_vb_u32(1),
                 funding_value: first.funding_value,
                 relative_locktime_block_delta: first.relative_locktime_block_delta,
+                anchor: None,
+                outcome_bound_splits: true,
             },
             funding_outpoint: OutPoint::null(),
         };
@@ -1352,19 +1356,11 @@ mod capacity_bounds {
         // retry after a lost nonce round carrying the previous preparation.
         let (ark_funding, funded) = ark_funded(f);
         let scope = pool.scope(&funded);
-        // With two places, outcomes ranking the same winners in either order share one outcome
-        // transaction: the player signs its message once per outcome, under each adaptor point.
+        // Splits bound to their outcome give every outcome its own outcome transaction, so no
+        // message repeats, with one place or two.
         let digests: std::collections::BTreeSet<_> =
             scope.batch.iter().map(|i| i.message_digest).collect();
-        let repeated = scope.batch.len() - digests.len();
-        assert_eq!(
-            repeated,
-            if places == 2 {
-                players * (players - 1) / 2
-            } else {
-                0
-            }
-        );
+        assert_eq!(scope.batch.len() - digests.len(), 0);
         let attempt = ActionAttempt {
             attempt_id: Uuid::now_v7(),
             signing_session_id: Some(SessionId::new_v7()),
@@ -1644,33 +1640,16 @@ mod capacity_bounds {
         }
     }
 
-    /// With two places, the outcomes ranking the same two winners in either order share one
-    /// outcome transaction. The verifier permits its message once under each outcome's adaptor
-    /// point, and refuses an extra copy, a copy under any other point, and a missing copy.
+    /// With two places, splits bound to their outcome give every outcome its own outcome
+    /// transaction, so each message is permitted once. The verifier refuses an extra copy, a copy
+    /// under another outcome's adaptor point, and a missing message.
     #[tokio::test]
-    async fn a_shared_outcome_message_is_permitted_once_under_each_of_its_points() {
+    async fn two_place_outcome_messages_are_each_permitted_once() {
         let pool = funded_pool(10, 2);
         let scope = pool.scope();
-        let mut seen = BTreeMap::new();
-        let (first, second) = scope
-            .batch
-            .iter()
-            .enumerate()
-            .find_map(|(index, item)| {
-                seen.insert(item.message_digest, index)
-                    .map(|first| (first, index))
-            })
-            .expect("two outcomes share an outcome transaction");
-        let shared = scope.batch[first].message_digest;
-        assert_ne!(point(&scope.batch[first]), point(&scope.batch[second]));
-        assert_eq!(
-            scope
-                .batch
-                .iter()
-                .filter(|item| item.message_digest == shared)
-                .count(),
-            2
-        );
+        let digests: std::collections::BTreeSet<_> =
+            scope.batch.iter().map(|item| item.message_digest).collect();
+        assert_eq!(digests.len(), scope.batch.len());
         for prepared in [
             pool.full(&scope).await.unwrap(),
             pool.compact(ContractItem::compact(&scope)).await.unwrap(),
@@ -1682,57 +1661,33 @@ mod capacity_bounds {
                 }
             );
         }
-
-        // An extra copy, under either point.
-        for source in [first, second] {
-            let mut bad = scope.clone();
-            bad.batch.push(copy(&scope.batch[source]));
-            refused(pool.full(&bad).await, OUTSIDE);
-            refused(pool.compact(ContractItem::compact(&bad)).await, OUTSIDE);
-        }
-        // Both copies under one of the two points.
-        let mut bad = scope.clone();
-        bad.batch[second].adaptor = AdaptorContext::Single {
-            adaptor_id: Uuid::now_v7(),
-            point: point(&scope.batch[first]),
-        };
-        refused(pool.full(&bad).await, OUTSIDE);
-        // A copy under the point of an outcome with other winners.
-        let other = scope
+        let outcomes: Vec<usize> = scope
             .batch
             .iter()
-            .find(|item| {
-                item.message_digest != shared
-                    && matches!(item.adaptor, AdaptorContext::Single { .. })
-            })
-            .map(point)
-            .unwrap();
+            .enumerate()
+            .filter(|(_, item)| matches!(item.adaptor, AdaptorContext::Single { .. }))
+            .map(|(index, _)| index)
+            .take(2)
+            .collect();
+        let (first, second) = (outcomes[0], outcomes[1]);
+
+        // An extra copy.
+        let mut bad = scope.clone();
+        bad.batch.push(copy(&scope.batch[first]));
+        refused(pool.full(&bad).await, OUTSIDE);
+        refused(pool.compact(ContractItem::compact(&bad)).await, OUTSIDE);
+        // A copy under another outcome's point.
         let mut bad = scope.clone();
         bad.batch[first].adaptor = AdaptorContext::Single {
             adaptor_id: Uuid::now_v7(),
-            point: other,
+            point: point(&scope.batch[second]),
         };
         refused(pool.full(&bad).await, OUTSIDE);
-        // A missing copy.
-        for missing in [first, second] {
-            let mut bad = scope.clone();
-            bad.batch.remove(missing);
-            refused(pool.full(&bad).await, OMITTED);
-            refused(pool.compact(ContractItem::compact(&bad)).await, OMITTED);
-        }
-        // The compact form names no outcome, so it pairs a shared message's copies with their
-        // points in batch order. Reordered copies still name only the contract's messages, each
-        // under its own point once, but the permitted scope is no longer the one the Coordinator
-        // asked for, so its digest fails the Coordinator's and the signing enclave's checks.
-        let mut reordered = ContractItem::compact(&scope);
-        reordered.swap(first, second);
-        let prepared = pool.compact(reordered).await.unwrap();
-        let Action::Sign { scope: permitted } = &prepared.action else {
-            panic!("contract signing permits a signing scope");
-        };
-        assert_ne!(permitted, &scope);
-        assert_eq!(point(&permitted.batch[first]), point(&scope.batch[first]));
-        assert_eq!(permitted.batch[first].item_id, scope.batch[second].item_id);
+        // A missing message.
+        let mut bad = scope.clone();
+        bad.batch.remove(first);
+        refused(pool.full(&bad).await, OMITTED);
+        refused(pool.compact(ContractItem::compact(&bad)).await, OMITTED);
     }
 
     /// The expiry outcome transaction is signed without an adaptor; naming one is refused.

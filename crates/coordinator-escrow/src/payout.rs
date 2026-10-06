@@ -148,6 +148,10 @@ impl ContractAuthorization {
         let p = &commitment.contract_parameters;
         p.validate()
             .map_err(|e| PayoutError::ContractMismatch(e.to_string()))?;
+        // The anchor and split binding are not part of the authorized economics: a stored
+        // contract keeps the options it was built with. Bound them instead.
+        crate::contract_options::check_contract_options(p)
+            .map_err(|e| PayoutError::ContractMismatch(e.to_string()))?;
         if p.market_maker != self.market_maker
             || p.event != self.event
             || p.outcome_payouts != self.outcome_payouts
@@ -194,7 +198,8 @@ pub fn verify_completed_contract(
     contract: &ContractCommitment,
     signatures: &ContractSignatures,
 ) -> Result<(), PayoutError> {
-    let dlc = TicketedDLC::new(
+    // An agreed contract: rebuild skips the shared-winners rule 0.1.0 contracts predate.
+    let dlc = TicketedDLC::rebuild(
         contract.contract_parameters.clone(),
         contract.funding_outpoint,
     )
@@ -337,7 +342,9 @@ pub struct SigningRequirement {
 pub fn signing_requirements(
     commitment: &ContractCommitment,
 ) -> Result<Vec<([u8; 32], SigningRequirement)>, PayoutError> {
-    let dlc = TicketedDLC::new(
+    // Contract options are checked before signing (`check_contract_options`); rebuilding here
+    // also lists the signatures of agreed 0.1.0 contracts whose outcomes share winners.
+    let dlc = TicketedDLC::rebuild(
         commitment.contract_parameters.clone(),
         commitment.funding_outpoint,
     )

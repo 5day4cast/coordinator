@@ -11,7 +11,7 @@ payout-witness-local = ["coordinator-escrow-verifier/payout-witness-local"]
 
 [dependencies]
 coordinator-escrow-verifier = { path = "../coordinator-escrow-verifier" }
-keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "69db916f33953a4ec228a5aed36942be39134795", default-features = false, features = ["escrow", "enclave"] }
-keymeld-enclave = { git = "https://github.com/tee8z/keymeld", rev = "69db916f33953a4ec228a5aed36942be39134795", default-features = false, features = ["escrow"] }
+keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "30e84199ea091ca0947e0d90c5e601df06052da0", default-features = false, features = ["escrow", "enclave"] }
+keymeld-enclave = { git = "https://github.com/tee8z/keymeld", rev = "30e84199ea091ca0947e0d90c5e601df06052da0", default-features = false, features = ["escrow"] }
 anyhow.workspace = true
 tokio = { workspace = true, features = ["full"] }

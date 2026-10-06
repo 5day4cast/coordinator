@@ -304,6 +304,7 @@ mod tests {
             scoring_rules: None,
             scoring_fields: None,
             max_entries_per_player: 1,
+            contract_options: None,
         });
         competition.awaiting_attestation_at = Some(signing() - time::Duration::hours(24));
         competition

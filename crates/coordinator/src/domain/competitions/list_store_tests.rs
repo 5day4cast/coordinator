@@ -34,6 +34,7 @@ fn competition(start: OffsetDateTime, unlisted: bool) -> Competition {
         scoring_rules: None,
         scoring_fields: None,
         max_entries_per_player: 1,
+        contract_options: None,
     })
 }
 
@@ -64,6 +65,8 @@ fn pot_return_contract() -> (ContractParameters, EventLockingConditions, MaybeSc
         fee_rate: FeeRate::from_sat_per_vb_u32(1),
         funding_value: Amount::from_sat(3_000),
         relative_locktime_block_delta: 72,
+        anchor: None,
+        outcome_bound_splits: false,
     };
     (params, event, attestation.into())
 }

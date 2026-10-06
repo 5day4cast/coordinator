@@ -190,7 +190,8 @@ mod metrics_settings_tests {
 
 /// Each ticket's share of the Bitcoin network fees, added to its price as its own line.
 ///
-/// A game's chain cost is `base_vbytes + vbytes_per_player × players` vbytes. Each entry pays
+/// A game's chain cost is `base_vbytes + vbytes_per_player × players` vbytes, plus the anchor
+/// output new contracts put on their outcome transaction (its vbytes and value). Each entry pays
 /// its share of that for a pool of `pool_players`, at the current estimate for `conf_target`
 /// blocks (at least `min_sat_per_vb`) times `multiplier_percent`. The fee is fixed on a ticket
 /// when it is issued; the coordinator keeps any surplus and absorbs any shortfall. While the fee

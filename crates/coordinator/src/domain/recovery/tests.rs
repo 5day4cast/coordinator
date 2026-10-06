@@ -245,6 +245,8 @@ fn signed_contract() -> (SignedContract, [Scalar; 3], [Scalar; 2]) {
         fee_rate: FeeRate::from_sat_per_vb_u32(1),
         funding_value: Amount::from_sat(100_000),
         relative_locktime_block_delta: 72,
+        anchor: None,
+        outcome_bound_splits: false,
     };
     let dlc = TicketedDLC::new(params, OutPoint::null()).unwrap();
     let mut rng = ChaCha20Rng::from_seed([42; 32]);
@@ -553,6 +555,9 @@ fn a_twenty_player_two_place_contract_fits_in_events() {
         fee_rate: FeeRate::from_sat_per_vb_u32(2),
         funding_value: Amount::from_sat(200_000),
         relative_locktime_block_delta: 432,
+        anchor: None,
+        // Two places: the outcomes share winners, so splits are bound to their outcome.
+        outcome_bound_splits: true,
     };
     // Distinct signatures, so compression gains no more than it would on real ones.
     let signer = scalar(6_000);

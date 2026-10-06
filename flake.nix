@@ -10,9 +10,9 @@
     };
     crane.url = "github:ipetkov/crane";
 
-    # Match the SDK and verifier to the Keymeld 0.9.0 release.
+    # Match the SDK and verifier to the Keymeld pin in Cargo.toml (Keymeld v0.9.1).
     keymeld = {
-      url = "github:tee8z/keymeld/69db916f33953a4ec228a5aed36942be39134795";
+      url = "github:tee8z/keymeld/30e84199ea091ca0947e0d90c5e601df06052da0";
     };
   };
 

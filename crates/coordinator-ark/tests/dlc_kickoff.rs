@@ -64,6 +64,9 @@ fn contract(fixture: &Fixture, expiry: bool) -> ContractParameters {
         fee_rate: FeeRate::from_sat_per_vb_u32(2),
         funding_value: Amount::from_sat(3 * ESCROW_SATS),
         relative_locktime_block_delta: 144,
+        // As new competitions build them: P2A anchors and outcome-bound splits.
+        anchor: Some(dlctix::AnchorParams::default()),
+        outcome_bound_splits: true,
     }
 }
 

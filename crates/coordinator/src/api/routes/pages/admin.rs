@@ -456,6 +456,7 @@ pub async fn admin_create_competition_handler(
         scoring_rules: Some(scoring_rules),
         scoring_fields: None,
         max_entries_per_player,
+        contract_options: None,
     };
 
     match state.coordinator.create_competition(create_event).await {

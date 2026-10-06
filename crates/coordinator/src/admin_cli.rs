@@ -297,6 +297,7 @@ impl CreateArgs {
             scoring_rules: Some(self.scoring_rules),
             scoring_fields: None,
             max_entries_per_player: self.max_entries_per_player,
+            contract_options: None,
         })
     }
 }

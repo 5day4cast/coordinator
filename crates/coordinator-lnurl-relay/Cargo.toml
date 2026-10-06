@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 coordinator-escrow = { path = "../coordinator-escrow", features = ["networking"] }
-keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "69db916f33953a4ec228a5aed36942be39134795", default-features = false, features = ["networking"] }
+keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "30e84199ea091ca0947e0d90c5e601df06052da0", default-features = false, features = ["networking"] }
 anyhow.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tokio-vsock = "0.7.2"

@@ -658,7 +658,7 @@ Pending: whether the closing sweep can board back into Arkade.
 ### Network fee
 
 Each ticket carries its share of the pool's chain cost, as its own line next to the entry and service fees.
-It is priced for the smallest pool the game runs, five players, with a 50% margin: `ceil((342 + 26 × 5) / 5 × rate × 1.5)` sats.
+It is priced for the smallest pool the game runs, five players, with a 50% margin, and includes the pay-to-anchor output new contracts put on their outcome transaction (13 vB, and its 240-sat value): `ceil(((342 + 26 × 5 + 13) × rate × 1.5 + 240) / 5)` sats.
 
 The configured electrs server supplies a historical baseline through `blockchain.estimatefee(144)`.
 This is a 144-block confirmation target, about 72 minutes on Mutinynet or one day on Bitcoin.
@@ -678,7 +678,7 @@ The coordinator does not fall back to LND estimates or a public explorer.
 The contract rate adds the larger of 10% and 0.25 sat/vB after the next-block mempool adjustment.
 Ticket pricing uses the two-block mempool adjustment with the same baseline and margin.
 For a quiet mempool and a historical estimate of 1.029 sat/vB, the contract rate is 1.280 sat/vB at wallet precision.
-At LND's floor of 1.012 sat/vB, the contract rate is 1.264 sat/vB and the ticket's network fee is 179 sats.
+At LND's floor of 1.012 sat/vB, the contract rate is 1.264 sat/vB and the ticket's network fee is 232 sats.
 
 The fee is fixed on the ticket's invoice when the ticket is issued and does not change for that payment hash.
 It is refunded with the escrow.
@@ -692,7 +692,7 @@ At kickoff the coordinator knows the pool's size and the rate it will pay, so it
 A pool is checked when it forms, before its oracle event, and every Arkade competition again just before its contract is built.
 It passes only if all of these hold:
 
-- what the entries paid beyond the pot, as the kickoff can collect it, covers `(342 + 26 × players)` vbytes at the kickoff rate plus 0.5% of the pot for paying the winner over Lightning and keeping channels balanced;
+- what the entries paid beyond the pot, as the kickoff can collect it, covers `(342 + 26 × players)` vbytes, plus 13 for a contract with anchors, at the kickoff rate plus 0.5% of the pot for paying the winner over Lightning and keeping channels balanced;
 - the kickoff rate is within the fee ceiling in the terms;
 - the pool has enough players for the rate: its terms' minimum while the rate is at most 2 sat/vB, and at least five above that.
 

@@ -39,6 +39,8 @@ pub(crate) fn fixture() -> (ContractCommitment, ContractAuthorization) {
         fee_rate: FeeRate::from_sat_per_vb_u32(1),
         funding_value: Amount::from_sat(100_000),
         relative_locktime_block_delta: 72,
+        anchor: None,
+        outcome_bound_splits: false,
     };
     let terms = ContractAuthorization {
         competition_id: Uuid::from_u128(1),
@@ -355,9 +357,10 @@ fn signing_context_covers_expiry_and_all_adaptor_and_subset_requirements() {
     .is_err());
 }
 
-/// Two outcomes ranking the same two winners in either order build one outcome transaction, so
-/// the contract signs its sighash once under each outcome's adaptor point: no more, no fewer.
-/// Split transactions differ by payout, so their sighashes never repeat.
+/// In a 0.1.0 contract (splits not bound to their outcome), two outcomes ranking the same two
+/// winners in either order build one outcome transaction, so the contract signs its sighash once
+/// under each outcome's adaptor point: no more, no fewer. Split transactions differ by payout, so
+/// their sighashes never repeat.
 #[test]
 fn a_shared_outcome_transaction_is_signed_once_per_outcome() {
     let (mut contract, _) = fixture();
@@ -370,7 +373,7 @@ fn a_shared_outcome_transaction_is_signed_once_per_outcome() {
         (Outcome::Attestation(1), BTreeMap::from([(0, 30), (1, 70)])),
         (Outcome::Expiry, BTreeMap::from([(0, 50), (1, 50)])),
     ]);
-    let data = TicketedDLC::new(params.clone(), contract.funding_outpoint)
+    let data = TicketedDLC::rebuild(params.clone(), contract.funding_outpoint)
         .unwrap()
         .signing_data()
         .unwrap();
@@ -473,4 +476,24 @@ fn verified_contracts_remember_only_successes_within_their_bound() {
     assert!(verified.recall(&key(0)));
     assert!(!verified.recall(&key(1)));
     assert!(verified.recall(&key(MAX_VERIFIED_CONTRACTS)));
+}
+
+/// The anchor and split binding are not part of the authorized economics, so a contract with or
+/// without them binds, but an anchor out of bounds does not.
+#[test]
+fn contract_options_are_bounded_rather_than_fixed() {
+    use crate::contract_options::{ContractOptions, MAX_ANCHOR_VALUE};
+    let (contract, terms) = fixture();
+    let key = contract.contract_parameters.players[0].pubkey.serialize();
+    let mut anchored = contract.clone();
+    ContractOptions::NEW.apply(&mut anchored.contract_parameters);
+    terms.verify_contract(&anchored, &key).unwrap();
+    anchored.contract_parameters.anchor = Some(dlctix::AnchorParams {
+        value: MAX_ANCHOR_VALUE,
+    });
+    terms.verify_contract(&anchored, &key).unwrap();
+    anchored.contract_parameters.anchor = Some(dlctix::AnchorParams {
+        value: MAX_ANCHOR_VALUE + Amount::ONE_SAT,
+    });
+    assert!(terms.verify_contract(&anchored, &key).is_err());
 }

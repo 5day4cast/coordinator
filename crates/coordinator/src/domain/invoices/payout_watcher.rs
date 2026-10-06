@@ -717,6 +717,8 @@ mod tests {
             funding_value: bitcoin::Amount::from_sat(100_000),
             fee_rate: bitcoin::FeeRate::from_sat_per_vb_u32(1),
             relative_locktime_block_delta: 72,
+            anchor: None,
+            outcome_bound_splits: false,
         };
         let params = serde_json::to_vec(&params).unwrap();
         let outcome = serde_json::to_vec(&bitcoin::Transaction {

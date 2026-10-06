@@ -1,18 +1,21 @@
 //! Which recovery transactions can be fee bumped.
 //!
-//! dlctix 0.1's outcome, expiry and split transactions are signed at a fixed fee rate and have no
-//! anchor output. The win transaction cannot pay for them either: it waits `delta` blocks behind
-//! the split. So until contracts carry anchors, a recovery that does not confirm in a fee spike
-//! can only wait. A pay-to-anchor (P2A) output changes that: anyone can spend it in a child
-//! transaction that pays for both (CPFP). [`bump_status`] finds one; an [`AnchorBumper`] builds
-//! the child. None is implemented here yet: the anchors work fills it in.
+//! Outcome, expiry and split transactions are signed at a fixed fee rate. The win transaction
+//! cannot pay for them: it waits `delta` blocks behind the split. Contracts built without anchors
+//! (every contract from before dlctix 0.2.0) cannot be bumped, so a recovery that does not
+//! confirm in a fee spike can only wait. Contracts built with dlctix 0.2.0's anchors put a
+//! pay-to-anchor (P2A) output last on each of those transactions: anyone can spend it in a child
+//! transaction that pays for both (CPFP). [`bump_status`] finds it with dlctix's
+//! `anchor::find_anchor`; an [`AnchorBumper`] builds the child, for example with dlctix's
+//! `SignedContract::cpfp_child_template` and the bumper's own coins. None is implemented here
+//! yet.
 
 use bitcoin::{Amount, FeeRate, OutPoint, ScriptBuf, Transaction, TxOut};
 use serde::Serialize;
 
 /// The pay-to-anchor output script: `OP_1 <0x4e73>`.
 pub fn p2a_script() -> ScriptBuf {
-    ScriptBuf::from_bytes(vec![0x51, 0x02, 0x4e, 0x73])
+    dlctix::anchor::anchor_script_pubkey()
 }
 
 /// Whether a transaction can be fee bumped, and how.
@@ -43,15 +46,10 @@ impl BumpStatus {
 
 /// `tx`'s anchor, if it has one. `fee` is what it pays, if known (its inputs' values).
 pub fn bump_status(tx: &Transaction, fee: Option<Amount>) -> BumpStatus {
-    let anchor = p2a_script();
-    match tx
-        .output
-        .iter()
-        .position(|output| output.script_pubkey == anchor)
-    {
-        Some(vout) => BumpStatus::Anchor {
-            outpoint: OutPoint::new(tx.compute_txid(), vout as u32),
-            value_sat: tx.output[vout].value.to_sat(),
+    match dlctix::anchor::find_anchor(tx) {
+        Some((outpoint, output)) => BumpStatus::Anchor {
+            outpoint,
+            value_sat: output.value.to_sat(),
         },
         None => BumpStatus::Fixed {
             fee_sat: fee.map(Amount::to_sat),
