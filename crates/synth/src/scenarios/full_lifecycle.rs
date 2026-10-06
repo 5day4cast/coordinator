@@ -130,7 +130,9 @@ pub(super) async fn request_entry(
 ///
 /// The entry id is the ticket request's idempotency key, and the entry key is derived from it,
 /// so a player asking again for the ticket they hold unpaid must use the same entry id. The
-/// coordinator refuses another entry key with `409` and releases the reservation.
+/// coordinator refuses another entry key with `409` and releases the reservation. It refuses an
+/// entry id too old to pay for now and releases the ticket held under it; the entry then starts
+/// again under a new id.
 pub(super) async fn request_entry_resuming(
     client: &CoordinatorClient,
     user: &SynthUser,
@@ -149,15 +151,62 @@ pub(super) async fn request_entry_resuming(
                 .and_then(|saved| saved.key_derivation_id.or(saved.entry_id))
         })
         .or(trace.entry_id);
-    let entry_id = match saved {
-        Some(entry_id) => entry_id,
+    let resumed = match saved {
+        Some(entry_id) => Some(entry_id),
         // The step began before the restart without saving its key. A queued ticket's id is its
         // entry id: pay the oldest one the player holds rather than starting another.
-        None if prior.is_some() => resumable_ticket(client, user, competition_id)
-            .await
-            .unwrap_or_else(Uuid::now_v7),
-        None => Uuid::now_v7(),
+        None if prior.is_some() => resumable_ticket(client, user, competition_id).await,
+        None => None,
     };
+    let entry_id = resumed.unwrap_or_else(Uuid::now_v7);
+    match request_ticket_for(
+        client,
+        user,
+        competition_id,
+        lightning_address,
+        step,
+        trace,
+        entry_id,
+    )
+    .await
+    {
+        Err(error)
+            if resumed.is_some()
+                && error
+                    .downcast_ref::<ApiRejection>()
+                    .is_some_and(ApiRejection::is_stale_entry_id) =>
+        {
+            warn!(
+                "{}'s entry {entry_id} in competition {competition_id} was started too long ago \
+                 to pay for now; starting it again: {error:#}",
+                user.name
+            );
+            request_ticket_for(
+                client,
+                user,
+                competition_id,
+                lightning_address,
+                step,
+                trace,
+                Uuid::now_v7(),
+            )
+            .await
+        }
+        requested => requested,
+    }
+}
+
+/// Ask for the ticket of entry `entry_id`, whose entry key and payout choice are derived from
+/// it, and record the ticket in `trace`.
+async fn request_ticket_for(
+    client: &CoordinatorClient,
+    user: &SynthUser,
+    competition_id: &Uuid,
+    lightning_address: Option<&str>,
+    step: &str,
+    trace: &mut EntryTrace,
+    entry_id: Uuid,
+) -> Result<RequestedEntry> {
     trace.key_derivation_id = Some(entry_id);
     trace.entry_id = Some(entry_id);
     crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;

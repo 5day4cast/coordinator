@@ -200,9 +200,8 @@ impl Coordinator {
     }
 
     /// Whether `competition` is checked at this step: an Arkade competition with the check on,
-    /// whose contract is not built yet, either a pool without its oracle event, or one whose
-    /// contract is built next: a single competition with its oracle event (its entries go to the
-    /// oracle at the start, after the contract), or any whose entries are with the oracle.
+    /// whose contract is not built yet, either a pool without its oracle event, or any whose
+    /// entries are with the oracle, so the contract is built next.
     pub(super) async fn needs_kickoff_check(
         &self,
         competition: &Competition,
@@ -217,8 +216,6 @@ impl Coordinator {
         }
         let due = (competition.kind == CompetitionKind::Pool
             && competition.event_created_at.is_none())
-            || (competition.kind == CompetitionKind::Single
-                && competition.event_created_at.is_some())
             || competition.entries_submitted_at.is_some();
         Ok(due && self.competition_store.is_ark_funded(competition.id).await?)
     }

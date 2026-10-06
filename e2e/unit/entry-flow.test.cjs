@@ -1100,6 +1100,34 @@ test("with no unpaid ticket listed, the refusal is shown as it came", async () =
   assert.equal(elements.submitEntry.disabled, false);
 });
 
+// The coordinator's refusal of a ticket for an entry started too long ago to pay for now.
+const STALE = { ok: false, status: 400, json: async () => ({ error: "the entry id is too old or from the future; start the entry again for a new one" }) };
+
+test("an unpaid ticket started too long ago is not paid: Pay starts the entry again under a new id", async () => {
+  const server = reservingCoordinator();
+  const ticket = (body) => (body.payout.entry_id === UNPAID ? STALE : server.ticket(body));
+  const { elements, modal, pay, tickets } = payingPlayer({ ticket, unpaid: UNPAID });
+  await pay();
+  const [stale, fresh] = entryIds(tickets);
+  assert.equal(stale, UNPAID);
+  assert.equal(fresh, "0190b6a0-0000-7000-8000-000000000001", "a new entry id from the wallet");
+  assert.ok(modal.classList.contains("is-active"), "the new ticket's invoice is shown");
+  assert.ok(elements.errorMessage.classList.contains("hidden"), "no refusal is shown");
+});
+
+test("an entry the tab kept from long ago starts again under a new id, which the tab keeps", async () => {
+  const server = reservingCoordinator();
+  const sessionStorage = tabStorage();
+  const kept = "0190b6a0-0000-7000-8000-0000000000cc";
+  sessionStorage.setItem(`fw:entry:${COMPETITION}`, JSON.stringify({ id: kept, ephemeral_pubkey: "pubkey" }));
+  const ticket = (body) => (body.payout.entry_id === kept ? STALE : server.ticket(body));
+  const { modal, pay, tickets } = payingPlayer({ ticket, sessionStorage });
+  await pay();
+  assert.deepEqual(entryIds(tickets), [kept, "0190b6a0-0000-7000-8000-000000000001"]);
+  assert.ok(modal.classList.contains("is-active"));
+  assert.equal(JSON.parse(sessionStorage.getItem(`fw:entry:${COMPETITION}`)).id, "0190b6a0-0000-7000-8000-000000000001");
+});
+
 test("the payment dialog counts down to the invoice's expiry", async () => {
   let ticks = null;
   let stopped = false;
@@ -1115,73 +1143,6 @@ test("the payment dialog counts down to the invoice's expiry", async () => {
   announce("fw:ticket-paid");
   await done;
   assert.ok(stopped, "the countdown stops with the dialog");
-});
-
-// The picks dialog's edit screen: Save sends the checked picks for the entry, signed.
-function editScreen({ checked = [{ name: "KPWM_temp_high", value: "under" }], post } = {}) {
-  const elements = {
-    editPicksForm: element({
-      dataset: { entryId: "0190b6a0-0000-7000-8000-0000000000ee", maxValues: "1", pickRows: "3", counter: "editPicksLeft" },
-      querySelectorAll: () => checked,
-    }),
-    savePicks: element(),
-    editPicksMessage: element({ classes: ["hidden"] }),
-    loginModal: element(),
-  };
-  const document = {
-    body: { dataset: { apiBase: "https://coordinator" } },
-    getElementById: (id) => elements[id] ?? null,
-    addEventListener: () => {},
-  };
-  const requests = [];
-  const page = loggedIn({
-    AuthorizedClient: class {
-      async post(url, body) {
-        requests.push({ url, body: JSON.parse(JSON.stringify(body)) });
-        const response = await post();
-        if (!response.ok) {
-          const error = new Error(`HTTP error! status: ${response.status}`);
-          error.response = response;
-          throw error;
-        }
-        return response;
-      }
-    },
-  });
-  const session = { nostrClient: page.nostrClient, dlcWallet: null, wasm: {} };
-  const sandbox = loadBundle(["fragments/entry_form/entry_form.js"],
-    { ...page, window: {}, document, fetch: async () => assert.fail("no fetch"), crypto: webcrypto,
-      TextEncoder, console, session, isLoggedIn: () => true },
-    ["savePicks"]);
-  return { sandbox, elements, requests };
-}
-
-test("saving edited picks sends them for the entry and says they were saved", async () => {
-  const { sandbox, elements, requests } = editScreen({ post: async () => ({ ok: true, status: 204 }) });
-  await sandbox.savePicks();
-  assert.deepEqual(requests, [{
-    url: "https://coordinator/api/v1/entries/0190b6a0-0000-7000-8000-0000000000ee/picks",
-    body: { expected_observations: [{ stations: "KPWM", temp_high: "Under" }] },
-  }]);
-  assert.equal(elements.editPicksMessage.textContent, "Picks saved.");
-  assert.ok(elements.editPicksMessage.classList.contains("is-success"));
-  assert.equal(elements.savePicks.disabled, false);
-});
-
-test("edited picks of the wrong count are refused before anything is sent", async () => {
-  const { sandbox, elements, requests } = editScreen({ checked: [], post: async () => assert.fail("nothing sent") });
-  await sandbox.savePicks();
-  assert.equal(requests.length, 0);
-  assert.equal(elements.editPicksMessage.textContent, "Make exactly 1 pick; you made 0.");
-});
-
-test("a locked entry's picks say why they were not saved", async () => {
-  const { sandbox, elements } = editScreen({
-    post: async () => ({ ok: false, status: 400, json: async () => ({ error: "Entries have closed, so these picks are locked" }) }),
-  });
-  await sandbox.savePicks();
-  assert.equal(elements.editPicksMessage.textContent, "Entries have closed, so these picks are locked");
-  assert.ok(elements.editPicksMessage.classList.contains("is-danger"));
 });
 
 // A ticket paid for before the page reloaded, whose entry never went in. Its entry id is the one
@@ -1232,6 +1193,28 @@ test("a paid ticket under another account's key is not entered from this one", a
   assert.equal(entries().length, 0);
   assert.equal(tickets().length, 0);
   assert.match(elements.errorMessage.textContent, /another account/);
+});
+
+test("a paid ticket past the hour to finish it says it is refunded, and Pay starts a new entry", async () => {
+  const late = "This entry was started over an hour ago, so it can no longer be finished; its entry fee will be refunded";
+  const { sandbox, elements, modal, pay, tickets, entries } = payingPlayer({
+    paid: PAID,
+    entry: () => ({ ok: false, status: 400, json: async () => ({ error: late }) }),
+  });
+  const label = "Pay 5,300 sats and enter";
+  Object.assign(elements.submitEntry, { textContent: "Enter", dataset: { payLabel: label } });
+  await sandbox.submitEntry();
+  assert.equal(entries().length, 1);
+  assert.equal(elements.errorMessage.textContent, late);
+  assert.equal(elements.entryPaid.dataset.ticketId, undefined, "no longer offered");
+  assert.equal(elements.submitEntry.textContent, label);
+  assert.equal(elements.submitEntry.disabled, false);
+
+  await pay();
+  assert.equal(entries().length, 1, "the paid ticket is not entered again");
+  assert.equal(tickets().length, 1, "a new ticket for a new entry");
+  assert.notEqual(tickets()[0].body.payout.entry_id, PAID.entryId);
+  assert.ok(modal.classList.contains("is-active"));
 });
 
 test("Pay reads Enter while the form shows a paid ticket, and its price otherwise", () => {

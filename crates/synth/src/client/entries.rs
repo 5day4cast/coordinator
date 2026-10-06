@@ -47,6 +47,23 @@ impl ApiRejection {
     pub fn is_ticket_conflict(&self) -> bool {
         self.status == 409
     }
+
+    /// The entry was started too long ago for its ticket to be paid for now. The coordinator
+    /// released any unpaid ticket held under it, so the entry starts again under a new id.
+    pub fn is_stale_entry_id(&self) -> bool {
+        self.status == 400
+            && self.message
+                == "the entry id is too old or from the future; start the entry again for a new one"
+    }
+
+    /// A paid ticket's entry was not made within the hour its entry id allows; the ticket waits
+    /// for its refund.
+    pub fn is_entry_window_passed(&self) -> bool {
+        self.status == 400
+            && self.message
+                == "This entry was started over an hour ago, so it can no longer be finished; its \
+                    entry fee will be refunded"
+    }
 }
 
 /// A ticket the player holds unpaid in a queued competition. Its id is its entry's id, from

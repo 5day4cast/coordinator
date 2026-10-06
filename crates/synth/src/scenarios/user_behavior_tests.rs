@@ -49,6 +49,10 @@ struct Protocol {
     /// The player's unpaid queued tickets, oldest first, and how often they were listed.
     unpaid: Vec<Uuid>,
     unpaid_lookups: usize,
+    /// A ticket for this entry is refused as started too long ago to pay for now.
+    stale_entry: Option<Uuid>,
+    /// Entries are refused as started over an hour ago.
+    entry_window_passed: bool,
 }
 
 type Shared = Arc<Mutex<Protocol>>;
@@ -100,11 +104,23 @@ async fn ticket(State(state): State<Shared>, Json(body): Json<Value>) -> (Status
     let mut state = state.lock().unwrap();
     state.attempts += 1;
     let key = body["btc_pubkey"].clone();
+    let entry_id = body["payout"]["entry_id"].as_str().map(str::to_owned);
     state.ticket_requests.push(body);
     if state.tickets_closed {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error":"Competition is no longer accepting entries"})),
+        );
+    }
+    if state
+        .stale_entry
+        .is_some_and(|stale| entry_id == Some(stale.to_string()))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({"error":"the entry id is too old or from the future; start the entry again for a new one"}),
+            ),
         );
     }
     if let Some(reserved) = state.reserved_key.take() {
@@ -273,6 +289,14 @@ async fn submit(State(state): State<Shared>, Json(body): Json<Value>) -> (Status
     let mut state = state.lock().unwrap();
     let ticket = body["ticket_id"].as_str().unwrap().parse::<Uuid>().unwrap();
     state.events.push(format!("submit:{ticket}"));
+    if state.entry_window_passed {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({"error":"This entry was started over an hour ago, so it can no longer be finished; its entry fee will be refunded"}),
+            ),
+        );
+    }
     if state.closed {
         return (
             StatusCode::from_u16(state.duplicate_status.max(400)).unwrap(),
@@ -1635,4 +1659,80 @@ async fn unpaid_tickets_are_listed_only_for_a_resumed_step_that_lost_its_key() {
     .unwrap();
     assert_eq!(resumed.key_derivation_id, Some(saved_key));
     assert_eq!(mock.state.lock().unwrap().unpaid_lookups, 0);
+}
+
+#[tokio::test]
+async fn a_resumed_entry_started_too_long_ago_starts_again_under_a_new_id() {
+    let user = SynthUser::new_random("alice").unwrap();
+    let saved_key = Uuid::now_v7();
+    let mock = Mock::new(Protocol {
+        capacity: 1,
+        stale_entry: Some(saved_key),
+        ..Default::default()
+    })
+    .await;
+    let saved = EntryTrace {
+        key_derivation_id: Some(saved_key),
+        ..EntryTrace::new(&user)
+    };
+    let mut resumed = EntryTrace::new(&user);
+    let requested = full_lifecycle::request_entry_resuming(
+        &mock.client,
+        &user,
+        &Uuid::now_v7(),
+        None,
+        "user_alice_enter",
+        &mut resumed,
+        Some(Some(saved)),
+    )
+    .await
+    .unwrap();
+    let fresh = resumed.key_derivation_id.unwrap();
+    assert_ne!(fresh, saved_key);
+    assert_eq!(resumed.ticket_id, Some(requested.ticket.ticket_id));
+    assert_eq!(resumed.entry_id, Some(fresh));
+    let protocol = mock.state.lock().unwrap();
+    assert_eq!(protocol.ticket_requests.len(), 2);
+    assert_eq!(
+        protocol.ticket_requests[0]["payout"]["entry_id"],
+        json!(saved_key)
+    );
+    assert_eq!(
+        protocol.ticket_requests[1]["payout"]["entry_id"],
+        json!(fresh)
+    );
+    assert_eq!(
+        protocol.ticket_requests[1]["btc_pubkey"],
+        json!(user.derive_ephemeral_key(&fresh).unwrap().public_key),
+        "the entry key is derived from the new entry id"
+    );
+}
+
+#[tokio::test]
+async fn restart_leaves_an_entry_started_over_an_hour_ago_for_its_refund() {
+    let user = SynthUser::new_random("alice").unwrap();
+    let competition = Uuid::now_v7();
+    let mut trace = saved_paid_entry(&user, competition);
+    let ticket = trace.ticket_id.unwrap();
+    let mock = Mock::new(Protocol {
+        capacity: 1,
+        paid: BTreeSet::from([ticket]),
+        entry_window_passed: true,
+        ..Default::default()
+    })
+    .await;
+    assert!(!resume_paid_submission(
+        &mock.client,
+        &user,
+        &competition,
+        &config(1),
+        "user_alice_enter",
+        &mut trace
+    )
+    .await
+    .unwrap());
+    assert!(!trace.entry_submitted);
+    let state = mock.state.lock().unwrap();
+    assert_eq!(state.events, [format!("submit:{ticket}")]);
+    assert!(state.entries.is_empty());
 }

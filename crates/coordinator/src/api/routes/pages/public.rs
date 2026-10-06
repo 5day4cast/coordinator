@@ -39,9 +39,9 @@ use crate::{
         fragments::{
             entries_paused_banner,
             entry_form::{
-                edit_picks, entry_form, forecast_choices, forecasts_url, paid_notice, payout_line,
-                picked, picks_locked, ticket_status, unpaid_notice, Forecasts, NetworkFee,
-                PayoutDestination, TicketProgress,
+                entry_form, forecast_choices, forecasts_url, paid_notice, payout_line,
+                ticket_status, unpaid_notice, Forecasts, NetworkFee, PayoutDestination,
+                TicketProgress,
             },
             leaderboard::{
                 leaderboard, leaderboard_scores, queue_pools, rows_url, LeaderboardRow,
@@ -813,8 +813,8 @@ pub async fn entry_unpaid_fragment(
 }
 
 /// The player's first paid ticket in the competition whose entry never went in, which the entry
-/// form's Pay enters without paying again; none when signed out, when entries are closed, or
-/// when it cannot be read.
+/// form's Pay enters without paying again; none when signed out, when entries are closed, when
+/// the entry can no longer be finished, or when it cannot be read.
 async fn paid_ticket(
     state: &AppState,
     auth: Option<&NostrAuth>,
@@ -839,7 +839,7 @@ pub async fn entry_paid_fragment(
 ) -> Response {
     let paid = paid_ticket(&state, auth.as_ref(), competition_id).await;
     fragment(
-        paid_notice(&competition_id.to_string(), paid.as_ref()),
+        paid_notice(&competition_id.to_string(), paid.as_ref(), now()),
         Caching::Private,
     )
 }
@@ -1167,49 +1167,7 @@ pub async fn own_entry_detail_fragment(
             station_name: station_name(&stations, &pick.station_id),
         })
         .collect();
-    fragment(
-        own_picks_detail(&id, &views, now, competition.picks_lock(now)),
-        Caching::Private,
-    )
-}
-
-/// The picks dialog's edit screen for the entry's owner: the competition's picks with theirs
-/// checked while it still takes picks, or why it doesn't. Signed (see `htmx_auth.js`).
-pub async fn edit_picks_fragment(
-    State(state): State<Arc<AppState>>,
-    Path(entry_id): Path<Uuid>,
-    MaybeAuth(auth): MaybeAuth,
-) -> Response {
-    let Some(NostrAuth { pubkey, .. }) = auth else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-    let entry = match state.coordinator.get_entry_by_id(entry_id).await {
-        Ok(Some(entry)) if entry.pubkey == pubkey.to_hex() => entry,
-        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => {
-            error!("entry {entry_id}: {error}");
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
-    };
-    let competition = match find_competition(&state, entry.event_id).await {
-        Ok(Some(competition)) => competition,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => {
-            error!("competition of entry {entry_id}: {error}");
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
-    };
-    let now = now();
-    let id = entry_id.to_string();
-    if let Some(reason) = competition.picks_lock(now) {
-        return fragment(picks_locked(&id, reason), Caching::Private);
-    }
-    let (view, forecasts) = tokio::join!(
-        competition_view(&state, &competition, now),
-        forecasts(&state, &competition, FIRST_READ_WAIT),
-    );
-    let made = picked(&entry.entry_submission.expected_observations);
-    fragment(edit_picks(&id, &view, &forecasts, &made), Caching::Private)
+    fragment(own_picks_detail(&id, &views, now), Caching::Private)
 }
 
 #[cfg(test)]

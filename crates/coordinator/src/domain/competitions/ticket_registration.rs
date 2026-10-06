@@ -74,9 +74,10 @@ pub struct PaidUnenteredTicket {
     pub registered: bool,
 }
 
-/// A ticket the player paid for and has not entered yet, while its competition takes entries.
-/// The player finishes the entry by sending their picks under `entry_id`, with the entry key the
-/// ticket was paid with; the Keymeld registration sent before paying is used again.
+/// A ticket the player paid for and has not entered yet, while its competition takes entries and
+/// until `finish_by`. The player finishes the entry by sending their picks under `entry_id`, with
+/// the entry key the ticket was paid with; the Keymeld registration sent before paying is used
+/// again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaidTicket {
     pub ticket_id: Uuid,
@@ -86,6 +87,10 @@ pub struct PaidTicket {
     pub entry_id: Uuid,
     /// The entry key the ticket was paid with.
     pub ephemeral_pubkey: Option<String>,
+    /// When the entry can no longer be finished: an hour after `entry_id` was made. The ticket
+    /// is refunded after that.
+    #[serde(with = "time::serde::rfc3339")]
+    pub finish_by: OffsetDateTime,
 }
 
 impl CompetitionStore {

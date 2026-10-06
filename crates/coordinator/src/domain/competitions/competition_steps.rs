@@ -141,24 +141,22 @@ impl Coordinator {
                 return Ok(Step::Next(Wait::Until(failed_at + FAILED_EXPIRY)));
             }
         }
-        if competition.event_created_at.is_some()
-            && competition
-                .oracle_entries_due()
-                .is_some_and(|due| now >= due)
+        if competition.kind == crate::domain::competitions::CompetitionKind::Single
+            && competition.event_created_at.is_some()
+            && competition.contract_parameters.is_some()
+            && competition.entries_submitted_at.is_none()
         {
-            // Entries closed at the start, and the picks with them: they go to the oracle now,
-            // wherever the contract is. The oracle takes them until the window ends.
+            // v2.22.0 held a single competition's entries until its start and built its contract
+            // meanwhile. One left that way sends them to the oracle now, wherever its contract
+            // is: picks no longer change once entered.
             match self.submit_entries_to_oracle(&mut competition).await {
                 Ok(_) => {
                     self.save_leased(competition, lease).await?;
-                    info!(
-                        "Sent competition {competition_id}'s entries to the oracle at entry close"
-                    );
+                    info!("Sent competition {competition_id}'s held entries to the oracle");
                     return Ok(Step::Next(Wait::Now));
                 }
-                // Tried again at the next step. The rest of the lifecycle carries on meanwhile:
-                // an expiry refund must not wait for the oracle.
-                Err(e) => error!("Cannot send competition {competition_id}'s entries: {e:#}"),
+                // Tried again at the next step; the rest of the lifecycle carries on meanwhile.
+                Err(e) => error!("Cannot send competition {competition_id}'s held entries: {e:#}"),
             }
         }
         self.renew_funding_reservation(&competition)
@@ -174,9 +172,7 @@ impl Coordinator {
         let moved_to = next.state_name();
         // Name and schedule the state the next step will load, which is derived from the stored
         // fields, so the log never reports a transition the database does not hold.
-        let next = next.into_competition();
-        let held_until = next.event_created_at.and(next.oracle_entries_due());
-        let stored = CompetitionStatus::from(next);
+        let stored = CompetitionStatus::from(next.into_competition());
         let after = stored.state_name();
         if after != moved_to {
             // Every state a step moves to has stored fields that imply it. One that does not is
@@ -196,14 +192,7 @@ impl Coordinator {
         let wait = if after != before && stored.is_immediate_transition() {
             Wait::Now
         } else {
-            let now = OffsetDateTime::now_utc();
-            let check = stored.next_check(now, pacing.idle);
-            // Whatever the state waits for, entries held for the start go to the oracle then,
-            // and are tried again at the idle pace if that failed.
-            let retry = now + pacing.idle;
-            Wait::Until(
-                held_until.map_or(check, |due| check.min(if due > now { due } else { retry })),
-            )
+            Wait::Until(stored.next_check(OffsetDateTime::now_utc(), pacing.idle))
         };
         let competition = stored.into_competition();
         let died = competition.is_failed() || competition.is_cancelled();
@@ -404,16 +393,17 @@ mod tests {
         database.close().await.unwrap();
     }
 
-    /// A single competition whose seats filled, with its oracle event and contract built, and
-    /// two paid entries that picked Under for KDEN's high; observations start at `start`.
-    async fn filled_single(
+    /// A single competition whose seats filled, with its oracle event and contract built but its
+    /// entries still with the coordinator, as v2.22.0 held them until the start. Its two paid
+    /// entries picked Under for KDEN's high.
+    async fn held_single(
         store: &CompetitionStore,
         database: &DBConnection,
         oracle: &MockOracle,
-        start: OffsetDateTime,
     ) -> (Competition, Vec<Uuid>) {
         use crate::infra::oracle::Oracle;
         let now = OffsetDateTime::now_utc();
+        let start = now + time::Duration::minutes(10);
         let event = CreateEvent {
             id: Uuid::now_v7(),
             signing_date: start + time::Duration::hours(3),
@@ -501,12 +491,11 @@ mod tests {
         (competition, entries)
     }
 
-    /// A single competition's picks change until its start, so its entries go to the oracle
-    /// then, though its contract was built when its seats filled. Until then its runner wakes
-    /// for the start, whatever its state waits for.
+    /// v2.22.0 held a single competition's entries until its start and built its contract
+    /// meanwhile. One it left that way sends them to the oracle at its next step, once, and its
+    /// contract carries on where it was.
     #[tokio::test]
-    async fn a_single_competition_s_entries_go_to_the_oracle_at_the_start() {
-        use crate::infra::oracle::ValueOptions;
+    async fn a_single_competition_s_held_entries_go_to_the_oracle_at_its_next_step() {
         let directory = tempfile::tempdir().unwrap();
         let database = DBConnection::new(
             directory.path().to_str().unwrap(),
@@ -553,88 +542,39 @@ mod tests {
             ..Pacing::default()
         };
 
-        // Before the start: the picks still change, and the entries stay with the coordinator.
-        let start = OffsetDateTime::now_utc() + time::Duration::minutes(10);
-        let (open, entries) = filled_single(store, &database, &oracle, start).await;
-        assert_eq!(open.picks_lock(OffsetDateTime::now_utc()), None);
-        let edited = vec![crate::infra::oracle::WeatherChoices {
-            stations: "KDEN".into(),
-            temp_high: Some(ValueOptions::Over),
-            temp_low: None,
-            wind_speed: None,
-        }];
-        coordinator
-            .update_entry_picks("alice", entries[0], edited.clone())
-            .await
-            .unwrap();
+        let (held, entries) = held_single(store, &database, &oracle).await;
         assert_eq!(
-            coordinator
-                .get_entry_by_id(entries[0])
-                .await
-                .unwrap()
-                .unwrap()
-                .entry_submission
-                .expected_observations,
-            edited,
-            "after its contract was built"
-        );
-        let step = coordinator
-            .advance_competition(open.id, &lease(open.id).await, &pacing)
-            .await
-            .unwrap();
-        let due = start + crate::domain::competitions::admission::ORACLE_ENTRIES_GRACE;
-        assert!(
-            matches!(step, Step::Next(Wait::Until(at)) if at <= due),
-            "its runner wakes for the start"
-        );
-        assert!(oracle.submitted_entries(&open.id).is_empty());
-        let reloaded = store.get_competition(open.id).await.unwrap();
-        assert_eq!(reloaded.entries_submitted_at, None);
-        assert_eq!(
-            CompetitionStatus::from(reloaded).state_name(),
+            CompetitionStatus::from(held.clone()).state_name(),
             "contract_created"
         );
+        assert!(oracle.submitted_entries(&held.id).is_empty());
 
-        // From the start: they go, with the picks as they were then, and lock.
-        let start = OffsetDateTime::now_utc() - time::Duration::minutes(1);
-        let (closed, entries) = filled_single(store, &database, &oracle, start).await;
-        coordinator
-            .advance_competition(closed.id, &lease(closed.id).await, &pacing)
+        let step = coordinator
+            .advance_competition(held.id, &lease(held.id).await, &pacing)
             .await
             .unwrap();
-        let sent = oracle.submitted_entries(&closed.id);
+        assert!(matches!(step, Step::Next(Wait::Now)));
+        let sent = oracle.submitted_entries(&held.id);
         assert_eq!(sent.len(), 1);
-        assert!(sent[0].entries.iter().all(|entry| {
-            entry.expected_observations[0].temp_high == Some(ValueOptions::Under)
-        }));
         let mut ids: Vec<Uuid> = sent[0].entries.iter().map(|entry| entry.id).collect();
         ids.sort();
         let mut expected = entries.clone();
         expected.sort();
         assert_eq!(ids, expected);
-        let reloaded = store.get_competition(closed.id).await.unwrap();
+        let reloaded = store.get_competition(held.id).await.unwrap();
         assert!(reloaded.entries_submitted_at.is_some());
         assert_eq!(
-            CompetitionStatus::from(reloaded.clone()).state_name(),
+            CompetitionStatus::from(reloaded).state_name(),
             "contract_created",
             "the contract carries on where it was"
         );
-        assert_eq!(
-            reloaded.picks_lock(OffsetDateTime::now_utc()),
-            Some(crate::domain::competitions::admission::PICKS_LOCKED_CLOSED)
-        );
-        assert!(matches!(
-            coordinator
-                .update_entry_picks("alice", entries[0], edited)
-                .await,
-            Err(crate::domain::Error::BadRequest(_))
-        ));
+
         // Sent once.
         coordinator
-            .advance_competition(closed.id, &lease(closed.id).await, &pacing)
+            .advance_competition(held.id, &lease(held.id).await, &pacing)
             .await
             .unwrap();
-        assert_eq!(oracle.submitted_entries(&closed.id).len(), 1);
+        assert_eq!(oracle.submitted_entries(&held.id).len(), 1);
         database.close().await.unwrap();
     }
 

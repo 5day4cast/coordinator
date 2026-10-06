@@ -734,6 +734,10 @@ pub(super) async fn resume_paid_submission(
             // The server may have accepted it before the connection was interrupted.
             if !saved_entry_exists(client, user, &entry).await? {
                 match response {
+                    // Started over an hour before this restart: the ticket waits for its refund.
+                    Ok(EntrySubmission::Rejected(error)) if error.is_entry_window_passed() => {
+                        return Ok(false)
+                    }
                     Ok(EntrySubmission::Rejected(error)) => return Err(error.into()),
                     Err(error) => return Err(error),
                     _ => unreachable!(),

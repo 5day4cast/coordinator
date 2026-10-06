@@ -8,14 +8,6 @@ use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 pub(super) const TICKETS_CLOSED: &str =
     "Ticket requests close one minute before observations start";
 pub(super) const ENTRIES_CLOSED: &str = "Competition is no longer accepting entries";
-/// Why an entry's picks can no longer change: its competition stopped taking entries. Entries
-/// reach the oracle only then: a queued competition's once it forms its pools, a single
-/// competition's at the start.
-pub const PICKS_LOCKED_CLOSED: &str = "Entries have closed, so these picks are locked";
-/// How long after the start a single competition's entries go to the oracle. A picks edit checks
-/// the start inside its write, then commits; this gives one that passed the check at the last
-/// moment time to commit before the entries are read.
-pub(super) const ORACLE_ENTRIES_GRACE: Duration = Duration::seconds(5);
 /// The fewest players a single competition's terms allow, as its kickoff check counts them.
 pub(super) const SINGLE_COMPETITION_MIN_PLAYERS: u64 = 2;
 
@@ -79,44 +71,6 @@ impl Competition {
                 queue.pool_rules.min_players() as u64
             });
         Some(settings.min_players_at(template_min, sat_per_vb))
-    }
-
-    /// Whether an entry's picks may still change at `now`, and why not when they may not. Picks
-    /// are held by the coordinator alone until the entries reach the oracle, which takes them
-    /// once and never again; nothing signed or committed names them (the contract, the Keymeld
-    /// deposit and the payout policy name the entry id). Entries reach the oracle only once
-    /// entries close, so picks change until then:
-    ///
-    /// - a queued competition sends them when it forms its pools, at or after the start;
-    /// - a single competition sends them at the start (see [`Self::oracle_entries_due`]), though
-    ///   its contract is built and signed as soon as its seats fill;
-    /// - a pool's entries were its queue's, and moved to it after the start.
-    pub fn picks_lock(&self, now: OffsetDateTime) -> Option<&'static str> {
-        let closed = match self.kind {
-            CompetitionKind::Queued => {
-                self.require_entry_admission(now).is_err() || self.pools_formed_at.is_some()
-            }
-            CompetitionKind::Single => {
-                now >= self.event_submission.start_observation_date
-                    || self.entries_submitted_at.is_some()
-                    || self.is_cancelled()
-                    || self.is_failed()
-            }
-            CompetitionKind::Pool => true,
-        };
-        closed.then_some(PICKS_LOCKED_CLOSED)
-    }
-
-    /// When a single competition's entries are due at the oracle: once its entries close at the
-    /// start, and its picks with them. None once they are there, and for other kinds: a queued
-    /// competition has no oracle event, and a pool sends its entries as it is set up.
-    ///
-    /// The contract does not wait for this: it names the entries' ids and keys, never their
-    /// picks, so it is built and signed as soon as the seats fill. The oracle takes entries
-    /// until the end of the observation window, so they must go before then.
-    pub fn oracle_entries_due(&self) -> Option<OffsetDateTime> {
-        (self.kind == CompetitionKind::Single && self.entries_submitted_at.is_none())
-            .then(|| self.event_submission.start_observation_date + ORACLE_ENTRIES_GRACE)
     }
 
     pub(super) fn require_entry_admission(&self, now: OffsetDateTime) -> Result<(), Error> {

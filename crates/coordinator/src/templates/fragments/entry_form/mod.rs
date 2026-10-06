@@ -9,7 +9,6 @@ use crate::domain::{
     PaidTicket, PayoutTermsQuote, TicketStatus, UnpaidTicket, ARKADE_UNAVAILABLE, ENTRIES_PAUSED,
     SETTLE_ONLY_PAUSED,
 };
-use crate::infra::oracle::{ValueOptions, WeatherChoices};
 use crate::templates::{
     components::{tip, tip_start},
     format::{self, city_name, sats, MetricText, TimeStyle},
@@ -189,11 +188,10 @@ pub fn entry_form(
                 summary { "Advanced: how the entry is held and paid" }
                 ul {
                     li {
-                        "Your ticket is locked into a Bitcoin contract with the other entries"
+                        "Your picks and ticket are locked into a Bitcoin contract with the other entries"
                         @if queue.is_some() { " in your pool" }
                         ". "
-                        "A Keymeld enclave signs it for you, so you don't need to stay online. "
-                        "The contract names no picks: you can change yours until entries close."
+                        "A Keymeld enclave signs it for you, so you don't need to stay online."
                     }
                     @if let Some(terms) = terms {
                         li {
@@ -225,7 +223,7 @@ pub fn entry_form(
 
             div class="entry-submit" {
                 (unpaid_notice(&competition.id, unpaid, time::OffsetDateTime::now_utc()))
-                (paid_notice(&competition.id, paid))
+                (paid_notice(&competition.id, paid, time::OffsetDateTime::now_utc()))
                 // How many picks are still to make; `entry_form.js` counts as the player picks.
                 p id="picksLeft" class="picks-left" role="status" aria-live="polite" {
                     (picks_to_make(picks_allowed, rows))
@@ -270,18 +268,24 @@ pub fn paid_url(competition_id: &str) -> String {
 }
 
 /// The player's paid ticket in this competition whose entry never went in (their page reloaded
-/// before it did), if they hold one: Pay enters the picks on the form under it, without paying
-/// again. Empty otherwise, and reloaded on log-in and log-out without touching the picks.
-pub fn paid_notice(competition_id: &str, paid: Option<&PaidTicket>) -> Markup {
+/// before it did), if they hold one, and how long is left to finish it: Pay enters the picks on
+/// the form under it, without paying again. Empty otherwise, and reloaded on log-in and log-out
+/// without touching the picks.
+pub fn paid_notice(
+    competition_id: &str,
+    paid: Option<&PaidTicket>,
+    now: time::OffsetDateTime,
+) -> Markup {
     html! {
         div id="entryPaid" hx-get=(paid_url(competition_id))
             hx-trigger="fw:login from:body, fw:logout from:body" hx-swap="outerHTML"
             data-ticket-id=[paid.map(|ticket| ticket.ticket_id)]
             data-entry-id=[paid.map(|ticket| ticket.entry_id)]
             data-entry-key=[paid.and_then(|ticket| ticket.ephemeral_pubkey.as_deref())] {
-            @if paid.is_some() {
+            @if let Some(ticket) = paid {
                 p class="notification is-info paid-entry" {
-                    "Paid — make your picks to finish entering."
+                    "Paid — make your picks to finish entering; "
+                    (format::duration(ticket.finish_by - now)) " left."
                 }
             }
         }
@@ -315,89 +319,6 @@ pub fn unpaid_notice(
                 }
             }
         }
-    }
-}
-
-/// Where an entry's picks are edited, in the picks dialog.
-pub fn edit_picks_url(entry_id: &str) -> String {
-    format!("/entries/{entry_id}/edit")
-}
-
-/// The picks dialog's edit screen: the competition's picks with the entry's own checked, and
-/// Save, which sends them through the checks a new entry's go through (`savePicks` in
-/// `entry_form.js`). Only while the competition takes picks; see [`picks_locked`].
-pub fn edit_picks(
-    entry_id: &str,
-    competition: &CompetitionView,
-    forecasts: &Forecasts,
-    picked: &Picked,
-) -> Markup {
-    let picks_allowed = competition.number_of_values_per_entry;
-    let rows = (competition.locations.len() * competition.metrics.len()).max(picks_allowed);
-    html! {
-        div class="picks-edit" {
-            (edit_header(entry_id))
-            p class="fact-note" {
-                "You can change them until entries close "
-                (format::zoned_time(competition.start, TimeStyle::Weekday)) "."
-            }
-            @match forecasts {
-                Forecasts::Ready { stations, .. } => {
-                    form id="editPicksForm" data-entry-id=(entry_id) data-max-values=(picks_allowed)
-                         data-pick-rows=(rows) data-counter="editPicksLeft" {
-                        @for station in stations { (station_picks(station, picked)) }
-                    }
-                    p id="editPicksLeft" class="picks-left" role="status" aria-live="polite" {
-                        (picks_left(picked.len(), picks_allowed, rows))
-                    }
-                    button type="button" id="savePicks" class="button is-primary" { "Save picks" }
-                    p id="editPicksMessage" class="notification hidden" role="alert" {}
-                }
-                Forecasts::Pending(_) => {
-                    p class="notice" { "The forecasts are still loading; try again in a moment." }
-                }
-            }
-        }
-    }
-}
-
-/// The edit screen once the entry's picks can no longer change, saying why.
-pub fn picks_locked(entry_id: &str, reason: &str) -> Markup {
-    html! {
-        div class="picks-edit" {
-            (edit_header(entry_id))
-            p class="notice" { (reason) "." }
-        }
-    }
-}
-
-fn edit_header(entry_id: &str) -> Markup {
-    html! {
-        div class="entry-detail-header" {
-            div {
-                h2 class="title is-5 mb-1" { "Edit your picks" }
-                span class="entry-id" { "Entry " (format::copyable_id(entry_id)) }
-            }
-        }
-    }
-}
-
-/// The counter for `made` picks of the `need` a competition with `rows` rows takes, as
-/// `picksLeft` in `entry_form.js` says it.
-fn picks_left(made: usize, need: usize, rows: usize) -> String {
-    let picks = |n: usize| format!("{n} {}", if n == 1 { "pick" } else { "picks" });
-    if made == 0 {
-        picks_to_make(need, rows)
-    } else if made < need {
-        format!("{} more to pick: {made} of {need} made.", need - made)
-    } else if made == need {
-        format!("All {} made.", picks(need))
-    } else {
-        format!(
-            "{} too many: take {} back to make exactly {need}.",
-            picks(made - need),
-            made - need
-        )
     }
 }
 
@@ -445,7 +366,7 @@ pub fn forecast_choices(competition_id: &str, forecasts: &Forecasts, asked: u8) 
                     strong { "City" }
                     (tip_start("Weather is measured at each city's named airport station. The forecast is NOAA's; the pick ranges use historical forecast errors."))
                 }
-                @for station in stations { (station_picks(station, &[])) }
+                @for station in stations { (station_picks(station)) }
             }
         },
         Forecasts::Pending(pending) => placeholder(
@@ -490,39 +411,7 @@ pub fn payout_line(
     }
 }
 
-/// Picks already made, as `(station, metric, "over" | "par" | "under")`: an entry's, when its
-/// picks are edited.
-pub type Picked = [(String, Metric, &'static str)];
-
-/// The form's value for a pick, as `pick_row` names its radio buttons.
-pub fn pick_value(pick: &ValueOptions) -> &'static str {
-    match pick {
-        ValueOptions::Over => "over",
-        ValueOptions::Par => "par",
-        ValueOptions::Under => "under",
-    }
-}
-
-/// An entry's picks as [`Picked`].
-pub fn picked(choices: &[WeatherChoices]) -> Vec<(String, Metric, &'static str)> {
-    choices
-        .iter()
-        .flat_map(|choice| {
-            [
-                (Metric::TempHigh, &choice.temp_high),
-                (Metric::TempLow, &choice.temp_low),
-                (Metric::WindSpeed, &choice.wind_speed),
-            ]
-            .into_iter()
-            .filter_map(|(metric, pick)| {
-                pick.as_ref()
-                    .map(|pick| (choice.stations.clone(), metric, pick_value(pick)))
-            })
-        })
-        .collect()
-}
-
-fn station_picks(station: &StationForecast, picked: &Picked) -> Markup {
+fn station_picks(station: &StationForecast) -> Markup {
     html! {
         fieldset class="station-picks" id=(format!("station-{}", station.station_id)) data-station=(station.station_id) {
             legend {
@@ -537,11 +426,7 @@ fn station_picks(station: &StationForecast, picked: &Picked) -> Markup {
                 span { "Your pick" }
             }
             @for (metric, forecast, rule) in &station.forecasts {
-                @let made = picked
-                    .iter()
-                    .find(|(id, picked, _)| *id == station.station_id && picked == metric)
-                    .map(|(_, _, value)| *value);
-                (pick_row(&station.station_id, *metric, *forecast, *rule, made))
+                (pick_row(&station.station_id, *metric, *forecast, *rule))
             }
         }
     }
@@ -609,16 +494,14 @@ pub fn ticket_status(url: &str, progress: TicketProgress) -> Markup {
     }
 }
 
-/// Under / Par / Over for one forecast, as radio buttons named `KPWM_temp_high`, none checked
-/// at first unless `picked` names one; choosing the checked one again takes the pick back
-/// (`entry_form.js`). With a Par
+/// Under / Par / Over for one forecast, as radio buttons named `KPWM_temp_high`, none
+/// checked at first; choosing the checked one again takes the pick back (`entry_form.js`). With a Par
 /// band the buttons show the ranges themselves: `< 67.4°F`, `67.4–70.2°F`, `> 70.2°F`.
 pub(crate) fn pick_row(
     station_id: &str,
     metric: Metric,
     forecast: Option<f64>,
     rule: Option<Rule>,
-    picked: Option<&str>,
 ) -> Markup {
     let name = format!("{station_id}_{}", metric.id());
     let band = match (forecast, rule) {
@@ -647,7 +530,6 @@ pub(crate) fn pick_row(
                 @for (value, word, text) in &options {
                     label class="pick-option" title=[band.map(|_| word)] {
                         input type="radio" name=(name) value=(value) disabled[forecast.is_none()]
-                              checked[picked == Some(*value)] data-picked=[(picked == Some(*value)).then_some("1")]
                               aria-label=[band.map(|_| format!("{word} ({text})"))];
                         span { (text) }
                     }
@@ -660,77 +542,6 @@ pub(crate) fn pick_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_edit_screen_checks_the_entry_s_picks_and_saves_through_the_entry_checks() {
-        use crate::infra::oracle::{ValueOptions, WeatherChoices};
-        let mut competition = view("c1", Phase::Upcoming, 60);
-        competition.number_of_values_per_entry = 2;
-        let made = picked(&[WeatherChoices {
-            stations: "KPWM".into(),
-            temp_high: Some(ValueOptions::Over),
-            temp_low: Some(ValueOptions::Par),
-            wind_speed: None,
-        }]);
-        assert_eq!(
-            made,
-            vec![
-                ("KPWM".to_string(), Metric::TempHigh, "over"),
-                ("KPWM".to_string(), Metric::TempLow, "par"),
-            ]
-        );
-        let html = edit_picks(
-            "e1",
-            &competition,
-            &Forecasts::Ready {
-                stations: vec![station()],
-                pins: vec![],
-            },
-            &made,
-        )
-        .into_string();
-        assert!(html.contains("Edit your picks"));
-        assert!(html.contains("You can change them until entries close"));
-        assert!(html.contains(r#"id="editPicksForm" data-entry-id="e1" data-max-values="2""#));
-        assert!(html.contains(r#"data-counter="editPicksLeft""#));
-        assert!(html.contains(r#"name="KPWM_temp_high" value="over" checked data-picked="1""#));
-        assert!(html.contains(r#"name="KPWM_temp_low" value="par" checked data-picked="1""#));
-        assert_eq!(
-            html.matches(" checked").count(),
-            2,
-            "only the entry's picks"
-        );
-        assert!(html.contains("All 2 picks made."));
-        assert!(html.contains(r#"id="savePicks""#));
-        // The entry form's own ids stay its own.
-        assert!(!html.contains(r#"id="entryForm""#) && !html.contains(r#"id="picksLeft""#));
-
-        let loading = edit_picks(
-            "e1",
-            &competition,
-            &Forecasts::Pending(Pending::Loading),
-            &made,
-        )
-        .into_string();
-        assert!(loading.contains("still loading") && !loading.contains("savePicks"));
-
-        let locked =
-            picks_locked("e1", "Entries have closed, so these picks are locked").into_string();
-        assert!(locked.contains("Entries have closed, so these picks are locked."));
-        assert!(!locked.contains("savePicks") && !locked.contains("radio"));
-        assert_eq!(edit_picks_url("e1"), "/entries/e1/edit");
-    }
-
-    #[test]
-    fn the_counter_matches_what_the_browser_says() {
-        assert_eq!(picks_left(0, 2, 3), "2 picks to make: any 2 of the 3 rows.");
-        assert_eq!(picks_left(1, 2, 3), "1 more to pick: 1 of 2 made.");
-        assert_eq!(picks_left(2, 2, 3), "All 2 picks made.");
-        assert_eq!(
-            picks_left(3, 2, 3),
-            "1 pick too many: take 1 back to make exactly 2."
-        );
-    }
 
     #[test]
     fn an_unpaid_entry_says_when_its_invoice_expires_and_that_pay_pays_it() {
@@ -792,28 +603,32 @@ mod tests {
 
     #[test]
     fn a_paid_ticket_says_to_make_picks_and_pay_enters_without_paying() {
-        let ticket = PaidTicket {
+        let now = time::macros::datetime!(2026-10-06 12:00 UTC);
+        let mut ticket = PaidTicket {
             ticket_id: uuid::Uuid::from_u128(7),
             competition_id: uuid::Uuid::from_u128(1),
             entry_id: uuid::Uuid::from_u128(8),
             ephemeral_pubkey: Some("02aa".into()),
+            finish_by: now + time::Duration::minutes(42),
         };
-        let html = paid_notice("c1", Some(&ticket)).into_string();
+        let html = paid_notice("c1", Some(&ticket), now).into_string();
         assert!(html.contains(r#"id="entryPaid""#));
         assert!(html.contains(&format!(r#"data-ticket-id="{}""#, ticket.ticket_id)));
         assert!(html.contains(&format!(r#"data-entry-id="{}""#, ticket.entry_id)));
         assert!(html.contains(r#"data-entry-key="02aa""#));
-        assert!(html.contains("Paid — make your picks to finish entering."));
+        assert!(html.contains("Paid — make your picks to finish entering; 42 min left."));
         // Reloaded on log-in and log-out, signed (htmx_auth.js), without touching the picks.
         assert!(html.contains(r#"hx-get="/competitions/c1/entry-form/paid""#));
         assert!(html.contains(r#"hx-trigger="fw:login from:body, fw:logout from:body""#));
-        let none = paid_notice("c1", None).into_string();
+        let none = paid_notice("c1", None, now).into_string();
         assert!(
             none.contains(r#"id="entryPaid""#),
             "kept for the log-in reload"
         );
         assert!(!none.contains("data-ticket-id") && !none.contains("Paid —"));
 
+        // The form says how long is left from the time it is rendered.
+        ticket.finish_by = time::OffsetDateTime::now_utc() + time::Duration::minutes(42);
         let form = |paid: Option<&PaidTicket>, fee: NetworkFee| {
             entry_form(
                 &view("c1", Phase::Upcoming, 60),
@@ -833,6 +648,7 @@ mod tests {
         let notice = html.find("Paid — make your picks").unwrap();
         let button = html.find(r#"id="submitEntry""#).unwrap();
         assert!(notice < button);
+        assert!(html[notice..button].contains(" min left."));
         assert!(
             html[button..].contains(">Enter</button>"),
             "nothing more to pay"
@@ -899,15 +715,6 @@ mod tests {
                 (Metric::WindSpeed, Some(7.0), Some(Rule::Fixed)),
             ],
         }
-    }
-
-    #[test]
-    fn the_terms_say_picks_change_until_entries_close() {
-        let html = form(PayoutDestination::LoggedOut);
-        assert!(html.contains("Your ticket is locked into a Bitcoin contract"));
-        assert!(
-            html.contains("The contract names no picks: you can change yours until entries close.")
-        );
     }
 
     fn form(destination: PayoutDestination) -> String {

@@ -11,7 +11,7 @@ use crate::domain::{
 use crate::templates::{
     components::tip,
     format::{self, sats, thousands, tx_url, Explorers, TimeStyle},
-    fragments::{entry_form::edit_picks_url, picks::detail_url},
+    fragments::picks::detail_url,
     pages::competitions::{phase_badge, CompetitionView, Queue},
 };
 
@@ -52,7 +52,7 @@ pub fn entries_page(
     html! {
         div id="allEntries" class="account-page" {
             h1 class="title is-4" { "Your entries" }
-            (paid_entries(paid))
+            (paid_entries(paid, OffsetDateTime::now_utc()))
             (unpaid_entries(unpaid, OffsetDateTime::now_utc()))
             @if rows.is_empty() {
                 (no_entries(open))
@@ -80,9 +80,10 @@ pub fn entries_page(
     }
 }
 
-/// Tickets paid for whose entry never went in: each links to its competition's entry form, whose
-/// Pay enters the picks made there without paying again. Nothing when there are none.
-pub fn paid_entries(paid: &[PaidRow]) -> Markup {
+/// Tickets paid for whose entry never went in, and how long is left to finish each: each links to
+/// its competition's entry form, whose Pay enters the picks made there without paying again.
+/// Nothing when there are none.
+pub fn paid_entries(paid: &[PaidRow], now: OffsetDateTime) -> Markup {
     html! {
         @if !paid.is_empty() {
             div id="paidEntries" class="notification is-info paid-entries" {
@@ -91,7 +92,7 @@ pub fn paid_entries(paid: &[PaidRow]) -> Markup {
                     @for row in paid {
                         li {
                             (format::window(row.competition.start, row.competition.end))
-                            " "
+                            " · " (format::duration(row.ticket.finish_by - now)) " left "
                             a href=(row.competition.url()) hx-get=(row.competition.url())
                               hx-target="#main-content" hx-push-url="true" { "Make picks" }
                         }
@@ -249,28 +250,11 @@ fn entry_row(row: &EntryRow, explorers: Explorers) -> Markup {
             td class="has-text-right entry-links" {
                 (details(row, explorers))
                 button type="button" class="button is-small is-text picks-button" { "Picks" }
-                @if row.competition.is_some_and(picks_editable) {
-                    button type="button" class="button is-small is-text"
-                      hx-get=(edit_picks_url(&row.entry.entry_id)) hx-trigger="click consume"
-                      hx-target="#entryValues" hx-swap="innerHTML" { "Edit picks" }
-                }
                 a href=(leaderboard) hx-get=(leaderboard) hx-trigger="click consume"
                   hx-target="#main-content" hx-push-url="true" { "Leaderboard" }
             }
         }
     }
-}
-
-/// Whether an entry in `competition` may still change its picks, as far as the page can tell:
-/// a single or queued competition before entries close. The edit screen itself has the final
-/// say (`Competition::picks_lock`).
-fn picks_editable(competition: &CompetitionView) -> bool {
-    competition.phase == Phase::Upcoming
-        && match &competition.queue {
-            Queue::Single => true,
-            Queue::Queued(queue) => queue.pools.is_empty(),
-            Queue::Pool(_) => false,
-        }
 }
 
 /// The all-in entry fee, its parts in a tip, and when it was paid.
@@ -910,24 +894,6 @@ mod tests {
     }
 
     #[test]
-    fn entries_in_a_competition_taking_entries_can_edit_their_picks() {
-        use crate::templates::pages::competitions::tests::queued;
-        let edit = format!(
-            r##"hx-get="/entries/{ENTRY}/edit" hx-trigger="click consume" hx-target="#entryValues""##
-        );
-        let open = one_row(&entry(), &queued("c1", 3));
-        assert!(open.contains(&edit));
-        assert!(open.contains("Edit picks"));
-        // A single competition's too, until its start.
-        assert!(one_row(&entry(), &view("c1", Phase::Upcoming, 60)).contains(&edit));
-        // Not once entries close.
-        let mut started = queued("c1", 3);
-        started.phase = Phase::Live;
-        assert!(!one_row(&entry(), &started).contains("Edit picks"));
-        assert!(!one_row(&entry(), &view("c1", Phase::Live, 60)).contains("Edit picks"));
-    }
-
-    #[test]
     fn unpaid_entries_link_to_their_entry_form_with_the_invoice_expiry() {
         let competition = view("c1", Phase::Upcoming, 90);
         let ticket = UnpaidTicket {
@@ -964,22 +930,25 @@ mod tests {
     #[test]
     fn paid_tickets_to_enter_link_to_their_entry_form() {
         let competition = view("c1", Phase::Upcoming, 90);
+        let now = OffsetDateTime::now_utc();
         let ticket = PaidTicket {
             ticket_id: uuid::Uuid::from_u128(7),
             competition_id: uuid::Uuid::from_u128(1),
             entry_id: uuid::Uuid::from_u128(8),
             ephemeral_pubkey: None,
+            finish_by: now + time::Duration::minutes(42),
         };
         let rows = [PaidRow {
             ticket: &ticket,
             competition: &competition,
         }];
-        let html = paid_entries(&rows).into_string();
+        let html = paid_entries(&rows, now).into_string();
         assert!(html.contains("Paid — make your picks to finish entering"));
+        assert!(html.contains(" · 42 min left "), "{html}");
         assert!(html.contains(r#"href="/competitions/c1/entry-form""#));
         assert!(html.contains("Make picks"));
         assert!(!html.contains("Pay"), "nothing more to pay");
-        assert!(paid_entries(&[]).into_string().is_empty());
+        assert!(paid_entries(&[], now).into_string().is_empty());
 
         // Shown even before any entry went in, above the rest.
         let page = entries_page(

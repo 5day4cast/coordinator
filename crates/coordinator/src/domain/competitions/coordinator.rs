@@ -911,29 +911,6 @@ impl Coordinator {
             }
 
             CompetitionStatus::EventCreated(mut state) => {
-                if state
-                    .competition()
-                    .oracle_entries_due()
-                    .is_some_and(|due| OffsetDateTime::now_utc() < due)
-                {
-                    // A single competition's picks change until the start, so its entries go to
-                    // the oracle then (see `advance_competition`). The contract names none of
-                    // them: it is built now, as it was once the entries were sent.
-                    let building = EntriesSubmitted::from_competition(state.into_competition());
-                    return match Box::pin(
-                        self.process_status(CompetitionStatus::EntriesSubmitted(building)),
-                    )
-                    .await
-                    {
-                        // Stored without its entries at the oracle, it is still EventCreated.
-                        CompetitionStatus::EntriesSubmitted(waiting) => {
-                            CompetitionStatus::EventCreated(EventCreated::from_competition(
-                                waiting.into_competition(),
-                            ))
-                        }
-                        next => next,
-                    };
-                }
                 match self.submit_entries_to_oracle(state.competition_mut()).await {
                     Ok(_) => state.entries_submitted(),
                     Err(e) => {
@@ -3619,6 +3596,10 @@ impl Coordinator {
         if automatic {
             let choice = payout.as_ref().ok_or_else(|| Error::BadRequest("This competition requires payout authorization before ticket payment; update your client".into()))?;
             Self::validate_ticket_payout_choice(&btc_pubkey, choice)?;
+            // The entry this ticket pays for is finished within the window its id allows, as a
+            // queued one is: a ticket is issued only while the id leaves time for that.
+            super::queued::check_ticket_entry_id(choice.entry_id, OffsetDateTime::now_utc())
+                .map_err(Error::BadRequest)?;
             self.require_payout_capabilities(choice.lightning_address.is_some())
                 .await?;
         }
@@ -4085,6 +4066,19 @@ impl Coordinator {
             }
         }
 
+        // With automatic payouts the entry id is the one the ticket's payout authorization
+        // names (checked below), made when the player started the entry. The entry is finished
+        // within the window that id allows; a paid ticket left past it is refunded, as any paid
+        // ticket left without an entry.
+        if self
+            .competition_store
+            .has_automatic_payouts(entry.event_id)
+            .await?
+            && super::queued::check_entry_id(entry.id, OffsetDateTime::now_utc()).is_err()
+        {
+            return Err(Error::BadRequest(super::queued::ENTRY_WINDOW_PASSED.into()));
+        }
+
         if self.is_keymeld_enabled() {
             self.use_ticket_registration(&mut entry, &ticket).await?;
         }
@@ -4247,11 +4241,14 @@ impl Coordinator {
     /// For one competition: only while it takes entries. For all of them, the caller keeps the
     /// ones whose competitions still do. A ticket without the registration its entry needs, or
     /// without a payout authorization naming its entry id, is left out: it can only be refunded.
+    /// So is one whose entry id is older than the entry may be (see `queued::check_entry_id`):
+    /// its entry is refused, and the ticket refunded.
     pub async fn paid_tickets(
         &self,
         pubkey: &str,
         competition_id: Option<Uuid>,
     ) -> Result<Vec<super::PaidTicket>, Error> {
+        let now = OffsetDateTime::now_utc();
         if let Some(competition_id) = competition_id {
             let competition = self
                 .competition_store
@@ -4261,10 +4258,7 @@ impl Coordinator {
                     sqlx::Error::RowNotFound => Error::NotFound("Competition not found".into()),
                     e => Error::from(e),
                 })?;
-            if competition
-                .require_entry_admission(OffsetDateTime::now_utc())
-                .is_err()
-            {
+            if competition.require_entry_admission(now).is_err() {
                 return Ok(Vec::new());
             }
         }
@@ -4282,11 +4276,14 @@ impl Coordinator {
                     serde_json::from_str(ticket.payout_policy.as_deref()?).ok()?;
                 let consent =
                     coordinator_escrow::queued::EntryConsent::from_policy(&policy).ok()?;
+                let entry_id = consent.entry_id();
+                super::queued::check_entry_id(entry_id, now).ok()?;
                 Some(super::PaidTicket {
                     ticket_id: ticket.ticket_id,
                     competition_id: ticket.competition_id,
-                    entry_id: consent.entry_id(),
+                    entry_id,
                     ephemeral_pubkey: ticket.entry_pubkey,
+                    finish_by: super::queued::entry_finish_by(entry_id).ok()?,
                 })
             })
             .collect())

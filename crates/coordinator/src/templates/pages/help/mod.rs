@@ -242,7 +242,7 @@ fn walkthrough() -> Markup {
                     }
                     fieldset class="station-picks" {
                         legend { "Chicago, IL " span class="station-code" { "KORD" } (callout(4)) }
-                        (pick_row("KORD", Metric::TempHigh, Some(77.0), Some(band), None))
+                        (pick_row("KORD", Metric::TempHigh, Some(77.0), Some(band)))
                         p class="help-pointer" { "↑ " (callout(5)) }
                     }
                     button type="button" class="button is-primary" { "Pay 5,687 sats and enter" (callout(6)) }
@@ -254,7 +254,7 @@ fn walkthrough() -> Markup {
                     li { "The city and NOAA forecast: here, a 77°F high for Chicago. The city tooltip identifies the airport station." }
                     li {
                         "Your pick, left to right: Under, Par (73.4–76.0°F, both ends included) or Over. "
-                        "Choose one range for each category. You can change your picks until entries close."
+                        "Choose one range for each category. You can change a pick before paying."
                     }
                     li { "Pay the Lightning invoice and you're in. Your picks show on the leaderboard once entries close." }
                 }
