@@ -91,6 +91,9 @@ pub(crate) mod sdk_dlctix {
     }
 
     /// Keymeld's view of the parameters has no anchor; it reads only the players and payouts.
+    /// Production signing builds subsets from the coordinator's own parameters, so only the
+    /// integration tests, which drive the SDK's subset builder, need this.
+    #[cfg(test)]
     pub(crate) fn contract_parameters(
         params: &ContractParameters,
     ) -> Result<sdk::ContractParameters, KeymeldError> {
