@@ -123,6 +123,7 @@ fn the_reference_event_has_one_winner_lines_and_room_for_the_largest_pool() {
     assert_eq!(pool.signing_date, event.signing_date);
     assert_eq!(pool.scoring_rules, event.scoring_rules);
     assert_eq!(pool.coordinator_fee, event.coordinator_fee);
+    assert!(!pool.unlisted);
     assert_ne!(pool.id, event.id);
     pool.validate_oracle_settings().unwrap();
 }
@@ -146,10 +147,10 @@ fn a_queued_entry_id_must_be_a_recent_uuidv7() {
     assert!(queued::check_entry_id(at(now + Duration::minutes(10)), now).is_err());
 }
 
-/// A queued competition's reference event is off the oracle's list, and its pools copy it, but
-/// the public lists show them. A single competition's flag keeps it off the lists.
+/// A queued competition's reference event is off the oracle's list and its pools are on it;
+/// the public lists show both. A single competition's flag keeps it off the lists.
 #[test]
-fn queues_and_pools_are_listed_though_their_events_are_unlisted() {
+fn queues_and_pools_are_listed_whatever_their_events_say() {
     let event = request(OffsetDateTime::now_utc() + Duration::hours(6))
         .reference_event()
         .unwrap();
@@ -158,7 +159,7 @@ fn queues_and_pools_are_listed_though_their_events_are_unlisted() {
     assert!(queue.is_listed());
     let mut pool = Competition::new(&queued::pool_event(&event, Uuid::now_v7(), 7, 5_000).unwrap());
     pool.kind = CompetitionKind::Pool;
-    assert!(pool.event_submission.unlisted && pool.is_listed());
+    assert!(!pool.event_submission.unlisted && pool.is_listed());
 
     assert!(!Competition::new(&event).is_listed());
     let listed = CreateEvent {

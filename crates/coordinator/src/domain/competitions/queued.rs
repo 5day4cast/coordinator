@@ -217,8 +217,9 @@ impl CreateQueuedCompetition {
 }
 
 /// The event a pool of `players` players asks the oracle for: its queued competition's reference
-/// event with the pool's id, seat count and funding value. Every other field is the reference
-/// event's, so the pool's statement carries the terms its players consented to.
+/// event with the pool's id, seat count and funding value, on the oracle's list. Every other
+/// field is the reference event's, so the pool's statement carries the terms its players
+/// consented to. The reference event stays off the list: nobody enters it.
 pub fn pool_event(
     reference: &CreateEvent,
     pool_id: Uuid,
@@ -233,6 +234,7 @@ pub fn pool_event(
         id: pool_id,
         total_allowed_entries: players,
         total_competition_pool,
+        unlisted: false,
         ..reference.clone()
     })
 }
