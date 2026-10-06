@@ -553,7 +553,7 @@ async fn taking_over_a_stale_reservation_rotates_the_ticket_and_reports_the_old_
     assert_eq!(bob.ticket.id, ticket_id);
     assert_eq!(bob.ticket.reserved_by.as_deref(), Some("bob"));
     assert_ne!(bob.ticket.hash, "old-hash");
-    assert_ne!(bob.ticket.encrypted_preimage, "old-preimage");
+    assert_ne!(bob.ticket.legacy_preimage_hex, "old-preimage");
     assert!(bob.ticket.payment_request.is_none());
 
     // An in-flight request or watcher holding Alice's old snapshot must not
