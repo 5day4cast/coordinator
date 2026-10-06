@@ -13,7 +13,6 @@ use crate::infra::oracle::ValueOptions;
 use crate::templates::{
     components::{tip_end, tip_start},
     format::{self, city_name, MetricText},
-    fragments::entry_form::edit_picks_url,
 };
 
 /// How often an open window's picks and leaderboard refresh.
@@ -108,48 +107,18 @@ pub fn picks_detail(
     updated_at: Option<OffsetDateTime>,
     now: OffsetDateTime,
 ) -> Markup {
-    detail(
-        entry_id,
-        picks,
-        phase,
-        updated_at,
-        now,
-        Viewer::Unknown,
-        None,
-    )
+    detail(entry_id, picks, phase, updated_at, now, Viewer::Unknown)
 }
 
 /// The dialog's content for the entry's owner before the window opens, with
-/// the forecasts so far: what [`picks_detail`] withholds until then. `lock` is why the picks
-/// can no longer change; without one the owner gets Edit picks.
-pub fn own_picks_detail(
-    entry_id: &str,
-    picks: &[PickView],
-    now: OffsetDateTime,
-    lock: Option<&str>,
-) -> Markup {
-    detail(
-        entry_id,
-        picks,
-        Phase::Upcoming,
-        None,
-        now,
-        Viewer::Owner,
-        Some(lock),
-    )
+/// the forecasts so far: what [`picks_detail`] withholds until then.
+pub fn own_picks_detail(entry_id: &str, picks: &[PickView], now: OffsetDateTime) -> Markup {
+    detail(entry_id, picks, Phase::Upcoming, None, now, Viewer::Owner)
 }
 
 /// What anyone but the owner gets from [`own_detail_url`].
 pub fn withheld_picks_detail(entry_id: &str, now: OffsetDateTime) -> Markup {
-    detail(
-        entry_id,
-        &[],
-        Phase::Upcoming,
-        None,
-        now,
-        Viewer::Other,
-        None,
-    )
+    detail(entry_id, &[], Phase::Upcoming, None, now, Viewer::Other)
 }
 
 fn detail(
@@ -159,8 +128,6 @@ fn detail(
     updated_at: Option<OffsetDateTime>,
     now: OffsetDateTime,
     viewer: Viewer,
-    // The owner's: why their picks are locked, or none when they may edit them.
-    edit: Option<Option<&str>>,
 ) -> Markup {
     let live = phase == Phase::Live;
     let any_observed = picks.iter().any(|view| view.pick.observed.is_some());
@@ -183,12 +150,6 @@ fn detail(
                     }
                     span class="entry-id" { "Entry " (format::copyable_id(entry_id)) }
                 }
-                @if let Some(None) = edit {
-                    button type="button" class="button is-small is-link is-light"
-                      hx-get=(edit_picks_url(entry_id)) hx-target="#entryValues" hx-swap="innerHTML" {
-                        "Edit picks"
-                    }
-                }
                 @if any_observed {
                     div class="entry-detail-score" {
                         (total) " pts"
@@ -200,9 +161,6 @@ fn detail(
                         }
                     }
                 }
-            }
-            @if let Some(Some(reason)) = edit {
-                p class="fact-note picks-locked" { (reason) "." }
             }
             @match phase {
                 Phase::Live => {
@@ -565,7 +523,7 @@ mod tests {
         let live = picks_detail("e1", &views(&picks), Phase::Live, None, NOW).into_string();
         assert!(live.contains(r#"<span class="pick-reading">So far</span>"#));
         // Before the window there is only the pick to name.
-        let own = own_picks_detail("e1", &views(&picks), NOW, None).into_string();
+        let own = own_picks_detail("e1", &views(&picks), NOW).into_string();
         assert!(own.contains("<span>Reading</span><span>Pick</span></div>"));
         assert!(!own.contains(">Observed<") && !own.contains(">Points<"));
         // No picks, no header.
@@ -603,13 +561,7 @@ mod tests {
             None,
             PickState::Pending,
         )];
-        let own = own_picks_detail(
-            "e",
-            &views(&picks),
-            NOW,
-            Some("Picks in this competition are locked once entered"),
-        )
-        .into_string();
+        let own = own_picks_detail("e", &views(&picks), NOW).into_string();
         assert!(own.contains("Your picks"));
         assert!(own.contains(r#"Over <span class="pick-target">&gt; 69°F</span>"#));
         assert!(
@@ -617,13 +569,6 @@ mod tests {
             "nothing is due before the window"
         );
         assert!(!own.contains("hx-"));
-        assert!(own.contains("Picks in this competition are locked once entered."));
-        assert!(!own.contains("Edit picks"));
-        // While the competition takes picks, the owner can edit them in the same dialog.
-        let editable = own_picks_detail("e", &views(&picks), NOW, None).into_string();
-        assert!(editable.contains("Edit picks"));
-        assert!(editable.contains(r##"hx-get="/entries/e/edit" hx-target="#entryValues""##));
-        assert!(!editable.contains("locked"));
         let withheld = withheld_picks_detail("e", NOW).into_string();
         assert!(withheld.contains("Picks become public when entries close."));
         assert!(!withheld.contains("hx-"));

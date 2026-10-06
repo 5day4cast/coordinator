@@ -16,7 +16,6 @@
 // Pages that need an account, and pages that personalize when they have one.
 const AUTH_REQUIRED = [
   /^\/entries$/,
-  /^\/entries\/[^/]+\/edit$/,
   /^\/payouts$/,
   /^\/competitions\/[^/]+\/tickets\/[^/]+\/status$/,
 ];

@@ -29,7 +29,7 @@ use crate::{
         FundedContract, PaidTicket, PayoutClaimInfo, PayoutClaimReceipt, PayoutInfo, SearchBy,
         TicketRefund, TicketRegistration, TicketResponse, TicketStatus, UnpaidTicket, UserEntry,
     },
-    infra::{lnurl::LightningAddress, oracle::WeatherChoices},
+    infra::lnurl::LightningAddress,
     startup::AppState,
 };
 
@@ -271,34 +271,6 @@ pub async fn add_event_entry(
             } else {
                 error!("error adding entry: {}", e.detail());
             }
-            e.into()
-        })
-}
-
-/// New picks for an entry, in the shape the entry carried them.
-#[derive(Debug, Deserialize)]
-pub struct UpdatePicks {
-    pub expected_observations: Vec<WeatherChoices>,
-}
-
-/// Replace the picks of one of the player's entries, while its competition still takes them:
-/// a queued competition's until entries close. `204` once saved; `400` with the reason when the
-/// picks are locked or invalid; `404` for an entry that isn't the player's.
-pub async fn update_entry_picks(
-    State(state): State<Arc<AppState>>,
-    Path(entry_id): Path<Uuid>,
-    AuthedJson {
-        auth: NostrAuth { pubkey, .. },
-        body,
-    }: AuthedJson<UpdatePicks>,
-) -> Result<StatusCode, ApiError> {
-    state
-        .coordinator
-        .update_entry_picks(&pubkey.to_hex(), entry_id, body.expected_observations)
-        .await
-        .map(|()| StatusCode::NO_CONTENT)
-        .map_err(|e| {
-            log_failure("updating picks", &e);
             e.into()
         })
 }
