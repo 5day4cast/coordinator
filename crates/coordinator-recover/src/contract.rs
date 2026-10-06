@@ -91,7 +91,8 @@ impl EntryContract {
             }
         }
 
-        let dlc = TicketedDLC::new(params.clone(), funding_outpoint)
+        // A signed contract: rebuild skips the shared-winners rule 0.1.0 contracts predate.
+        let dlc = TicketedDLC::rebuild(params.clone(), funding_outpoint)
             .map_err(|e| fail(format!("invalid contract: {e}")))?;
         let candidates: Vec<&ContractSignatures> = competition
             .signed_contract

@@ -357,9 +357,10 @@ fn signing_context_covers_expiry_and_all_adaptor_and_subset_requirements() {
     .is_err());
 }
 
-/// Two outcomes ranking the same two winners in either order build one outcome transaction, so
-/// the contract signs its sighash once under each outcome's adaptor point: no more, no fewer.
-/// Split transactions differ by payout, so their sighashes never repeat.
+/// In a 0.1.0 contract (splits not bound to their outcome), two outcomes ranking the same two
+/// winners in either order build one outcome transaction, so the contract signs its sighash once
+/// under each outcome's adaptor point: no more, no fewer. Split transactions differ by payout, so
+/// their sighashes never repeat.
 #[test]
 fn a_shared_outcome_transaction_is_signed_once_per_outcome() {
     let (mut contract, _) = fixture();
@@ -372,7 +373,7 @@ fn a_shared_outcome_transaction_is_signed_once_per_outcome() {
         (Outcome::Attestation(1), BTreeMap::from([(0, 30), (1, 70)])),
         (Outcome::Expiry, BTreeMap::from([(0, 50), (1, 50)])),
     ]);
-    let data = TicketedDLC::new(params.clone(), contract.funding_outpoint)
+    let data = TicketedDLC::rebuild(params.clone(), contract.funding_outpoint)
         .unwrap()
         .signing_data()
         .unwrap();

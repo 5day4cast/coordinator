@@ -58,7 +58,7 @@ keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "8de16b8dd8d7ec
 # Bitcoin
 bitcoin = { version = "0.32", features = ["serde", "base64", "rand-std"] }
 electrum-client = "0.21"
-dlctix = "0.2.1"
+dlctix = "0.2.2"
 miniscript = "12.3.2"
 
 # Web
