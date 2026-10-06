@@ -24,7 +24,12 @@ use axum::{
 #[derive(Clone)]
 pub struct PublicHeaders {
     content_security_policy: HeaderValue,
+    recover_policy: HeaderValue,
 }
+
+/// The recovery page (`/recover`) holds no wallet signer, and must reach whichever relays and
+/// Esplora the player names, so it alone may connect to any https or wss origin.
+const RECOVER_PATH: &str = "/recover";
 
 impl PublicHeaders {
     /// `connect` lists the other sites the page's scripts call: the API
@@ -34,9 +39,17 @@ impl PublicHeaders {
         Self {
             content_security_policy: HeaderValue::from_str(&policy)
                 .expect("origins parsed from URLs are valid header text"),
+            recover_policy: HeaderValue::from_static(RECOVER_POLICY),
         }
     }
 }
+
+/// The recovery page's policy: the public pages' own, but connections to any https or wss
+/// origin, and no Trusted Types policy at all, since its script writes text only.
+const RECOVER_POLICY: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; \
+    style-src 'self'; img-src 'self' data:; connect-src 'self' https: wss:; object-src 'none'; \
+    base-uri 'none'; frame-ancestors 'none'; form-action 'self'; \
+    require-trusted-types-for 'script'; trusted-types 'none'";
 
 fn origin(url: &str) -> Option<String> {
     let url = reqwest::Url::parse(url).ok()?;
@@ -82,6 +95,7 @@ pub async fn public_response_headers(
     next: Next,
 ) -> Response {
     let signed = request.headers().contains_key(AUTHORIZATION);
+    let recover = request.uri().path() == RECOVER_PATH;
     let mut response = next.run(request).await;
     let is_html = response
         .headers()
@@ -90,10 +104,12 @@ pub async fn public_response_headers(
         .is_some_and(|value| value.starts_with("text/html"));
     let response_headers = response.headers_mut();
     if is_html {
-        response_headers.insert(
-            CONTENT_SECURITY_POLICY,
-            headers.content_security_policy.clone(),
-        );
+        let policy = if recover {
+            &headers.recover_policy
+        } else {
+            &headers.content_security_policy
+        };
+        response_headers.insert(CONTENT_SECURITY_POLICY, policy.clone());
         response_headers.insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     }
     if signed {
@@ -128,6 +144,18 @@ pub async fn public_response_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_recovery_page_may_reach_any_relay_or_esplora() {
+        let headers = PublicHeaders::new(&["https://5day4cast.com"]);
+        let recover = headers.recover_policy.to_str().unwrap();
+        assert!(recover.contains("connect-src 'self' https: wss:;"));
+        assert!(recover.contains("script-src 'self' 'wasm-unsafe-eval';"));
+        assert!(recover.contains("trusted-types 'none'"));
+        assert!(!recover.contains("unsafe-inline"));
+        let public = headers.content_security_policy.to_str().unwrap();
+        assert!(!public.contains("https:;") && !public.contains("wss:"));
+    }
 
     #[test]
     fn the_policy_allows_only_this_sites_scripts_and_the_oracle() {

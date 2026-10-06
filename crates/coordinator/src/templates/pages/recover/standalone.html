@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<!-- The recovery page without the coordinator: scripts/build-recover-page.sh puts this beside
+     recover.js, recover.css, Bulma and the WASM package (pkg/). Host the directory anywhere that
+     serves static files, or open it from a local web server. The form repeats
+     templates/pages/recover/mod.rs; a test there keeps the two alike. -->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'self' https: wss:; base-uri 'none'; form-action 'none'">
+    <title>Recover your entries</title>
+    <link rel="stylesheet" href="bulma.min.css">
+    <link rel="stylesheet" href="recover.css">
+    <script src="recover.js" defer></script>
+  </head>
+  <body data-network="bitcoin" data-wasm-glue="pkg/coordinator_wasm.js" data-wasm-module="pkg/coordinator_wasm_bg.wasm">
+    <section class="section">
+      <main class="container recover-page">
+        <h1 class="title is-4">Recover your entries</h1>
+        <p class="content">Your nsec is all this needs: it finds your entries on Nostr relays,
+          follows their money on chain, and builds the transactions that claim it. The recovery
+          file from your account page saves the relay search. Your nsec stays in this page; only
+          relay, chain and oracle requests leave it.</p>
+        <form id="recover-form">
+          <div class="field">
+            <label class="label" for="recover-nsec">nsec</label>
+            <input class="input" id="recover-nsec" type="password" autocomplete="off" spellcheck="false" required>
+          </div>
+          <div class="field">
+            <label class="label" for="recover-kit">Recovery file (optional)</label>
+            <input id="recover-kit" type="file" accept=".json,application/json">
+          </div>
+          <details class="recover-settings">
+            <summary>Settings</summary>
+            <div class="field">
+              <label class="label" for="recover-network">Network</label>
+              <div class="select">
+                <select id="recover-network">
+                  <option value="bitcoin">Bitcoin</option>
+                  <option value="signet">Mutinynet (signet)</option>
+                </select>
+              </div>
+            </div>
+            <div class="field">
+              <label class="label" for="recover-coordinator">Coordinator recovery key (hex)</label>
+              <input class="input" id="recover-coordinator" autocomplete="off" spellcheck="false">
+            </div>
+            <div class="field">
+              <label class="label" for="recover-relays">Relays, one per line</label>
+              <textarea class="textarea" id="recover-relays" rows="3" spellcheck="false"></textarea>
+            </div>
+            <div class="field">
+              <label class="label" for="recover-esplora">Esplora API</label>
+              <input class="input" id="recover-esplora" placeholder="https://mempool.space/api" autocomplete="off" spellcheck="false">
+            </div>
+            <div class="field">
+              <label class="label" for="recover-oracle">Oracle</label>
+              <input class="input" id="recover-oracle" autocomplete="off" spellcheck="false">
+            </div>
+          </details>
+          <button class="button is-primary" id="recover-start" type="submit">Find my entries</button>
+        </form>
+        <p id="recover-status" class="mt-3" aria-live="polite"></p>
+        <div id="recover-entries"></div>
+      </main>
+    </section>
+  </body>
+</html>

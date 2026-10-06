@@ -26,6 +26,8 @@ lightning-invoice.workspace = true
 
 # Keymeld registration: attestation-verified, context-bound entry key envelopes
 coordinator-core = { path = "../coordinator-core", features = ["keymeld"] }
+# The recovery page: records, keys and claims, without its CLI's I/O
+coordinator-recover.workspace = true
 
 # Crypto
 sha2.workspace = true

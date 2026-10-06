@@ -1014,6 +1014,7 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Result<Router, anyhow
         .route("/", get(public_page_handler))
         .merge(htmx_routes)
         .fallback(public_fallback)
+        .route("/recover", get(crate::api::routes::recover_page_handler))
         .route("/api/v1/health_check", get(health))
         .route("/api/v1/competitions", get(get_competitions))
         .route(
@@ -1544,6 +1545,26 @@ mod startup_tests {
 
     const BEARER: &str = "Bearer 0123456789abcdef0123456789abcdef";
     const FORM: &str = "application/x-www-form-urlencoded";
+
+    #[tokio::test]
+    async fn the_recovery_page_may_reach_relays_and_esplora_but_runs_only_its_own_script() {
+        let test = TestState::start().await;
+        let public = test.public();
+        let (status, headers, body) = send(&public, request("GET", "/recover", &[], "")).await;
+        assert_eq!(status, StatusCode::OK);
+        let policy = headers["content-security-policy"].to_str().unwrap();
+        assert!(
+            policy.contains("connect-src 'self' https: wss:;"),
+            "{policy}"
+        );
+        assert!(policy.contains("script-src 'self' 'wasm-unsafe-eval';"));
+        assert!(body.contains("id=\"recover-form\""));
+        assert!(body.contains("/ui/pkg/coordinator_wasm.js"));
+        // Every other page keeps its narrow policy.
+        let (_, headers, _) = send(&public, request("GET", "/help", &[], "")).await;
+        let policy = headers["content-security-policy"].to_str().unwrap();
+        assert!(!policy.contains("wss:"), "{policy}");
+    }
 
     #[tokio::test]
     async fn public_pages_carry_the_content_security_policy() {

@@ -115,6 +115,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             content_type: "text/javascript; charset=utf-8",
             bytes: bundle_scripts(&[static_dir.join("login-worker.js")], "login-worker")?,
         },
+        // The recovery page's only script; also shipped in its standalone copy.
+        Asset {
+            constant: "RECOVER_JS",
+            stem: "recover",
+            extension: "js",
+            content_type: "text/javascript; charset=utf-8",
+            bytes: private_scope(bundle_scripts(&[static_dir.join("recover.js")], "recover")?),
+        },
         Asset {
             constant: "HTMX_JS",
             stem: "htmx",
