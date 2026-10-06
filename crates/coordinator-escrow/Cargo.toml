@@ -9,7 +9,7 @@ default = []
 networking = ["dep:tokio"]
 
 [dependencies]
-keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "fbc3c30094be986af5b37ca03482bece09e5dafb", default-features = false, features = ["escrow"] }
+keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "8de16b8dd8d7ec5e4312b1aed5f943b0f8f90569", default-features = false, features = ["escrow"] }
 coordinator-ark-escrow.workspace = true
 dlctix.workspace = true
 lightning-invoice.workspace = true

@@ -16,8 +16,8 @@ test-support = ["lnurl", "dep:rcgen"]
 coordinator-escrow = { path = "../coordinator-escrow", features = ["networking"] }
 coordinator-ark-escrow = { path = "../coordinator-ark-escrow" }
 coordinator-payout-witness = { path = "../coordinator-payout-witness", optional = true }
-keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "fbc3c30094be986af5b37ca03482bece09e5dafb", default-features = false, features = ["escrow", "enclave"] }
-keymeld-enclave = { git = "https://github.com/tee8z/keymeld", rev = "fbc3c30094be986af5b37ca03482bece09e5dafb", default-features = false, features = ["escrow"] }
+keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "8de16b8dd8d7ec5e4312b1aed5f943b0f8f90569", default-features = false, features = ["escrow", "enclave"] }
+keymeld-enclave = { git = "https://github.com/tee8z/keymeld", rev = "8de16b8dd8d7ec5e4312b1aed5f943b0f8f90569", default-features = false, features = ["escrow"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
