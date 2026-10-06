@@ -649,10 +649,12 @@ async fn queued_tickets_are_made_on_demand_up_to_the_cap() {
     let original = hash.clone();
     assert_eq!(
         hex::encode(dlctix::hashlock::sha256(
-            &hex::decode(&reserved.ticket.legacy_preimage_hex).unwrap()
+            &store.ticket_preimage(&reserved.ticket).unwrap()
         )),
         hash
     );
+    // A sealed preimage is not also kept in plaintext.
+    assert_eq!(reserved.ticket.legacy_preimage_hex, "");
 
     // Asking again for the same entry gets the same ticket.
     let QueuedReservation::Reserved(again) = reserve(first, "alice").await else {

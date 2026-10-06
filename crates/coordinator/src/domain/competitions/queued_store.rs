@@ -269,11 +269,12 @@ impl CompetitionStore {
         let ticket = ticket_id.to_string();
         let player = player.to_string();
         let preimage = hashlock::preimage_random(&mut rand::rng());
-        let preimage_hex = hex::encode(preimage);
         let hash_hex = hex::encode(hashlock::sha256(&preimage));
         let ciphertext = self
             .seal_preimage(ticket_id, &hash_hex, &preimage)
             .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let preimage_hex =
+            super::ticket_preimage::plaintext_column(ciphertext.as_deref(), &preimage);
         self.db_connection
             .execute_write(move |pool| async move {
                 let mut tx = pool.begin().await?;

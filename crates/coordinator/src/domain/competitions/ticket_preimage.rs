@@ -9,10 +9,12 @@
 //! blue/green slots already load that key, and it is already backed up, so losing a second file
 //! can never lose the preimages.
 //!
-//! Older releases read the plaintext `tickets.encrypted_preimage` column (named before this
-//! existed), so it is still written beside the ciphertext. Rows without a ciphertext, written by
-//! an older release, are sealed by `backfill_ticket_preimages` and read from the plaintext
-//! column until then.
+//! The `tickets.encrypted_preimage` column (named before this existed) held the preimage as
+//! plaintext hex. A sealed preimage leaves it empty; it is NOT NULL, so it holds `''`. The
+//! previous release still writes both columns while it runs beside this one, and
+//! `backfill_ticket_preimages` clears the plaintext it leaves behind. A store without a ticket
+//! key (tests and tools) keeps writing the plaintext column, and readers fall back to it only for
+//! a row with no ciphertext.
 
 use aes_gcm::{
     aead::{Aead, KeyInit, Nonce, Payload},
@@ -31,7 +33,7 @@ use crate::infra::db::DatabaseWriteError;
 const KEY_TAG: &[u8] = b"coordinator/ticket-preimage-key/v1";
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
-/// Rows the backfill seals per write.
+/// Rows the backfill seals or clears per write.
 pub const TICKET_PREIMAGE_BATCH: u32 = 100;
 
 #[derive(Debug, thiserror::Error)]
@@ -166,8 +168,8 @@ fn verified(
     Ok(preimage)
 }
 
-/// The preimage stored for a ticket: its ciphertext when it has one, else the plaintext column
-/// an older release wrote. Either way it must hash to `hash_hex`.
+/// The preimage stored for a ticket: its ciphertext when it has one, else the plaintext column of
+/// a row not sealed yet. A row with neither is an error. Either way it must hash to `hash_hex`.
 pub(super) fn stored_preimage(
     cipher: Option<&TicketCipher>,
     ticket_id: Uuid,
@@ -186,6 +188,14 @@ pub(super) fn stored_preimage(
             .ok_or(TicketPreimageError::Malformed(ticket_id))?,
     };
     verified(ticket_id, hash_hex, preimage)
+}
+
+/// The `encrypted_preimage` column's value for a new preimage: empty once it is sealed.
+pub(super) fn plaintext_column(ciphertext: Option<&[u8]>, preimage: &[u8; 32]) -> String {
+    match ciphertext {
+        Some(_) => String::new(),
+        None => hex::encode(preimage),
+    }
 }
 
 impl Ticket {
@@ -220,19 +230,21 @@ impl CompetitionStore {
             .transpose()
     }
 
-    /// Seal the preimage of every ticket an older release stored only in plaintext, `batch`
-    /// rows per write. Returns how many rows it sealed. A row whose preimage does not hash to its
-    /// hash is left alone and logged; readers refuse it too.
+    /// Seal the preimage of every ticket that still holds it in plaintext, and clear the
+    /// plaintext column, `batch` rows per write. That covers rows an older release wrote and rows
+    /// the previous release keeps writing to both columns while it runs beside this one. Returns
+    /// how many rows it changed. A row whose preimage does not open or does not hash to its hash
+    /// is left alone and logged; readers refuse it too.
     pub async fn backfill_ticket_preimages(&self, batch: u32) -> Result<usize, DatabaseWriteError> {
         let Some(cipher) = self.ticket_cipher.clone() else {
             return Ok(0);
         };
-        let mut sealed_total = 0;
+        let mut changed_total = 0;
         let mut after = String::new();
         loop {
             let rows = sqlx::query(
-                "SELECT id, hash, encrypted_preimage FROM tickets
-                 WHERE preimage_ciphertext IS NULL AND encrypted_preimage != '' AND id > ?
+                "SELECT id, hash, encrypted_preimage, preimage_ciphertext FROM tickets
+                 WHERE encrypted_preimage != '' AND id > ?
                  ORDER BY id LIMIT ?",
             )
             .bind(&after)
@@ -240,7 +252,7 @@ impl CompetitionStore {
             .fetch_all(self.db_connection.read())
             .await?;
             let Some(last) = rows.last() else {
-                return Ok(sealed_total);
+                return Ok(changed_total);
             };
             after = last.try_get("id")?;
             let mut updates = Vec::with_capacity(rows.len());
@@ -248,37 +260,42 @@ impl CompetitionStore {
                 let id: String = row.try_get("id")?;
                 let hash: String = row.try_get("hash")?;
                 let legacy: String = row.try_get("encrypted_preimage")?;
+                let ciphertext: Option<Vec<u8>> = row.try_get("preimage_ciphertext")?;
                 let Ok(ticket_id) = Uuid::parse_str(&id) else {
                     warn!("Ticket preimage backfill skipped a ticket with id {id:?}");
                     continue;
                 };
-                let sealed = match stored_preimage(None, ticket_id, &hash, None, &legacy)
-                    .and_then(|preimage| cipher.seal(ticket_id, &hash, &preimage))
-                {
-                    Ok(sealed) => sealed,
-                    Err(error) => {
-                        warn!("Ticket preimage backfill skipped: {error}");
-                        continue;
+                // A sealed row keeps its ciphertext; it only has to open.
+                let sealed = match &ciphertext {
+                    Some(sealed) => {
+                        stored_preimage(Some(&*cipher), ticket_id, &hash, Some(sealed), &legacy)
+                            .map(|_| sealed.clone())
                     }
+                    None => stored_preimage(None, ticket_id, &hash, None, &legacy)
+                        .and_then(|preimage| cipher.seal(ticket_id, &hash, &preimage)),
                 };
-                updates.push((id, hash, legacy, sealed));
+                match sealed {
+                    Ok(sealed) => updates.push((id, hash, legacy, ciphertext, sealed)),
+                    Err(error) => warn!("Ticket preimage backfill skipped: {error}"),
+                }
             }
             let count = self
                 .db_connection
                 .execute_write(move |pool| async move {
                     let mut tx = pool.begin().await?;
                     let mut count = 0;
-                    for (id, hash, legacy, sealed) in &updates {
-                        // A preimage rotated since the read keeps its own ciphertext.
+                    for (id, hash, legacy, ciphertext, sealed) in &updates {
+                        // A preimage rotated since the read keeps its own columns.
                         count += sqlx::query(
-                            "UPDATE tickets SET preimage_ciphertext = ?
+                            "UPDATE tickets SET preimage_ciphertext = ?, encrypted_preimage = ''
                              WHERE id = ? AND hash = ? AND encrypted_preimage = ?
-                               AND preimage_ciphertext IS NULL",
+                               AND preimage_ciphertext IS ?",
                         )
                         .bind(sealed)
                         .bind(id)
                         .bind(hash)
                         .bind(legacy)
+                        .bind(ciphertext)
                         .execute(&mut *tx)
                         .await?
                         .rows_affected() as usize;
@@ -287,7 +304,7 @@ impl CompetitionStore {
                     Ok(count)
                 })
                 .await?;
-            sealed_total += count;
+            changed_total += count;
         }
     }
 }
@@ -482,6 +499,14 @@ mod tests {
             .unwrap()
     }
 
+    async fn plaintext(database: &DBConnection, id: Uuid) -> String {
+        sqlx::query_scalar("SELECT encrypted_preimage FROM tickets WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_one(database.read())
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn backfill_seals_legacy_rows_once() {
         let directory = tempfile::tempdir().unwrap();
@@ -505,8 +530,10 @@ mod tests {
         assert_eq!(store.backfill_ticket_preimages(2).await.unwrap(), 5);
         assert_eq!(store.backfill_ticket_preimages(2).await.unwrap(), 0);
         assert!(ciphertext(&database, dummy).await.is_none());
+        assert_eq!(plaintext(&database, dummy).await, "preimage");
         for (id, preimage) in tickets {
             let sealed = ciphertext(&database, id).await.unwrap();
+            assert_eq!(plaintext(&database, id).await, "");
             let ticket = store.get_ticket(id).await.unwrap();
             assert_eq!(
                 ticket.preimage_ciphertext.as_deref(),
@@ -551,7 +578,85 @@ mod tests {
         store.backfill_ticket_preimages(10).await.unwrap();
         let ticket = store.get_ticket(id).await.unwrap();
         assert!(ticket.preimage_ciphertext.is_some());
+        assert_eq!(ticket.legacy_preimage_hex, "");
         assert_eq!(store.ticket_preimage(&ticket).unwrap(), rotated);
+    }
+
+    #[tokio::test]
+    async fn backfill_clears_the_plaintext_the_previous_release_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let (store, database) = store(&directory).await;
+        let competition = insert_competition(&database).await;
+        let preimage = [7u8; 32];
+        let hash = ticket_hash(&preimage);
+        let id = insert_legacy_ticket(&database, competition, &hex::encode(preimage), &hash).await;
+        // The previous release writes both columns.
+        let sealed = TicketCipher::from_coordinator_key(&[7; 32])
+            .seal(id, &hash, &preimage)
+            .unwrap();
+        write(
+            &database,
+            "UPDATE tickets SET preimage_ciphertext = ? WHERE id = ?",
+            vec![Bind::Blob(sealed.clone()), Bind::Text(id.to_string())],
+        )
+        .await;
+
+        assert_eq!(store.backfill_ticket_preimages(10).await.unwrap(), 1);
+        assert_eq!(plaintext(&database, id).await, "");
+        assert_eq!(ciphertext(&database, id).await, Some(sealed));
+        let ticket = store.get_ticket(id).await.unwrap();
+        assert_eq!(store.ticket_preimage(&ticket).unwrap(), preimage);
+        assert_eq!(store.backfill_ticket_preimages(10).await.unwrap(), 0);
+
+        // A ciphertext that does not open keeps its plaintext, and is still refused.
+        let other =
+            insert_legacy_ticket(&database, competition, &hex::encode(preimage), &hash).await;
+        write(
+            &database,
+            "UPDATE tickets SET preimage_ciphertext = ? WHERE id = ?",
+            vec![Bind::Blob(vec![0; 60]), Bind::Text(other.to_string())],
+        )
+        .await;
+        assert_eq!(store.backfill_ticket_preimages(10).await.unwrap(), 0);
+        assert_eq!(plaintext(&database, other).await, hex::encode(preimage));
+        let ticket = store.get_ticket(other).await.unwrap();
+        assert!(matches!(
+            store.ticket_preimage(&ticket),
+            Err(TicketPreimageError::Decrypt(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_new_preimage_is_written_only_sealed() {
+        let directory = tempfile::tempdir().unwrap();
+        let (store, database) = store(&directory).await;
+        let competition = insert_competition(&database).await;
+        let preimage = [8u8; 32];
+        let id = insert_legacy_ticket(
+            &database,
+            competition,
+            &hex::encode(preimage),
+            &ticket_hash(&preimage),
+        )
+        .await;
+        let ticket = store.get_ticket(id).await.unwrap();
+        // Releasing the ticket gives it a fresh preimage.
+        assert!(store.clear_ticket_reservation(&ticket).await.unwrap());
+        let released = store.get_ticket(id).await.unwrap();
+        assert_ne!(released.hash, ticket.hash);
+        assert_eq!(released.legacy_preimage_hex, "");
+        let fresh = store.ticket_preimage(&released).unwrap();
+        assert_eq!(ticket_hash(&fresh), released.hash);
+
+        // Without a ticket key the plaintext column is still written.
+        let plain = CompetitionStore::new(database.clone());
+        assert!(plain.clear_ticket_reservation(&released).await.unwrap());
+        let again = plain.get_ticket(id).await.unwrap();
+        assert!(again.preimage_ciphertext.is_none());
+        assert_eq!(
+            ticket_hash(&plain.ticket_preimage(&again).unwrap()),
+            again.hash
+        );
     }
 
     #[tokio::test]

@@ -16,8 +16,9 @@ use crate::{
 };
 
 use super::{
-    admission::before_deadline, ticket_preimage::stored_preimage, Competition, EntryStatus,
-    SearchBy, Ticket, TicketCipher, UserEntry,
+    admission::before_deadline,
+    ticket_preimage::{plaintext_column, stored_preimage},
+    Competition, EntryStatus, SearchBy, Ticket, TicketCipher, UserEntry,
 };
 
 /// A ticket reserved for a caller. When a stale reservation was taken over,
@@ -961,8 +962,8 @@ impl CompetitionStore {
             .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
         let competition_id_str = competition.id.to_string();
 
-        // Prepare ticket data for the closure. Older releases read the plaintext column, so it is
-        // written beside the ciphertext.
+        // Prepare ticket data for the closure. A sealed preimage leaves the plaintext column
+        // empty.
         let mut ticket_data = Vec::with_capacity(tickets.len());
         for t in &tickets {
             let ciphertext = match &t.preimage_ciphertext {
@@ -979,7 +980,11 @@ impl CompetitionStore {
             ticket_data.push((
                 t.id.to_string(),
                 t.competition_id.to_string(),
-                t.legacy_preimage_hex.clone(),
+                if ciphertext.is_some() {
+                    String::new()
+                } else {
+                    t.legacy_preimage_hex.clone()
+                },
                 ciphertext,
                 t.hash.clone(),
                 t.payment_request.clone(),
@@ -1833,7 +1838,6 @@ impl CompetitionStore {
         // a fresh preimage and hash, so the previous holder's invoice can never
         // pay for the new holder's slot.
         let rotated_preimage = hashlock::preimage_random(&mut rand::rng());
-        let rotated_preimage_hex = hex::encode(rotated_preimage);
         let rotated_hash_hex = hex::encode(hashlock::sha256(&rotated_preimage));
         let cipher = self.ticket_cipher.clone();
 
@@ -1963,6 +1967,8 @@ impl CompetitionStore {
                     ),
                     None => None,
                 };
+                let rotated_plaintext =
+                    plaintext_column(rotated_ciphertext.as_deref(), &rotated_preimage);
 
                 // Reserve the ticket. A takeover (the row still names a
                 // previous holder) also rotates its preimage and hash and
@@ -1982,7 +1988,7 @@ impl CompetitionStore {
                          AND event_id = ?"#,
                 )
                 .bind(&pubkey_owned)
-                .bind(&rotated_preimage_hex)
+                .bind(&rotated_plaintext)
                 .bind(rotated_ciphertext)
                 .bind(&rotated_hash_hex)
                 .bind(&ticket_id)
@@ -2630,11 +2636,11 @@ impl CompetitionStore {
         let expected_hash = ticket.hash.clone();
         let expected_invoice = ticket.payment_request.clone();
         let preimage = hashlock::preimage_random(&mut rand::rng());
-        let new_preimage = hex::encode(preimage);
         let new_hash = hex::encode(hashlock::sha256(&preimage));
         let new_ciphertext = self
             .seal_preimage(ticket.id, &new_hash, &preimage)
             .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let new_preimage = plaintext_column(new_ciphertext.as_deref(), &preimage);
 
         self.db_connection
             .execute_write(move |pool| async move {
@@ -2706,7 +2712,6 @@ impl CompetitionStore {
         new_hash: &str,
     ) -> Result<bool, DatabaseWriteError> {
         let ticket_id_str = ticket_id.to_string();
-        let new_preimage_hex_owned = new_preimage_hex.to_string();
         let new_hash_owned = new_hash.to_string();
         let new_ciphertext = match self.ticket_cipher {
             Some(_) => {
@@ -2716,6 +2721,11 @@ impl CompetitionStore {
                     .map_err(|e| sqlx::Error::Encode(Box::new(e)))?
             }
             None => None,
+        };
+        let new_preimage_hex_owned = if new_ciphertext.is_some() {
+            String::new()
+        } else {
+            new_preimage_hex.to_string()
         };
 
         self.db_connection
