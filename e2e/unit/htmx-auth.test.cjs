@@ -18,14 +18,15 @@ function load({ loggedIn = true, signer } = {}) {
     location: { origin: ORIGIN },
     htmx: { registerExtension: (name, hooks) => { assert.equal(name, 'fw-auth'); extension = hooks; } },
   };
-  loadBundle(['shared/htmx_auth.js'], {
-    window, session, isLoggedIn: () => state.loggedIn, URL,
+  const globals = {
+    window, session, isLoggedIn: () => state.loggedIn, URL, loginRestoring: null,
     openAuthModal: (id) => opened.push(id),
     console: { error: (message) => errors.push(message) },
     setTimeout: () => 0, clearTimeout: () => {},
     document: { baseURI: `${ORIGIN}/competitions`, body: { addEventListener() {}, appendChild() {} },
       createElement: () => ({ append() {}, addEventListener() {} }) },
-  }, []);
+  };
+  loadBundle(['shared/htmx_auth.js'], globals, []);
   assert.deepEqual(Object.keys(window), ['location', 'htmx'], 'nothing is put on window');
 
   // What htmx 4 does for one request: before:request, then ctx.fetch(action, request).
@@ -42,7 +43,7 @@ function load({ loggedIn = true, signer } = {}) {
       return { sent: false, error };
     }
   }
-  return { request, extension, state, session, signed, opened, sent, errors };
+  return { request, extension, state, session, signed, opened, sent, errors, globals };
 }
 
 test('public fragments and polling never ask the signer', async () => {
@@ -142,6 +143,19 @@ test('logged-out account navigation asks for a login; the public entry form stil
   // Back to an account page while logged out: its log-in prompt, unsigned.
   assert.deepEqual(await page.request('/entries', { headers: { 'HX-History-Restore-Request': 'true' } }), { sent: true });
   assert.deepEqual(page.signed, []);
+});
+
+test('an account request waits for a remembered login instead of asking for one', async () => {
+  for (const restored of [true, false]) {
+    const page = load({ loggedIn: false });
+    let finish;
+    page.globals.loginRestoring = new Promise((resolve) => { finish = resolve; });
+    assert.deepEqual(await page.request('/entries'), { sent: false });
+    assert.deepEqual(page.opened, []);
+    finish(restored);
+    await page.globals.loginRestoring;
+    assert.deepEqual(page.opened, restored ? [] : ['loginModal']);
+  }
 });
 
 test('a 401 asks the player to log in again', () => {

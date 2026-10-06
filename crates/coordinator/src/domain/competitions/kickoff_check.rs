@@ -183,11 +183,14 @@ impl Coordinator {
         Ok(self)
     }
 
-    /// The rate a contract is built at: LND's next-block estimate with its margin (see
+    /// The contract rate: the local historical baseline, next-block mempool adjustment, and margin (see
     /// [`fee_rate_for_target`]).
     pub(super) async fn contract_fee_rate(&self) -> Result<FeeRate, anyhow::Error> {
         let fee_rates = self.bitcoin.get_estimated_fee_rates().await?;
-        info!("Fee rates: {:?}", fee_rates);
+        info!(
+            "Fee rates (local electrs history and mempool): {:?}",
+            fee_rates
+        );
         fee_rate_for_target(&fee_rates, 1)
     }
 

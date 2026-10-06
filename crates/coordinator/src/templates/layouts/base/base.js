@@ -15,8 +15,15 @@ function initApp() {
   setupHtmxAuth();
   initPayouts(body.dataset.apiBase, body.dataset.oracleBase);
 
-  // An account page opened by its address asks for a login straight away.
-  if (document.querySelector(".sign-in-required")) openAuthModal("loginModal");
+  authManager.followOtherTabs();
+  // A remembered login loads the wallet; anyone else never downloads it.
+  const restoring = authManager.restoreLogin();
+  // An account page opened by its address asks for a login unless one is remembered.
+  if (document.querySelector(".sign-in-required")) {
+    restoring.then((restored) => {
+      if (!restored) openAuthModal("loginModal");
+    });
+  }
 }
 
 if (document.readyState === "loading") {
