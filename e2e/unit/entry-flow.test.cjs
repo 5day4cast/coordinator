@@ -82,7 +82,7 @@ function load(page, document, fetch) {
   const window = page.htmx ? { htmx: page.htmx } : {};
   const entryForm = loadBundle(["fragments/entry_form/entry_form.js"],
     { ...page, window, document, fetch, crypto: webcrypto, TextEncoder, console, session, isLoggedIn },
-    ["submitEntry", "collectPicks", "togglePick", "unpickWithSpace", "ticketPriceSats", "loadEntryTerms", "Entry"]);
+    ["submitEntry", "collectPicks", "togglePick", "unpickWithSpace", "ticketPriceSats", "loadEntryTerms", "Entry", "picksLeft"]);
   assert.deepEqual(Object.keys(window), page.htmx ? ["htmx"] : [], "nothing is put on window");
   return entryForm;
 }
@@ -1016,4 +1016,28 @@ test("missing required picks are refused before login or payment", async () => {
   await sandbox.submitEntry();
   assert.match(elements.errorMessage.textContent, /Make exactly 3 picks; you made 1/);
   assert.ok(!elements.errorMessage.classList.contains("hidden"));
+});
+
+// A competition may take fewer picks than it has rows; the counter above Pay says how many are
+// left, and the first line matches what the server renders before any pick.
+test("the counter says how many picks are left", () => {
+  const { document } = entryPage();
+  const { picksLeft } = load({}, document, termsFetch());
+  assert.equal(picksLeft(0, 3, 12), "3 picks to make: any 3 of the 12 rows.");
+  assert.equal(picksLeft(0, 12, 12), "12 picks to make: one in every row.");
+  assert.equal(picksLeft(0, 1, 3), "1 pick to make: any 1 of the 3 rows.");
+  assert.equal(picksLeft(1, 3, 12), "2 more to pick: 1 of 3 made.");
+  assert.equal(picksLeft(3, 3, 12), "All 3 picks made.");
+  assert.equal(picksLeft(1, 1, 3), "All 1 pick made.");
+  assert.equal(picksLeft(5, 3, 12), "2 picks too many: take 2 back to make exactly 3.");
+});
+
+test("with fewer picks than rows, paying with none says how many of them", async () => {
+  const { elements, document } = entryPage([]);
+  elements.entryForm.dataset.maxValues = "3";
+  elements.entryForm.dataset.pickRows = "12";
+  elements.entryForm.querySelector = () => null;
+  const sandbox = load({}, document, async () => assert.fail("nothing fetched"));
+  await sandbox.submitEntry();
+  assert.equal(elements.errorMessage.textContent, "Make exactly 3 picks, any 3 of the 12 rows, before paying.");
 });

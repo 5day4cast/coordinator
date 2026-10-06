@@ -63,8 +63,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             stem: "admin-theme",
             extension: "js",
             content_type: "text/javascript; charset=utf-8",
+            // The admin pages' one script: the theme, then the game form's helpers.
             bytes: private_scope(bundle_scripts(
-                &[templates.join("admin/theme.js")],
+                &[
+                    templates.join("admin/theme.js"),
+                    templates.join("admin/create_form.js"),
+                ],
                 "admin-theme",
             )?),
         },

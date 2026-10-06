@@ -246,6 +246,7 @@ pub(super) async fn register_entry(
             config.seed,
             user_index,
             config.window_shape(),
+            config.values_per_entry(),
         ),
         encrypted_keymeld_private_key,
         keymeld_auth_pubkey,
@@ -469,12 +470,14 @@ async fn entry_payment(lnd: &Lnd, paid: crate::lnd::Paid) -> EntryPayment {
 }
 
 /// A player's picks: over, par or under for each station and metric `shape` scores. Every
-/// metric is drawn whatever the window, so a seed replays the same picks.
+/// metric is drawn whatever the window, so a seed replays the same picks. A competition taking
+/// fewer than all of them keeps `picks` of those, chosen by the same seed.
 pub(super) fn generate_predictions(
     stations: &[String],
     seed: Option<u64>,
     user_index: usize,
     shape: WindowShape,
+    picks: usize,
 ) -> Vec<WeatherChoices> {
     let [high, low, wind] = shape.scores();
     use rand::SeedableRng;
@@ -482,7 +485,7 @@ pub(super) fn generate_predictions(
     let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(
         seed.unwrap_or(0) ^ (user_index as u64).wrapping_mul(0x9e3779b97f4a7c15),
     );
-    stations
+    let mut choices: Vec<WeatherChoices> = stations
         .iter()
         .map(|station| {
             let mut pick = || match rng.random_range(0..3u8) {
@@ -498,7 +501,31 @@ pub(super) fn generate_predictions(
                 temp_low: temp_low.filter(|_| low),
             }
         })
-        .collect()
+        .collect();
+    let mut slots: Vec<(usize, usize)> = choices
+        .iter()
+        .enumerate()
+        .flat_map(|(index, choice)| {
+            [&choice.wind_speed, &choice.temp_high, &choice.temp_low]
+                .into_iter()
+                .enumerate()
+                .filter(|(_, pick)| pick.is_some())
+                .map(move |(field, _)| (index, field))
+        })
+        .collect();
+    if picks < slots.len() {
+        use rand::seq::SliceRandom;
+        slots.shuffle(&mut rng);
+        for (index, field) in slots.into_iter().skip(picks) {
+            let choice = &mut choices[index];
+            match field {
+                0 => choice.wind_speed = None,
+                1 => choice.temp_high = None,
+                _ => choice.temp_low = None,
+            }
+        }
+    }
+    choices
 }
 
 #[cfg(test)]

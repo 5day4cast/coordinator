@@ -70,6 +70,10 @@ pub struct LaneConfig {
     /// When backfilling: players above the competition's minimum synth makes sure of.
     #[serde(default = "default_backfill_margin")]
     pub backfill_margin: u64,
+    /// Picks each entry makes, instead of the defaults'; at most every station and metric the
+    /// window scores, which is what an unset value takes.
+    #[serde(default)]
+    pub picks_per_entry: Option<usize>,
     /// The most entries its queued runs take, instead of the scenario's own: for
     /// `queued_one_pool`, its pool's seats.
     #[serde(default)]
@@ -145,6 +149,10 @@ impl LaneConfig {
                 .validate()
                 .map_err(|error| anyhow::anyhow!("lane {name}: {error:#}"))?;
         }
+        anyhow::ensure!(
+            self.picks_per_entry != Some(0),
+            "lane {name}: picks_per_entry must be at least 1"
+        );
         let entry_window = self.entry_window_secs.unwrap_or(base.entry_window_secs);
         base.entry_timing
             .validate(entry_window)
@@ -246,6 +254,9 @@ impl LaneConfig {
         if let Some(entry_window) = self.entry_window_secs {
             config.entry_window_secs = entry_window;
         }
+        if self.picks_per_entry.is_some() {
+            config.picks_per_entry = self.picks_per_entry;
+        }
         let stations = self.stations.as_ref().unwrap_or(&base.stations);
         config.stations = match self.stations_per_run {
             Some(count) => stations
@@ -341,6 +352,7 @@ mod tests {
             early_players: 1,
             backfill_before_close_secs: 1800,
             backfill_margin: 1,
+            picks_per_entry: None,
             max_entries: None,
             places: None,
         }
@@ -396,6 +408,18 @@ mod tests {
         assert_eq!(config.observation_window_secs, DAY);
         assert_eq!(config.window_shape(), WindowShape::FullDay);
         assert_eq!(config.values_per_entry(), 6);
+
+        // A lane may take fewer picks; never more than the window holds, nor none.
+        let mut fewer = lane.clone();
+        fewer.picks_per_entry = Some(3);
+        fewer.validate(&base).unwrap();
+        let (_, config) = fewer.run_config(&base, 3, Some(datetime!(2026-09-29 12:00 UTC)));
+        assert_eq!(config.values_per_entry(), 3);
+        fewer.picks_per_entry = Some(40);
+        let (_, config) = fewer.run_config(&base, 3, Some(datetime!(2026-09-29 12:00 UTC)));
+        assert_eq!(config.values_per_entry(), 6);
+        fewer.picks_per_entry = Some(0);
+        assert!(fewer.validate(&base).is_err());
     }
 
     #[test]

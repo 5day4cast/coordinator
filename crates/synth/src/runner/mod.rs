@@ -1243,6 +1243,7 @@ mod tests {
             unlisted: None,
             stress: None,
             picker: None,
+            picks_per_entry: None,
             max_entries: None,
             places: None,
         };
@@ -1489,6 +1490,7 @@ mod tests {
             unlisted: None,
             stress: None,
             picker: None,
+            picks_per_entry: None,
             max_entries: None,
             places: None,
         };

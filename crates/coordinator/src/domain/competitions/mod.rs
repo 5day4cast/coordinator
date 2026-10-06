@@ -635,7 +635,8 @@ pub struct CreateEvent {
     pub end_observation_date: OffsetDateTime,
     /// NOAA observation stations used in this event
     pub locations: Vec<String>,
-    /// The number of values that can be selected per entry in the event (default to number_of_locations * 3, (temp_low, temp_high, wind_speed))
+    /// How many picks each entry makes: 1 to the location count times the metrics the window
+    /// scores (three for a full day: high, low and wind; two for a day or night half).
     pub number_of_values_per_entry: usize,
     /// The number of ranks that can win, 1st -> 40%, 2nd -> 35%, 3rd -> 25% (something like that from the prize pool)
     pub number_of_places_win: usize,

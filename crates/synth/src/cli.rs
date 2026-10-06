@@ -131,6 +131,10 @@ pub struct CompetitionArgs {
     /// manual-competition: put it on the oracle's public list.
     #[arg(long)]
     pub listed: bool,
+    /// manual-competition: picks each entry makes; every station and metric the window scores
+    /// if unset.
+    #[arg(long)]
+    pub picks: Option<usize>,
 }
 
 impl CompetitionArgs {
@@ -142,6 +146,7 @@ impl CompetitionArgs {
             || self.entry_fee.is_some()
             || self.seats.is_some()
             || self.listed
+            || self.picks.is_some()
     }
 
     /// The form's fields, as the dashboard sends them.
@@ -157,6 +162,7 @@ impl CompetitionArgs {
             ("players", self.players.map(|n| n as u64)),
             ("entry_fee", self.entry_fee),
             ("seats", self.seats.map(|n| n as u64)),
+            ("picks", self.picks.map(|n| n as u64)),
         ];
         fields.extend(
             optional

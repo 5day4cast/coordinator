@@ -1,6 +1,11 @@
 //! LNURL-pay stand-in for mocked Lightning: every well-formed address
 //! resolves, and ordinary invoices are signed locally so the claim flow runs
 //! without a network. Metadata and invoice descriptions are display data.
+//!
+//! A few user names fail the way real providers do, for the checks a Lightning
+//! Address gets before it is saved: `unreachable` (no public host), `unknown`
+//! (HTTP 404), `no-invoice` (the provider refuses an invoice) and
+//! `wrong-network` (an invoice for another network).
 
 use super::lnurl::{LightningAddress, LnurlError, LnurlPay, PayRequest};
 use async_trait::async_trait;
@@ -34,6 +39,11 @@ fn currency(network: Network) -> Currency {
 #[async_trait]
 impl LnurlPay for MockLnurlPay {
     async fn resolve(&self, address: &LightningAddress) -> Result<PayRequest, LnurlError> {
+        match address.user() {
+            "unreachable" => return Err(LnurlError::NotPublic(address.domain().into())),
+            "unknown" => return Err(LnurlError::Status(404)),
+            _ => {}
+        }
         let metadata = serde_json::json!([
             ["text/plain", format!("Pay {address}")],
             ["text/identifier", address.to_string()],
@@ -54,13 +64,23 @@ impl LnurlPay for MockLnurlPay {
         amount_msat: u64,
     ) -> Result<Bolt11Invoice, LnurlError> {
         request.check_amount(amount_msat)?;
+        let network = match request.address().user() {
+            "no-invoice" => {
+                return Err(LnurlError::Provider(
+                    "this address cannot receive right now".into(),
+                ))
+            }
+            "wrong-network" if self.network == Network::Bitcoin => Network::Signet,
+            "wrong-network" => Network::Bitcoin,
+            _ => self.network,
+        };
         let secp = Secp256k1::new();
         let node_key =
             SecretKey::from_slice(&[0x11; 32]).map_err(|e| LnurlError::Invoice(e.to_string()))?;
         let mut preimage = [0u8; 32];
         rand::rng().fill_bytes(&mut preimage);
         // The payment secret is the preimage, so `MockLnClient` can prove it paid the invoice.
-        let invoice = InvoiceBuilder::new(currency(self.network))
+        let invoice = InvoiceBuilder::new(currency(network))
             .description(format!("Payout to {}", request.address()))
             .payment_hash(sha256::Hash::hash(&preimage))
             .payment_secret(PaymentSecret(preimage))

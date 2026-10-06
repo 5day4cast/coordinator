@@ -64,7 +64,7 @@ function initWeatherMaps() {
           label.append(input,` ${el.dataset.station} · ${el.dataset.name}`);form.querySelector('#map-selections').append(label);inputs.set(input.value,input);
         }
         if (!input.checked && [...inputs.values()].filter(el => el.checked).length >= 50) { inspector.textContent='Select at most 50 stations.'; return; }
-        input.checked=!input.checked;selected();inspector.textContent=description(el)+(input.checked ? ' · added to game' : ' · removed');
+        input.checked=!input.checked;input.dispatchEvent(new Event('change',{bubbles:true}));inspector.textContent=description(el)+(input.checked ? ' · added to game' : ' · removed');
       });
     });
     [layer,time,wind].forEach(el => el.addEventListener('change',render));

@@ -70,6 +70,9 @@ pub(crate) struct CreateForm {
     pub listed: String,
     #[serde(default)]
     pub players: String,
+    /// Picks each entry makes; every station and metric the window scores when empty.
+    #[serde(default)]
+    pub picks: String,
 }
 
 /// Whether the oracle attests a window of `seconds`: a full day or more, up to a week, or a
@@ -206,6 +209,20 @@ pub(crate) fn manual_config(
     config.stress = None;
     // Synth's players come over the whole window, as people do.
     config.entry_timing.arrival_pattern = ArrivalPattern::Spread;
+    if !form.picks.trim().is_empty() {
+        let picks = number(&form.picks, "the picks per entry", 0)?;
+        let metrics = config.window_shape().metrics();
+        let all = config.stations.len() * metrics;
+        if !(1..=all).contains(&picks) {
+            let stations = config.stations.len();
+            return Err(format!(
+                "the picks per entry must be between 1 and {all}: the {metrics} metrics the \
+                 window scores at {stations} station{}",
+                if stations == 1 { "" } else { "s" }
+            ));
+        }
+        config.picks_per_entry = Some(picks);
+    }
     Ok(config)
 }
 
@@ -261,6 +278,10 @@ pub(super) fn form(state: &Dashboard) -> Markup {
                 label { "Seats"
                     input type="number" name="seats" min="2" max=(MAX_POOL_PLAYERS) value=(MAX_POOL_PLAYERS) required;
                 }
+                label { "Picks per entry"
+                    input type="number" name="picks" min="1" placeholder="All";
+                }
+                p.note { "Empty takes every metric at every station: three a station for a full day, two for a half." }
                 fieldset {
                     legend { "The oracle's public list" }
                     label { input type="radio" name="listed" value="unlisted" checked; " Unlisted" }
@@ -500,6 +521,7 @@ mod tests {
                 ("seats", "10"),
                 ("listed", "listed"),
                 ("players", "4"),
+                ("picks", "5"),
             ]),
             &base,
             &WINDOWS,
@@ -507,6 +529,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.stations, ["KDEN", "KJFK", "KSEA", "KBOS"]);
+        assert_eq!(config.picks_per_entry, Some(5));
+        assert_eq!(config.values_per_entry(), 5);
         assert_eq!((config.entry_fee, config.entry_window_secs), (5000, 3600));
         assert_eq!(config.observation_window_secs, DAY);
         assert_eq!(
@@ -522,6 +546,9 @@ mod tests {
             (0, Some(MAX_POOL_PLAYERS), false)
         );
         assert_eq!(defaults.entry_fee, base.entry_fee);
+        // Every pick, as before: one station, and the half's two metrics.
+        assert_eq!(defaults.picks_per_entry, None);
+        assert_eq!(defaults.values_per_entry(), 2);
         // The default hour stretches to the half-day boundary the window starts on.
         assert_eq!(defaults.entry_window_secs, 5400);
         assert_eq!(defaults.observation_window_secs, HALF_DAY);
@@ -563,6 +590,19 @@ mod tests {
                 vec![("stations", "KDEN"), ("seats", "3"), ("players", "4")],
                 "do not fit in 3 seats",
             ),
+            (
+                vec![
+                    ("stations", "KDEN"),
+                    ("window_secs", "86400"),
+                    ("picks", "4"),
+                ],
+                "between 1 and 3: the 3 metrics the window scores at 1 station",
+            ),
+            (
+                vec![("stations", "KDEN"), ("picks", "0")],
+                "between 1 and 2",
+            ),
+            (vec![("stations", "KDEN"), ("picks", "all")], "whole number"),
         ] {
             let refused = manual_config(&form(&fields), &base, &WINDOWS, now).unwrap_err();
             assert!(refused.contains(error), "{fields:?}: {refused}");
