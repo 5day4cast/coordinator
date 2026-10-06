@@ -716,6 +716,9 @@ The verifier only signs a contract whose anchor is at most 240 sats.
 
 When an outcome, expiry or split transaction the coordinator broadcast has waited `cpfp_after_secs` (30 minutes) without confirming and pays less than the estimate for `cpfp_conf_target` blocks, the coordinator spends its anchor and one confirmed coin of the LND wallet in a child that brings the pair to the estimate.
 It bumps again only once the estimate has risen by a quarter; the coordinator pays the child's fee.
+A transaction the chain already holds counts as broadcast (as after a restore), and is bumped the same way once it has waited.
+
+Without the coordinator, a player bumps the same transactions with the recovery tool: `coordinator-recover claim --fee-utxo <txid>:<vout> --fee-change <address>` spends the anchor and one coin of theirs in a child that brings the pair to `--fee-rate`, and broadcasts both as a package ([RECOVERY.md](RECOVERY.md#fee-bumping)).
 
 ## Failure paths
 

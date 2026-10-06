@@ -175,6 +175,55 @@ impl Esplora {
         Txid::from_str(body.trim()).map_err(|e| format!("broadcast answer {body}: {e}"))
     }
 
+    /// Broadcast `parent` with its CPFP `child` as a package (`POST /txs/package`), so a parent
+    /// below the mempool minimum still relays. On an Esplora without the package endpoint they go
+    /// one after the other, which works when the parent pays the relay minimum on its own, as
+    /// anchored contract transactions do. A parent the chain already has is not sent again.
+    pub async fn broadcast_package(
+        &self,
+        parent: &Transaction,
+        child: &Transaction,
+    ) -> Result<(), String> {
+        let url = format!("{}/txs/package", self.base);
+        let response = self
+            .client
+            .post(&url)
+            .json(&[serialize_hex(parent), serialize_hex(child)])
+            .send()
+            .await
+            .map_err(|e| format!("{url}: {e}"))?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if status.is_success() {
+            // Bitcoin Core's submitpackage answer: "success", or why the package was refused.
+            let message = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|answer| answer["package_msg"].as_str().map(str::to_owned));
+            return match message.as_deref() {
+                None | Some("success") => Ok(()),
+                Some(message) => Err(format!(
+                    "package of {} and {} refused: {message}",
+                    parent.compute_txid(),
+                    child.compute_txid()
+                )),
+            };
+        }
+        if !matches!(
+            status,
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+        ) {
+            return Err(format!(
+                "package of {} and {} refused: {body}",
+                parent.compute_txid(),
+                child.compute_txid()
+            ));
+        }
+        if self.tx_status(parent.compute_txid()).await?.is_none() {
+            self.broadcast(parent).await?;
+        }
+        self.broadcast(child).await.map(|_| ())
+    }
+
     /// The fee rate Esplora estimates for confirmation within `blocks`, at least 1 sat/vB.
     pub async fn fee_rate(&self, blocks: u16) -> Result<FeeRate, String> {
         let estimates: std::collections::HashMap<String, f64> =

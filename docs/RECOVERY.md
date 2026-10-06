@@ -111,8 +111,9 @@ Nothing is signed for an entry unless the key derived from the seed is the key i
 coordinator-recover --kit coordinator-recovery-npub1….json inspect
 coordinator-recover --network signet --coordinator-pubkey <hex> inspect   # nsec only
 coordinator-recover claim --to bc1q… [--fee-rate 5] [--ticket-preimage <hex>] [--dry-run]
+coordinator-recover claim --to bc1q… --fee-rate 40 --fee-utxo <txid>:<vout> --fee-change bc1q…   # key from COORDINATOR_RECOVER_FEE_KEY
 coordinator-recover refund-escrow --entry <id> --to <ark address> [--dry-run]
-coordinator-recover unroll --entry <id> [--to bc1q…] [--dry-run]
+coordinator-recover unroll --entry <id> [--to bc1q…] [--fee-utxo … --fee-change …] [--dry-run]
 ```
 
 The nsec comes from `--nsec`, `COORDINATOR_RECOVER_NSEC`, or a prompt that does not echo it. It is never printed. Without the recovery file, the coordinator's recovery pubkey is needed (`--coordinator-pubkey`); `GET /api/v1/recovery/info` serves it while the coordinator is up.
@@ -122,12 +123,26 @@ The nsec comes from `--nsec`, `COORDINATOR_RECOVER_NSEC`, or a prompt that does 
 - **`refund-escrow`**: from the refund locktime `T` on, moves the whole escrow through its refund leaf with the Arkade server's signature to the player's Ark address. If the VTXO has expired and been swept, it registers a recovery intent instead and signs the batch that pays it.
 - **`unroll`**: without the Arkade server's cooperation, puts the escrow on chain and then sweeps it through the player's own leaf once its delay has passed.
 
+#### Fee bumping
+
+Contracts built with anchors (dlctix 0.2, `dlc_anchor_settings.enabled`, see [QUEUED_COMPETITIONS.md](QUEUED_COMPETITIONS.md#anchors)) carry a 240 sat pay-to-anchor output on every outcome, expiry and split transaction. Those transactions still pay the contract's fee rate and relay on their own. When one pays less than the claim's `--fee-rate` (by default Esplora's six-block estimate), `claim` builds a CPFP child that spends the anchor and one coin of the player's, so that the two together pay `--fee-rate`, and broadcasts them as a package through Esplora's `POST /txs/package`, or one after the other where the Esplora has none. It does this both for a transaction it is about to broadcast and for one already in the mempool and not yet confirmed.
+
+- **The coin.** `--fee-utxo <txid>:<vout>` and its private key in WIF, from `COORDINATOR_RECOVER_FEE_KEY` (or `--fee-key`, which leaves it in the shell history). The coin must pay that key's P2WPKH address or its single-key P2TR address (BIP 86, no script tree), as single-key wallets make them; the tool reads the coin's value and script from Esplora, refuses a spent coin or a key that does not match, and never prints the key. Use a small coin set aside for this, not a key that guards anything else: the key signs only the child's own input. A PSBT for an external wallet would keep the key out of the tool, but needs a second round trip per child; a single-purpose coin is the simpler safe option.
+- **The change.** `--fee-change <address>`: everything the child does not pay in fees, including the anchor's 240 sats, goes there.
+- **One child per run.** The coin is spent by the first child, so `claim` bumps at most one transaction per run; run it again with another coin for the next.
+- `--dry-run` prints the child after its parent instead of broadcasting either.
+- Contracts built without anchors are unchanged: the tool says each of their transactions "has no anchor and cannot be fee bumped", and does not touch the fee coin.
+- An anchor has no key, so anyone may attach a large low-rate child to it (pinning). Bump early, before the `delta` window closes.
+
+`unroll` uses the same coin to pay for each Arkade virtual transaction, which pays no fee and has a zero-value anchor. Those are TRUC (version 3) transactions, so the child is version 3 too, and the pair must go out as a package.
+
 #### What the CLI cannot do yet
 
-- **Fee bumping.** dlctix 0.1's outcome, expiry and split transactions pay the fee rate fixed at signing and have no anchor output; nobody can bump them, and the tool says so for each one. The win and unroll sweep transactions are the player's own and can be signed again at a higher `--fee-rate`. `crates/coordinator-recover/src/fees.rs` detects pay-to-anchor outputs and defines the `AnchorBumper` hook for when contracts carry them.
+- **Fee bumping contracts without anchors.** Contracts built before anchors (dlctix 0.1) have outcome, expiry and split transactions that pay the fee rate fixed at signing and no anchor output; nobody can bump them, and the tool says so for each one. The win and unroll sweep transactions are the player's own and can be signed again at a higher `--fee-rate`.
+- **Fee bumping from the page.** The recovery page says which transactions have an anchor, but builds no child: it holds no coin of the player's. Use the CLI's `--fee-utxo`.
 - **On-chain refunds of a live escrow.** A live VTXO is refunded offchain to an Ark address; leaving Arkade from there is any Arkade wallet's offboard. (Offboarding directly needs a forfeit through the refund leaf in a batch, which is not built.)
 - **Unroll without arkd.** The escrow's virtual transactions come from arkd's indexer; the records do not carry them. With arkd down, an escrow can be unrolled only if its ancestry was saved elsewhere.
-- **Unroll fees.** Each virtual transaction pays no fee and needs a child spending its anchor, broadcast with it as a package. The tool prints each transaction and its anchor; the child comes from the player's own wallet (for example `bitcoin-cli submitpackage`) until an `AnchorBumper` is built in.
+- **Unroll fees without a fee coin.** Without `--fee-utxo`, the tool prints each virtual transaction and its anchor, and the child comes from the player's own wallet (for example `bitcoin-cli submitpackage`).
 
 ### The recovery page
 

@@ -62,6 +62,9 @@ pub struct ClaimPlan {
     pub txs: Vec<ClaimTx>,
     /// Steps already on chain.
     pub done: Vec<String>,
+    /// Steps in the mempool and not yet confirmed: the outcome, expiry or split transaction a
+    /// child can still pay for, if it has an anchor.
+    pub unconfirmed: Vec<ClaimTx>,
     /// Why the claim stops where it does, if it is not finished.
     pub waiting: Option<String>,
 }
@@ -506,6 +509,7 @@ impl Session {
             entry_id,
             txs: Vec::new(),
             done: Vec::new(),
+            unconfirmed: Vec::new(),
             waiting: None,
         };
         let preimage = self.ticket_preimage(entry, ticket_preimage);
@@ -586,8 +590,32 @@ impl Session {
             Stage::NotPaid { outcome } => {
                 plan.waiting = Some(format!("the {outcome} outcome pays this player nothing"))
             }
-            Stage::OutcomeUnspent { outcome, txid, .. } => {
+            Stage::OutcomeUnspent {
+                outcome,
+                txid,
+                height,
+            } => {
                 plan.done.push(format!("outcome transaction {txid}"));
+                if height.is_none() {
+                    let signed = match outcome {
+                        Outcome::Expiry => contract.expiry_tx().ok(),
+                        Outcome::Attestation(_) => self
+                            .attestation(entry.competition_id)
+                            .and_then(|attestation| contract.outcome_tx(attestation).ok()),
+                    };
+                    if let Some(tx) = signed.filter(|tx| tx.compute_txid() == txid) {
+                        let fee = fee_paid(&tx, &[contract.funding_value()]);
+                        plan.unconfirmed.push(ClaimTx {
+                            label: if outcome == Outcome::Expiry {
+                                "expiry"
+                            } else {
+                                "outcome"
+                            },
+                            bump: bump_status(&tx, fee),
+                            tx,
+                        });
+                    }
+                }
                 split(&mut plan, outcome, &unsigned_outcome(outcome)?)?;
             }
             Stage::OutcomeSpentElsewhere { txid, by } => {
@@ -600,6 +628,16 @@ impl Session {
                 outcome, height, ..
             } => {
                 plan.done.push("outcome and split transactions".into());
+                if let (None, Ok(preimage)) = (height, &preimage) {
+                    if let Ok(tx) = contract.split_tx(outcome, *preimage) {
+                        let fee = fee_paid(&tx, &[unsigned_outcome(outcome)?.output[0].value]);
+                        plan.unconfirmed.push(ClaimTx {
+                            label: "split",
+                            bump: bump_status(&tx, fee),
+                            tx,
+                        });
+                    }
+                }
                 let delta = contract.delta();
                 match height {
                     Some(height) if self.chain.matured(height, delta) => {

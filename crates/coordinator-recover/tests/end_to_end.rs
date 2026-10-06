@@ -12,18 +12,20 @@ use bitcoin::secp256k1::{schnorr, Message};
 use bitcoin::sighash::{Prevouts, SighashCache};
 use bitcoin::taproot::LeafVersion;
 use bitcoin::{
-    Amount, FeeRate, Network, OutPoint, ScriptBuf, TapLeafHash, TapSighashType, Transaction, TxOut,
-    Txid, XOnlyPublicKey,
+    Amount, CompressedPublicKey, EcdsaSighashType, FeeRate, Network, OutPoint, PrivateKey,
+    ScriptBuf, TapLeafHash, TapSighashType, Transaction, TxOut, Txid, XOnlyPublicKey,
 };
 use coordinator_recover::chain::{Outspend, TxStatus};
+use coordinator_recover::fees::{AnchorBumper, BumpStatus, FeeCoin};
 use coordinator_recover::inspect::{Action, Location};
 use coordinator_recover::{Error, Identity, Session, WalletSeed};
 use dlctix::hashlock::{self, Preimage};
 use dlctix::musig2::{PartialSignature, PubNonce};
 use dlctix::secp::{MaybePoint, MaybeScalar, Point, Scalar};
 use dlctix::{
-    ContractParameters, EventLockingConditions, MarketMaker, NonceSharingRound, Outcome,
-    PayoutWeights, Player, SigMap, SignedContract, SigningSession, TicketedDLC, WinCondition,
+    AnchorParams, ContractParameters, EventLockingConditions, MarketMaker, NonceSharingRound,
+    Outcome, PayoutWeights, Player, SigMap, SignedContract, SigningSession, TicketedDLC,
+    WinCondition,
 };
 use nostr::nips::nip44;
 use nostr::{EventBuilder, Keys, Kind, Tag};
@@ -55,6 +57,11 @@ struct World {
 }
 
 fn world() -> World {
+    world_with(None)
+}
+
+/// As [`world`], with anchor outputs on the outcome, expiry and split transactions.
+fn world_with(anchor: Option<AnchorParams>) -> World {
     let mut rng = rand::rng();
     let player = Keys::generate();
     let coordinator = Keys::generate();
@@ -110,6 +117,7 @@ fn world() -> World {
         fee_rate: FeeRate::from_sat_per_vb(10).unwrap(),
         funding_value: Amount::from_sat(200_000),
         relative_locktime_block_delta: DELTA,
+        anchor,
     };
     let funding = OutPoint::new(Txid::from_byte_array([7; 32]), 0);
     let dlc = TicketedDLC::new(params, funding).unwrap();
@@ -690,4 +698,184 @@ fn ignores_records_signed_by_anyone_but_the_coordinator() {
     let session = world.session(events);
     assert_eq!(session.entries().count(), 1);
     assert!(session.warnings.is_empty(), "{:?}", session.warnings);
+}
+
+/// A player's own coin for CPFP children: P2WPKH or single-key P2TR, worth 100,000 sats.
+fn fee_coin(taproot: bool) -> (FeeCoin, TxOut) {
+    let secp = Secp256k1::new();
+    let key = PrivateKey::new(
+        bitcoin::secp256k1::SecretKey::from_slice(&random_scalar().serialize()).unwrap(),
+        Network::Signet,
+    );
+    let script_pubkey = if taproot {
+        ScriptBuf::new_p2tr(
+            &secp,
+            key.public_key(&secp).inner.x_only_public_key().0,
+            None,
+        )
+    } else {
+        ScriptBuf::new_p2wpkh(
+            &CompressedPublicKey::from_private_key(&secp, &key)
+                .unwrap()
+                .wpubkey_hash(),
+        )
+    };
+    let prevout = TxOut {
+        value: Amount::from_sat(100_000),
+        script_pubkey,
+    };
+    let outpoint = OutPoint::new(Txid::from_byte_array([9; 32]), 1);
+    let coin = FeeCoin::new(outpoint, prevout.clone(), key, destination()).unwrap();
+    (coin, prevout)
+}
+
+/// `child` spends `parent`'s anchor with an empty witness and the fee coin with a valid
+/// signature, and the two together pay at least `rate`.
+fn assert_cpfp(
+    parent: &Transaction,
+    parent_fee: Amount,
+    child: &Transaction,
+    coin: &TxOut,
+    rate: FeeRate,
+) {
+    let (anchor, anchor_output) = dlctix::anchor::find_anchor(parent).unwrap();
+    assert_eq!(child.input.len(), 2);
+    assert_eq!(child.input[0].previous_output, anchor);
+    assert!(child.input[0].witness.is_empty());
+    assert_eq!(child.output.len(), 1);
+    let child_fee = anchor_output.value + coin.value - child.output[0].value;
+    let package_vsize = parent.weight().to_vbytes_ceil() + child.weight().to_vbytes_ceil();
+    assert!(parent_fee + child_fee >= rate.fee_vb(package_vsize).unwrap());
+    // The child alone pays at least the rate too, and not wildly more than the package needs.
+    assert!(child_fee >= rate.fee_vb(child.weight().to_vbytes_ceil()).unwrap());
+    assert!(parent_fee + child_fee <= rate.fee_vb(package_vsize + 10).unwrap());
+
+    let secp = Secp256k1::verification_only();
+    let prevouts = [anchor_output.clone(), coin.clone()];
+    let mut cache = SighashCache::new(child);
+    if coin.script_pubkey.is_p2wpkh() {
+        let sighash = cache
+            .p2wpkh_signature_hash(1, &coin.script_pubkey, coin.value, EcdsaSighashType::All)
+            .unwrap();
+        let witness: Vec<&[u8]> = child.input[1].witness.iter().collect();
+        let pubkey = bitcoin::PublicKey::from_slice(witness[1]).unwrap();
+        assert_eq!(
+            ScriptBuf::new_p2wpkh(&pubkey.wpubkey_hash().unwrap()),
+            coin.script_pubkey
+        );
+        let signature = bitcoin::ecdsa::Signature::from_slice(witness[0]).unwrap();
+        secp.verify_ecdsa(&Message::from(sighash), &signature.signature, &pubkey.inner)
+            .expect("the fee coin's P2WPKH signature must verify");
+    } else {
+        let sighash = cache
+            .taproot_key_spend_signature_hash(1, &Prevouts::All(&prevouts), TapSighashType::Default)
+            .unwrap();
+        let key = XOnlyPublicKey::from_slice(&coin.script_pubkey.as_bytes()[2..34]).unwrap();
+        let signature = schnorr::Signature::from_slice(&child.input[1].witness[0]).unwrap();
+        secp.verify_schnorr(&signature, &Message::from(sighash), &key)
+            .expect("the fee coin's key-path signature must verify");
+    }
+}
+
+#[test]
+fn bumps_an_anchored_outcome_and_split_with_a_child_from_the_players_coin() {
+    let world = world_with(Some(AnchorParams::default()));
+    let entry = world.entry_record(
+        &hex::encode(world.our_point().serialize()),
+        Some(&world.ticket_preimage),
+    );
+    let mut session = world.session(world.events(entry, Some(world.attestations[0])));
+    let funding = world.signed.dlc().funding_outpoint();
+    session.chain.set_tip(1_000, u64::from(EXPIRY) - 10_000);
+    session.chain.insert_tx(
+        funding.txid,
+        Some(TxStatus {
+            confirmed_height: Some(900),
+        }),
+    );
+    session.chain.insert_outspend(funding, unspent());
+
+    // The contract pays 10 sat/vB; the fee market wants 50.
+    let rate = FeeRate::from_sat_per_vb(50).unwrap();
+    let plan = session
+        .claim(world.entry_id, Some(destination()), rate, None)
+        .unwrap();
+    let labels: Vec<&str> = plan.txs.iter().map(|step| step.label).collect();
+    assert_eq!(labels, ["outcome", "split"]);
+    for (step, taproot) in plan.txs.iter().zip([false, true]) {
+        let parent = &step.tx;
+        assert!(matches!(
+            step.bump,
+            BumpStatus::Anchor {
+                value_sat: 240,
+                fee_sat: Some(_),
+                ..
+            }
+        ));
+        assert!(step.bump.describe().contains("can be fee bumped"));
+        let parent_fee = world.signed.presigned_tx_fee(parent).unwrap();
+        assert_eq!(step.bump.below(parent, rate), Some(parent_fee));
+        // Well below the contract's own rate there is nothing to bump.
+        assert_eq!(
+            step.bump
+                .below(parent, FeeRate::from_sat_per_vb(5).unwrap()),
+            None
+        );
+
+        let (coin, prevout) = fee_coin(taproot);
+        let child = coin.bump(parent, parent_fee, rate).unwrap();
+        assert_eq!(child.input[1].previous_output, coin.outpoint());
+        assert_cpfp(parent, parent_fee, &child, &prevout, rate);
+    }
+
+    // Broadcast and not yet confirmed: the outcome transaction can still be bumped.
+    let outcome_tx = plan.txs[0].tx.clone();
+    session.chain.insert_outspend(
+        funding,
+        Outspend {
+            spent_by: Some(outcome_tx.compute_txid()),
+            confirmed_height: None,
+        },
+    );
+    session
+        .chain
+        .insert_outspend(OutPoint::new(outcome_tx.compute_txid(), 0), unspent());
+    let plan = session
+        .claim(world.entry_id, Some(destination()), rate, None)
+        .unwrap();
+    assert_eq!(plan.unconfirmed.len(), 1);
+    assert_eq!(plan.unconfirmed[0].label, "outcome");
+    assert_eq!(plan.unconfirmed[0].tx, outcome_tx);
+    assert!(plan.unconfirmed[0].bump.below(&outcome_tx, rate).is_some());
+}
+
+#[test]
+fn a_contract_without_anchors_still_cannot_be_bumped() {
+    let world = world();
+    let entry = world.entry_record(
+        &hex::encode(world.our_point().serialize()),
+        Some(&world.ticket_preimage),
+    );
+    let mut session = world.session(world.events(entry, Some(world.attestations[0])));
+    let funding = world.signed.dlc().funding_outpoint();
+    session.chain.set_tip(1_000, u64::from(EXPIRY) - 10_000);
+    session.chain.insert_tx(
+        funding.txid,
+        Some(TxStatus {
+            confirmed_height: Some(900),
+        }),
+    );
+    session.chain.insert_outspend(funding, unspent());
+    let rate = FeeRate::from_sat_per_vb(50).unwrap();
+    let plan = session
+        .claim(world.entry_id, Some(destination()), rate, None)
+        .unwrap();
+    assert_eq!(plan.txs.len(), 2);
+    let (coin, _) = fee_coin(false);
+    for step in &plan.txs {
+        assert!(matches!(step.bump, BumpStatus::Fixed { fee_sat: Some(_) }));
+        assert!(step.bump.describe().contains("cannot be fee bumped"));
+        assert_eq!(step.bump.below(&step.tx, rate), None);
+        assert!(coin.bump(&step.tx, Amount::ZERO, rate).is_err());
+    }
 }

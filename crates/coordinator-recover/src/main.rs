@@ -1,7 +1,7 @@
 //! coordinator-recover: find and move a player's entries' money with only their nsec.
 //!
 //! See `docs/RECOVERY.md`. The nsec is read from `--nsec`, `COORDINATOR_RECOVER_NSEC` or a prompt,
-//! and never printed.
+//! and never printed; so is the fee coin's key.
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
@@ -10,11 +10,12 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bitcoin::consensus::encode::serialize_hex;
-use bitcoin::{Address, FeeRate, Network, ScriptBuf};
+use bitcoin::{Address, FeeRate, Network, NetworkKind, OutPoint, PrivateKey, ScriptBuf};
 use clap::{Parser, Subcommand};
+use coordinator_recover::fees::{AnchorBumper, FeeCoin};
 use coordinator_recover::native::{self, ark, esplora::Esplora, relays::DEFAULT_RELAYS};
 use coordinator_recover::spec::{parse_pubkey, Kit};
-use coordinator_recover::{parse_network, Identity, Session};
+use coordinator_recover::{parse_network, ClaimTx, Identity, Session};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -55,6 +56,22 @@ struct Cli {
     /// The oracle's API, to fetch an attestation the relays do not have.
     #[arg(long, global = true)]
     oracle: Option<String>,
+    /// A confirmed coin of yours (txid:vout) that pays for CPFP children of anchored
+    /// transactions which pay less than the fee rate. One coin pays for one child per run.
+    #[arg(long, global = true)]
+    fee_utxo: Option<String>,
+    /// The WIF private key of --fee-utxo, which must pay this key's P2WPKH or single-key P2TR
+    /// address. If not given, it is read from COORDINATOR_RECOVER_FEE_KEY.
+    #[arg(
+        long,
+        env = "COORDINATOR_RECOVER_FEE_KEY",
+        hide_env_values = true,
+        global = true
+    )]
+    fee_key: Option<String>,
+    /// Where the CPFP child's change goes: a bitcoin address of yours.
+    #[arg(long, global = true)]
+    fee_change: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -72,7 +89,8 @@ enum Command {
         /// Where the final claim pays: a bitcoin address of yours.
         #[arg(long)]
         to: Option<String>,
-        /// The final claim's fee rate in sat/vB; by default Esplora's six-block estimate.
+        /// The final claim's fee rate in sat/vB, and the rate a CPFP child lifts an anchored
+        /// transaction to; by default Esplora's six-block estimate.
         #[arg(long)]
         fee_rate: Option<f64>,
         /// Your ticket preimage (hex), if the records do not hold it.
@@ -99,7 +117,8 @@ enum Command {
         /// Where the sweep pays: a bitcoin address of yours.
         #[arg(long)]
         to: Option<String>,
-        /// The sweep's fee rate in sat/vB; by default Esplora's six-block estimate.
+        /// The sweep's fee rate in sat/vB, and the CPFP children's; by default Esplora's six-block
+        /// estimate.
         #[arg(long)]
         fee_rate: Option<f64>,
         #[arg(long)]
@@ -188,6 +207,11 @@ async fn run(cli: Cli) -> Result<(), String> {
         eprintln!("Warning: {warning}");
     }
 
+    let cli_fees = FeeArgs {
+        utxo: cli.fee_utxo.clone(),
+        key: cli.fee_key.clone().map(Zeroizing::new),
+        change: cli.fee_change.clone(),
+    };
     match cli.command {
         Command::Inspect => inspect(&mut session, &esplora, cli.arkd.as_deref()).await,
         Command::Claim {
@@ -199,6 +223,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         } => {
             let destination = to.map(|to| destination(&to, network)).transpose()?;
             let fee_rate = fee_rate_or_estimate(fee_rate, &esplora).await?;
+            let mut fee_coin = fee_coin(&cli_fees, &esplora, network).await?;
             let entries: Vec<Uuid> = match entry {
                 Some(entry) => vec![entry],
                 None => session
@@ -218,6 +243,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                     destination.clone(),
                     fee_rate,
                     ticket_preimage.as_deref(),
+                    &mut fee_coin,
                     dry_run,
                 )
                 .await?;
@@ -253,6 +279,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
             let destination = to.map(|to| destination(&to, network)).transpose()?;
             let fee_rate = fee_rate_or_estimate(fee_rate, &esplora).await?;
+            let fee_coin = fee_coin(&cli_fees, &esplora, network).await?;
             let url = arkd_url(cli.arkd.as_deref(), &session, entry).ok();
             let lines = ark::unroll(
                 url.as_deref(),
@@ -261,7 +288,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 &esplora,
                 destination,
                 fee_rate,
-                None,
+                fee_coin.as_ref().map(|coin| coin as &dyn AnchorBumper),
                 dry_run,
             )
             .await?;
@@ -314,6 +341,7 @@ async fn claim(
     destination: Option<ScriptBuf>,
     fee_rate: FeeRate,
     ticket_preimage: Option<&str>,
+    fee_coin: &mut Option<FeeCoin>,
     dry_run: bool,
 ) -> Result<(), String> {
     println!("Entry {entry_id}");
@@ -325,6 +353,22 @@ async fn claim(
     for done in &plan.done {
         println!("  Already on chain: {done}");
     }
+    for step in &plan.unconfirmed {
+        println!(
+            "  {} transaction {} is in the mempool: {}",
+            step.label,
+            step.tx.compute_txid(),
+            step.bump.describe()
+        );
+        if let Some(child) = cpfp_child(step, fee_rate, fee_coin)? {
+            if dry_run {
+                println!("  {}", serialize_hex(&child));
+                continue;
+            }
+            esplora.broadcast_package(&step.tx, &child).await?;
+            println!("  Broadcast CPFP child {}", child.compute_txid());
+        }
+    }
     for step in &plan.txs {
         let txid = step.tx.compute_txid();
         println!(
@@ -332,8 +376,17 @@ async fn claim(
             step.label,
             step.bump.describe()
         );
+        let child = cpfp_child(step, fee_rate, fee_coin)?;
         if dry_run {
             println!("  {}", serialize_hex(&step.tx));
+            if let Some(child) = &child {
+                println!("  {}", serialize_hex(child));
+            }
+            continue;
+        }
+        if let Some(child) = child {
+            esplora.broadcast_package(&step.tx, &child).await?;
+            println!("  Broadcast with CPFP child {}", child.compute_txid());
             continue;
         }
         if esplora.tx_status(txid).await?.is_some() {
@@ -347,6 +400,92 @@ async fn claim(
         println!("  Then: {waiting}");
     }
     Ok(())
+}
+
+/// A CPFP child for `step` if it has an anchor and pays less than `fee_rate` on its own, paid
+/// from the fee coin, which it uses up. Without a coin, says how to give one.
+fn cpfp_child(
+    step: &ClaimTx,
+    fee_rate: FeeRate,
+    fee_coin: &mut Option<FeeCoin>,
+) -> Result<Option<bitcoin::Transaction>, String> {
+    let Some(parent_fee) = step.bump.below(&step.tx, fee_rate) else {
+        return Ok(None);
+    };
+    let rate = fee_rate.to_sat_per_vb_ceil();
+    let Some(coin) = fee_coin.take() else {
+        println!(
+            "  It pays less than {rate} sat/vB: pass --fee-utxo, --fee-key and --fee-change to \
+             pay for it with a child"
+        );
+        return Ok(None);
+    };
+    let child = coin.bump(&step.tx, parent_fee, fee_rate)?;
+    println!(
+        "  CPFP child {} spends its anchor and {} so that both pay {rate} sat/vB",
+        child.compute_txid(),
+        coin.outpoint()
+    );
+    Ok(Some(child))
+}
+
+/// The fee coin's flags, kept apart from the subcommand.
+struct FeeArgs {
+    utxo: Option<String>,
+    key: Option<Zeroizing<String>>,
+    change: Option<String>,
+}
+
+/// The fee coin, if --fee-utxo was given: its output is read from the chain, and it must be
+/// unspent and pay the key's address.
+async fn fee_coin(
+    args: &FeeArgs,
+    esplora: &Esplora,
+    network: Network,
+) -> Result<Option<FeeCoin>, String> {
+    let Some(utxo) = &args.utxo else {
+        if args.change.is_some() {
+            return Err("--fee-change goes with --fee-utxo".into());
+        }
+        return Ok(None);
+    };
+    let outpoint = OutPoint::from_str(utxo).map_err(|e| format!("--fee-utxo {utxo}: {e}"))?;
+    let key = args
+        .key
+        .as_ref()
+        .ok_or("--fee-utxo needs --fee-key or COORDINATOR_RECOVER_FEE_KEY")?;
+    let key = PrivateKey::from_wif(key.trim()).map_err(|_| "--fee-key is not a WIF key")?;
+    if key.network != NetworkKind::from(network) {
+        return Err("--fee-key is a key for another network".into());
+    }
+    let change = destination(
+        args.change
+            .as_deref()
+            .ok_or("--fee-utxo needs --fee-change <address>")?,
+        network,
+    )?;
+    let funding = esplora
+        .transaction(outpoint.txid)
+        .await?
+        .ok_or_else(|| format!("--fee-utxo: {} is not on chain", outpoint.txid))?;
+    let prevout = funding
+        .output
+        .get(outpoint.vout as usize)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "--fee-utxo: {} has no output {}",
+                outpoint.txid, outpoint.vout
+            )
+        })?;
+    if let Some(by) = esplora
+        .outspend(outpoint.txid, outpoint.vout)
+        .await?
+        .spent_by
+    {
+        return Err(format!("--fee-utxo {outpoint} is already spent by {by}"));
+    }
+    FeeCoin::new(outpoint, prevout, key, change).map(Some)
 }
 
 fn arkd_url(given: Option<&str>, session: &Session, entry: Uuid) -> Result<String, String> {
