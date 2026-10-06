@@ -14,7 +14,9 @@
 use super::*;
 use crate::domain::competitions::{
     admission,
-    queued::{self, CompetitionKind, CreateQueuedCompetition, PoolSummary, QueueSummary},
+    queued::{
+        self, CompetitionKind, CreateQueuedCompetition, PoolSummary, QueueSummary, UnpaidTicket,
+    },
     queued_store::{QueueSettings, QueuedReservation},
 };
 use crate::infra::keymeld::DepositScopeRequest;
@@ -210,43 +212,51 @@ impl Coordinator {
                     .into(),
             ));
         }
-        queued::check_entry_id(choice.entry_id, now).map_err(Error::BadRequest)?;
+        // An entry id may be no older than an hour when its ticket is made. Asking again for a
+        // ticket the player still holds unpaid resumes it: its invoice could be paid as it is,
+        // so the id's age changes nothing, and the entry key is the one derived from the id.
+        let resuming = self
+            .competition_store
+            .unpaid_queued_tickets(&pubkey, Some(competition.id))
+            .await?
+            .iter()
+            .any(|ticket| ticket.id == choice.entry_id);
+        if !resuming {
+            queued::check_entry_id(choice.entry_id, now).map_err(Error::BadRequest)?;
+        }
         self.require_payout_capabilities(true).await?;
         let settings = self.queue_settings(competition.id).await?;
-        let reserved =
-            match self
-                .competition_store
-                .reserve_queued_ticket(
-                    competition.id,
-                    choice.entry_id,
-                    &pubkey,
-                    settings.max_entries,
+        let reserved = match self
+            .competition_store
+            .reserve_queued_ticket(
+                competition.id,
+                choice.entry_id,
+                &pubkey,
+                settings.max_entries,
+                competition.event_submission.max_entries_per_player,
+                competition.ticket_deadline(),
+            )
+            .await?
+        {
+            QueuedReservation::Reserved(reserved) => reserved,
+            QueuedReservation::Closed => {
+                return Err(Error::BadRequest(admission::TICKETS_CLOSED.into()))
+            }
+            QueuedReservation::Full => return Err(Error::CompetitionFull),
+            QueuedReservation::TooManyUnpaid => {
+                return Err(Error::BadRequest(queued::TOO_MANY_UNPAID.into()))
+            }
+            QueuedReservation::EntryLimit => {
+                return Err(super::entry_limit_error(
                     competition.event_submission.max_entries_per_player,
-                    competition.ticket_deadline(),
-                )
-                .await?
-            {
-                QueuedReservation::Reserved(reserved) => reserved,
-                QueuedReservation::Closed => {
-                    return Err(Error::BadRequest(admission::TICKETS_CLOSED.into()))
-                }
-                QueuedReservation::Full => return Err(Error::CompetitionFull),
-                QueuedReservation::TooManyUnpaid => return Err(Error::BadRequest(
-                    "You already hold unpaid tickets for this competition; pay one or wait for \
-                     its invoice to expire"
-                        .into(),
-                )),
-                QueuedReservation::EntryLimit => {
-                    return Err(super::entry_limit_error(
-                        competition.event_submission.max_entries_per_player,
-                    ))
-                }
-                QueuedReservation::Taken => {
-                    return Err(Error::BadRequest(
-                        "This entry id is taken; start the entry again".into(),
-                    ))
-                }
-            };
+                ))
+            }
+            QueuedReservation::Taken => {
+                return Err(Error::BadRequest(
+                    "This entry id is taken; start the entry again".into(),
+                ))
+            }
+        };
         let ticket = reserved.ticket;
         if let Some(old_hash) = reserved.superseded_payment_hash {
             self.cancel_superseded_invoice(ticket.id, old_hash).await;
@@ -269,6 +279,22 @@ impl Coordinator {
             self.release_failed_reservation(&ticket).await;
         }
         result
+    }
+
+    /// The unpaid tickets `pubkey` holds in queued competitions, `competition_id`'s alone when
+    /// given, oldest entry first: what the entry form's Pay resumes, and the entries page lists.
+    pub async fn unpaid_tickets(
+        &self,
+        pubkey: &str,
+        competition_id: Option<Uuid>,
+    ) -> Result<Vec<UnpaidTicket>, Error> {
+        Ok(self
+            .competition_store
+            .unpaid_queued_tickets(pubkey, competition_id)
+            .await?
+            .iter()
+            .map(UnpaidTicket::from_ticket)
+            .collect())
     }
 
     /// Fix a queued ticket's payout policy: the player's consent to the competition's terms and

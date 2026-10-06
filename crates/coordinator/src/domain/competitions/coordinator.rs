@@ -223,7 +223,10 @@ impl Competition {
 pub struct TicketResponse {
     pub ticket_id: uuid::Uuid,
     pub payment_request: String, // Lightning HODL invoice to pay for entry
-    pub payment_hash: String,    // Hex-encoded payment hash for verification
+    /// When the invoice stops being payable; the payment dialog counts down to it.
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub invoice_expires_at: Option<OffsetDateTime>,
+    pub payment_hash: String, // Hex-encoded payment hash for verification
     /// What the invoice charges: `ticket_price_sats`.
     pub amount_sats: u64,
     /// The ticket's price line by line; the network fee is fixed on the ticket when it is issued.
@@ -3802,10 +3805,12 @@ impl Coordinator {
             (competition.event_submission.start_observation_date - now).whole_seconds();
         let buffer_seconds = 600i64; // 10 minutes buffer for signing + broadcast
         let invoice_expiry_seconds = (time_until_entries_close + buffer_seconds).max(900); // minimum 15 min
-        let payment_request = if let Some(existing_payment_request) = &ticket.payment_request {
+        let (payment_request, invoice_expires_at) = if let Some(existing_payment_request) =
+            &ticket.payment_request
+        {
             // Expired unpaid invoices are rotated atomically by the ticket
             // store. LND does not permit reusing a cancelled payment hash.
-            existing_payment_request.clone()
+            (existing_payment_request.clone(), ticket.invoice_expires_at)
         } else {
             // An Arkade competition's invoice comes from the swap into the ticket's escrow.
             let (payment_request, expires_at) =
@@ -3854,7 +3859,7 @@ impl Coordinator {
                     "Ticket reservation changed; request a new ticket".into(),
                 ));
             }
-            payment_request
+            (payment_request, Some(expires_at))
         };
 
         let keymeld_session_id = keymeld_registration
@@ -3867,6 +3872,7 @@ impl Coordinator {
         Ok(TicketResponse {
             ticket_id: ticket.id,
             payment_request,
+            invoice_expires_at,
             payment_hash: hex::encode(payment_hash),
             amount_sats: full_fee,
             price,

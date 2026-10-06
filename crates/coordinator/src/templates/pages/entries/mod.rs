@@ -6,7 +6,7 @@ use time::OffsetDateTime;
 
 use crate::domain::{
     leaderboard::Phase, EntryPayment, LedgerEntry, LedgerTotals, PayoutState, Refund, RefundKind,
-    RefundState, Returned,
+    RefundState, Returned, UnpaidTicket,
 };
 use crate::templates::{
     components::tip,
@@ -25,18 +25,27 @@ pub struct EntryRow<'a> {
     pub returned: &'a Returned,
 }
 
-/// Entries page content (requires auth): the totals over all `count` entries, and the first
-/// page of them. Each row's on-chain references link to `explorers`.
+/// An unpaid ticket the player holds, in a competition still taking entries.
+pub struct UnpaidRow<'a> {
+    pub ticket: &'a UnpaidTicket,
+    pub competition: &'a CompetitionView,
+}
+
+/// Entries page content (requires auth): the player's unpaid entries, the totals over all
+/// `count` entries, and the first page of them. Each row's on-chain references link to
+/// `explorers`.
 pub fn entries_page(
     rows: &[EntryRow],
     totals: &LedgerTotals,
     count: usize,
     open: Option<&CompetitionView>,
     explorers: Explorers,
+    unpaid: &[UnpaidRow],
 ) -> Markup {
     html! {
         div id="allEntries" class="account-page" {
             h1 class="title is-4" { "Your entries" }
+            (unpaid_entries(unpaid, OffsetDateTime::now_utc()))
             @if rows.is_empty() {
                 (no_entries(open))
             } @else {
@@ -58,6 +67,31 @@ pub fn entries_page(
                     }
                 }
                 p class="help" { "Select an entry to see its picks and how each one scored." }
+            }
+        }
+    }
+}
+
+/// Entries started but not paid for: each links to its competition's entry form, whose Pay pays
+/// the entry's invoice with the picks made there. Nothing when there are none.
+pub fn unpaid_entries(unpaid: &[UnpaidRow], now: OffsetDateTime) -> Markup {
+    html! {
+        @if !unpaid.is_empty() {
+            div id="unpaidEntries" class="notification is-warning unpaid-entries" {
+                p { strong { "Unpaid entries" } }
+                ul {
+                    @for row in unpaid {
+                        li {
+                            (format::window(row.competition.start, row.competition.end))
+                            @if let Some(expires) = row.ticket.invoice_expires_at {
+                                " · invoice expires in " (format::duration(expires - now))
+                            }
+                            " "
+                            a href=(row.competition.url()) hx-get=(row.competition.url())
+                              hx-target="#main-content" hx-push-url="true" { "Make picks and pay" }
+                        }
+                    }
+                }
             }
         }
     }
@@ -459,6 +493,7 @@ mod tests {
             1,
             None,
             explorers,
+            &[],
         )
         .into_string()
     }
@@ -787,6 +822,7 @@ mod tests {
             60,
             None,
             Explorers::default(),
+            &[],
         )
         .into_string();
         assert!(html.contains(r##"hx-get="/entries?from=25" hx-target="#olderEntries""##));
@@ -815,11 +851,45 @@ mod tests {
             0,
             Some(&open),
             Explorers::default(),
+            &[],
         )
         .into_string();
         assert!(html.contains(r#"href="/competitions/next/entry-form""#));
         assert!(html.contains("Enter the next competition"));
         assert!(!html.contains("ledgerSummary"));
+    }
+
+    #[test]
+    fn unpaid_entries_link_to_their_entry_form_with_the_invoice_expiry() {
+        let competition = view("c1", Phase::Upcoming, 90);
+        let ticket = UnpaidTicket {
+            ticket_id: uuid::Uuid::from_u128(7),
+            competition_id: uuid::Uuid::from_u128(1),
+            invoice_expires_at: Some(NOW + time::Duration::minutes(42)),
+        };
+        let rows = [UnpaidRow {
+            ticket: &ticket,
+            competition: &competition,
+        }];
+        let html = unpaid_entries(&rows, NOW).into_string();
+        assert!(html.contains("Unpaid entries"));
+        assert!(html.contains("invoice expires in 42 min"));
+        assert!(html.contains(r#"href="/competitions/c1/entry-form""#));
+        assert!(html.contains("Make picks and pay"));
+        assert!(unpaid_entries(&[], NOW).into_string().is_empty());
+
+        // Shown even before any entry is paid.
+        let page = entries_page(
+            &[],
+            &LedgerTotals::default(),
+            0,
+            None,
+            Explorers::default(),
+            &rows,
+        )
+        .into_string();
+        assert!(page.contains(r#"id="unpaidEntries""#));
+        assert!(page.contains("You haven't entered a competition yet."));
     }
 
     #[test]

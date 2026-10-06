@@ -22,7 +22,10 @@ class Entry {
   async init(kept = null) {
     // The entry key is derived from the entry id, so every entry gets its own
     // key and no counter or entry ordering is involved.
-    const reuse = kept && session.dlcWallet.entryRegistration(kept.id).ephemeral_pubkey === kept.ephemeral_pubkey;
+    // An unpaid ticket the coordinator lists for this account (`kept` without a key) is the
+    // account's own: its key is the one this wallet derives from its id.
+    const reuse = kept && (kept.ephemeral_pubkey === undefined ||
+      session.dlcWallet.entryRegistration(kept.id).ephemeral_pubkey === kept.ephemeral_pubkey);
     const id = reuse ? kept.id : session.wasm.DlcWallet.newEntryId();
     const { ephemeral_pubkey, payout_hash } =
       session.dlcWallet.entryRegistration(id);
@@ -56,6 +59,7 @@ class Entry {
     this.ticket = {
       id: ticketData.ticket_id,
       payment_request: ticketData.payment_request,
+      invoice_expires_at: ticketData.invoice_expires_at ?? null,
       keymeld_session_id: ticketData.keymeld_session_id,
       keymeld_enclave_public_key: ticketData.keymeld_enclave_public_key,
       keymeld_user_id: ticketData.keymeld_user_id,
@@ -228,6 +232,7 @@ class Entry {
     // One all-in number; what it is made of is on the form only.
     document.getElementById("ticketPaymentAmount").textContent =
       `Pay ${formatSats(this.ticketAmountSats)} by Lightning to enter this competition.`;
+    const stopCountdown = countDownTo(this.ticket.invoice_expires_at, document.getElementById("ticketPaymentExpiry"));
 
     const status = document.createElement("div");
     status.id = "paymentStatus";
@@ -249,6 +254,7 @@ class Entry {
       const finish = (error) => {
         if (finished) return;
         finished = true;
+        stopCountdown();
         document.removeEventListener("fw:ticket-paid", paid);
         document.removeEventListener("fw:ticket-failed", failed);
         $modal.removeEventListener("fw:modal-closed", closed);
@@ -349,6 +355,27 @@ class Entry {
   }
 }
 
+
+// "Invoice expires in 12:34" in `element`, every second until `expiresAt` (RFC 3339) or until
+// the returned function stops it. Nothing when the ticket carries no expiry.
+function countDownTo(expiresAt, element) {
+  const end = expiresAt ? Date.parse(expiresAt) : NaN;
+  if (!element) return () => {};
+  if (Number.isNaN(end)) {
+    element.textContent = "";
+    return () => {};
+  }
+  const tick = () => {
+    const seconds = Math.max(0, Math.floor((end - Date.now()) / 1000));
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor(seconds / 60) % 60;
+    const clock = `${hours ? `${hours}:${String(minutes).padStart(2, "0")}` : minutes}:${String(seconds % 60).padStart(2, "0")}`;
+    element.textContent = seconds > 0 ? `Invoice expires in ${clock}` : "Invoice expired";
+  };
+  tick();
+  const timer = setInterval(tick, 1000);
+  return () => clearInterval(timer);
+}
 
 // Picks by station from the form's checked radios, named `KPWM_temp_high`.
 // A reading with no radio checked is skipped.
@@ -705,14 +732,21 @@ async function submitEntry() {
       // Paid, but the entry didn't go through: enter it again, never pay again.
       currentEntry.entry.submit = picks;
     } else {
-      currentEntry = await newEntry(form, picks);
+      currentEntry = await newEntry(form, picks, takeUnpaidTicket(competitionId));
       pendingEntry = currentEntry;
     }
-    // The dialog closed with the ticket unpaid: Pay works again, and reopens it.
-    currentEntry.onDialogClosed = () => setBusy(payButton(), false);
-    currentEntry.onPaid = () => setBusy(payButton(), true);
-
-    await currentEntry.submit();
+    try {
+      await enter(currentEntry, payButton);
+    } catch (refused) {
+      // This page didn't know of the player's unpaid entries (opened before they were made, or
+      // in another tab): pay the oldest of them instead of starting another.
+      const unpaid = refused?.message === TOO_MANY_UNPAID && !currentEntry.paid && !currentEntry.awaitingPayment
+        ? await oldestUnpaidTicket(currentEntry) : null;
+      if (!unpaid) throw refused;
+      currentEntry = await newEntry(form, picks, unpaid);
+      pendingEntry = currentEntry;
+      await enter(currentEntry, payButton);
+    }
     pendingEntry = null;
     forgetEntry(currentEntry.competition.id);
 
@@ -744,8 +778,47 @@ async function submitEntry() {
   }
 }
 
+// Pays for `entry`'s ticket and enters it, keeping Pay in step with the payment dialog.
+async function enter(entry, payButton) {
+  // The dialog closed with the ticket unpaid: Pay works again, and reopens it.
+  entry.onDialogClosed = () => setBusy(payButton(), false);
+  entry.onPaid = () => setBusy(payButton(), true);
+  await entry.submit();
+}
+
+// The coordinator's refusal when the player already holds as many unpaid tickets in a queued
+// competition as one may (`queued::TOO_MANY_UNPAID`).
+const TOO_MANY_UNPAID = "You have unpaid entries waiting in this competition; open its entry form and press Pay to pay one, or wait for its invoice to expire";
+
+// The unpaid ticket the form says the player holds (the `entryUnpaid` notice, rendered for the
+// signed-in player), as the entry to resume: a queued ticket's id is its entry's, and the entry
+// key is derived from the id. Taken once: if it expires or fails, the next Pay starts afresh.
+function takeUnpaidTicket(competitionId) {
+  const notice = document.getElementById("entryUnpaid");
+  const id = notice?.dataset.ticketId;
+  if (!id || document.getElementById("entryForm")?.dataset.competitionId !== competitionId) return null;
+  delete notice.dataset.ticketId;
+  notice.replaceChildren?.();
+  return { id };
+}
+
+// The oldest unpaid ticket the player holds in `entry`'s competition, asked of the coordinator.
+async function oldestUnpaidTicket(entry) {
+  try {
+    const response = await entry.client.get(
+      `${entry.coordinator_url}/api/v1/competitions/${entry.competition.id}/tickets/unpaid`,
+    );
+    const [oldest] = await response.json();
+    return oldest?.ticket_id ? { id: oldest.ticket_id } : null;
+  } catch (error) {
+    console.error("Unpaid tickets could not be listed:", error);
+    return null;
+  }
+}
+
 // A new entry for `picks`, checked against the terms the form showed, with its payout address.
-async function newEntry(form, picks) {
+// `unpaid` is an unpaid ticket of the player's to pay instead of starting a new entry.
+async function newEntry(form, picks, unpaid = null) {
   const payoutTerms = await loadEntryTerms(form);
   // Automatic payouts go to the account's address; without one, or for a
   // legacy competition, the winner submits an invoice instead.
@@ -771,7 +844,7 @@ async function newEntry(form, picks) {
   const currentEntry = new Entry(body.dataset.apiBase || "", body.dataset.oracleBase || "", {
     id: form.dataset.competitionId,
   });
-  await currentEntry.init(keptEntry(form.dataset.competitionId));
+  await currentEntry.init(unpaid ?? keptEntry(form.dataset.competitionId));
   currentEntry.payoutTerms = payoutTerms;
   currentEntry.shownPrice = shownPrice;
   currentEntry.payoutChoice = {

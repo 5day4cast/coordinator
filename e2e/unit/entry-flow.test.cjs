@@ -600,8 +600,12 @@ test("with the picks still loading, the message shows under Pay", async () => {
 function payingPlayer({ ticket = () => ({ ok: true, json: async () => ({ ticket_id: "ticket",
   payment_request: "lnbc53000n1ticket", ...price(), keymeld_session_id: "session",
   keymeld_registration: { user_id: "ticket", session_id: "session", payout_policy: "policy" } }) }),
-  entry = () => ({ ok: true, json: async () => ({ id: "entry" }) }), sessionStorage } = {}) {
+  entry = () => ({ ok: true, json: async () => ({ id: "entry" }) }), sessionStorage,
+  unpaid = null, listed = [], timers = null } = {}) {
   const { elements, document } = entryPage();
+  // The notice the form shows for the signed-in player's unpaid ticket, when they hold one.
+  if (unpaid) elements.entryUnpaid = element({ dataset: { ticketId: unpaid } });
+  if (timers) elements.ticketPaymentExpiry = element();
   Object.assign(elements, {
     ticketPaymentModal: element({ querySelector: () => null }),
     copyFeedback: element(),
@@ -641,7 +645,12 @@ function payingPlayer({ ticket = () => ({ ok: true, json: async () => ({ ticket_
     },
     setTimeout: () => 0,
     clearTimeout: () => {},
+    ...(timers ?? {}),
     AuthorizedClient: class {
+      async get(url) {
+        requests.push({ url, method: "GET" });
+        return { ok: true, json: async () => listed };
+      }
       async post(url, body) {
         requests.push({ url, body });
         if (url.endsWith("/api/v1/users/login")) {
@@ -1040,4 +1049,68 @@ test("with fewer picks than rows, paying with none says how many of them", async
   const sandbox = load({}, document, async () => assert.fail("nothing fetched"));
   await sandbox.submitEntry();
   assert.equal(elements.errorMessage.textContent, "Make exactly 3 picks, any 3 of the 12 rows, before paying.");
+});
+
+// A queued ticket's id is its entry's, so paying an unpaid ticket means asking for that entry's
+// ticket again: the coordinator answers with the same ticket and invoice.
+const UNPAID = "0190b6a0-0000-7000-8000-0000000000aa";
+
+test("an unpaid ticket the form shows is paid with the picks on the form, under its own entry id", async () => {
+  const server = reservingCoordinator();
+  const { elements, modal, pay, tickets, entries, announce } = payingPlayer({ ticket: server.ticket, entry: server.entry, unpaid: UNPAID });
+  const { done } = await pay();
+  assert.ok(modal.classList.contains("is-active"), "its invoice is shown, not a refusal");
+  assert.deepEqual(entryIds(tickets), [UNPAID]);
+  assert.equal(elements.entryUnpaid.dataset.ticketId, undefined, "taken once");
+  announce("fw:ticket-paid", { ticket_id: "ticket-1" });
+  await done;
+  assert.equal(entries().length, 1);
+  assert.equal(entries()[0].body.id, UNPAID);
+  assert.deepEqual(JSON.parse(JSON.stringify(entries()[0].body.expected_observations)), [{ stations: "KPWM", temp_high: "Over" }]);
+  assert.equal(elements.submitEntry.textContent, "Entered");
+});
+
+test("a refusal for too many unpaid tickets pays the oldest of them instead", async () => {
+  const server = reservingCoordinator();
+  let refused = 0;
+  const ticket = (body) => {
+    if (body.payout.entry_id !== UNPAID) {
+      refused++;
+      return { ok: false, status: 400, json: async () => ({ error: "You have unpaid entries waiting in this competition; open its entry form and press Pay to pay one, or wait for its invoice to expire" }) };
+    }
+    return server.ticket(body);
+  };
+  const { elements, modal, pay, tickets } = payingPlayer({ ticket, listed: [
+    { ticket_id: UNPAID, competition_id: COMPETITION, invoice_expires_at: "2026-10-06T12:00:00Z" },
+  ] });
+  await pay();
+  assert.equal(refused, 1);
+  assert.ok(modal.classList.contains("is-active"), "the oldest unpaid ticket's invoice is shown");
+  assert.equal(entryIds(tickets).at(-1), UNPAID);
+  assert.ok(elements.errorMessage.classList.contains("hidden"), "no refusal is shown");
+});
+
+test("with no unpaid ticket listed, the refusal is shown as it came", async () => {
+  const ticket = () => ({ ok: false, status: 400, json: async () => ({ error: "You have unpaid entries waiting in this competition; open its entry form and press Pay to pay one, or wait for its invoice to expire" }) });
+  const { elements, pay } = payingPlayer({ ticket });
+  await (await pay()).done;
+  assert.match(elements.errorMessage.textContent, /unpaid entries waiting/);
+  assert.equal(elements.submitEntry.disabled, false);
+});
+
+test("the payment dialog counts down to the invoice's expiry", async () => {
+  let ticks = null;
+  let stopped = false;
+  const timers = { setInterval: (tick) => { ticks = tick; return 1; }, clearInterval: () => { stopped = true; } };
+  const expires = new Date(Date.now() + (41 * 60 + 30) * 1000).toISOString();
+  const ticket = () => ({ ok: true, json: async () => ({ ticket_id: "ticket", payment_request: "lnbc53000n1ticket",
+    invoice_expires_at: expires, ...price(), keymeld_session_id: "session",
+    keymeld_registration: { user_id: "ticket", session_id: "session", payout_policy: "policy" } }) });
+  const { elements, pay, announce } = payingPlayer({ ticket, timers });
+  const { done } = await pay();
+  assert.match(elements.ticketPaymentExpiry.textContent, /^Invoice expires in 41:(29|30)$/);
+  assert.equal(typeof ticks, "function");
+  announce("fw:ticket-paid");
+  await done;
+  assert.ok(stopped, "the countdown stops with the dialog");
 });

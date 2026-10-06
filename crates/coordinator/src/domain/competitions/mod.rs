@@ -68,8 +68,8 @@ pub use metrics_store::*;
 pub use operator_payouts::OperatorPayoutProgress;
 pub use payout::*;
 pub use queued::{
-    CompetitionKind, CreateQueuedCompetition, PoolSummary, QueueSummary, DEFAULT_MAX_ENTRIES,
-    DEFAULT_MIN_PLAYERS,
+    CompetitionKind, CreateQueuedCompetition, PoolSummary, QueueSummary, UnpaidTicket,
+    DEFAULT_MAX_ENTRIES, DEFAULT_MIN_PLAYERS,
 };
 pub use queued_store::{PoolRecord, QueueSettings};
 pub use recovery_store::*;

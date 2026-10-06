@@ -27,7 +27,7 @@ use crate::{
     domain::{
         AddEntry, Competition, CreateEvent, CreateQueuedCompetition, Error as DomainError,
         FundedContract, PayoutClaimInfo, PayoutClaimReceipt, PayoutInfo, SearchBy, TicketRefund,
-        TicketRegistration, TicketResponse, TicketStatus, UserEntry,
+        TicketRegistration, TicketResponse, TicketStatus, UnpaidTicket, UserEntry,
     },
     infra::lnurl::LightningAddress,
     startup::AppState,
@@ -165,6 +165,25 @@ pub async fn get_ticket_status(
         .map(Json)
         .map_err(|e| {
             log_failure("getting ticket status", &e);
+            e.into()
+        })
+}
+
+/// The unpaid tickets the player holds in a queued competition, oldest entry first. The entry
+/// form's Pay asks for the first again, with its id as the entry id, rather than starting an
+/// entry that the player's unpaid tickets would refuse.
+pub async fn get_unpaid_tickets(
+    NostrAuth { pubkey, .. }: NostrAuth,
+    State(state): State<Arc<AppState>>,
+    Path(competition_id): Path<Uuid>,
+) -> Result<Json<Vec<UnpaidTicket>>, ApiError> {
+    state
+        .coordinator
+        .unpaid_tickets(&pubkey.to_hex(), Some(competition_id))
+        .await
+        .map(Json)
+        .map_err(|e| {
+            log_failure("listing unpaid tickets", &e);
             e.into()
         })
 }
