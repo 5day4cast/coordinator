@@ -166,6 +166,149 @@ async fn only_the_signed_in_owner_gets_their_ledger() {
     coordinator.stop().await;
 }
 
+#[tokio::test]
+async fn only_the_owner_sees_their_escrow_and_everyone_the_contract_funding() {
+    use bitcoin::{
+        absolute::LockTime, transaction::Version, Amount, OutPoint, ScriptBuf, Transaction, TxOut,
+    };
+    let coordinator = Coordinator::start_with("http://127.0.0.1:9".into(), |settings| {
+        settings.bitcoin_settings.explorer_url = Some("https://mempool.example".into());
+        settings.ark_settings.explorer_url = Some("https://ark.example/".into());
+    })
+    .await;
+    let competition = coordinator
+        .competition(
+            OffsetDateTime::now_utc() - time::Duration::days(2),
+            &["KPWM"],
+            3,
+        )
+        .await;
+    let owner = Keys::generate();
+    let other = Keys::generate();
+    entries(
+        &coordinator,
+        competition.id,
+        &owner.public_key().to_hex(),
+        1,
+    )
+    .await;
+    entries(
+        &coordinator,
+        competition.id,
+        &other.public_key().to_hex(),
+        1,
+    )
+    .await;
+
+    // The owner's entry fee, held in an Arkade escrow.
+    let vtxo_txid = "e".repeat(64);
+    let vtxo = format!("{vtxo_txid}:0");
+    let (pubkey, outpoint) = (owner.public_key().to_hex(), vtxo.clone());
+    coordinator.databases[0]
+        .execute_write(move |pool| async move {
+            sqlx::query(
+                "INSERT INTO ticket_ark_escrows (ticket_id, ticket_hash, escrow_tap_tree,
+                     escrow_address, vtxo_outpoint, vtxo_sats, funded_at)
+                 SELECT t.id, t.hash, '', 'tark1escrow', ?, 6340, 1756720800
+                 FROM tickets t JOIN entries e ON e.ticket_id = t.id WHERE e.pubkey = ?",
+            )
+            .bind(outpoint)
+            .bind(pubkey)
+            .execute(&pool)
+            .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let (status, _, body) = get(&coordinator, "/entries", true, Some(&owner)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("On-chain details"));
+    assert!(body.contains(&format!(r#"data-copy="{vtxo}""#)));
+    assert!(body.contains(&format!(r#"href="https://ark.example/tx/{vtxo_txid}""#)));
+
+    // No one else sees it: not another player, not a visitor, not the public pages.
+    let entry = coordinator
+        .state
+        .coordinator
+        .player_ledger(&owner.public_key().to_hex())
+        .await
+        .unwrap()[0]
+        .entry_id
+        .clone();
+    let leaderboard = format!("/competitions/{}/leaderboard", competition.id);
+    for (path, keys) in [
+        ("/entries".to_owned(), Some(&other)),
+        ("/entries".to_owned(), None),
+        ("/entries?from=1".to_owned(), Some(&other)),
+        (format!("/entries/{entry}/detail"), Some(&other)),
+        (format!("/entries/{entry}/detail"), None),
+        (format!("/entries/{entry}/detail/mine"), Some(&other)),
+        (leaderboard.clone(), None),
+    ] {
+        let (_, _, body) = get(&coordinator, &path, true, keys).await;
+        assert!(!body.contains(&vtxo_txid), "{path} shows the escrow VTXO");
+    }
+    assert!(!get(&coordinator, &leaderboard, true, None)
+        .await
+        .2
+        .contains("Contract funding"));
+
+    // Kicked off: the contract's funding output, public on the leaderboard and on the
+    // entries page, linked to the chain's explorer.
+    let commitment = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![],
+        output: vec![
+            TxOut {
+                value: Amount::from_sat(330),
+                script_pubkey: ScriptBuf::new(),
+            },
+            TxOut {
+                value: Amount::from_sat(12_680),
+                script_pubkey: ScriptBuf::new(),
+            },
+        ],
+    };
+    let funding = OutPoint::new(commitment.compute_txid(), 1);
+    let (event, outpoint, transaction) = (
+        competition.id.to_string(),
+        serde_json::to_string(&funding).unwrap(),
+        serde_json::to_string(&commitment).unwrap(),
+    );
+    coordinator.databases[0]
+        .execute_write(move |pool| async move {
+            sqlx::query(
+                "UPDATE competitions SET funding_outpoint = ?, funding_transaction = ?,
+                     funding_broadcasted_at = datetime('now') WHERE id = ?",
+            )
+            .bind(outpoint)
+            .bind(transaction)
+            .bind(event)
+            .execute(&pool)
+            .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let link = format!(
+        r#"href="https://mempool.example/tx/{}""#,
+        commitment.compute_txid()
+    );
+    let (_, _, body) = get(&coordinator, &leaderboard, true, None).await;
+    assert!(body.contains("Contract funding"));
+    assert!(body.contains(&format!(r#"data-copy="{funding}""#)));
+    assert!(body.contains(&link));
+    for keys in [&owner, &other] {
+        let (_, _, body) = get(&coordinator, "/entries", true, Some(keys)).await;
+        assert!(body.contains("Contract funding") && body.contains(&link));
+        assert!(body.contains("12,680 sats"));
+    }
+
+    coordinator.stop().await;
+}
+
 /// Not a check: prints how long the entries page takes, warm, for a player with 200 entries
 /// over 50 competitions, and the next page of rows.
 ///

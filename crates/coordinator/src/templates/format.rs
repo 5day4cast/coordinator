@@ -213,6 +213,31 @@ pub fn copyable_id(id: &str) -> Markup {
     }
 }
 
+/// The block explorers player pages link to: the chain's for on-chain transactions, and
+/// Arkade's for VTXOs and Arkade transactions. Empty when not configured.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Explorers<'a> {
+    pub chain: &'a str,
+    pub ark: &'a str,
+}
+
+/// Where `explorer` shows the transaction `txid`; none without an explorer.
+pub fn tx_url(explorer: &str, txid: &str) -> Option<String> {
+    (!explorer.is_empty()).then(|| format!("{}/tx/{txid}", explorer.trim_end_matches('/')))
+}
+
+/// A transaction or output ID to copy, with a link to `url` (an explorer) when there is one.
+pub fn chain_id(id: &str, url: Option<String>) -> Markup {
+    html! {
+        (copyable_id(id))
+        @if let Some(url) = url {
+            " "
+            a class="explorer-link" href=(url) target="_blank" rel="noopener noreferrer"
+              title="Open in explorer" aria-label="Open in explorer" { "↗" }
+        }
+    }
+}
+
 /// `npub1qqqq…wxyz`, for a player without a username.
 pub fn short_npub(npub: &str) -> String {
     if npub.len() <= 16 {

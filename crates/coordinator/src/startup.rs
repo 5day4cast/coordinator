@@ -330,6 +330,8 @@ pub struct AppState {
     /// Gateway the browser calls to verify its assigned signing enclave.
     pub keymeld_public_url: Option<String>,
     pub explorer_url: String,
+    /// Arkade explorer for VTXOs and Arkade transactions; empty when none is configured.
+    pub ark_explorer_url: String,
     pub network: String,
     pub bitcoin: Arc<dyn Bitcoin>,
     pub coordinator: Arc<Coordinator>,
@@ -813,6 +815,7 @@ pub async fn build_app(
             .explorer_url
             .clone()
             .unwrap_or_default(),
+        ark_explorer_url: config.ark_settings.explorer_url.clone().unwrap_or_default(),
         oracle_url: config.coordinator_settings.oracle_url,
         keymeld_public_url: config
             .keymeld_settings

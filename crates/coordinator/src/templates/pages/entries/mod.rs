@@ -10,7 +10,7 @@ use crate::domain::{
 };
 use crate::templates::{
     components::tip,
-    format::{self, sats, thousands, TimeStyle},
+    format::{self, sats, thousands, tx_url, Explorers, TimeStyle},
     fragments::picks::detail_url,
     pages::competitions::{phase_badge, CompetitionView, Queue},
 };
@@ -26,12 +26,13 @@ pub struct EntryRow<'a> {
 }
 
 /// Entries page content (requires auth): the totals over all `count` entries, and the first
-/// page of them.
+/// page of them. Each row's on-chain references link to `explorers`.
 pub fn entries_page(
     rows: &[EntryRow],
     totals: &LedgerTotals,
     count: usize,
     open: Option<&CompetitionView>,
+    explorers: Explorers,
 ) -> Markup {
     html! {
         div id="allEntries" class="account-page" {
@@ -52,7 +53,7 @@ pub fn entries_page(
                             }
                         }
                         tbody {
-                            (older_entries(rows, 0, count))
+                            (older_entries(rows, 0, count, explorers))
                         }
                     }
                 }
@@ -64,12 +65,12 @@ pub fn entries_page(
 
 /// The rows from `from` on, and the button for the ones after them, which it replaces with
 /// the next page.
-pub fn older_entries(rows: &[EntryRow], from: usize, count: usize) -> Markup {
+pub fn older_entries(rows: &[EntryRow], from: usize, count: usize, explorers: Explorers) -> Markup {
     let shown = from + rows.len();
     let next = format!("/entries?from={shown}");
     html! {
         @for row in rows {
-            (entry_row(row))
+            (entry_row(row, explorers))
         }
         @if shown < count {
             tr id="olderEntries" {
@@ -152,7 +153,7 @@ fn signed_sats(value: i64) -> String {
 /// their own click, as do the fee's "?" and the details (see page.js); the Picks
 /// button's click reaches the row, and the Leaderboard link consumes its click
 /// so the row does not see it.
-fn entry_row(row: &EntryRow) -> Markup {
+fn entry_row(row: &EntryRow, explorers: Explorers) -> Markup {
     let picks = detail_url(&row.entry.entry_id);
     let leaderboard = format!("/competitions/{}/leaderboard", row.entry.competition_id);
     html! {
@@ -182,7 +183,7 @@ fn entry_row(row: &EntryRow) -> Markup {
             td data-label="Entry fee" class="ledger-paid" { (paid(row.entry.payment.as_ref())) }
             td data-label="Returned" class="ledger-returned" { (returned(row)) }
             td class="has-text-right entry-links" {
-                (details(row))
+                (details(row, explorers))
                 button type="button" class="button is-small is-text picks-button" { "Picks" }
                 a href=(leaderboard) hx-get=(leaderboard) hx-trigger="click consume"
                   hx-target="#main-content" hx-push-url="true" { "Leaderboard" }
@@ -288,15 +289,38 @@ fn nothing(note: &str) -> Markup {
     html! { "—" (when(note, None)) }
 }
 
-/// The references support asks for: the entry, its payment, and its payout or refund.
-fn details(row: &EntryRow) -> Markup {
+/// The references support asks for: the entry, its payment, and its payout or refund; and
+/// where its money is on chain: the escrow VTXO while the entry fee is held in it, and the
+/// transaction that funded the contract.
+fn details(row: &EntryRow, explorers: Explorers) -> Markup {
     let refund = match row.returned {
         Returned::Refund(refund) => Some(refund),
         _ => None,
     };
+    // The escrow is the entry's own: the page is only ever its owner's.
+    let escrow = row
+        .entry
+        .escrow
+        .as_ref()
+        .filter(|escrow| !escrow.spent_into_pool);
+    let vtxo = escrow.and_then(|escrow| {
+        let outpoint = escrow.vtxo.as_deref()?;
+        let (txid, _) = outpoint.split_once(':')?;
+        Some((outpoint, tx_url(explorers.ark, txid), escrow.sats))
+    });
+    let ark_refund = escrow
+        .and_then(|escrow| escrow.refund.as_ref())
+        .and_then(|refund| refund.ark_txid.as_deref());
+    let funding = row.entry.funding.as_ref();
+    let on_chain = vtxo.is_some() || ark_refund.is_some() || funding.is_some();
+    let label = if on_chain {
+        "Payment and on-chain details"
+    } else {
+        "Payment details"
+    };
     html! {
         details class="ledger-details" {
-            summary title="Payment details" aria-label="Payment details" { "?" }
+            summary title=(label) aria-label=(label) { "?" }
             dl {
                 dt { "Entry" } dd { (format::copyable_id(&row.entry.entry_id)) }
                 dt { "Payment hash" } dd { (format::copyable_id(&row.entry.payment_hash)) }
@@ -311,6 +335,31 @@ fn details(row: &EntryRow) -> Markup {
                     .and_then(|refund| refund.payment_hash.as_ref())
                 {
                     dt { "Refund payment hash" } dd { (format::copyable_id(hash)) }
+                }
+            }
+            @if on_chain {
+                p class="ledger-chain" { "On-chain details" }
+                dl {
+                    @if let Some((outpoint, url, amount)) = vtxo {
+                        dt { "Escrow VTXO" }
+                        dd {
+                            (format::chain_id(outpoint, url))
+                            span class="ledger-amount" { (sats(amount)) }
+                        }
+                    }
+                    @if let Some(txid) = ark_refund {
+                        dt { "Refund transaction" }
+                        dd { (format::chain_id(txid, tx_url(explorers.ark, txid))) }
+                    }
+                    @if let Some(funding) = funding {
+                        dt { "Contract funding" }
+                        dd {
+                            (format::chain_id(&funding.outpoint(), tx_url(explorers.chain, &funding.txid)))
+                            @if let Some(amount) = funding.sats {
+                                span class="ledger-amount" { (sats(amount)) }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -386,11 +435,20 @@ mod tests {
             lightning_released_at: None,
             escrow: None,
             payout: None,
+            funding: None,
         }
     }
 
     /// The page with one row for `entry` in `competition`.
     fn one_row(entry: &LedgerEntry, competition: &CompetitionView) -> String {
+        one_row_with(entry, competition, Explorers::default())
+    }
+
+    fn one_row_with(
+        entry: &LedgerEntry,
+        competition: &CompetitionView,
+        explorers: Explorers,
+    ) -> String {
         let returned = entry.returned(Some(competition.phase), NOW);
         let mut totals = LedgerTotals::default();
         totals.add(entry, &returned);
@@ -403,6 +461,7 @@ mod tests {
             &totals,
             1,
             None,
+            explorers,
         )
         .into_string()
     }
@@ -527,6 +586,7 @@ mod tests {
                 spent_into_pool: false,
                 written_off: false,
                 refund: None,
+                vtxo: None,
             }),
             ..entry()
         };
@@ -539,6 +599,7 @@ mod tests {
             fee_sats: 20,
             state: ArkRefundState::Submitted,
             updated_at: None,
+            ark_txid: None,
         });
         assert!(returned_cell(&escrowed, Phase::Cancelled).contains("refunding…"));
         escrowed
@@ -564,6 +625,99 @@ mod tests {
             assert!(details.contains(reference), "{reference}");
         }
         assert!(details.contains(r#"data-copy="refund-1""#));
+    }
+
+    /// The row's "?" details.
+    fn details_of(html: &str) -> &str {
+        &html[html.find("<details").unwrap()..html.find("</details>").unwrap()]
+    }
+
+    #[test]
+    fn the_details_show_where_the_money_is_on_chain() {
+        let vtxo = format!("{}:0", "e".repeat(64));
+        let mut escrowed = LedgerEntry {
+            escrow: Some(LedgerEscrow {
+                sats: 5_300,
+                opens_at: None,
+                spent_into_pool: false,
+                written_off: false,
+                refund: None,
+                vtxo: Some(vtxo.clone()),
+            }),
+            ..entry()
+        };
+        let explorers = Explorers {
+            chain: "https://mempool.example/",
+            ark: "https://ark.example",
+        };
+        let upcoming = view("c1", Phase::Upcoming, 30);
+
+        // Nothing on chain yet: only the payment references.
+        let html = one_row_with(&entry(), &upcoming, explorers);
+        assert!(!details_of(&html).contains("On-chain details"));
+        assert!(html.contains(r#"title="Payment details""#));
+
+        // In escrow: its VTXO and amount, linked to the Arkade explorer.
+        let html = one_row_with(&escrowed, &upcoming, explorers);
+        let details = details_of(&html);
+        assert!(details.contains("On-chain details"));
+        assert!(details.contains("Escrow VTXO"));
+        assert!(details.contains(&format!(r#"data-copy="{vtxo}""#)));
+        assert!(details.contains(&format!(
+            r#"href="https://ark.example/tx/{}""#,
+            "e".repeat(64)
+        )));
+        assert!(details.contains("5,300 sats"));
+        assert!(!details.contains("Contract funding"));
+
+        // Without an Arkade explorer, the VTXO is there to copy, with no link.
+        let html = one_row_with(&escrowed, &upcoming, Explorers::default());
+        let details = details_of(&html);
+        assert!(details.contains(&format!(r#"data-copy="{vtxo}""#)));
+        assert!(!details.contains("explorer-link"));
+
+        // Funded: the escrow went into the contract, whose funding output links to the chain's
+        // explorer.
+        escrowed.escrow.as_mut().unwrap().spent_into_pool = true;
+        escrowed.funding = Some(crate::domain::ContractFunding {
+            txid: "f".repeat(64),
+            vout: 2,
+            sats: Some(15_900),
+        });
+        let html = one_row_with(&escrowed, &view("c1", Phase::Live, -5), explorers);
+        let details = details_of(&html);
+        assert!(!details.contains("Escrow VTXO"));
+        assert!(details.contains("Contract funding"));
+        assert!(details.contains(&format!(r#"data-copy="{}:2""#, "f".repeat(64))));
+        assert!(details.contains(&format!(
+            r#"href="https://mempool.example/tx/{}""#,
+            "f".repeat(64)
+        )));
+        assert!(details.contains("15,900 sats"));
+
+        // Refunded: the Arkade transaction that moved the escrow out.
+        let mut refunded = LedgerEntry {
+            escrow: Some(LedgerEscrow {
+                refund: Some(EscrowRefund {
+                    id: "refund-1".into(),
+                    payment_hash: "b".repeat(64),
+                    fee_sats: 20,
+                    state: ArkRefundState::Settled,
+                    updated_at: None,
+                    ark_txid: Some("a".repeat(64)),
+                }),
+                ..escrowed.escrow.clone().unwrap()
+            }),
+            ..entry()
+        };
+        refunded.escrow.as_mut().unwrap().spent_into_pool = false;
+        let html = one_row_with(&refunded, &view("c1", Phase::Cancelled, -5), explorers);
+        let details = details_of(&html);
+        assert!(details.contains("Refund transaction"));
+        assert!(details.contains(&format!(
+            r#"href="https://ark.example/tx/{}""#,
+            "a".repeat(64)
+        )));
     }
 
     fn summary(totals: LedgerTotals) -> String {
@@ -631,17 +785,24 @@ mod tests {
                 returned: &returned,
             })
             .collect();
-        let html = entries_page(&rows, &LedgerTotals::default(), 60, None).into_string();
+        let html = entries_page(
+            &rows,
+            &LedgerTotals::default(),
+            60,
+            None,
+            Explorers::default(),
+        )
+        .into_string();
         assert!(html.contains(r##"hx-get="/entries?from=25" hx-target="#olderEntries""##));
         assert!(html.contains("Show older entries (35 more)"));
 
-        let more = older_entries(&rows, 25, 60).into_string();
+        let more = older_entries(&rows, 25, 60, Explorers::default()).into_string();
         assert_eq!(
             more.matches("<tr class=\"is-clickable\"").count(),
             PAGE_SIZE
         );
         assert!(more.contains(r#"hx-get="/entries?from=50""#));
-        let last = older_entries(&rows[..10], 50, 60).into_string();
+        let last = older_entries(&rows[..10], 50, 60, Explorers::default()).into_string();
         assert!(
             !last.contains("olderEntries"),
             "the last page has no button"
@@ -652,7 +813,14 @@ mod tests {
     fn no_entries_links_to_an_open_competition() {
         let mut open = view("next", Phase::Upcoming, 90);
         open.start = NOW.max(OffsetDateTime::now_utc()) + time::Duration::minutes(90);
-        let html = entries_page(&[], &LedgerTotals::default(), 0, Some(&open)).into_string();
+        let html = entries_page(
+            &[],
+            &LedgerTotals::default(),
+            0,
+            Some(&open),
+            Explorers::default(),
+        )
+        .into_string();
         assert!(html.contains(r#"href="/competitions/next/entry-form""#));
         assert!(html.contains("Enter the next competition"));
         assert!(!html.contains("ledgerSummary"));

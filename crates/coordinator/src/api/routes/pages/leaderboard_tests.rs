@@ -88,8 +88,17 @@ pub(super) struct Coordinator {
 
 impl Coordinator {
     pub(super) async fn start(oracle_url: String) -> Self {
+        Self::start_with(oracle_url, |_| {}).await
+    }
+
+    /// [`Self::start`], with `configure` changing the settings first.
+    pub(super) async fn start_with(
+        oracle_url: String,
+        configure: impl FnOnce(&mut Settings),
+    ) -> Self {
         let data = tempfile::tempdir().unwrap();
         let mut settings = Settings::default();
+        configure(&mut settings);
         settings.db_settings.data_folder = data.path().display().to_string();
         settings.bitcoin_settings.mock_enabled = true;
         settings.ln_settings.mock_enabled = true;

@@ -3,7 +3,7 @@
 //!
 //! Read in one query from the tables that already record it: the ticket (its price and when it
 //! was paid, and whether its hold invoice settled or was cancelled), its Arkade escrow and that
-//! escrow's refund, and the entry's latest payout.
+//! escrow's refund, the entry's latest payout, and the transaction that funded the contract.
 
 use sqlx::{sqlite::SqliteRow, Row};
 use time::OffsetDateTime;
@@ -54,6 +54,8 @@ pub struct LedgerEscrow {
     /// An operator wrote its refund off: it can never finish, and support settles it instead.
     pub written_off: bool,
     pub refund: Option<EscrowRefund>,
+    /// The escrow's VTXO, `txid:vout`. Only its owner is shown it.
+    pub vtxo: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +66,33 @@ pub struct EscrowRefund {
     pub fee_sats: u64,
     pub state: ArkRefundState,
     pub updated_at: Option<OffsetDateTime>,
+    /// The Arkade transaction that moved the escrow into the refund's swap, once submitted.
+    pub ark_txid: Option<String>,
+}
+
+/// The output that funded a competition's contract: on-chain, so public.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContractFunding {
+    pub txid: String,
+    pub vout: u32,
+    /// The output's amount, when the funding transaction is recorded.
+    pub sats: Option<u64>,
+}
+
+impl ContractFunding {
+    /// From an outpoint as the competitions table stores it, `txid:vout`.
+    pub fn parse(outpoint: &str, sats: Option<u64>) -> Option<Self> {
+        let (txid, vout) = outpoint.split_once(':')?;
+        Some(Self {
+            txid: txid.to_owned(),
+            vout: vout.parse().ok()?,
+            sats,
+        })
+    }
+
+    pub fn outpoint(&self) -> String {
+        format!("{}:{}", self.txid, self.vout)
+    }
 }
 
 /// One of a player's entries, with its money.
@@ -83,6 +112,8 @@ pub struct LedgerEntry {
     pub lightning_released_at: Option<OffsetDateTime>,
     pub escrow: Option<LedgerEscrow>,
     pub payout: Option<LedgerPayout>,
+    /// The output that funded the competition's contract, once its funding was broadcast.
+    pub funding: Option<ContractFunding>,
 }
 
 /// What came back for an entry.
@@ -303,16 +334,26 @@ impl CompetitionStore {
                    t.settled_at IS NOT NULL AS settled,
                    unixepoch(t.invoice_cancelled_at) AS released_at,
                    a.vtxo_sats AS escrow_sats, a.escrow_tap_tree AS escrow_tap_tree,
+                   a.vtxo_outpoint AS escrow_vtxo,
                    f.commitment_tx IS NOT NULL AS spent_into_pool,
                    w.ticket_id IS NOT NULL AS written_off,
                    r.refund_id AS refund_id, r.payment_hash AS refund_payment_hash,
                    r.fee_sats AS refund_fee_sats, r.state AS refund_state,
-                   r.updated_at AS refund_updated_at,
+                   r.updated_at AS refund_updated_at, r.ark_txid AS refund_ark_txid,
                    p.id AS payout_id, p.payout_amount_sats AS payout_sats,
                    unixepoch(p.initiated_at) AS payout_initiated_at,
                    p.succeed_at IS NOT NULL AS payout_settled,
                    unixepoch(p.succeed_at) AS payout_settled_at,
-                   p.failed_at IS NOT NULL AS payout_failed
+                   p.failed_at IS NOT NULL AS payout_failed,
+                   CASE WHEN c.funding_broadcasted_at IS NOT NULL
+                       THEN json_extract(c.funding_outpoint, '$') END AS funding_outpoint,
+                   -- The funding output's amount, from the transaction's JSON: `txid:vout`
+                   -- puts the vout after the 64-character txid and its colon.
+                   CASE WHEN c.funding_broadcasted_at IS NOT NULL THEN json_extract(
+                       c.funding_transaction,
+                       '$.output[' || CAST(substr(json_extract(c.funding_outpoint, '$'), 66)
+                           AS INTEGER) || '].value'
+                   ) END AS funding_sats
             FROM entries e
             JOIN competitions c ON c.id = e.event_id
             JOIN tickets t ON t.id = e.ticket_id
@@ -389,6 +430,7 @@ fn ledger_entry(row: &SqliteRow) -> Result<LedgerEntry, sqlx::Error> {
             fee_sats: sats(row, "refund_fee_sats")?.unwrap_or_default(),
             state: row.try_get::<String, _>("refund_state")?.parse()?,
             updated_at: unix(row, "refund_updated_at")?,
+            ark_txid: row.try_get("refund_ark_txid")?,
         }),
         None => None,
     };
@@ -410,6 +452,7 @@ fn ledger_entry(row: &SqliteRow) -> Result<LedgerEntry, sqlx::Error> {
                 spent_into_pool,
                 written_off,
                 refund,
+                vtxo: row.try_get("escrow_vtxo")?,
             })
         }
         None => None,
@@ -441,6 +484,10 @@ fn ledger_entry(row: &SqliteRow) -> Result<LedgerEntry, sqlx::Error> {
         lightning_released_at: unix(row, "released_at")?,
         escrow,
         payout,
+        funding: match row.try_get::<Option<String>, _>("funding_outpoint")? {
+            Some(outpoint) => ContractFunding::parse(&outpoint, sats(row, "funding_sats")?),
+            None => None,
+        },
     })
 }
 
@@ -608,8 +655,9 @@ mod tests {
         run(
             database,
             "INSERT INTO ticket_ark_escrows (ticket_id, ticket_hash, escrow_tap_tree,
-                 escrow_address, vtxo_sats, funded_at)
-             VALUES (?1, 'hash-' || ?1, ?2, 'tark1escrow', 5300, 1756720800)",
+                 escrow_address, vtxo_outpoint, vtxo_sats, funded_at)
+             VALUES (?1, 'hash-' || ?1, ?2, 'tark1escrow', 'vtxo-' || ?1 || ':1', 5300,
+                 1756720800)",
             vec![ticket.to_owned(), escrow_tap_tree(refund_at)],
         )
         .await;
@@ -648,8 +696,8 @@ mod tests {
         run(
             &database,
             "INSERT INTO ticket_ark_refunds (ticket_id, refund_id, invoice, payment_hash,
-                 fee_sats, state, created_at, updated_at)
-             VALUES (?, 'refund-1', 'lnbc1refund', 'refund-hash', 20, 'settled',
+                 fee_sats, state, ark_txid, created_at, updated_at)
+             VALUES (?, 'refund-1', 'lnbc1refund', 'refund-hash', 20, 'settled', 'ark-refund-tx',
                  1788436000, 1788436800)",
             vec![refunded_ticket],
         )
@@ -734,9 +782,11 @@ mod tests {
             ("refund-1", 20, ArkRefundState::Settled)
         );
         assert_eq!(refund.updated_at, Some(at(1_788_436_800)));
+        assert_eq!(refund.ark_txid.as_deref(), Some("ark-refund-tx"));
 
         let locked = by_id(&locked).escrow.as_ref().unwrap();
         assert_eq!(locked.opens_at, Some(opens));
+        assert_eq!(locked.vtxo, Some(format!("vtxo-{locked_ticket}:1")));
         assert!(!locked.spent_into_pool && !locked.written_off && locked.refund.is_none());
 
         let released = by_id(&released);
@@ -775,6 +825,60 @@ mod tests {
         assert!(store.player_ledger("nobody").await.unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn an_entry_carries_its_contract_funding_once_broadcast() {
+        use bitcoin::{
+            absolute::LockTime, transaction::Version, Amount, OutPoint, ScriptBuf, Transaction,
+            TxOut,
+        };
+        let (store, database, _directory) = store().await;
+        let event = competition(&store, 1).await;
+        entry(&database, event, PLAYER).await;
+        let output = |sats| TxOut {
+            value: Amount::from_sat(sats),
+            script_pubkey: ScriptBuf::new(),
+        };
+        let commitment = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![output(330), output(15_000)],
+        };
+        let funding = OutPoint::new(commitment.compute_txid(), 1);
+        run(
+            &database,
+            "UPDATE competitions SET funding_outpoint = ?, funding_transaction = ? WHERE id = ?",
+            vec![
+                serde_json::to_string(&funding).unwrap(),
+                serde_json::to_string(&commitment).unwrap(),
+                event.to_string(),
+            ],
+        )
+        .await;
+        // Not shown before the funding is broadcast.
+        assert_eq!(store.player_ledger(PLAYER).await.unwrap()[0].funding, None);
+
+        run(
+            &database,
+            "UPDATE competitions SET funding_broadcasted_at = datetime('now') WHERE id = ?",
+            vec![event.to_string()],
+        )
+        .await;
+        let funding_read = store.player_ledger(PLAYER).await.unwrap()[0]
+            .funding
+            .clone()
+            .unwrap();
+        assert_eq!(
+            funding_read,
+            ContractFunding {
+                txid: commitment.compute_txid().to_string(),
+                vout: 1,
+                sats: Some(15_000),
+            }
+        );
+        assert_eq!(funding_read.outpoint(), funding.to_string());
+    }
+
     fn paid() -> LedgerEntry {
         LedgerEntry {
             entry_id: "e".into(),
@@ -792,6 +896,7 @@ mod tests {
             lightning_released_at: None,
             escrow: None,
             payout: None,
+            funding: None,
         }
     }
 
@@ -834,6 +939,7 @@ mod tests {
                 spent_into_pool: false,
                 written_off: false,
                 refund: None,
+                vtxo: None,
             }),
             ..paid()
         };
@@ -878,6 +984,7 @@ mod tests {
             fee_sats: 20,
             state: ArkRefundState::Submitted,
             updated_at: Some(now),
+            ark_txid: None,
         });
         assert_eq!(state(&refunding, now), RefundState::Refunding);
         refunding

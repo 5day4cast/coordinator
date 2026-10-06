@@ -274,6 +274,11 @@ pub struct ArkSettings {
     /// `ark-swapd`'s URL.
     #[serde(default)]
     pub swap_url: String,
+    /// Optional public Arkade explorer for the server's network. A player's entries link their
+    /// escrow VTXO and refund transaction to `<url>/tx/<txid>`; without one they show the IDs
+    /// to copy.
+    #[serde(default)]
+    pub explorer_url: Option<String>,
     /// A file holding `ark-swapd`'s bearer token.
     #[serde(default)]
     pub swap_token_file: String,
@@ -930,7 +935,9 @@ pub struct BitcoinSettings {
     /// Electrum server (electrs) used for chain lookups LND cannot answer,
     /// such as escrow and outcome transactions: "tcp://host:50001" or "ssl://host:50002"
     pub electrum_url: String,
-    /// Optional block explorer linked from the admin wallet page
+    /// Optional public block explorer, such as `https://mempool.space`. The admin pages link
+    /// transactions to `<url>/tx/<txid>`, and so do players' entries and leaderboards for a
+    /// contract's funding transaction, so it must be reachable by players.
     #[serde(default)]
     pub explorer_url: Option<String>,
     /// Path to the coordinator's private key (can be the same as the nostr private key file).
