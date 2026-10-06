@@ -130,6 +130,7 @@ pub fn entry_form(
                         @if let Some(rule) = competition.prize_rule() {
                             span class="fact-note prize-note" { (rule) }
                         }
+                        span class="fact-note prize-note" { "Ties go to the earliest entry" }
                     }
                 }
                 div {
@@ -560,7 +561,7 @@ mod tests {
     fn entry_form_shows_what_first_place_wins() {
         let html = form(PayoutDestination::LoggedOut);
         assert!(
-            html.contains("<dt>Prizes</dt><dd>15,000 sats</dd>"),
+            html.contains(r#"<dt>Prizes</dt><dd>15,000 sats<span class="fact-note prize-note">Ties go to the earliest entry</span></dd>"#),
             "{html}"
         );
         let mut two = view("c1", Phase::Upcoming, 60);
@@ -598,6 +599,7 @@ mod tests {
         assert!(html.contains("20 seats · 17 left"), "{html}");
         assert!(html.contains("1st 70% · 2nd 30%"));
         assert!(html.contains("Under 10 players: winner takes all"));
+        assert!(html.contains("Ties go to the earliest entry"));
         assert!(html.contains("Up to 20 players, all in one pool"));
         // Three players so far: first place takes their whole pot.
         assert!(html.contains("<dd>15,000 sats"));
@@ -773,7 +775,7 @@ mod tests {
             html.contains(r#"data-tip="Players are split into pools of up to 25 at the start.""#)
         );
         // Forty entries make two pools of twenty: each winner takes 100,000 sats.
-        assert!(html.contains("<dd>100,000 sats</dd>"), "{html}");
+        assert!(html.contains("<dd>100,000 sats<"), "{html}");
         assert!(html.contains("pool&#39;s winner") || html.contains("pool's winner"));
         assert!(!html.contains(" of 3"));
         assert!(html.contains(r#"data-kind="queued""#));
