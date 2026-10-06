@@ -63,6 +63,13 @@ impl Coordinator {
             self.start_pools(competition.id).await;
             return Ok(Step::Finished);
         }
+        if self
+            .cancel_unstarted_for_settle_only(&competition, lease)
+            .await
+            .map_err(|e| anyhow!("Cannot cancel queued competition: {e:#}"))?
+        {
+            return Ok(Step::Finished);
+        }
         let now = OffsetDateTime::now_utc();
         let close = competition.event_submission.start_observation_date;
         if now < close {

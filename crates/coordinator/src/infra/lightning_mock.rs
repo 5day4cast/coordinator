@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use super::lightning::{
     extract_payment_hash_from_invoice, InvoiceAddResponse, InvoiceLookupResponse, InvoiceState,
-    InvoiceUpdate, Ln, PaymentLookupResponse, PaymentNotFound, PaymentUpdate,
+    InvoiceUpdate, Ln, PaymentLookupResponse, PaymentNotFound, PaymentUpdate, SentPayment,
 };
 use crate::domain::PaymentStatus;
 
@@ -42,6 +42,8 @@ pub struct MockLnClient {
     preimages: Arc<RwLock<HashMap<String, String>>>,
     /// Payments sent, so a test can tell a resumed payout or refund never paid twice.
     sent: Arc<std::sync::atomic::AtomicUsize>,
+    /// Every payment sent, as LND's payment history lists it.
+    history: Arc<RwLock<Vec<SentPayment>>>,
     auto_accept_delay: Option<Duration>,
     invoice_counter: Arc<RwLock<u64>>,
     /// Senders for invoice update subscriptions
@@ -64,6 +66,7 @@ impl MockLnClient {
             payments: Arc::new(RwLock::new(HashMap::new())),
             preimages: Arc::new(RwLock::new(HashMap::new())),
             sent: Arc::default(),
+            history: Arc::default(),
             auto_accept_delay: None,
             invoice_counter: Arc::new(RwLock::new(0)),
             invoice_subscribers: Arc::new(RwLock::new(Vec::new())),
@@ -78,6 +81,7 @@ impl MockLnClient {
             payments: Arc::new(RwLock::new(HashMap::new())),
             preimages: Arc::new(RwLock::new(HashMap::new())),
             sent: Arc::default(),
+            history: Arc::default(),
             auto_accept_delay: Some(delay),
             invoice_counter: Arc::new(RwLock::new(0)),
             invoice_subscribers: Arc::new(RwLock::new(Vec::new())),
@@ -248,6 +252,32 @@ impl MockLnClient {
             state: InvoiceState::Accepted,
             amt_paid_sat: Some(invoice.value_sats),
         })
+    }
+
+    /// An invoice for `payment_hash_hex`, as a payee would issue it; nothing is stored.
+    pub fn invoice_for_hash(
+        &self,
+        value_sats: u64,
+        payment_hash_hex: &str,
+    ) -> anyhow::Result<String> {
+        self.generate_mock_invoice(value_sats, payment_hash_hex)
+    }
+
+    /// Record what LND knows of a payment, as if this node had sent it.
+    pub fn set_payment(
+        &self,
+        payment_hash_hex: &str,
+        status: PaymentStatus,
+        preimage: Option<String>,
+    ) -> anyhow::Result<()> {
+        self.record_payment_status(payment_hash_hex.to_owned(), status)?;
+        if let Some(preimage) = preimage {
+            self.preimages
+                .write()
+                .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?
+                .insert(payment_hash_hex.to_owned(), preimage);
+        }
+        Ok(())
     }
 
     fn store_invoice(&self, invoice: MockInvoice) -> anyhow::Result<()> {
@@ -560,6 +590,17 @@ impl Ln for MockLnClient {
         self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         self.record_payment_status(payment_hash_hex.clone(), PaymentStatus::Succeeded)?;
+        self.history
+            .write()
+            .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?
+            .push(SentPayment {
+                payment_hash: payment_hash_hex.clone(),
+                payment_request: payout_payment_request.clone(),
+                value_sat: amount_sats,
+                status: PaymentStatus::Succeeded,
+                creation_time_ns: u64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos())
+                    .unwrap_or_default(),
+            });
         if let Ok(invoice) = payout_payment_request.parse::<lightning_invoice::Bolt11Invoice>() {
             let secret = invoice.payment_secret().0;
             if hex::encode(sha256::Hash::hash(&secret).to_byte_array()) == payment_hash_hex {
@@ -592,6 +633,20 @@ impl Ln for MockLnClient {
     ) -> Result<(), anyhow::Error> {
         self.send_payment(invoice, amount_sats, timeout_seconds, fee_limit_sat)
             .await
+    }
+
+    async fn payments_since(&self, since: i64) -> anyhow::Result<Vec<SentPayment>> {
+        let since_ns = u64::try_from(since.max(0))
+            .unwrap_or_default()
+            .saturating_mul(1_000_000_000);
+        Ok(self
+            .history
+            .read()
+            .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?
+            .iter()
+            .filter(|payment| payment.creation_time_ns >= since_ns)
+            .cloned()
+            .collect())
     }
 
     async fn subscribe_invoices(&self) -> Result<mpsc::Receiver<InvoiceUpdate>, anyhow::Error> {

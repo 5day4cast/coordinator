@@ -60,6 +60,15 @@ to write one off.
 entries. Once an entry is paid the coordinator refuses, and the competition runs its course; a
 competition that fails or never fills is cancelled and refunded by the coordinator itself.
 
+```sh
+# Lightning payouts held after a restore: LND made a payment the database does not know, for an
+# amount the entry could be owed (see disaster-recovery.md). --all includes released ones.
+coordinator admin payout-holds list
+coordinator admin payout-holds list --all --json
+# Release one once LND's payment is known not to be this entry's; the coordinator then pays it.
+coordinator admin payout-holds release <entry-id> --yes
+```
+
 The commands use these operator-listener endpoints, which scripts may call directly with the same
 bearer token:
 
@@ -70,6 +79,8 @@ bearer token:
 | `POST` | `/api/v1/competitions` | create (JSON `CreateEvent`) |
 | `DELETE` | `/api/v1/admin/competitions/{id}` | delete a competition with no paid entries |
 | `POST` | `/api/v1/admin/refunds/write-off` | write off escrow refunds (JSON `ticket_id` or `competition_id`, `reason`, `force`) |
+| `GET` | `/api/v1/admin/payout-holds` | held Lightning payouts; `?all=true` includes released ones |
+| `POST` | `/api/v1/admin/payout-holds/{entry_id}/release` | release an entry's held payout |
 
 ## `synth`
 

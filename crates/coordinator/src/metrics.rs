@@ -123,6 +123,27 @@ pub static ARKADE_UNAVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
     .expect("valid metric")
 });
 
+/// Whether the coordinator runs in settle-only mode (1) or takes new money (0). Set at start
+/// (`Coordinator::with_settle_only`).
+pub static SETTLE_ONLY: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "coordinator_settle_only",
+        "Whether the coordinator settles what it owes and takes no new competitions, tickets or entries",
+    )
+    .expect("valid metric")
+});
+
+/// Lightning payouts held for an operator because LND reported a payment the database has no
+/// record of, for an amount the entry could be owed. Set by the restore reconciliation and when
+/// a hold is released.
+pub static PAYOUT_HOLDS: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "coordinator_payout_holds",
+        "Lightning payouts held until an operator checks a payment LND made that the database does not know",
+    )
+    .expect("valid metric")
+});
+
 /// Whether the LND invoice subscription is connected (1) or not (0). While it is not, the
 /// invoice watcher polls at its fallback interval. Set by `SubscriptionHealth`.
 pub static LN_INVOICE_SUBSCRIPTION_UP: LazyLock<IntGauge> = LazyLock::new(|| {
@@ -418,6 +439,8 @@ impl Metrics {
         metrics
             .registry
             .register(Box::new(ARKADE_UNAVAILABLE.clone()))?;
+        metrics.registry.register(Box::new(SETTLE_ONLY.clone()))?;
+        metrics.registry.register(Box::new(PAYOUT_HOLDS.clone()))?;
         metrics
             .registry
             .register(Box::new(LN_INVOICE_SUBSCRIPTION_UP.clone()))?;
@@ -638,6 +661,8 @@ mod tests {
             "coordinator_payout_send_failures_total",
             "coordinator_competition_step_failures_total",
             "coordinator_arkade_unavailable",
+            "coordinator_settle_only",
+            "coordinator_payout_holds",
             "coordinator_escrow_subscription_up",
             "coordinator_escrow_subscription_escrows",
             "coordinator_entry_form_unavailable",

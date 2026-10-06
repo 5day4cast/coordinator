@@ -1,4 +1,5 @@
 use super::*;
+use crate::domain::{PaymentStatus, PayoutError};
 use crate::{
     config::KeymeldSettings,
     infra::{
@@ -366,6 +367,7 @@ struct UnpaidWinners {
     competition: Competition,
     contract: SignedContract,
     broadcasts: Arc<Mutex<Vec<Transaction>>>,
+    ln: MockLnClient,
 }
 
 impl UnpaidWinners {
@@ -414,11 +416,12 @@ impl UnpaidWinners {
         )
         .await
         .unwrap();
+        let ln = MockLnClient::new();
         let coordinator = Coordinator::new(
             Arc::new(MockOracle::new([12; 32])),
             CompetitionStore::new(database.clone()),
             Arc::new(chain),
-            Arc::new(MockLnClient::new()),
+            Arc::new(ln.clone()),
             Arc::new(MockLnurlPay::new(bitcoin::Network::Regtest)),
             Arc::new(
                 KeymeldService::new(KeymeldSettings::default(), Uuid::now_v7(), &[1; 32]).unwrap(),
@@ -516,6 +519,7 @@ impl UnpaidWinners {
             competition,
             contract,
             broadcasts,
+            ln,
         }
     }
 
@@ -868,4 +872,334 @@ async fn an_attestation_past_expiry_must_still_open_an_outcome() {
         Outcome::Attestation(0)
     );
     fixture.database.close().await.unwrap();
+}
+
+/// Settle-only mode stops no settlement: the unpaid winners' split outputs are reclaimed as
+/// usual and the competition completes.
+#[tokio::test]
+async fn settle_only_mode_still_reclaims_unpaid_winners() {
+    let mut settlement = UnpaidWinners::new(
+        Amount::from_sat(10_000),
+        HashMap::from([(1, 60.0), (ECONOMY_FEE_TARGET, LND_FLOOR_SAT_PER_VB)]),
+    )
+    .await;
+    settlement.coordinator.settle_only = SettleOnly {
+        enabled: true,
+        unstarted: crate::config::SettleOnlyUnstarted::Refund,
+    };
+
+    let status = settlement
+        .coordinator
+        .process_status(CompetitionStatus::from(settlement.competition.clone()))
+        .await;
+    assert_eq!(status.state_name(), "completed");
+    assert_eq!(settlement.broadcasts().len(), 3);
+    for entry in settlement.entries().await {
+        assert!(entry.reclaimed_broadcasted_at.is_some());
+    }
+    settlement.database.close().await.unwrap();
+}
+
+/// A coordinator whose chain answers every broadcast with an error, as for a transaction it
+/// already holds, and that lists `known` as on chain.
+async fn behind_the_chain(
+    market_maker: Scalar,
+    known: Option<Transaction>,
+) -> (tempfile::TempDir, DBConnection, Coordinator) {
+    let mut chain = MockChain::new();
+    chain
+        .expect_get_derived_private_key()
+        .returning(move || Ok(market_maker));
+    chain
+        .expect_broadcast()
+        .returning(|_| Err(anyhow!("transaction already in block chain")));
+    chain.expect_get_raw_transaction().returning(move |txid| {
+        known
+            .clone()
+            .filter(|tx| tx.compute_txid() == *txid)
+            .ok_or_else(|| anyhow!("transaction not found"))
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let database = DBConnection::new(
+        directory.path().to_str().unwrap(),
+        "competitions",
+        DatabasePoolConfig::default(),
+        DatabaseType::Competitions,
+    )
+    .await
+    .unwrap();
+    let coordinator = Coordinator::new(
+        Arc::new(MockOracle::new([12; 32])),
+        CompetitionStore::new(database.clone()),
+        Arc::new(chain),
+        Arc::new(MockLnClient::new()),
+        Arc::new(MockLnurlPay::new(bitcoin::Network::Regtest)),
+        Arc::new(
+            KeymeldService::new(KeymeldSettings::default(), Uuid::now_v7(), &[1; 32]).unwrap(),
+        ),
+        None,
+        72,
+        1,
+        "restore-test".into(),
+        false,
+        1,
+    )
+    .await
+    .unwrap();
+    (directory, database, coordinator)
+}
+
+/// An attested competition whose outcome transaction the database has not recorded.
+fn attested(contract: &SignedContract) -> Competition {
+    let now = OffsetDateTime::now_utc();
+    let mut competition = Competition::new(&CreateEvent {
+        id: Uuid::now_v7(),
+        signing_date: now - time::Duration::hours(5),
+        start_observation_date: now - time::Duration::hours(7),
+        end_observation_date: now - time::Duration::hours(6),
+        locations: vec!["KDEN".into()],
+        number_of_values_per_entry: 3,
+        number_of_places_win: 3,
+        total_allowed_entries: 3,
+        entry_fee: 1_000,
+        coordinator_fee: crate::domain::CoordinatorFee::whole_percent(0),
+        total_competition_pool: 100_000,
+        relative_locktime_block_delta: Some(72),
+        unlisted: false,
+        scoring_rules: None,
+        scoring_fields: None,
+        max_entries_per_player: 1,
+    });
+    competition.event_announcement = Some(contract.params().event.clone());
+    competition.attestation = Some(Scalar::from_slice(&[10; 32]).unwrap().into());
+    competition.signed_contract = Some(contract.clone());
+    competition
+}
+
+/// The database is behind the chain: it was restored from before the outcome transaction was
+/// broadcast, and the chain already holds it. The broadcast is refused, the chain lists the very
+/// transaction, so it is recorded as broadcast and settlement moves on. A transaction the chain
+/// does not hold still fails, and nothing is recorded.
+#[tokio::test]
+async fn an_outcome_transaction_already_on_chain_counts_as_broadcast() {
+    let (contract, market_maker, _) = signed_contract();
+    let attestation = Scalar::from_slice(&[10; 32]).unwrap();
+    let outcome_tx = contract.signed_outcome_tx(0, attestation).unwrap();
+
+    let (_directory, database, coordinator) =
+        behind_the_chain(market_maker, Some(outcome_tx.clone())).await;
+    let mut competition = attested(&contract);
+    coordinator
+        .publish_outcome_transaction(&mut competition)
+        .await
+        .unwrap();
+    assert!(competition.outcome_broadcasted_at.is_some());
+    assert_eq!(competition.outcome_transaction, Some(outcome_tx.clone()));
+    // Once recorded, it is not broadcast again.
+    coordinator
+        .publish_outcome_transaction(&mut competition)
+        .await
+        .unwrap();
+    database.close().await.unwrap();
+
+    let (_directory, database, coordinator) = behind_the_chain(market_maker, None).await;
+    let mut competition = attested(&contract);
+    assert!(coordinator
+        .publish_outcome_transaction(&mut competition)
+        .await
+        .is_err());
+    assert!(competition.outcome_broadcasted_at.is_none());
+    database.close().await.unwrap();
+}
+
+/// The unpaid winners as a contract not yet split: their Lightning payouts are still open.
+async fn unsplit_winners() -> (UnpaidWinners, u64) {
+    let mut settlement = UnpaidWinners::new(
+        Amount::from_sat(100_000),
+        HashMap::from([(1, 2.0), (ECONOMY_FEE_TARGET, 1.0)]),
+    )
+    .await;
+    settlement.competition.delta_broadcasted_at = None;
+    settlement
+        .coordinator
+        .competition_store
+        .update_competitions(vec![settlement.competition.clone()])
+        .await
+        .unwrap();
+    let entry = settlement.entries().await.remove(0);
+    let owed = winner_payout_sats(
+        settlement.contract.params(),
+        &Outcome::Attestation(0),
+        &entry.ephemeral_pubkey.parse::<Point>().unwrap(),
+    )
+    .unwrap();
+    (settlement, owed)
+}
+
+/// The database is behind LND: it was restored from before a payout was recorded, and LND paid
+/// it. The payment's hash is unknown and its amount is what each winner is owed, so every such
+/// winner's Lightning payout is held rather than paid again. A payment the database knows holds
+/// nothing. Reconciling again changes nothing, and a released hold stays released.
+#[tokio::test]
+async fn a_payment_lnd_made_that_the_database_lost_holds_the_payouts_it_could_be() {
+    let (settlement, owed) = unsplit_winners().await;
+    let coordinator = &settlement.coordinator;
+    let store = &coordinator.competition_store;
+    let entries = settlement.entries().await;
+
+    // A payout the database knows, which LND paid.
+    let known = settlement
+        .ln
+        .add_invoice(owed, 3_600, "known".into(), Uuid::now_v7())
+        .await
+        .unwrap()
+        .payment_request;
+    store
+        .store_payout_info_pending(
+            entries[2].id,
+            hex::encode([3; 32]),
+            "key".into(),
+            known.clone(),
+            owed,
+        )
+        .await
+        .unwrap();
+    settlement
+        .ln
+        .send_payment(known, owed, 60, 1_000)
+        .await
+        .unwrap();
+    let found = coordinator.reconcile_after_restore().await.unwrap();
+    assert_eq!(found, RestoreReconciliation::default());
+    for entry in &entries {
+        assert!(!store.payout_held(entry.id).await.unwrap());
+    }
+
+    // A payout recorded after the backup was taken: LND paid it, the database has no row.
+    let lost = settlement
+        .ln
+        .add_invoice(owed, 3_600, "lost".into(), Uuid::now_v7())
+        .await
+        .unwrap()
+        .payment_request;
+    settlement
+        .ln
+        .send_payment(lost, owed, 60, 1_000)
+        .await
+        .unwrap();
+    // Only the winners owed exactly that amount are held, and not the one whose payout the
+    // database knows is under way.
+    let owed_that = |entry: &UserEntry| {
+        entry.id != entries[2].id
+            && winner_payout_sats(
+                settlement.contract.params(),
+                &Outcome::Attestation(0),
+                &entry.ephemeral_pubkey.parse::<Point>().unwrap(),
+            )
+            .unwrap()
+                == owed
+    };
+    let matching: Vec<&UserEntry> = entries.iter().filter(|e| owed_that(e)).collect();
+    assert!(
+        matching.len() >= 2,
+        "{} winners owed {owed}",
+        matching.len()
+    );
+    let found = coordinator.reconcile_after_restore().await.unwrap();
+    assert_eq!(found.payouts_held, matching.len());
+    for entry in &entries {
+        assert_eq!(
+            store.payout_held(entry.id).await.unwrap(),
+            owed_that(entry),
+            "{}",
+            entry.id
+        );
+    }
+    assert!(matches!(
+        coordinator
+            .verify_payout_release(
+                &entries[0].pubkey,
+                settlement.competition.id,
+                entries[0].id,
+                entries[0].ticket_id,
+                "key",
+                &hex::encode([1; 32]),
+            )
+            .await,
+        Err(Error::Conflict(_))
+    ));
+
+    assert_eq!(
+        coordinator.reconcile_after_restore().await.unwrap(),
+        RestoreReconciliation::default(),
+        "reconciling again holds nothing new"
+    );
+    assert_eq!(
+        coordinator
+            .release_payout_hold(entries[0].id)
+            .await
+            .unwrap(),
+        1
+    );
+    coordinator.reconcile_after_restore().await.unwrap();
+    assert!(!store.payout_held(entries[0].id).await.unwrap());
+    assert!(store.payout_held(matching[1].id).await.unwrap());
+    assert_eq!(
+        coordinator.payout_holds(false).await.unwrap().len(),
+        matching.len() - 1
+    );
+    assert_eq!(
+        coordinator.payout_holds(true).await.unwrap().len(),
+        matching.len()
+    );
+    settlement.database.close().await.unwrap();
+}
+
+/// The database is behind LND: it recorded a payout as failed, and LND paid it. It is marked
+/// paid with LND's proof, so the entry is not paid again, and reconciling again changes nothing.
+#[tokio::test]
+async fn a_failed_payout_lnd_paid_is_marked_paid() {
+    let (settlement, owed) = unsplit_winners().await;
+    let coordinator = &settlement.coordinator;
+    let store = &coordinator.competition_store;
+    let entry = settlement.entries().await.remove(0);
+
+    let proof = [4; 32];
+    let hash = hex::encode(sha256::Hash::hash(&proof).to_byte_array());
+    let invoice = settlement.ln.invoice_for_hash(owed, &hash).unwrap();
+    let payout = store
+        .store_payout_info_pending(entry.id, hex::encode([1; 32]), "key".into(), invoice, owed)
+        .await
+        .unwrap();
+    assert!(store
+        .mark_payout_failed(
+            payout,
+            OffsetDateTime::now_utc(),
+            PayoutError::FailedToPayOut("timed out".into()),
+        )
+        .await
+        .unwrap());
+    settlement
+        .ln
+        .set_payment(&hash, PaymentStatus::Succeeded, Some(hex::encode(proof)))
+        .unwrap();
+
+    let found = coordinator.reconcile_after_restore().await.unwrap();
+    assert_eq!(found.payouts_marked_paid, 1);
+    assert_eq!(found.payouts_held, 0);
+    let payout = store.get_payout(payout).await.unwrap().unwrap();
+    assert!(payout.succeed_at.is_some() && payout.failed_at.is_none());
+    assert_eq!(payout.payment_preimage, Some(hex::encode(proof)));
+    let entry = settlement
+        .entries()
+        .await
+        .into_iter()
+        .find(|e| e.id == entry.id)
+        .unwrap();
+    assert!(entry.paid_out_at.is_some());
+    assert_eq!(
+        coordinator.reconcile_after_restore().await.unwrap(),
+        RestoreReconciliation::default()
+    );
+    settlement.database.close().await.unwrap();
 }

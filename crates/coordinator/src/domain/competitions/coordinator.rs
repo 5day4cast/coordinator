@@ -14,6 +14,10 @@ mod network_fee;
 mod queued_coordinator;
 #[path = "queued_kickoff.rs"]
 mod queued_kickoff;
+#[path = "restore_reconcile.rs"]
+mod restore_reconcile;
+#[path = "settle_only.rs"]
+mod settle_only;
 #[path = "settled_outputs.rs"]
 mod settled_outputs;
 pub use ark_coordinator::{ARK_SWAP_BOARDS_EVERY, SWAPS_UNAVAILABLE};
@@ -23,6 +27,8 @@ pub use network_fee::{
     network_fee_sats, NetworkFeeQuote, TicketPrice, ARKADE_UNAVAILABLE, ENTRIES_PAUSED,
     FEE_ESTIMATE_UNAVAILABLE,
 };
+pub use restore_reconcile::{PayoutHold, Reconciled, RestoreReconciliation};
+pub use settle_only::{SettleOnly, SETTLE_ONLY_PAUSED};
 
 use super::{
     parse_invoice,
@@ -272,6 +278,10 @@ pub struct Coordinator {
     pub(super) escrow_watch: escrow_watch::EscrowWatch,
     /// One ticket request at a time per competition and player (`lock_ticket_request`).
     ticket_requests: TicketRequestLocks,
+    /// Settle what is owed and take no new money; off until `with_settle_only`.
+    settle_only: SettleOnly,
+    /// Whether the reconciliation at start has run, which payouts wait for.
+    reconciled: Reconciled,
 }
 
 type TicketRequestLocks =
@@ -338,6 +348,8 @@ impl Coordinator {
             reported: super::Reported::default(),
             escrow_watch: Default::default(),
             ticket_requests: TicketRequestLocks::default(),
+            settle_only: SettleOnly::default(),
+            reconciled: Reconciled::default(),
         };
         coordinator.validate_coordinator_metadata().await?;
         Ok(coordinator)
@@ -2237,7 +2249,7 @@ impl Coordinator {
             funding_transaction
         );
 
-        self.bitcoin.broadcast(&funding_transaction).await?;
+        self.broadcast_or_known(&funding_transaction).await?;
         info!(
             "Competition {} funding tx broadcast: txid={}",
             competition.id,
@@ -2382,7 +2394,7 @@ impl Coordinator {
         })?;
         // Repeating this exact transaction after an uncertain response is safe;
         // only a successful broadcast selects and persists the expiry outcome.
-        self.bitcoin.broadcast(&expiry_tx).await?;
+        self.broadcast_or_known(&expiry_tx).await?;
         let now = OffsetDateTime::now_utc();
         info!(
             "Competition {} expired unattested; expiry tx broadcast: txid={}",
@@ -2450,7 +2462,7 @@ impl Coordinator {
         debug!("Transaction ID: {}", outcome_tx.compute_txid());
         competition.outcome_transaction = Some(outcome_tx.clone());
         if competition.outcome_broadcasted_at.is_none() {
-            self.bitcoin.broadcast(&outcome_tx).await?;
+            self.broadcast_or_known(&outcome_tx).await?;
             info!(
                 "Competition {} outcome tx broadcast: txid={}",
                 competition.id,
@@ -2484,7 +2496,7 @@ impl Coordinator {
 
                 if competition.expiry_broadcasted_at.is_none() {
                     debug!("expiry_tx: {:?}", expiry_tx);
-                    self.bitcoin.broadcast(&expiry_tx).await?;
+                    self.broadcast_or_known(&expiry_tx).await?;
                     info!(
                         "Competition {} expiry tx broadcast: txid={}",
                         competition.id,
@@ -2739,7 +2751,7 @@ impl Coordinator {
                     "Competition {} broadcasting unified close tx",
                     competition.id
                 );
-                self.bitcoin.broadcast(&close_tx).await?;
+                self.broadcast_or_known(&close_tx).await?;
                 info!(
                     "Competition {} unified close tx broadcast: txid={}",
                     competition.id,
@@ -2850,7 +2862,7 @@ impl Coordinator {
                     .signed_split_tx(&win_cond, ticket_preimage)
                     .map_err(|e| anyhow!("Failed to build signed split TX: {}", e))?;
 
-                self.bitcoin.broadcast(&split_tx).await?;
+                self.broadcast_or_known(&split_tx).await?;
                 info!(
                     "Competition {} split tx broadcast: txid={}",
                     competition.id,
@@ -2931,7 +2943,7 @@ impl Coordinator {
                     winner_seckey,
                 )?;
 
-                self.bitcoin.broadcast(&close_tx).await?;
+                self.broadcast_or_known(&close_tx).await?;
                 info!(
                     "Competition {} split-close tx broadcast for player {}: txid={}",
                     competition.id,
@@ -3148,7 +3160,7 @@ impl Coordinator {
                     self.private_key,
                 )?;
 
-                self.bitcoin.broadcast(&reclaim_tx).await?;
+                self.broadcast_or_known(&reclaim_tx).await?;
                 info!(
                     "Competition {} split-reclaim tx broadcast for player {}: txid={}",
                     competition.id,
@@ -3313,6 +3325,7 @@ impl Coordinator {
         &self,
         mut create_event: CreateEvent,
     ) -> Result<Competition, Error> {
+        self.require_new_money_allowed()?;
         // New competitions score against the oracle's lines unless they ask for fixed rules.
         create_event
             .scoring_rules
@@ -3500,6 +3513,7 @@ impl Coordinator {
         btc_pubkey: BitcoinPublicKey,
         payout: Option<coordinator_core::PayoutRegistrationRequest>,
     ) -> Result<TicketResponse, Error> {
+        self.require_new_money_allowed()?;
         let _one_at_a_time = self.lock_ticket_request(competition_id, &pubkey).await;
         let competition = self
             .competition_store
@@ -3925,6 +3939,7 @@ impl Coordinator {
     }
 
     pub async fn add_entry(&self, pubkey: String, mut entry: AddEntry) -> Result<UserEntry, Error> {
+        self.require_new_money_allowed()?;
         let competition = self
             .competition_store
             .get_competition(entry.event_id)
@@ -4649,6 +4664,11 @@ impl Coordinator {
                 "Entry {} already paid out at {}",
                 entry.id, paid_out_at
             )));
+        }
+        if self.competition_store.payout_held(entry.id).await? {
+            return Err(Error::Conflict(
+                "This payout is being checked; try again later".into(),
+            ));
         }
 
         let outcome = competition.get_current_outcome()?;
