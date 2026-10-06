@@ -1511,6 +1511,39 @@ mod startup_tests {
         test.stop().await;
     }
 
+    /// The Live and Finished tabs answer as pages and as htmx swaps, searched or not, and
+    /// a search that finds nothing says so.
+    #[tokio::test]
+    async fn the_competition_tabs_are_served_and_searched() {
+        let test = TestState::start().await;
+        let public = test.public();
+        for path in [
+            "/competitions?show=live",
+            "/competitions?show=finished&page=3&cancelled=1",
+            "/competitions?show=finished&q=no+such+competition",
+            "/?show=live&q=KPWM",
+        ] {
+            for headers in [&[][..], &[("hx-request", "true")][..]] {
+                let (status, _, body) = send(&public, request("GET", path, headers, "")).await;
+                assert_eq!(status, StatusCode::OK, "{path}");
+                assert!(body.contains(r#"class="competition-search""#), "{path}");
+                assert!(body.contains(r#"aria-current="page""#), "{path}");
+            }
+        }
+        let (_, _, body) = send(
+            &public,
+            request(
+                "GET",
+                "/competitions?show=finished&q=no+such+competition",
+                &[],
+                "",
+            ),
+        )
+        .await;
+        assert!(body.contains("Nothing matches “no such competition”."));
+        test.stop().await;
+    }
+
     #[tokio::test]
     async fn public_router_serves_no_operator_route() {
         let test = TestState::start().await;

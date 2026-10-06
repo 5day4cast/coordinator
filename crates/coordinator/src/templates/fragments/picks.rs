@@ -12,7 +12,7 @@ use crate::domain::leaderboard::{Phase, PickProgress, PickState, Rule};
 use crate::infra::oracle::ValueOptions;
 use crate::templates::{
     components::{tip_end, tip_start},
-    format::{self, MetricText},
+    format::{self, city_name, MetricText},
 };
 
 /// How often an open window's picks and leaderboard refresh.
@@ -213,9 +213,12 @@ fn detail(
             @for station in &stations {
                 @let station_picks: Vec<&PickView> = picks.iter().filter(|view| view.pick.station_id == *station).collect();
                 section class="picks-station" {
-                    h3 class="picks-station-name" {
-                        @if let Some(name) = station_picks.first().and_then(|view| view.station_name.as_deref()) {
-                            (name) " "
+                    @let name = station_picks.first().and_then(|view| view.station_name.as_deref());
+                    // The city leads; the station's own name is its tooltip, and its code
+                    // stays small beside it. Without the oracle's stations, the code alone.
+                    h3 class="picks-station-name" title=[name.map(|name| format!("Weather station: {name} ({station})"))] {
+                        @if let Some(name) = name {
+                            (city_name(name)) " "
                         }
                         span class="station-code" { (station) }
                     }
@@ -376,7 +379,7 @@ mod tests {
             .iter()
             .map(|pick| PickView {
                 pick,
-                station_name: Some("John F Kennedy International Airport".into()),
+                station_name: Some("New York/JFK International, NY".into()),
             })
             .collect()
     }
@@ -407,7 +410,8 @@ mod tests {
             NOW,
         )
         .into_string();
-        assert!(html.contains("John F Kennedy International Airport"));
+        // The city leads, with the station's full name on hover and its code beside it.
+        assert!(html.contains(r#"title="Weather station: New York/JFK International, NY (KJFK)">New York, NY <span class="station-code">KJFK</span>"#));
         assert!(html.contains(r#"Under <span class="pick-target">&lt; 69°F</span>"#));
         assert!(html.contains(r#"<span class="pick-reading">55°F</span>"#));
         assert!(html.contains("&gt; 18 knots"));

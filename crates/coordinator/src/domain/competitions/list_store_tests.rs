@@ -5,7 +5,7 @@ use super::*;
 use crate::domain::leaderboard::Phase;
 use crate::infra::db::{DBConnection, DatabasePoolConfig, DatabaseType};
 use crate::templates::pages::competitions::{
-    competitions_page, shown_ids, CompetitionView, ListOptions,
+    competitions_page, shown_ids, CompetitionView, ListOptions, Tab,
 };
 use dlctix::{
     bitcoin::{Amount, FeeRate},
@@ -206,34 +206,42 @@ async fn the_list_reads_the_same_rows_order_and_pages_as_the_full_read() {
         .map(|competition| CompetitionView::new(competition, now))
         .collect();
     assert!(full_views.iter().any(|view| view.pot_refunded));
-    for page in 0..4 {
-        for show_cancelled in [false, true] {
-            let options = ListOptions {
-                page,
-                show_cancelled,
-            };
-            // As the handler does: complete the shown rows with their contracts.
-            let mut lean_views: Vec<_> = lean
-                .iter()
-                .map(|competition| CompetitionView::new(competition, now))
-                .collect();
-            let shown = shown_ids(&lean_views, options);
-            assert_eq!(shown, shown_ids(&full_views, options));
-            for view in lean_views
-                .iter_mut()
-                .filter(|view| shown.contains(&view.id))
-            {
-                let competition = full.iter().find(|c| c.id.to_string() == view.id).unwrap();
-                view.add_contract(competition);
+    for tab in [Tab::Overview, Tab::Live, Tab::Finished] {
+        for page in 0..4 {
+            for show_cancelled in [false, true] {
+                let options = ListOptions {
+                    tab,
+                    page,
+                    show_cancelled,
+                    ..Default::default()
+                };
+                // As the handler does: complete the shown rows with their contracts.
+                let mut lean_views: Vec<_> = lean
+                    .iter()
+                    .map(|competition| CompetitionView::new(competition, now))
+                    .collect();
+                let shown = shown_ids(&lean_views, &options);
+                assert_eq!(shown, shown_ids(&full_views, &options));
+                for view in lean_views
+                    .iter_mut()
+                    .filter(|view| shown.contains(&view.id))
+                {
+                    let competition = full.iter().find(|c| c.id.to_string() == view.id).unwrap();
+                    view.add_contract(competition);
+                }
+                assert_eq!(
+                    competitions_page(&lean_views, &options, now).into_string(),
+                    competitions_page(&full_views, &options, now).into_string(),
+                    "{tab:?}, page {page}, cancelled {show_cancelled}"
+                );
             }
-            assert_eq!(
-                competitions_page(&lean_views, options, now).into_string(),
-                competitions_page(&full_views, options, now).into_string(),
-                "page {page}, cancelled {show_cancelled}"
-            );
         }
     }
-    let first = competitions_page(&full_views, ListOptions::default(), now).into_string();
+    let finished = ListOptions {
+        tab: Tab::Finished,
+        ..Default::default()
+    };
+    let first = competitions_page(&full_views, &finished, now).into_string();
     assert!(first.contains("Page 1 of 3"), "{first}");
     assert!(first.contains("no winner · pot shared back"));
     database.close().await.unwrap();

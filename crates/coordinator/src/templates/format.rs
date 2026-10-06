@@ -221,6 +221,31 @@ pub fn short_npub(npub: &str) -> String {
     format!("{}…{}", &npub[..9], &npub[npub.len() - 4..])
 }
 
+/// A station as players know it, by its city: `Anchorage, AK` for `Anchorage/Ted Stevens
+/// International, AK`. The station's full name and code stay beside it as secondary text.
+pub fn city_name(name: &str) -> String {
+    let (name, state) = name.rsplit_once(", ").unwrap_or((name, ""));
+    let city = name.split('/').next().unwrap_or(name).trim();
+    let city = [
+        " International Airport",
+        " International",
+        " Intl",
+        " Regional Airport",
+        " Regional",
+        " Municipal Airport",
+        " Municipal",
+        " Airport",
+    ]
+    .iter()
+    .find_map(|suffix| city.strip_suffix(suffix))
+    .unwrap_or(city);
+    if state.is_empty() {
+        city.to_owned()
+    } else {
+        format!("{city}, {state}")
+    }
+}
+
 /// Ordinal place: 1st, 2nd, 3rd, 4th…
 pub fn ordinal(place: usize) -> String {
     let suffix = match (place % 10, place % 100) {
@@ -237,6 +262,21 @@ pub fn ordinal(place: usize) -> String {
 mod tests {
     use super::*;
     use time::macros::datetime;
+
+    #[test]
+    fn stations_go_by_their_city() {
+        assert_eq!(
+            city_name("Anchorage/Ted Stevens International, AK"),
+            "Anchorage, AK"
+        );
+        assert_eq!(city_name("Portland International, ME"), "Portland, ME");
+        assert_eq!(
+            city_name("Burlington Regional Airport, VT"),
+            "Burlington, VT"
+        );
+        assert_eq!(city_name("New York/JFK International, NY"), "New York, NY");
+        assert_eq!(city_name("Bangor"), "Bangor");
+    }
 
     #[test]
     fn amounts_have_separators_and_units() {

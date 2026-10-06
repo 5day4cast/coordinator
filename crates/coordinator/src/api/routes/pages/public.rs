@@ -22,7 +22,9 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::oracle_view::{station_forecasts, station_name, station_pins, stations_by_id};
+use super::oracle_view::{
+    station_forecasts, station_name, station_pins, stations_by_id, stations_named,
+};
 use crate::{
     api::extractors::NostrAuth,
     domain::{
@@ -48,7 +50,7 @@ use crate::{
         },
         layouts::base::{base, PageConfig},
         pages::{
-            competitions::{competitions_page, shown_ids, CompetitionView, ListOptions},
+            competitions::{competitions_page, shown_ids, CompetitionView, ListOptions, Tab},
             entries::{entries_page, older_entries, sign_in_required, EntryRow, PAGE_SIZE},
             help::help_page,
             payouts::payouts_page,
@@ -280,20 +282,41 @@ async fn competition_view(
     view
 }
 
-/// `?page=1&cancelled=1` on the competitions list.
+/// `?show=finished&q=portland&page=1&cancelled=1` on the competitions list.
 #[derive(Debug, Default, Deserialize)]
 pub struct ListQuery {
+    show: Option<String>,
+    q: Option<String>,
     page: Option<usize>,
     cancelled: Option<String>,
 }
 
 impl From<ListQuery> for ListOptions {
     fn from(query: ListQuery) -> Self {
+        let page = query.page.unwrap_or(0);
+        let tab = query
+            .show
+            .as_deref()
+            .and_then(Tab::from_param)
+            // A page of finished competitions, as they were addressed before their tab.
+            .unwrap_or(if page > 0 {
+                Tab::Finished
+            } else {
+                Tab::Overview
+            });
         ListOptions {
-            page: query.page.unwrap_or(0),
+            tab,
+            page,
             show_cancelled: query
                 .cancelled
                 .is_some_and(|value| value == "1" || value == "true"),
+            // Only the Live and Finished tabs are searched.
+            search: query
+                .q
+                .as_deref()
+                .and_then(ListOptions::search_for)
+                .filter(|_| tab != Tab::Overview),
+            stations: Default::default(),
         }
     }
 }
@@ -326,11 +349,26 @@ pub async fn competitions_fragment(
     headers: HeaderMap,
 ) -> Response {
     let now = now();
-    let options = ListOptions::from(query);
-    let mut competitions = competition_views(&state, now).await;
-    let shown = shown_ids(&competitions, options);
+    let mut options = ListOptions::from(query);
+    // A search finds competitions by their stations' names too, when the oracle's stations
+    // are cached; without them, by id and station code alone.
+    let named = async {
+        match options.search.as_deref() {
+            Some(search) => {
+                let stations = state.leaderboards.stations(FIRST_READ_WAIT).await;
+                stations_named(
+                    stations.value().map(Vec::as_slice).unwrap_or_default(),
+                    search,
+                )
+            }
+            None => Default::default(),
+        }
+    };
+    let (mut competitions, named) = tokio::join!(competition_views(&state, now), named);
+    options.stations = named;
+    let shown = shown_ids(&competitions, &options);
     complete(&state, &mut competitions, &shown).await;
-    let content = competitions_page(&competitions, options, now);
+    let content = competitions_page(&competitions, &options, now);
     page(
         &headers,
         &state,

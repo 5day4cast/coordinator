@@ -84,13 +84,36 @@
   margin-bottom: 0;
 }
 
-.cancelled-toggle {
+.cancelled-toggle,
+.group-more {
   font-size: 0.875rem;
   color: var(--competition-muted);
 }
 
 .cancelled-toggle {
   margin-left: auto;
+}
+
+/* The Live and Finished lists: tabs back to the overview, and a search. */
+.competition-tabs {
+  margin-bottom: 1.25rem;
+}
+
+.competition-search {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.competition-search .input {
+  flex: 1 1 14rem;
+  max-width: 24rem;
+}
+
+.competition-search a {
+  font-size: 0.875rem;
 }
 
 .competition-list {

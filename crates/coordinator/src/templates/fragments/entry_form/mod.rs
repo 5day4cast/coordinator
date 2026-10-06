@@ -10,7 +10,7 @@ use crate::domain::{
 };
 use crate::templates::{
     components::{tip, tip_start},
-    format::{self, sats, MetricText, TimeStyle},
+    format::{self, city_name, sats, MetricText, TimeStyle},
     fragments::loading::{placeholder, Pending},
     pages::competitions::CompetitionView,
     shared_map::{station_map, StationPin},
@@ -297,27 +297,6 @@ pub fn payout_line(
                 }
             }
         }
-    }
-}
-
-/// Lead with the city; the original station name remains in its tooltip.
-fn city_name(name: &str) -> String {
-    let (name, state) = name.rsplit_once(", ").unwrap_or((name, ""));
-    let city = name.split('/').next().unwrap_or(name);
-    let city = [
-        " International Airport",
-        " International",
-        " Intl",
-        " Municipal Airport",
-        " Municipal",
-    ]
-    .iter()
-    .find_map(|suffix| city.strip_suffix(suffix))
-    .unwrap_or(city);
-    if state.is_empty() {
-        city.to_owned()
-    } else {
-        format!("{city}, {state}")
     }
 }
 

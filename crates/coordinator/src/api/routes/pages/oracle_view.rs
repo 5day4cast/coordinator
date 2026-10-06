@@ -1,12 +1,13 @@
 //! The oracle's stations as the public pages show them: by id, with the
 //! names players know, pinned on the map, and with their forecasts.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::domain::leaderboard::{CompetitionWeather, Metric};
 use crate::infra::oracle::ScoringRules;
 use crate::infra::oracle_weather::Station;
 use crate::templates::{
+    format::city_name,
     fragments::entry_form::StationForecast,
     shared_map::{lat_lon_to_svg, StationPin},
 };
@@ -49,7 +50,7 @@ pub fn station_forecasts(
         .collect()
 }
 
-/// Map pins for `locations` the oracle knows.
+/// Map pins for `locations` the oracle knows, named by their city.
 pub fn station_pins(locations: &[String], stations: &StationsById) -> Vec<StationPin> {
     locations
         .iter()
@@ -64,7 +65,9 @@ pub fn station_pins(locations: &[String], stations: &StationsById) -> Vec<Statio
             Some(StationPin {
                 station_id: station_id.clone(),
                 label,
-                name: station_name(stations, station_id).unwrap_or_else(|| station_id.clone()),
+                name: station_name(stations, station_id)
+                    .map(|name| city_name(&name))
+                    .unwrap_or_else(|| station_id.clone()),
                 svg_x,
                 svg_y,
             })
@@ -74,7 +77,27 @@ pub fn station_pins(locations: &[String], stations: &StationsById) -> Vec<Statio
 
 /// A station's name as players know it: `Portland International, ME`.
 pub fn station_name(stations: &StationsById, station_id: &str) -> Option<String> {
-    let station = stations.get(station_id)?;
+    spelled_out(stations.get(station_id)?)
+}
+
+/// The stations whose code, name or city has `search` in it, ignoring case: what a search of
+/// the competitions finds by station.
+pub fn stations_named(stations: &[Station], search: &str) -> HashSet<String> {
+    let search = search.to_lowercase();
+    stations
+        .iter()
+        .filter(|station| {
+            station.station_id.to_lowercase().contains(&search)
+                || spelled_out(station).is_some_and(|name| {
+                    name.to_lowercase().contains(&search)
+                        || city_name(&name).to_lowercase().contains(&search)
+                })
+        })
+        .map(|station| station.station_id.clone())
+        .collect()
+}
+
+fn spelled_out(station: &Station) -> Option<String> {
     let name = station
         .station_name
         .split_whitespace()
@@ -118,5 +141,35 @@ mod tests {
             Some("Portland International, ME")
         );
         assert_eq!(station_name(&stations, "KXXX"), None);
+    }
+
+    #[test]
+    fn stations_are_found_by_code_name_or_city() {
+        let station = |id: &str, name: &str, state: &str| Station {
+            station_id: id.into(),
+            station_name: name.into(),
+            state: state.into(),
+            iata_id: String::new(),
+            elevation_m: None,
+            latitude: 0.0,
+            longitude: 0.0,
+        };
+        let stations = [
+            station("PANC", "Anchorage/Ted Stevens Intl", "AK"),
+            station("KPWM", "Portland Intl", "ME"),
+            station("KPDX", "Portland Intl", "OR"),
+        ];
+        let found = |search: &str| {
+            let mut found: Vec<_> = stations_named(&stations, search).into_iter().collect();
+            found.sort();
+            found
+        };
+        assert_eq!(found("anchorage, ak"), ["PANC"]);
+        assert_eq!(found("Ted Stevens"), ["PANC"]);
+        assert_eq!(found("portland"), ["KPDX", "KPWM"]);
+        assert_eq!(found("Portland, ME"), ["KPWM"]);
+        assert_eq!(found("portland international"), ["KPDX", "KPWM"]);
+        assert_eq!(found("kpwm"), ["KPWM"]);
+        assert!(found("Boston").is_empty());
     }
 }
