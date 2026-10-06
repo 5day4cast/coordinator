@@ -677,7 +677,7 @@ fn small_competition_contents_are_published_as_they_are() {
         vec![(format!("competition:{id}"), content.clone())]
     );
     assert_eq!(
-        join_competition_contents(&[content.clone()]).unwrap(),
+        join_competition_contents(std::slice::from_ref(&content)).unwrap(),
         content
     );
 }
