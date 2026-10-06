@@ -1,6 +1,8 @@
 //! The home page: what the game is, the competition to enter now, and every
 //! competition grouped by where it stands.
 
+use std::collections::HashSet;
+
 use maud::{html, Markup};
 use time::OffsetDateTime;
 
@@ -522,17 +524,74 @@ pub fn refund_line(competition: &CompetitionView, now: OffsetDateTime) -> Option
     })
 }
 
-/// What the list shows: which page of finished competitions, and whether
-/// cancelled ones are included.
-#[derive(Debug, Clone, Copy, Default)]
+/// Which list the page shows: the overview, or every live or every finished competition.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Tab {
+    /// Every open competition first, then a few live, those awaiting results and the
+    /// latest finished.
+    #[default]
+    Overview,
+    Live,
+    Finished,
+}
+
+impl Tab {
+    /// Its `?show=` value.
+    pub fn param(self) -> Option<&'static str> {
+        match self {
+            Tab::Overview => None,
+            Tab::Live => Some("live"),
+            Tab::Finished => Some("finished"),
+        }
+    }
+
+    pub fn from_param(value: &str) -> Option<Self> {
+        match value {
+            "live" => Some(Tab::Live),
+            "finished" => Some(Tab::Finished),
+            _ => None,
+        }
+    }
+}
+
+/// Live competitions the overview shows; the Live tab lists them all.
+pub const LIVE_SHOWN: usize = 4;
+
+/// Finished competitions the overview shows; the Finished tab pages through them all.
+pub const FINISHED_SHOWN: usize = 2;
+
+/// The longest search kept.
+const SEARCH_LENGTH: usize = 64;
+
+/// What the list shows: which tab, which page of finished competitions, whether cancelled
+/// ones are included, and what the Live and Finished tabs are searched for.
+#[derive(Debug, Clone, Default)]
 pub struct ListOptions {
+    pub tab: Tab,
     pub page: usize,
     pub show_cancelled: bool,
+    /// The start of a competition's id, or a station's code or name; `None` for every one.
+    pub search: Option<String>,
+    /// The stations whose names match the search, from the oracle's stations when the
+    /// handler has them.
+    pub stations: HashSet<String>,
 }
 
 impl ListOptions {
-    pub fn url_for(page: usize, show_cancelled: bool) -> String {
+    /// A search for `text`, trimmed and cut to a sensible length; `None` when it is empty.
+    pub fn search_for(text: &str) -> Option<String> {
+        let text: String = text.trim().chars().take(SEARCH_LENGTH).collect();
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn link(tab: Tab, page: usize, show_cancelled: bool, search: Option<&str>) -> String {
         let mut parts = Vec::new();
+        if let Some(tab) = tab.param() {
+            parts.push(format!("show={tab}"));
+        }
+        if let Some(search) = search {
+            parts.push(format!("q={}", query_encode(search)));
+        }
         if page > 0 {
             parts.push(format!("page={page}"));
         }
@@ -546,9 +605,58 @@ impl ListOptions {
         }
     }
 
-    pub fn url(self) -> String {
-        Self::url_for(self.page, self.show_cancelled)
+    pub fn url(&self) -> String {
+        Self::link(
+            self.tab,
+            self.page,
+            self.show_cancelled,
+            self.search.as_deref(),
+        )
     }
+
+    /// This list's `page`.
+    fn page_url(&self, page: usize) -> String {
+        Self::link(self.tab, page, self.show_cancelled, self.search.as_deref())
+    }
+
+    /// `tab`'s first page, unsearched, keeping whether cancelled ones are shown.
+    fn tab_url(&self, tab: Tab) -> String {
+        Self::link(tab, 0, self.show_cancelled, None)
+    }
+
+    /// Whether `competition` is one the search asks for: its id or one of its pools' ids
+    /// starts with it, or one of its stations has it in its code or name.
+    fn matches(&self, competition: &CompetitionView) -> bool {
+        let Some(search) = self.search.as_deref().map(str::to_lowercase) else {
+            return true;
+        };
+        let search = search.as_str();
+        let pools = competition
+            .queue
+            .queued()
+            .map(|queue| queue.pools.as_slice())
+            .unwrap_or_default();
+        competition.id.to_lowercase().starts_with(search)
+            || pools
+                .iter()
+                .any(|pool| pool.id.to_lowercase().starts_with(search))
+            || competition.locations.iter().any(|station| {
+                station.to_lowercase().contains(search) || self.stations.contains(station)
+            })
+    }
+}
+
+/// `text` as a query string value.
+fn query_encode(text: &str) -> String {
+    text.bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            b' ' => "+".to_owned(),
+            byte => format!("%{byte:02X}"),
+        })
+        .collect()
 }
 
 /// A link that replaces the list in place and records the new address.
@@ -559,26 +667,33 @@ fn list_link(url: String, label: Markup) -> Markup {
     }
 }
 
-/// What the list shows for `options`: every competition taking entries, live or awaiting
-/// results, one page of finished ones, and the one to feature.
+/// What the list shows for `options`. The overview: every competition taking entries, the
+/// soonest first, a few live, those awaiting results, the latest finished, and the one to
+/// feature. The Live tab: every live one; the Finished tab: a page of the finished ones.
 struct Sections<'a> {
+    /// Soonest start first, those taking entries before those full.
     open: Vec<&'a CompetitionView>,
+    /// Soonest start first.
     live: Vec<&'a CompetitionView>,
     waiting: Vec<&'a CompetitionView>,
     /// This page of the finished ones, newest first.
     finished: Vec<&'a CompetitionView>,
+    /// How many are live and finished in all, whatever the page shows.
+    live_count: usize,
+    finished_count: usize,
     page: usize,
     pages: usize,
     /// How many cancelled competitions there are, shown or not.
     cancelled: usize,
+    /// On the overview, the competition to act on now: the first of its list.
     featured: Option<&'a CompetitionView>,
 }
 
 impl<'a> Sections<'a> {
     /// `competitions` as [`listed`] gives them.
-    fn of(competitions: &'a [CompetitionView], options: ListOptions) -> Self {
-        let mut live = by_phase(competitions, &[Phase::Live]);
+    fn of(competitions: &'a [CompetitionView], options: &ListOptions) -> Self {
         let mut open = by_phase(competitions, &[Phase::Upcoming]);
+        let mut live = by_phase(competitions, &[Phase::Live]);
         let mut waiting = by_phase(competitions, &[Phase::AwaitingResult]);
         let finished_phases: &[Phase] = if options.show_cancelled {
             &[
@@ -598,29 +713,55 @@ impl<'a> Sections<'a> {
         };
         let mut finished = by_phase(competitions, finished_phases);
         let cancelled = by_phase(competitions, &[Phase::Cancelled]).len();
-        live.sort_by_key(|competition| std::cmp::Reverse(competition.start));
-        open.sort_by_key(|competition| std::cmp::Reverse(competition.start));
-        waiting.sort_by_key(|competition| std::cmp::Reverse(competition.end));
+        // Soonest first: the next one to enter, the next to end, the next result due.
+        open.sort_by_key(|competition| (!competition.can_enter, competition.start));
+        live.sort_by_key(|competition| competition.start);
+        waiting.sort_by_key(|competition| competition.start);
         finished.sort_by_key(|competition| std::cmp::Reverse(competition.end));
+        let live_count = live.len();
+        let finished_count = finished.len();
 
-        let pages = finished.len().div_ceil(PAGE_SIZE).max(1);
-        let page = options.page.min(pages - 1);
-        let finished = finished
-            .into_iter()
-            .skip(page * PAGE_SIZE)
-            .take(PAGE_SIZE)
-            .collect();
-        let featured = open
-            .iter()
-            .filter(|competition| competition.can_enter)
-            .min_by_key(|competition| competition.start)
-            .or_else(|| live.first())
-            .copied();
+        let mut featured = None;
+        let (mut page, mut pages) = (0, 1);
+        match options.tab {
+            Tab::Overview => {
+                // The soonest to enter, or with none open the next to end. It stays in its
+                // list too, so every open competition reads the same way.
+                featured = open
+                    .iter()
+                    .find(|competition| competition.can_enter)
+                    .or_else(|| live.first())
+                    .copied();
+                live.truncate(LIVE_SHOWN);
+                finished.truncate(FINISHED_SHOWN);
+            }
+            Tab::Live => {
+                live.retain(|competition| options.matches(competition));
+                open.clear();
+                waiting.clear();
+                finished.clear();
+            }
+            Tab::Finished => {
+                finished.retain(|competition| options.matches(competition));
+                pages = finished.len().div_ceil(PAGE_SIZE).max(1);
+                page = options.page.min(pages - 1);
+                finished = finished
+                    .into_iter()
+                    .skip(page * PAGE_SIZE)
+                    .take(PAGE_SIZE)
+                    .collect();
+                open.clear();
+                live.clear();
+                waiting.clear();
+            }
+        }
         Self {
             open,
             live,
             waiting,
             finished,
+            live_count,
+            finished_count,
             page,
             pages,
             cancelled,
@@ -640,7 +781,7 @@ impl<'a> Sections<'a> {
 
 /// The ids of the competitions the list shows for `options`: the ones a page needs refunds and
 /// contracts for. A queue split into pools is shown by its own id.
-pub fn shown_ids(competitions: &[CompetitionView], options: ListOptions) -> Vec<String> {
+pub fn shown_ids(competitions: &[CompetitionView], options: &ListOptions) -> Vec<String> {
     let competitions = listed(competitions);
     Sections::of(&competitions, options)
         .shown()
@@ -648,24 +789,16 @@ pub fn shown_ids(competitions: &[CompetitionView], options: ListOptions) -> Vec<
         .collect()
 }
 
-/// Competitions page content: intro, the one to enter now, then every group.
+/// Competitions page content. The overview: intro and the one to enter now, then every open
+/// competition, a few live, those awaiting results and the latest finished, each short list
+/// linking its tab. The Live and Finished tabs: the whole list, with a search.
 pub fn competitions_page(
     competitions: &[CompetitionView],
-    options: ListOptions,
+    options: &ListOptions,
     now: OffsetDateTime,
 ) -> Markup {
     let competitions = &listed(competitions);
-    let Sections {
-        open,
-        live,
-        waiting,
-        finished,
-        page,
-        pages,
-        cancelled,
-        featured,
-    } = Sections::of(competitions, options);
-    let show_cancelled = options.show_cancelled;
+    let sections = Sections::of(competitions, options);
 
     html! {
         div id="competitions-page"
@@ -673,45 +806,167 @@ pub fn competitions_page(
             hx-trigger="every 30s"
             hx-select="#competitions-page"
             hx-swap="outerHTML" {
-            (intro(featured, now))
+            @match options.tab {
+                Tab::Overview => { (overview(&sections, options, now)) }
+                Tab::Live | Tab::Finished => { (full_list(&sections, options, now)) }
+            }
+        }
+    }
+}
 
-            @if !open.is_empty() {
-                (group("Upcoming", &open, now))
-            }
-            @if !live.is_empty() {
-                (group("Live", &live, now))
-            }
-            @if !waiting.is_empty() {
-                (group("Awaiting results", &waiting, now))
-            }
-            section class="competition-group" {
-                div class="group-heading" {
-                    h2 class="title is-5" { "Finished" }
-                    @if cancelled > 0 {
-                        span class="cancelled-toggle" {
-                            (list_link(
-                                ListOptions::url_for(0, !show_cancelled),
-                                html! { (if show_cancelled { "Hide" } else { "Show" }) " cancelled (" (cancelled) ")" },
-                            ))
-                        }
+fn overview(sections: &Sections, options: &ListOptions, now: OffsetDateTime) -> Markup {
+    let Sections {
+        open,
+        live,
+        waiting,
+        finished,
+        live_count,
+        finished_count,
+        featured,
+        ..
+    } = sections;
+    html! {
+        (intro(*featured, now))
+
+        @if !open.is_empty() {
+            (group("Open", open, None, now))
+        }
+        @if !live.is_empty() {
+            (group(
+                "Live",
+                live,
+                (*live_count > live.len()).then(|| {
+                    list_link(options.tab_url(Tab::Live), html! { "Show all live (" (live_count) ") →" })
+                }),
+                now,
+            ))
+        }
+        @if !waiting.is_empty() {
+            (group("Awaiting results", waiting, None, now))
+        }
+        section class="competition-group" {
+            div class="group-heading" {
+                h2 class="title is-5" { "Finished" }
+                @if *finished_count > 0 {
+                    span class="group-more" {
+                        (list_link(options.tab_url(Tab::Finished), html! { "All finished (" (finished_count) ") →" }))
                     }
                 }
-                @if finished.is_empty() {
-                    p class="empty-state" { "No finished competitions yet." }
-                } @else {
-                    (list(&finished, now))
+                (cancelled_toggle(sections, options))
+            }
+            @if finished.is_empty() {
+                p class="empty-state" { "No finished competitions yet." }
+            } @else {
+                (list(finished, now))
+            }
+        }
+    }
+}
+
+/// The Live or the Finished tab: every one of them, found by a search, the finished a page at
+/// a time.
+fn full_list(sections: &Sections, options: &ListOptions, now: OffsetDateTime) -> Markup {
+    let (title, shown) = match options.tab {
+        Tab::Live => ("Live", &sections.live),
+        _ => ("Finished", &sections.finished),
+    };
+    html! {
+        (tabs(sections, options))
+        section class="competition-group" {
+            div class="group-heading" {
+                h1 class="title is-5" { (title) }
+                @if options.tab == Tab::Finished {
+                    (cancelled_toggle(sections, options))
                 }
-                @if pages > 1 {
-                    nav class="pager" aria-label="Finished competitions pages" {
-                        @if page > 0 {
-                            (list_link(ListOptions::url_for(page - 1, show_cancelled), html! { "← Newer" }))
-                        }
-                        span { "Page " (page + 1) " of " (pages) }
-                        @if page + 1 < pages {
-                            (list_link(ListOptions::url_for(page + 1, show_cancelled), html! { "Older →" }))
-                        }
+            }
+            (search_form(options))
+            @if shown.is_empty() {
+                p class="empty-state" {
+                    @match (&options.search, options.tab) {
+                        (Some(search), _) => { "Nothing matches “" (search) "”." }
+                        (None, Tab::Live) => { "Nothing is live right now." }
+                        _ => { "No finished competitions yet." }
                     }
                 }
+            } @else {
+                (list(shown, now))
+            }
+            @if options.tab == Tab::Finished && sections.pages > 1 {
+                nav class="pager" aria-label="Finished competitions pages" {
+                    @if sections.page > 0 {
+                        (list_link(options.page_url(sections.page - 1), html! { "← Newer" }))
+                    }
+                    span { "Page " (sections.page + 1) " of " (sections.pages) }
+                    @if sections.page + 1 < sections.pages {
+                        (list_link(options.page_url(sections.page + 1), html! { "Older →" }))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The overview, live and finished lists, the one shown marked current.
+fn tabs(sections: &Sections, options: &ListOptions) -> Markup {
+    let tab = |tab: Tab, label: Markup| {
+        html! {
+            li class=[(options.tab == tab).then_some("is-active")]
+               aria-current=[(options.tab == tab).then_some("page")] {
+                (list_link(options.tab_url(tab), label))
+            }
+        }
+    };
+    html! {
+        nav class="tabs competition-tabs" aria-label="Competition lists" {
+            ul {
+                (tab(Tab::Overview, html! { "Open & recent" }))
+                (tab(Tab::Live, html! { "Live (" (sections.live_count) ")" }))
+                (tab(Tab::Finished, html! { "Finished (" (sections.finished_count) ")" }))
+            }
+        }
+    }
+}
+
+/// A search of the tab's competitions, by id or station. Without JavaScript it is a plain
+/// GET form; with it, htmx swaps the results in. The box keeps what is typed in it across the
+/// page's own refresh; its id changes as a search starts or is cleared, so the results bring
+/// their own box then.
+fn search_form(options: &ListOptions) -> Markup {
+    let tab = options.tab.param().unwrap_or("finished");
+    let id = match options.search {
+        Some(_) => format!("competition-search-{tab}-results"),
+        None => format!("competition-search-{tab}"),
+    };
+    html! {
+        form class="competition-search" role="search" method="get" action="/competitions"
+          hx-get="/competitions" hx-target="#competitions-page" hx-select="#competitions-page"
+          hx-swap="outerHTML" hx-push-url="true" {
+            input type="hidden" name="show" value=(tab);
+            @if options.show_cancelled {
+                input type="hidden" name="cancelled" value="1";
+            }
+            label class="is-sr-only" for=(id) { "Search by competition ID or city" }
+            input id=(id) class="input" type="search" name="q" value=[options.search.as_deref()]
+              maxlength=(SEARCH_LENGTH) placeholder="Competition ID or city" hx-preserve;
+            button class="button" type="submit" { "Search" }
+            @if options.search.is_some() {
+                (list_link(options.tab_url(options.tab), html! { "Clear" }))
+            }
+        }
+    }
+}
+
+/// Show or hide the cancelled competitions, when there are any.
+fn cancelled_toggle(sections: &Sections, options: &ListOptions) -> Markup {
+    let show = !options.show_cancelled;
+    let url = ListOptions::link(options.tab, 0, show, options.search.as_deref());
+    html! {
+        @if sections.cancelled > 0 {
+            span class="cancelled-toggle" {
+                (list_link(
+                    url,
+                    html! { (if show { "Show" } else { "Hide" }) " cancelled (" (sections.cancelled) ")" },
+                ))
             }
         }
     }
@@ -841,11 +1096,21 @@ fn featured_card(competition: &CompetitionView, now: OffsetDateTime) -> Markup {
     }
 }
 
-fn group(title: &str, competitions: &[&CompetitionView], now: OffsetDateTime) -> Markup {
+/// One group of competitions under its heading, with a link to all of them when the group
+/// shows only some.
+fn group(
+    title: &str,
+    competitions: &[&CompetitionView],
+    more: Option<Markup>,
+    now: OffsetDateTime,
+) -> Markup {
     html! {
         section class="competition-group" {
             div class="group-heading" {
                 h2 class="title is-5" { (title) }
+                @if let Some(more) = more {
+                    span class="group-more" { (more) }
+                }
             }
             (list(competitions, now))
         }
@@ -1008,9 +1273,19 @@ pub(crate) mod tests {
             .unwrap_or_else(|| panic!("{needle} missing"))
     }
 
+    /// The competitions `html` lists, in order.
+    fn row_ids(html: &str) -> Vec<String> {
+        html.match_indices(r#"data-competition-id=""#)
+            .map(|(at, found)| {
+                let rest = &html[at + found.len()..];
+                rest[..rest.find('"').unwrap()].to_owned()
+            })
+            .collect()
+    }
+
     #[test]
     fn groups_come_in_order_with_the_newest_finished_first() {
-        // Upcoming first: entering is the thing to do on this page.
+        // Open first: entering is the thing to do on this page.
         let competitions = vec![
             view("finished-old", Phase::Scored, -300),
             view("open", Phase::Upcoming, 60),
@@ -1018,20 +1293,149 @@ pub(crate) mod tests {
             view("waiting", Phase::AwaitingResult, -30),
             view("live", Phase::Live, -5),
         ];
-        let html = competitions_page(&competitions, ListOptions::default(), NOW).into_string();
-        let live = position(&html, r#"data-competition-id="live""#);
-        let open = position(&html, r#"data-competition-id="open""#);
-        let waiting = position(&html, r#"data-competition-id="waiting""#);
-        let newer = position(&html, r#"data-competition-id="finished-new""#);
-        let older = position(&html, r#"data-competition-id="finished-old""#);
-        assert!(open < live && live < waiting && waiting < newer && newer < older);
+        let html = competitions_page(&competitions, &ListOptions::default(), NOW).into_string();
+        assert_eq!(
+            row_ids(&html),
+            ["open", "live", "waiting", "finished-new", "finished-old"]
+        );
+    }
+
+    /// Open competitions come soonest first, those taking entries before those full, and the
+    /// soonest is featured; live ones and those awaiting results come by start, the earliest
+    /// first.
+    #[test]
+    fn open_and_live_competitions_come_soonest_first() {
+        let mut full = view("full", Phase::Upcoming, 30);
+        full.can_enter = false;
+        let competitions = vec![
+            view("open-later", Phase::Upcoming, 300),
+            full,
+            view("open-soon", Phase::Upcoming, 60),
+            view("open-middle", Phase::Upcoming, 120),
+            view("live-late", Phase::Live, -2),
+            view("live-early", Phase::Live, -8),
+            view("waiting-late", Phase::AwaitingResult, -12),
+            view("waiting-early", Phase::AwaitingResult, -60),
+        ];
+        let html = competitions_page(&competitions, &ListOptions::default(), NOW).into_string();
+        assert_eq!(
+            row_ids(&html),
+            [
+                "open-soon",
+                "open-middle",
+                "open-later",
+                "full",
+                "live-early",
+                "live-late",
+                "waiting-early",
+                "waiting-late"
+            ]
+        );
+        assert_eq!(
+            html.matches(r#"data-competition-id="open-soon""#).count(),
+            1
+        );
+        assert!(html.contains(r#"<h2 class="title is-5">Open</h2>"#));
+        let open = position(&html, ">Open</h2>");
+        assert!(open < position(&html, ">Live</h2>"));
+    }
+
+    /// The overview shows four live competitions and the two latest finished, each linking the
+    /// whole list.
+    #[test]
+    fn the_overview_shows_four_live_and_two_finished() {
+        let mut competitions: Vec<_> = (0..6)
+            .map(|index| view(&format!("live-{index}"), Phase::Live, -9 + index))
+            .collect();
+        competitions.extend(
+            (0..5).map(|index| view(&format!("done-{index}"), Phase::Scored, -1000 + index * 20)),
+        );
+        let html = competitions_page(&competitions, &ListOptions::default(), NOW).into_string();
+        // Nothing is open, so the first live one is featured as well.
+        assert!(html.contains("Observations end in"));
+        assert_eq!(
+            row_ids(&html),
+            ["live-0", "live-1", "live-2", "live-3", "done-4", "done-3"]
+        );
+        assert!(html.contains("Show all live (6) →"));
+        assert!(html.contains(r#"href="/competitions?show=live""#));
+        assert!(html.contains("All finished (5) →"));
+        assert!(html.contains(r#"href="/competitions?show=finished""#));
+        assert!(!html.contains("Page 1 of"));
+        // The tabs list them all.
+        let live = competitions_page(
+            &competitions,
+            &ListOptions {
+                tab: Tab::Live,
+                ..Default::default()
+            },
+            NOW,
+        )
+        .into_string();
+        assert_eq!(row_ids(&live).len(), 6);
+        assert!(!live.contains("done-"));
+        assert!(live.contains(r#"aria-current="page""#));
+        assert!(live.contains(r#"<input type="hidden" name="show" value="live">"#));
+        let finished = competitions_page(
+            &competitions,
+            &ListOptions {
+                tab: Tab::Finished,
+                ..Default::default()
+            },
+            NOW,
+        )
+        .into_string();
+        assert_eq!(
+            row_ids(&finished),
+            ["done-4", "done-3", "done-2", "done-1", "done-0"]
+        );
+        // The page refreshes itself as the tab it shows.
+        assert!(finished.contains(r#"hx-get="/competitions?show=finished""#));
+        assert!(finished.contains(r#"action="/competitions""#));
+    }
+
+    /// The Live and Finished tabs are searched by the start of an id, a station's code, or the
+    /// stations the handler found by name.
+    #[test]
+    fn the_tabs_are_searched_by_id_or_station() {
+        let mut portland = view("0199aaaa-done", Phase::Scored, -100);
+        portland.locations = vec!["KPWM".into()];
+        let mut boston = view("0199bbbb-done", Phase::Scored, -200);
+        boston.locations = vec!["KBOS".into()];
+        let competitions = [portland, boston];
+        let search = |text: &str, stations: &[&str]| {
+            let options = ListOptions {
+                tab: Tab::Finished,
+                search: ListOptions::search_for(text),
+                stations: stations.iter().map(|station| station.to_string()).collect(),
+                ..Default::default()
+            };
+            row_ids(&competitions_page(&competitions, &options, NOW).into_string())
+        };
+        assert_eq!(search("0199AAAA", &[]), ["0199aaaa-done"]);
+        assert_eq!(search("kbos", &[]), ["0199bbbb-done"]);
+        assert_eq!(search("Portland, ME", &["KPWM"]), ["0199aaaa-done"]);
+        assert_eq!(search("  ", &[]).len(), 2);
+        assert!(search("denver", &[]).is_empty());
+
+        let options = ListOptions {
+            tab: Tab::Finished,
+            search: ListOptions::search_for("Portland, ME"),
+            ..Default::default()
+        };
+        let html = competitions_page(&competitions, &options, NOW).into_string();
+        assert!(html.contains("Nothing matches “Portland, ME”."));
+        // The page refreshes with the search, and the box keeps it.
+        assert!(html.contains(r#"hx-get="/competitions?show=finished&amp;q=Portland%2C+ME""#));
+        assert!(html.contains(r#"value="Portland, ME""#));
+        assert!(html.contains("hx-preserve"));
     }
 
     #[test]
     fn the_open_competition_is_featured_with_a_countdown_and_enter() {
         let html = competitions_page(
             &[view("open", Phase::Upcoming, 133)],
-            ListOptions::default(),
+            &ListOptions::default(),
             NOW,
         )
         .into_string();
@@ -1058,16 +1462,16 @@ pub(crate) mod tests {
             view("done", Phase::Scored, -100),
             view("unfilled", Phase::Cancelled, -200),
         ];
-        let hidden = competitions_page(&competitions, ListOptions::default(), NOW).into_string();
+        let hidden = competitions_page(&competitions, &ListOptions::default(), NOW).into_string();
         assert!(!hidden.contains("unfilled"));
         assert!(hidden.contains("Show cancelled (1)"));
         assert!(hidden.contains(r#"href="/competitions?cancelled=1""#));
 
         let shown = competitions_page(
             &competitions,
-            ListOptions {
-                page: 0,
+            &ListOptions {
                 show_cancelled: true,
+                ..Default::default()
             },
             NOW,
         )
@@ -1092,7 +1496,7 @@ pub(crate) mod tests {
         let unfilled = view("unfilled", Phase::Unfilled, -5);
         let html = text(competitions_page(
             std::slice::from_ref(&unfilled),
-            ListOptions::default(),
+            &ListOptions::default(),
             NOW,
         ));
         assert!(html.contains(">Didn't run</span>"));
@@ -1316,12 +1720,12 @@ pub(crate) mod tests {
             hidden_done,
             view("listed-open", Phase::Upcoming, 60),
         ];
-        let html = competitions_page(&competitions, ListOptions::default(), NOW).into_string();
+        let html = competitions_page(&competitions, &ListOptions::default(), NOW).into_string();
         assert!(!html.contains("hidden-open") && !html.contains("hidden-done"));
         assert!(html.contains(r#"href="/competitions/listed-open/entry-form""#));
         assert!(html.contains("No finished competitions yet."));
         assert_eq!(
-            shown_ids(&competitions, ListOptions::default()),
+            shown_ids(&competitions, &ListOptions::default()),
             vec!["listed-open".to_owned()]
         );
     }
@@ -1341,24 +1745,25 @@ pub(crate) mod tests {
         competitions.push(view("open", Phase::Upcoming, 60));
         competitions.push(view("live", Phase::Live, -5));
         competitions.push(view("cancelled", Phase::Cancelled, -30));
-        for page in 0..4 {
-            for show_cancelled in [false, true] {
-                let options = ListOptions {
-                    page,
-                    show_cancelled,
-                };
-                let html = competitions_page(&competitions, options, NOW).into_string();
-                let mut rendered: Vec<_> = html
-                    .match_indices(r#"class="competition-row" data-competition-id=""#)
-                    .map(|(at, found)| {
-                        let rest = &html[at + found.len()..];
-                        rest[..rest.find('"').unwrap()].to_owned()
-                    })
-                    .collect();
-                let mut shown = shown_ids(&competitions, options);
-                rendered.sort();
-                shown.sort();
-                assert_eq!(rendered, shown, "page {page}, cancelled {show_cancelled}");
+        for tab in [Tab::Overview, Tab::Live, Tab::Finished] {
+            for page in 0..4 {
+                for show_cancelled in [false, true] {
+                    let options = ListOptions {
+                        tab,
+                        page,
+                        show_cancelled,
+                        ..Default::default()
+                    };
+                    let html = competitions_page(&competitions, &options, NOW).into_string();
+                    let mut rendered = row_ids(&html);
+                    let mut shown = shown_ids(&competitions, &options);
+                    rendered.sort();
+                    shown.sort();
+                    assert_eq!(
+                        rendered, shown,
+                        "{tab:?}, page {page}, cancelled {show_cancelled}"
+                    );
+                }
             }
         }
     }
@@ -1374,17 +1779,21 @@ pub(crate) mod tests {
                 )
             })
             .collect();
-        let first = competitions_page(&competitions, ListOptions::default(), NOW).into_string();
+        let finished = ListOptions {
+            tab: Tab::Finished,
+            ..Default::default()
+        };
+        let first = competitions_page(&competitions, &finished, NOW).into_string();
         assert_eq!(first.matches("class=\"competition-row\"").count(), 10);
         assert!(first.contains("done-24") && !first.contains("done-14"));
         assert!(first.contains("Page 1 of 3"));
-        assert!(first.contains(r#"href="/competitions?page=1""#));
+        assert!(first.contains(r#"href="/competitions?show=finished&amp;page=1""#));
 
         let last = competitions_page(
             &competitions,
-            ListOptions {
+            &ListOptions {
                 page: 2,
-                show_cancelled: false,
+                ..finished
             },
             NOW,
         )
@@ -1438,7 +1847,7 @@ pub(crate) mod tests {
         assert!(!row.contains(" of 3"));
         assert!(phase_badge(&queue).into_string().contains(">Open</span>"));
 
-        let page = competitions_page(std::slice::from_ref(&queue), ListOptions::default(), NOW)
+        let page = competitions_page(std::slice::from_ref(&queue), &ListOptions::default(), NOW)
             .into_string();
         assert!(!page.contains("1st place"));
         assert!(!page.contains("Full"));
@@ -1566,7 +1975,7 @@ pub(crate) mod tests {
         let shown = listed(&all);
         assert_eq!(shown.len(), 1);
         assert_eq!(shown[0].phase, Phase::Live);
-        let page = competitions_page(&all, ListOptions::default(), NOW).into_string();
+        let page = competitions_page(&all, &ListOptions::default(), NOW).into_string();
         assert!(!page.contains("Awaiting results"));
         assert!(!page.contains("Split into pools"));
         assert!(page.contains(">Live</span>"));

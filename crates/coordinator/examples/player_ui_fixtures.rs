@@ -197,7 +197,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "home",
             competitions_page(
                 &[open.clone(), queued.clone(), live.clone(), finished],
-                ListOptions::default(),
+                &ListOptions::default(),
                 now,
             ),
         ),

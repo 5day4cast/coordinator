@@ -318,6 +318,18 @@ test.describe("Competition Status Display", () => {
     }
   });
 
+  test("the finished tab lists every finished competition with a search", async ({ page }) => {
+    await page.goto("/competitions?show=finished");
+    await expect(page.locator("#competitions-page .competition-tabs [aria-current='page']")).toContainText("Finished");
+    const search = page.locator("#competitions-page form.competition-search input[name='q']");
+    await search.fill("no-such-competition");
+    await search.press("Enter");
+    await expect(page.locator("#competitions-page .empty-state")).toContainText("Nothing matches");
+    await expect(page).toHaveURL(/show=finished.*q=no-such-competition/);
+    await page.locator("#competitions-page .competition-tabs a", { hasText: "Open & recent" }).click();
+    await expect(page.locator("#competitions-page .intro")).toContainText("Daily Fantasy Weather");
+  });
+
   test("an account page opened by its address offers the log-in dialog", async ({ page }) => {
     await page.goto("/entries");
     await expect(page.locator(".sign-in-required")).toContainText("You're signed out");
