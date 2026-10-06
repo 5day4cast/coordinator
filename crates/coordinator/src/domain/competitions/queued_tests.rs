@@ -155,6 +155,15 @@ fn the_reference_event_has_one_winner_lines_and_room_for_the_largest_pool() {
     pool.validate_oracle_settings().unwrap();
 }
 
+/// An entry id the player's wallet made at `when`.
+pub(super) fn entry_id_at(when: OffsetDateTime) -> Uuid {
+    Uuid::new_v7(uuid::Timestamp::from_unix(
+        uuid::NoContext,
+        when.unix_timestamp() as u64,
+        when.nanosecond(),
+    ))
+}
+
 #[test]
 fn a_queued_entry_id_must_be_a_recent_uuidv7() {
     let now = OffsetDateTime::now_utc();
@@ -162,16 +171,29 @@ fn a_queued_entry_id_must_be_a_recent_uuidv7() {
     assert!(
         queued::check_entry_id(uuid::Builder::from_random_bytes([7; 16]).into_uuid(), now).is_err()
     );
-    let at = |when: OffsetDateTime| {
-        Uuid::new_v7(uuid::Timestamp::from_unix(
-            uuid::NoContext,
-            when.unix_timestamp() as u64,
-            when.nanosecond(),
-        ))
-    };
-    queued::check_entry_id(at(now - Duration::minutes(30)), now).unwrap();
-    assert!(queued::check_entry_id(at(now - Duration::hours(2)), now).is_err());
-    assert!(queued::check_entry_id(at(now + Duration::minutes(10)), now).is_err());
+    queued::check_entry_id(entry_id_at(now - Duration::minutes(30)), now).unwrap();
+    assert!(queued::check_entry_id(entry_id_at(now - Duration::hours(2)), now).is_err());
+    assert!(queued::check_entry_id(entry_id_at(now + Duration::minutes(10)), now).is_err());
+}
+
+/// A ticket is issued, or an unpaid one handed back, only while its entry id leaves time to pay
+/// it and finish the entry; the entry itself may be made until the id is an hour old.
+#[test]
+fn a_ticket_leaves_time_to_pay_and_finish_its_entry_within_the_hour() {
+    let now = OffsetDateTime::now_utc();
+    let made = |minutes: i64| entry_id_at(now - Duration::minutes(minutes));
+    queued::check_ticket_entry_id(made(40), now).unwrap();
+    assert_eq!(
+        queued::check_ticket_entry_id(made(50), now),
+        Err(queued::STALE_ENTRY_ID.to_string())
+    );
+    assert!(queued::check_ticket_entry_id(entry_id_at(now + Duration::minutes(10)), now).is_err());
+    queued::check_entry_id(made(50), now).unwrap();
+    assert!(queued::check_entry_id(made(61), now).is_err());
+
+    let finish_by = queued::entry_finish_by(made(20)).unwrap();
+    assert!((finish_by - (now + Duration::minutes(40))).abs() < Duration::seconds(1));
+    assert!(queued::entry_finish_by(Uuid::from_u128(1)).is_err());
 }
 
 /// A queued competition's reference event is off the oracle's list and its pools are on it;
@@ -384,7 +406,11 @@ impl Queue {
     /// A paid ticket of the queue; with `entered`, also its entry, payout policy, funded escrow
     /// and key deposit, which make it complete.
     pub(super) async fn ticket(&self, player: &str, entered: bool) -> Uuid {
-        let ticket = Uuid::now_v7();
+        self.ticket_with_id(player, entered, Uuid::now_v7()).await
+    }
+
+    /// [`Self::ticket`], for the entry id `ticket`.
+    pub(super) async fn ticket_with_id(&self, player: &str, entered: bool, ticket: Uuid) -> Uuid {
         let parent = self.competition.id;
         let player = player.to_string();
         let hash = format!("{:064x}", ticket.as_u128());
@@ -1315,9 +1341,10 @@ async fn a_player_s_unpaid_tickets_are_listed_oldest_first_while_they_can_be_pai
         }
     };
 
-    // Ids in entry order, oldest first.
+    // Ids in entry order, oldest first, all young enough to be handed back.
+    let now = OffsetDateTime::now_utc();
     let [oldest, invoiced, expiring, paid, expired] =
-        [1u128, 2, 3, 4, 5].map(|n| Uuid::from_u128(n << 100));
+        [30, 25, 20, 15, 10].map(|minutes| entry_id_at(now - Duration::minutes(minutes)));
     // Three unpaid tickets is as many as a player may hold, so the last two are made once the
     // first ones stop counting.
     reserve(invoiced, "alice").await;
@@ -1384,6 +1411,159 @@ async fn a_player_s_unpaid_tickets_are_listed_oldest_first_while_they_can_be_pai
     assert!(json["invoice_expires_at"].is_string());
 }
 
+/// An unpaid ticket whose entry id is too old to pay for now is neither listed nor handed back.
+/// Asking for it releases it, as the next ticket request does, so a new entry under a new id
+/// can take its place even when the player held as many unpaid tickets as one may.
+#[tokio::test]
+async fn an_unpaid_ticket_too_old_to_pay_for_is_released_for_a_new_entry() {
+    let start = OffsetDateTime::now_utc() + Duration::hours(3);
+    let queue = Queue::new(start, PoolRules::new(2, 25).unwrap(), 100).await;
+    let store = queue.store();
+    let id = queue.competition.id;
+    let deadline = queue.competition.ticket_deadline();
+    let now = OffsetDateTime::now_utc();
+    let [stale, older, newer] =
+        [50, 20, 10].map(|minutes| entry_id_at(now - Duration::minutes(minutes)));
+    for ticket in [stale, older, newer] {
+        assert!(matches!(
+            store
+                .reserve_queued_ticket(id, ticket, "alice", 100, 3, deadline)
+                .await
+                .unwrap(),
+            QueuedReservation::Reserved(_)
+        ));
+    }
+    let stale_id = stale.to_string();
+    queue
+        .db
+        .execute_write(move |pool| async move {
+            sqlx::query(
+                "UPDATE tickets SET payment_request = 'lnbc1',
+                     invoice_expires_at = datetime('now', '+1 hour')
+                 WHERE id = ?",
+            )
+            .bind(stale_id)
+            .execute(&pool)
+            .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let coordinator = &queue.coordinator;
+    let listed = move || async move {
+        coordinator
+            .unpaid_tickets("alice", Some(id))
+            .await
+            .unwrap()
+            .iter()
+            .map(|ticket| ticket.ticket_id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        listed().await,
+        vec![older, newer],
+        "the stale one is not offered"
+    );
+    let fresh = Uuid::now_v7();
+    assert!(
+        matches!(
+            store
+                .reserve_queued_ticket(id, fresh, "alice", 100, 3, deadline)
+                .await
+                .unwrap(),
+            QueuedReservation::TooManyUnpaid
+        ),
+        "it still counts until it is released"
+    );
+
+    let key: bitcoin::PublicKey =
+        "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+            .parse()
+            .unwrap();
+    let choice = coordinator_core::PayoutRegistrationRequest {
+        entry_id: stale,
+        payout_hash: hex::encode([4; 32]),
+        lightning_address: Some("alice@example.org".into()),
+        allow_invoice_fallback: true,
+        release_entry_key_after_payment: true,
+    };
+    let refused = queue
+        .coordinator
+        .request_ticket_with_payout("alice".into(), id, key, Some(choice))
+        .await
+        .err();
+    assert!(
+        matches!(&refused, Some(Error::BadRequest(reason)) if reason == queued::STALE_ENTRY_ID),
+        "{refused:?}"
+    );
+    assert_eq!(store.get_ticket(stale).await.unwrap().reserved_by, None);
+    assert_eq!(listed().await, vec![older, newer]);
+    assert!(matches!(
+        store
+            .reserve_queued_ticket(id, fresh, "alice", 100, 3, deadline)
+            .await
+            .unwrap(),
+        QueuedReservation::Reserved(_)
+    ));
+}
+
+/// A paid ticket's entry is made within the hour its entry id allows. Past it the entry is
+/// refused, and the ticket is left for its refund.
+#[tokio::test]
+async fn a_paid_entry_is_refused_once_its_entry_id_is_over_an_hour_old() {
+    let start = OffsetDateTime::now_utc() + Duration::hours(3);
+    let queue = Queue::new(start, PoolRules::new(2, 25).unwrap(), 100).await;
+    let now = OffsetDateTime::now_utc();
+    let entry = |ticket: Uuid| AddEntry {
+        id: ticket,
+        ticket_id: ticket,
+        ephemeral_pubkey: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+            .into(),
+        payout_hash: hex::encode(dlctix::hashlock::sha256(ticket.as_bytes())),
+        event_id: queue.competition.id,
+        expected_observations: ["KORD", "KSAW"]
+            .map(|station| WeatherChoices {
+                stations: station.into(),
+                temp_high: Some(crate::infra::oracle::ValueOptions::Over),
+                temp_low: None,
+                wind_speed: None,
+            })
+            .into(),
+        encrypted_keymeld_private_key: None,
+        keymeld_auth_pubkey: None,
+        keymeld_registration_context: None,
+        keymeld_escrow_policy: None,
+    };
+    let late = queue
+        .ticket_with_id("alice", false, entry_id_at(now - Duration::minutes(61)))
+        .await;
+    let refused = queue
+        .coordinator
+        .add_entry("alice".into(), entry(late))
+        .await
+        .err();
+    assert!(
+        matches!(&refused, Some(Error::BadRequest(reason)) if reason == queued::ENTRY_WINDOW_PASSED),
+        "{refused:?}"
+    );
+    assert_eq!(queue.store().get_ticket(late).await.unwrap().entry_id, None);
+
+    // Within the hour the entry gets past this check to the ones after it, here the payout
+    // authorization this ticket was never given.
+    let timely = queue
+        .ticket_with_id("alice", false, entry_id_at(now - Duration::minutes(55)))
+        .await;
+    let other = queue
+        .coordinator
+        .add_entry("alice".into(), entry(timely))
+        .await
+        .err();
+    assert!(
+        matches!(&other, Some(Error::BadRequest(reason)) if reason != queued::ENTRY_WINDOW_PASSED),
+        "{other:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_player_s_paid_tickets_without_an_entry_are_listed_while_entries_are_open() {
     let start = OffsetDateTime::now_utc() + Duration::hours(3);
@@ -1424,11 +1604,20 @@ async fn a_player_s_paid_tickets_without_an_entry_are_listed_while_entries_are_o
     };
     let paid = queue.ticket("alice", false).await;
     authorize("alice", paid, true).await;
-    // Entered already; another player's; one without a payout authorization naming its entry.
+    // Entered already; another player's; one without a payout authorization naming its entry;
+    // one whose entry id is over an hour old, too late to finish.
     queue.ticket("alice", true).await;
     let bobs = queue.ticket("bob", false).await;
     authorize("bob", bobs, true).await;
     queue.ticket("alice", false).await;
+    let late = queue
+        .ticket_with_id(
+            "alice",
+            false,
+            entry_id_at(OffsetDateTime::now_utc() - Duration::minutes(61)),
+        )
+        .await;
+    authorize("alice", late, true).await;
 
     let listed = queue
         .coordinator
@@ -1442,6 +1631,7 @@ async fn a_player_s_paid_tickets_without_an_entry_are_listed_while_entries_are_o
             competition_id: id,
             entry_id: paid,
             ephemeral_pubkey: Some(format!("key-{paid}")),
+            finish_by: queued::entry_finish_by(paid).unwrap(),
         }]
     );
     assert_eq!(
@@ -1450,6 +1640,7 @@ async fn a_player_s_paid_tickets_without_an_entry_are_listed_while_entries_are_o
     );
     let json = serde_json::to_value(&listed[0]).unwrap();
     assert_eq!(json["entry_id"], paid.to_string());
+    assert!(json["finish_by"].is_string());
 
     // Once the pools formed, its entries are closed: there is nothing to finish here.
     let competition = id.to_string();

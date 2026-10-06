@@ -52,7 +52,7 @@ pub fn entries_page(
     html! {
         div id="allEntries" class="account-page" {
             h1 class="title is-4" { "Your entries" }
-            (paid_entries(paid))
+            (paid_entries(paid, OffsetDateTime::now_utc()))
             (unpaid_entries(unpaid, OffsetDateTime::now_utc()))
             @if rows.is_empty() {
                 (no_entries(open))
@@ -80,9 +80,10 @@ pub fn entries_page(
     }
 }
 
-/// Tickets paid for whose entry never went in: each links to its competition's entry form, whose
-/// Pay enters the picks made there without paying again. Nothing when there are none.
-pub fn paid_entries(paid: &[PaidRow]) -> Markup {
+/// Tickets paid for whose entry never went in, and how long is left to finish each: each links to
+/// its competition's entry form, whose Pay enters the picks made there without paying again.
+/// Nothing when there are none.
+pub fn paid_entries(paid: &[PaidRow], now: OffsetDateTime) -> Markup {
     html! {
         @if !paid.is_empty() {
             div id="paidEntries" class="notification is-info paid-entries" {
@@ -91,7 +92,7 @@ pub fn paid_entries(paid: &[PaidRow]) -> Markup {
                     @for row in paid {
                         li {
                             (format::window(row.competition.start, row.competition.end))
-                            " "
+                            " · " (format::duration(row.ticket.finish_by - now)) " left "
                             a href=(row.competition.url()) hx-get=(row.competition.url())
                               hx-target="#main-content" hx-push-url="true" { "Make picks" }
                         }
@@ -929,22 +930,25 @@ mod tests {
     #[test]
     fn paid_tickets_to_enter_link_to_their_entry_form() {
         let competition = view("c1", Phase::Upcoming, 90);
+        let now = OffsetDateTime::now_utc();
         let ticket = PaidTicket {
             ticket_id: uuid::Uuid::from_u128(7),
             competition_id: uuid::Uuid::from_u128(1),
             entry_id: uuid::Uuid::from_u128(8),
             ephemeral_pubkey: None,
+            finish_by: now + time::Duration::minutes(42),
         };
         let rows = [PaidRow {
             ticket: &ticket,
             competition: &competition,
         }];
-        let html = paid_entries(&rows).into_string();
+        let html = paid_entries(&rows, now).into_string();
         assert!(html.contains("Paid — make your picks to finish entering"));
+        assert!(html.contains(" · 42 min left "), "{html}");
         assert!(html.contains(r#"href="/competitions/c1/entry-form""#));
         assert!(html.contains("Make picks"));
         assert!(!html.contains("Pay"), "nothing more to pay");
-        assert!(paid_entries(&[]).into_string().is_empty());
+        assert!(paid_entries(&[], now).into_string().is_empty());
 
         // Shown even before any entry went in, above the rest.
         let page = entries_page(

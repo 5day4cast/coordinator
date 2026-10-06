@@ -212,18 +212,13 @@ impl Coordinator {
                     .into(),
             ));
         }
-        // An entry id may be no older than an hour when its ticket is made. Asking again for a
-        // ticket the player still holds unpaid resumes it: its invoice could be paid as it is,
-        // so the id's age changes nothing, and the entry key is the one derived from the id.
-        let resuming = self
-            .competition_store
-            .unpaid_queued_tickets(&pubkey, Some(competition.id))
-            .await?
-            .iter()
-            .any(|ticket| ticket.id == choice.entry_id);
-        if !resuming {
-            queued::check_entry_id(choice.entry_id, now).map_err(Error::BadRequest)?;
-        }
+        // A ticket is issued, or one the player holds unpaid handed back, only while its entry
+        // id leaves time to pay it and finish the entry within the hour the id allows. The
+        // player's unpaid tickets here that are past that are released first, so they no longer
+        // count against the player and a new entry, under a new id, can take their place.
+        self.release_stale_tickets(&pubkey, competition.id, now)
+            .await?;
+        queued::check_ticket_entry_id(choice.entry_id, now).map_err(Error::BadRequest)?;
         self.require_payout_capabilities(true).await?;
         let settings = self.queue_settings(competition.id).await?;
         let reserved = match self
@@ -283,18 +278,49 @@ impl Coordinator {
 
     /// The unpaid tickets `pubkey` holds in queued competitions, `competition_id`'s alone when
     /// given, oldest entry first: what the entry form's Pay resumes, and the entries page lists.
+    /// One whose entry id is too old to be handed back is left out (see
+    /// [`queued::check_ticket_entry_id`]): Pay starts a new entry instead.
     pub async fn unpaid_tickets(
         &self,
         pubkey: &str,
         competition_id: Option<Uuid>,
     ) -> Result<Vec<UnpaidTicket>, Error> {
+        let now = OffsetDateTime::now_utc();
         Ok(self
             .competition_store
             .unpaid_queued_tickets(pubkey, competition_id)
             .await?
             .iter()
+            .filter(|ticket| queued::check_ticket_entry_id(ticket.id, now).is_ok())
             .map(UnpaidTicket::from_ticket)
             .collect())
+    }
+
+    /// Release the unpaid tickets `pubkey` holds in queued `competition_id` whose entry ids are
+    /// too old to be handed back (see [`queued::check_ticket_entry_id`]). Their invoices can no
+    /// longer buy them, and they stop counting against the player's unpaid tickets.
+    async fn release_stale_tickets(
+        &self,
+        pubkey: &str,
+        competition_id: Uuid,
+        now: OffsetDateTime,
+    ) -> Result<(), Error> {
+        let held = self
+            .competition_store
+            .unpaid_queued_tickets(pubkey, Some(competition_id))
+            .await?;
+        for ticket in held
+            .iter()
+            .filter(|ticket| queued::check_ticket_entry_id(ticket.id, now).is_err())
+        {
+            info!(
+                "Releasing unpaid ticket {} in competition {competition_id}: its entry id is too \
+                 old to pay for now",
+                ticket.id
+            );
+            self.release_failed_reservation(ticket).await;
+        }
+        Ok(())
     }
 
     /// Fix a queued ticket's payout policy: the player's consent to the competition's terms and

@@ -223,7 +223,7 @@ pub fn entry_form(
 
             div class="entry-submit" {
                 (unpaid_notice(&competition.id, unpaid, time::OffsetDateTime::now_utc()))
-                (paid_notice(&competition.id, paid))
+                (paid_notice(&competition.id, paid, time::OffsetDateTime::now_utc()))
                 // How many picks are still to make; `entry_form.js` counts as the player picks.
                 p id="picksLeft" class="picks-left" role="status" aria-live="polite" {
                     (picks_to_make(picks_allowed, rows))
@@ -268,18 +268,24 @@ pub fn paid_url(competition_id: &str) -> String {
 }
 
 /// The player's paid ticket in this competition whose entry never went in (their page reloaded
-/// before it did), if they hold one: Pay enters the picks on the form under it, without paying
-/// again. Empty otherwise, and reloaded on log-in and log-out without touching the picks.
-pub fn paid_notice(competition_id: &str, paid: Option<&PaidTicket>) -> Markup {
+/// before it did), if they hold one, and how long is left to finish it: Pay enters the picks on
+/// the form under it, without paying again. Empty otherwise, and reloaded on log-in and log-out
+/// without touching the picks.
+pub fn paid_notice(
+    competition_id: &str,
+    paid: Option<&PaidTicket>,
+    now: time::OffsetDateTime,
+) -> Markup {
     html! {
         div id="entryPaid" hx-get=(paid_url(competition_id))
             hx-trigger="fw:login from:body, fw:logout from:body" hx-swap="outerHTML"
             data-ticket-id=[paid.map(|ticket| ticket.ticket_id)]
             data-entry-id=[paid.map(|ticket| ticket.entry_id)]
             data-entry-key=[paid.and_then(|ticket| ticket.ephemeral_pubkey.as_deref())] {
-            @if paid.is_some() {
+            @if let Some(ticket) = paid {
                 p class="notification is-info paid-entry" {
-                    "Paid — make your picks to finish entering."
+                    "Paid — make your picks to finish entering; "
+                    (format::duration(ticket.finish_by - now)) " left."
                 }
             }
         }
@@ -597,28 +603,32 @@ mod tests {
 
     #[test]
     fn a_paid_ticket_says_to_make_picks_and_pay_enters_without_paying() {
-        let ticket = PaidTicket {
+        let now = time::macros::datetime!(2026-10-06 12:00 UTC);
+        let mut ticket = PaidTicket {
             ticket_id: uuid::Uuid::from_u128(7),
             competition_id: uuid::Uuid::from_u128(1),
             entry_id: uuid::Uuid::from_u128(8),
             ephemeral_pubkey: Some("02aa".into()),
+            finish_by: now + time::Duration::minutes(42),
         };
-        let html = paid_notice("c1", Some(&ticket)).into_string();
+        let html = paid_notice("c1", Some(&ticket), now).into_string();
         assert!(html.contains(r#"id="entryPaid""#));
         assert!(html.contains(&format!(r#"data-ticket-id="{}""#, ticket.ticket_id)));
         assert!(html.contains(&format!(r#"data-entry-id="{}""#, ticket.entry_id)));
         assert!(html.contains(r#"data-entry-key="02aa""#));
-        assert!(html.contains("Paid — make your picks to finish entering."));
+        assert!(html.contains("Paid — make your picks to finish entering; 42 min left."));
         // Reloaded on log-in and log-out, signed (htmx_auth.js), without touching the picks.
         assert!(html.contains(r#"hx-get="/competitions/c1/entry-form/paid""#));
         assert!(html.contains(r#"hx-trigger="fw:login from:body, fw:logout from:body""#));
-        let none = paid_notice("c1", None).into_string();
+        let none = paid_notice("c1", None, now).into_string();
         assert!(
             none.contains(r#"id="entryPaid""#),
             "kept for the log-in reload"
         );
         assert!(!none.contains("data-ticket-id") && !none.contains("Paid —"));
 
+        // The form says how long is left from the time it is rendered.
+        ticket.finish_by = time::OffsetDateTime::now_utc() + time::Duration::minutes(42);
         let form = |paid: Option<&PaidTicket>, fee: NetworkFee| {
             entry_form(
                 &view("c1", Phase::Upcoming, 60),
@@ -638,6 +648,7 @@ mod tests {
         let notice = html.find("Paid — make your picks").unwrap();
         let button = html.find(r#"id="submitEntry""#).unwrap();
         assert!(notice < button);
+        assert!(html[notice..button].contains(" min left."));
         assert!(
             html[button..].contains(">Enter</button>"),
             "nothing more to pay"

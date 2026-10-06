@@ -813,8 +813,8 @@ pub async fn entry_unpaid_fragment(
 }
 
 /// The player's first paid ticket in the competition whose entry never went in, which the entry
-/// form's Pay enters without paying again; none when signed out, when entries are closed, or
-/// when it cannot be read.
+/// form's Pay enters without paying again; none when signed out, when entries are closed, when
+/// the entry can no longer be finished, or when it cannot be read.
 async fn paid_ticket(
     state: &AppState,
     auth: Option<&NostrAuth>,
@@ -839,7 +839,7 @@ pub async fn entry_paid_fragment(
 ) -> Response {
     let paid = paid_ticket(&state, auth.as_ref(), competition_id).await;
     fragment(
-        paid_notice(&competition_id.to_string(), paid.as_ref()),
+        paid_notice(&competition_id.to_string(), paid.as_ref(), now()),
         Caching::Private,
     )
 }

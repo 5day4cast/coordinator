@@ -54,9 +54,22 @@ pub const TOO_MANY_UNPAID: &str =
      pay one, or wait for its invoice to expire";
 /// A queued ticket's id is its entry's id, which the player's wallet makes when it opens the
 /// entry form. The oracle breaks an exact tie by entry id, so an id may not claim to be older
-/// than this, nor from the future.
+/// than this, nor from the future. The entry is finished within the same window: once its id is
+/// older, the entry is refused and its paid ticket is refunded. A single competition's entry id,
+/// which its payout authorization names, is held to the same window.
 pub const MAX_ENTRY_ID_AGE: Duration = Duration::hours(1);
 pub const MAX_ENTRY_ID_SKEW: Duration = Duration::minutes(5);
+/// The end of [`MAX_ENTRY_ID_AGE`] kept for paying a ticket's invoice and finishing its entry: an
+/// invoice is issued, or an unpaid ticket handed back, only for an entry id younger than the rest.
+pub const PAY_AND_ENTER_TIME: Duration = Duration::minutes(15);
+/// Why a ticket is refused for an entry id outside its window. The entry form and Synth start the
+/// entry again under a new id when they get it.
+pub const STALE_ENTRY_ID: &str =
+    "the entry id is too old or from the future; start the entry again for a new one";
+/// Why a paid ticket's entry is refused once its entry id is older than [`MAX_ENTRY_ID_AGE`].
+pub const ENTRY_WINDOW_PASSED: &str =
+    "This entry was started over an hour ago, so it can no longer be finished; its entry fee \
+     will be refunded";
 
 /// What a `competitions` row is.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -363,26 +376,49 @@ pub fn oracle_pubkey_text(key: &PublicKey) -> String {
     key.x_only_public_key().0.to_string()
 }
 
-/// Whether a queued ticket's id, its entry's id, is a UUIDv7 made recently enough to be the
-/// time its player started entering.
+/// Whether an entry's id is a UUIDv7 made recently enough to be the time its player started
+/// entering, so that the entry may still be made at `now`: at most [`MAX_ENTRY_ID_AGE`] ago.
 pub fn check_entry_id(entry_id: Uuid, now: OffsetDateTime) -> Result<(), String> {
+    check_entry_id_age(entry_id, now, MAX_ENTRY_ID_AGE)
+}
+
+/// Whether a ticket may be issued at `now` for an entry under `entry_id`, or handed back unpaid:
+/// as [`check_entry_id`], with [`PAY_AND_ENTER_TIME`] of the window left to pay its invoice and
+/// finish the entry.
+pub fn check_ticket_entry_id(entry_id: Uuid, now: OffsetDateTime) -> Result<(), String> {
+    check_entry_id_age(entry_id, now, MAX_ENTRY_ID_AGE - PAY_AND_ENTER_TIME)
+}
+
+/// When an entry under `entry_id` can no longer be finished: [`MAX_ENTRY_ID_AGE`] after the
+/// player's wallet made the id.
+pub fn entry_finish_by(entry_id: Uuid) -> Result<OffsetDateTime, String> {
+    Ok(entry_id_time(entry_id)? + MAX_ENTRY_ID_AGE)
+}
+
+fn check_entry_id_age(
+    entry_id: Uuid,
+    now: OffsetDateTime,
+    max_age: Duration,
+) -> Result<(), String> {
+    let made = entry_id_time(entry_id)?;
+    if made > now + MAX_ENTRY_ID_SKEW || now - made > max_age {
+        return Err(STALE_ENTRY_ID.into());
+    }
+    Ok(())
+}
+
+/// When the player's wallet made `entry_id`, a UUIDv7.
+fn entry_id_time(entry_id: Uuid) -> Result<OffsetDateTime, String> {
     if entry_id.get_version_num() != 7 {
-        return Err("a queued entry's id must be a UUIDv7".into());
+        return Err("an entry's id must be a UUIDv7".into());
     }
     let (seconds, nanos) = entry_id
         .get_timestamp()
-        .ok_or("a queued entry's id has no time")?
+        .ok_or("an entry's id has no time")?
         .to_unix();
-    let made = OffsetDateTime::from_unix_timestamp(seconds as i64)
-        .map_err(|_| "a queued entry's id has an invalid time")?
-        + Duration::nanoseconds(i64::from(nanos));
-    if made > now + MAX_ENTRY_ID_SKEW || now - made > MAX_ENTRY_ID_AGE {
-        return Err(
-            "the entry id is too old or from the future; start the entry again for a new one"
-                .into(),
-        );
-    }
-    Ok(())
+    Ok(OffsetDateTime::from_unix_timestamp(seconds as i64)
+        .map_err(|_| "an entry's id has an invalid time")?
+        + Duration::nanoseconds(i64::from(nanos)))
 }
 
 /// Header times may run ahead of the clock by up to two hours, so a run of headers is known to

@@ -399,6 +399,10 @@ Each pool runs the lifecycle of [In the coordinator](#in-the-coordinator) from e
    The wallet checks the template against the oracle's reference event and key, and against the entry form.
    It then seals the entry key as a Keymeld deposit under the competition's scope.
    The coordinator has the enclave validate the deposit before it shows the invoice.
+   The ticket's id is the entry id the wallet made when the player started the entry.
+   A ticket is issued, or an unpaid one handed back, only while that id is at most 45 minutes old, and the entry is made within the hour: later, it is refused and the paid ticket is refunded.
+   An unpaid ticket past 45 minutes is released when the player asks for another, and the entry form starts the entry again under a new id.
+   Picks cannot change once entered.
 3. **Kickoff.**
    When observation starts, the coordinator finds the first block at or after the close.
    It takes the complete tickets: paid into their escrows, with an entry and a deposit.
@@ -715,6 +719,7 @@ So the kickoff collects at most the lowest cap times the number of players, the 
 | An escrow's VTXO expires before its refund | The refund waits for the server to sweep it, then recovers it in a batch into the same swap. |
 | Kickoff keeps failing | The pool fails, and every escrow is refunded after `T`. |
 | A ticket is paid with a coin that expires before `T` plus the margin | The ticket is not counted, and never reaches a pool. Its escrow needs an operator. |
+| A paid ticket's entry comes over an hour after its entry id was made | The entry is refused; the ticket never reaches a pool and is refunded with the others no pool took. |
 | A pool fails its kickoff check | The pool waits up to an hour for fees to fall, then is cancelled and every escrow refunded. |
 | A pool cannot be signed within a batch | Kickoff retries in the next batch. Repeated failures refund that pool. |
 | Ark operator unavailable before kickoff | Kickoff waits. Players can unroll and exit alone, no earlier than `T` plus the exit delay. |

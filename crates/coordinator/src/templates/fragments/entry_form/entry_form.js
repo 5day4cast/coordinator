@@ -630,15 +630,19 @@ function currentPayButton(competitionId) {
   return form?.dataset.competitionId === competitionId ? document.getElementById("submitEntry") : null;
 }
 
-function showEntrySuccess(competitionId) {
-  const button = currentPayButton(competitionId);
-  if (!button) return;
-  // The paid ticket the form showed is entered now.
+// The paid ticket the form showed is done with: entered, or past the hour to finish it.
+function clearPaidNotice() {
   const paidNotice = document.getElementById("entryPaid");
   if (paidNotice?.dataset.ticketId) {
     delete paidNotice.dataset.ticketId;
     paidNotice.replaceChildren?.();
   }
+}
+
+function showEntrySuccess(competitionId) {
+  const button = currentPayButton(competitionId);
+  if (!button) return;
+  clearPaidNotice();
   document.getElementById("errorMessage")?.classList.add("hidden");
   document.getElementById("successMessage")?.classList.remove("hidden");
   button.textContent = "Entered";
@@ -749,12 +753,9 @@ async function submitEntry() {
     try {
       await enter(currentEntry, payButton);
     } catch (refused) {
-      // This page didn't know of the player's unpaid entries (opened before they were made, or
-      // in another tab): pay the oldest of them instead of starting another.
-      const unpaid = refused?.message === TOO_MANY_UNPAID && !currentEntry.paid && !currentEntry.awaitingPayment
-        ? await oldestUnpaidTicket(currentEntry) : null;
-      if (!unpaid) throw refused;
-      currentEntry = await newEntry(form, picks, unpaid);
+      const retry = await retryAfter(refused, currentEntry);
+      if (!retry) throw refused;
+      currentEntry = await newEntry(form, picks, retry.unpaid);
       pendingEntry = currentEntry;
       await enter(currentEntry, payButton);
     }
@@ -764,6 +765,17 @@ async function submitEntry() {
     showEntrySuccess(competitionId);
   } catch (caught) {
     console.error("Entry submission failed:", caught);
+    const error = caught?.response ? await requestFailure(caught) : caught;
+    // WASM rejects with plain strings, which have no message property.
+    const detail = typeof error === "string" ? error : typeof error?.message === "string" ? error.message : "";
+    // A paid entry not finished within the hour its entry id allows is refunded: the next Pay
+    // starts a new entry.
+    const expired = Boolean(pendingEntry?.paid) && detail === ENTRY_WINDOW_PASSED;
+    if (expired) {
+      forgetEntry(pendingEntry.competition.id);
+      pendingEntry = null;
+      clearPaidNotice();
+    }
     // A ticket that failed or was never paid is done with; a paid one is entered on the next Pay.
     // The entry itself is kept for the next request unless its ticket expired, failed or was
     // refused: a request whose answer never came gets the same ticket back.
@@ -772,9 +784,6 @@ async function submitEntry() {
       pendingEntry = null;
     }
 
-    const error = caught?.response ? await requestFailure(caught) : caught;
-    // WASM rejects with plain strings, which have no message property.
-    const detail = typeof error === "string" ? error : typeof error?.message === "string" ? error.message : "";
     let userMessage = detail || "Failed to submit entry";
     if (detail.includes("No signer initialized")) {
       userMessage = "Session expired. Please log in again.";
@@ -784,6 +793,7 @@ async function submitEntry() {
     }
 
     showEntryFailure(competitionId, userMessage);
+    if (expired) labelPay();
   } finally {
     submissionBusy = false;
   }
@@ -800,6 +810,29 @@ async function enter(entry, payButton) {
 // The coordinator's refusal when the player already holds as many unpaid tickets in a queued
 // competition as one may (`queued::TOO_MANY_UNPAID`).
 const TOO_MANY_UNPAID = "You have unpaid entries waiting in this competition; open its entry form and press Pay to pay one, or wait for its invoice to expire";
+// Its refusal of a ticket for an entry started too long ago to pay for and finish within the
+// hour its entry id allows (`queued::STALE_ENTRY_ID`), as `requestFailure` words it.
+const STALE_ENTRY_ID = "The entry id is too old or from the future; start the entry again for a new one";
+// Its refusal of a paid entry whose entry id is over an hour old (`queued::ENTRY_WINDOW_PASSED`).
+const ENTRY_WINDOW_PASSED = "This entry was started over an hour ago, so it can no longer be finished; its entry fee will be refunded";
+
+// How Pay goes on after the coordinator refused the ticket for `entry`: with a new entry that
+// resumes `unpaid` (or starts afresh when it is null), or not at all (null). A page that didn't
+// know of the player's unpaid entries (opened before they were made, or in another tab) pays the
+// oldest of them instead of starting another; an entry started too long ago starts again under a
+// new entry id.
+async function retryAfter(refused, entry) {
+  if (entry.paid || entry.awaitingPayment) return null;
+  if (refused?.message === TOO_MANY_UNPAID) {
+    const unpaid = await oldestUnpaidTicket(entry);
+    return unpaid ? { unpaid } : null;
+  }
+  if (refused?.message === STALE_ENTRY_ID) {
+    forgetEntry(entry.competition.id);
+    return { unpaid: null };
+  }
+  return null;
+}
 
 // The unpaid ticket the form says the player holds (the `entryUnpaid` notice, rendered for the
 // signed-in player), as the entry to resume: a queued ticket's id is its entry's, and the entry
