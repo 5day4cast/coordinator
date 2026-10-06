@@ -652,11 +652,31 @@ Pending: whether the closing sweep can board back into Arkade.
 
 Each ticket carries its share of the pool's chain cost, as its own line next to the entry and service fees.
 It is priced for the smallest pool the game runs, five players, with a 50% margin: `ceil((342 + 26 × 5) / 5 × rate × 1.5)` sats.
-The rate is the one contracts are built at: the current two-block estimate plus the larger of 10% and 0.25 sat/vB, so the kickoff check costs a pool at the rate its fees were priced at.
-That is 179 sats at LND's floor of 1.012 sat/vB, which contracts build at 1.264.
+
+The configured electrs server supplies a historical baseline through `blockchain.estimatefee(144)`.
+This is a 144-block confirmation target, about 72 minutes on Mutinynet or one day on Bitcoin.
+It provides a baseline for the coordinator's pricing policy; it does not promise next-block confirmation.
+The coordinator bounds that baseline by the relay minimum from `blockchain.relayfee` and LND's wallet minimum.
+
+The server also supplies current demand through `mempool.get_fee_histogram`.
+The [Electrum protocol](https://electrum-protocol.readthedocs.io/en/latest/protocol-methods.html#mempool-get-fee-histogram) specifies the histogram's fee and size units.
+The estimator adds bucket sizes until they fill 800,000 virtual bytes per target block, leaving 20% for new arrivals.
+It raises the baseline to one sat/kWU above the boundary bucket when that rate is higher.
+When the current mempool fits, it uses the historical baseline with its relay and wallet minimums.
+These targets describe current demand; they cannot guarantee future confirmation times.
+
+If any of these three local RPCs fails or returns invalid data, pricing waits for valid local evidence.
+The coordinator does not fall back to LND estimates or a public explorer.
+
+The contract rate adds the larger of 10% and 0.25 sat/vB after the next-block mempool adjustment.
+Ticket pricing uses the two-block mempool adjustment with the same baseline and margin.
+For a quiet mempool and a historical estimate of 1.029 sat/vB, the contract rate is 1.280 sat/vB at wallet precision.
+At LND's floor of 1.012 sat/vB, the contract rate is 1.264 sat/vB and the ticket's network fee is 179 sats.
+
 The fee is fixed on the ticket's invoice when the ticket is issued and does not change for that payment hash.
 It is refunded with the escrow.
 No ticket is issued without a fee estimate, and no ticket is issued while the fee would be more than 10% of the entry fee; the entry form says entries are paused.
+
 The weights and thresholds are `network_fee_settings`.
 
 ### Kickoff check
