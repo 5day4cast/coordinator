@@ -198,7 +198,7 @@ mod tests {
                 expiry: None,
             },
             outcome_payouts: payouts,
-            fee_rate: FeeRate::from_sat_per_vb_unchecked(1),
+            fee_rate: FeeRate::from_sat_per_vb_u32(1),
             funding_value: Amount::from_sat(100_000),
             relative_locktime_block_delta: 72,
             anchor: None,
