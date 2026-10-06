@@ -2193,6 +2193,109 @@ async fn the_registration_sent_before_paying_is_the_one_the_entry_registers() {
 }
 
 #[tokio::test]
+async fn a_paid_ticket_is_entered_with_the_registration_sent_before_paying() {
+    let f = Fixture::new().await;
+    let now = OffsetDateTime::now_utc().unix_timestamp() as u32;
+    let (ticket, escrow) = f.ticket_refundable_from(23, PRICE, now + 3_600).await;
+    let session = f.keymeld_session_for(&[UserId::from(ticket.id)]).await;
+    let (registration, _) = f.registration(&session, &ticket, &escrow, 23);
+    f.coordinator
+        .register_ticket(
+            "player".into(),
+            f.competition_id,
+            ticket.id,
+            registration.clone(),
+        )
+        .await
+        .unwrap();
+    let vtxo = outpoint(23, 0);
+    f.arkade_lists(&ticket.escrow_address, vtxo, PRICE, false);
+    f.swap_reports(&ticket, SwapState::Settled, Some(vtxo), Some(vtxo.txid));
+    f.coordinator.check_ark_swaps().await.unwrap();
+    // The page reloaded after paying: the registration cannot be sent again.
+    let mut resealed = registration.clone();
+    resealed.encrypted_keymeld_private_key = "sealed-again".into();
+    assert!(matches!(
+        f.coordinator
+            .register_ticket("player".into(), f.competition_id, ticket.id, resealed)
+            .await,
+        Err(Error::BadRequest(_))
+    ));
+
+    // The entry leaves the registration out; the one sent before paying is used.
+    let entry = |key: String| AddEntry {
+        id: Uuid::now_v7(),
+        ticket_id: ticket.id,
+        ephemeral_pubkey: key,
+        payout_hash: hex::encode([23; 32]),
+        event_id: f.competition_id,
+        expected_observations: vec![WeatherChoices {
+            stations: "KDEN".into(),
+            temp_high: Some(crate::infra::oracle::ValueOptions::Par),
+            temp_low: Some(crate::infra::oracle::ValueOptions::Par),
+            wind_speed: Some(crate::infra::oracle::ValueOptions::Par),
+        }],
+        encrypted_keymeld_private_key: None,
+        keymeld_auth_pubkey: None,
+        keymeld_registration_context: None,
+        keymeld_escrow_policy: None,
+    };
+    assert!(
+        matches!(
+            f.coordinator
+                .add_entry(
+                    "mallory".into(),
+                    entry(registration.ephemeral_pubkey.clone())
+                )
+                .await,
+            Err(Error::BadRequest(_))
+        ),
+        "only the ticket's player"
+    );
+    assert!(
+        matches!(
+            f.coordinator
+                .add_entry("player".into(), entry(keypair(24).public_key().to_string()))
+                .await,
+            Err(Error::BadRequest(_))
+        ),
+        "only under the key the ticket was paid with"
+    );
+    let entered = f
+        .coordinator
+        .add_entry(
+            "player".into(),
+            entry(registration.ephemeral_pubkey.clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(entered.ticket_id, ticket.id);
+    assert_eq!(
+        entered.encrypted_keymeld_private_key.as_deref(),
+        Some(registration.encrypted_keymeld_private_key.as_str())
+    );
+    assert_eq!(
+        entered.keymeld_auth_pubkey.as_deref(),
+        Some(registration.keymeld_auth_pubkey.as_str())
+    );
+    assert_eq!(
+        serde_json::to_value(&entered.keymeld_registration_context).unwrap(),
+        serde_json::to_value(Some(&registration.keymeld_registration_context)).unwrap()
+    );
+    // Once entered, the ticket is used.
+    assert!(matches!(
+        f.coordinator
+            .add_entry(
+                "player".into(),
+                entry(registration.ephemeral_pubkey.clone())
+            )
+            .await,
+        Err(Error::BadRequest(_))
+    ));
+    f.database.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_kickoff_intent_left_queued_is_deleted_so_the_refunds_complete() {
     let f = Fixture::new().await;
     let session = f.keymeld_session().await;

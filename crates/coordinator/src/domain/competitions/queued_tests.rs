@@ -388,29 +388,7 @@ impl Queue {
         let parent = self.competition.id;
         let player = player.to_string();
         let hash = format!("{:064x}", ticket.as_u128());
-        let policy = serde_json::to_string(&coordinator_escrow::authorization::PayoutPolicy {
-            automatic_lightning_address: Some(format!("{player}@example.org")),
-            allow_invoice_fallback: true,
-            release_entry_key_after_payment: true,
-            contract_terms: String::new(),
-            ark_escrow: Some(coordinator_escrow::authorization::ArkEscrowPolicy {
-                escrow_tap_tree: "00".into(),
-                max_fee_sats: 150,
-                max_refund_fee_sats: 100,
-                checkpoint_exit_script: "00".into(),
-            }),
-            queued_entry: Some(
-                coordinator_escrow::queued::QueuedEntryTerms {
-                    terms: self.settings.terms.clone(),
-                    entry_id: ticket,
-                    ticket_hash: hex::decode(&hash).unwrap().try_into().unwrap(),
-                    payout_hash: dlctix::hashlock::sha256(ticket.as_bytes()),
-                }
-                .to_json()
-                .unwrap(),
-            ),
-        })
-        .unwrap();
+        let policy = self.policy(&player, ticket, &hash);
         let submission = serde_json::to_vec(&AddEventEntry {
             id: ticket,
             event_id: parent,
@@ -481,6 +459,33 @@ impl Queue {
             .await
             .unwrap();
         ticket
+    }
+
+    /// The payout authorization `player` signs for queued `ticket`, whose hash is `hash`.
+    pub(super) fn policy(&self, player: &str, ticket: Uuid, hash: &str) -> String {
+        serde_json::to_string(&coordinator_escrow::authorization::PayoutPolicy {
+            automatic_lightning_address: Some(format!("{player}@example.org")),
+            allow_invoice_fallback: true,
+            release_entry_key_after_payment: true,
+            contract_terms: String::new(),
+            ark_escrow: Some(coordinator_escrow::authorization::ArkEscrowPolicy {
+                escrow_tap_tree: "00".into(),
+                max_fee_sats: 150,
+                max_refund_fee_sats: 100,
+                checkpoint_exit_script: "00".into(),
+            }),
+            queued_entry: Some(
+                coordinator_escrow::queued::QueuedEntryTerms {
+                    terms: self.settings.terms.clone(),
+                    entry_id: ticket,
+                    ticket_hash: hex::decode(hash).unwrap().try_into().unwrap(),
+                    payout_hash: dlctix::hashlock::sha256(ticket.as_bytes()),
+                }
+                .to_json()
+                .unwrap(),
+            ),
+        })
+        .unwrap()
     }
 
     pub(super) async fn lease(&self) -> Lease {
@@ -1559,4 +1564,95 @@ async fn a_queued_entry_s_picks_change_until_its_pools_form() {
         stored().await.expected_observations,
         picks(ValueOptions::Under)
     );
+}
+
+#[tokio::test]
+async fn a_player_s_paid_tickets_without_an_entry_are_listed_while_entries_are_open() {
+    let start = OffsetDateTime::now_utc() + Duration::hours(3);
+    let queue = Queue::new(start, PoolRules::new(2, 25).unwrap(), 100).await;
+    let id = queue.competition.id;
+    // Paid, with the payout authorization and registration sent before paying.
+    let authorize = |player: &'static str, ticket: Uuid, registered: bool| {
+        let hash = format!("{:064x}", ticket.as_u128());
+        let policy = queue.policy(player, ticket, &hash);
+        let db = queue.db.clone();
+        async move {
+            db.execute_write(move |pool| async move {
+                sqlx::query(
+                    "INSERT INTO ticket_payout_policies (ticket_id, ticket_hash, entry_pubkey,
+                        policy_json) VALUES (?, ?, ?, ?)",
+                )
+                .bind(ticket.to_string())
+                .bind(&hash)
+                .bind(format!("key-{ticket}"))
+                .bind(policy)
+                .execute(&pool)
+                .await?;
+                if registered {
+                    sqlx::query(
+                        "INSERT INTO ticket_keymeld_registrations (ticket_id, ticket_hash,
+                            registration_json) VALUES (?, ?, '{}')",
+                    )
+                    .bind(ticket.to_string())
+                    .bind(&hash)
+                    .execute(&pool)
+                    .await?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+    };
+    let paid = queue.ticket("alice", false).await;
+    authorize("alice", paid, true).await;
+    // Entered already; another player's; one without a payout authorization naming its entry.
+    queue.ticket("alice", true).await;
+    let bobs = queue.ticket("bob", false).await;
+    authorize("bob", bobs, true).await;
+    queue.ticket("alice", false).await;
+
+    let listed = queue
+        .coordinator
+        .paid_tickets("alice", Some(id))
+        .await
+        .unwrap();
+    assert_eq!(
+        listed,
+        vec![PaidTicket {
+            ticket_id: paid,
+            competition_id: id,
+            entry_id: paid,
+            ephemeral_pubkey: Some(format!("key-{paid}")),
+        }]
+    );
+    assert_eq!(
+        queue.coordinator.paid_tickets("alice", None).await.unwrap(),
+        listed
+    );
+    let json = serde_json::to_value(&listed[0]).unwrap();
+    assert_eq!(json["entry_id"], paid.to_string());
+
+    // Once the pools formed, its entries are closed: there is nothing to finish here.
+    let competition = id.to_string();
+    queue
+        .db
+        .execute_write(move |pool| async move {
+            sqlx::query(
+                "UPDATE competitions SET pools_formed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                 WHERE id = ?",
+            )
+            .bind(competition)
+            .execute(&pool)
+            .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(queue
+        .coordinator
+        .paid_tickets("alice", Some(id))
+        .await
+        .unwrap()
+        .is_empty());
 }

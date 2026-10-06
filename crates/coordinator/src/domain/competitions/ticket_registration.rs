@@ -61,7 +61,74 @@ pub struct PaidTicketRegistration {
     pub payout_policy: Option<String>,
 }
 
+/// A ticket its player paid for and has not used for an entry yet.
+#[derive(Debug, Clone)]
+pub struct PaidUnenteredTicket {
+    pub ticket_id: Uuid,
+    pub competition_id: Uuid,
+    /// The entry key the ticket was paid with.
+    pub entry_pubkey: Option<String>,
+    /// The payout policy the player accepted before paying, if the competition has one.
+    pub payout_policy: Option<String>,
+    /// Whether the player sent the ticket's Keymeld registration before paying.
+    pub registered: bool,
+}
+
+/// A ticket the player paid for and has not entered yet, while its competition takes entries.
+/// The player finishes the entry by sending their picks under `entry_id`, with the entry key the
+/// ticket was paid with; the Keymeld registration sent before paying is used again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaidTicket {
+    pub ticket_id: Uuid,
+    pub competition_id: Uuid,
+    /// The id the entry key is derived from, as the payout authorization the player signed
+    /// before paying names it.
+    pub entry_id: Uuid,
+    /// The entry key the ticket was paid with.
+    pub ephemeral_pubkey: Option<String>,
+}
+
 impl CompetitionStore {
+    /// The paid tickets `player` has not used for an entry, in one competition or all of them,
+    /// the first paid first.
+    pub async fn paid_unentered_tickets(
+        &self,
+        player: &str,
+        competition_id: Option<Uuid>,
+    ) -> Result<Vec<PaidUnenteredTicket>, sqlx::Error> {
+        sqlx::query(
+            "SELECT t.id, t.event_id, COALESCE(p.entry_pubkey, t.ephemeral_pubkey) AS entry_pubkey,
+                    p.policy_json, r.ticket_id IS NOT NULL AS registered
+             FROM tickets t
+             LEFT JOIN ticket_payout_policies p ON p.ticket_id = t.id AND p.ticket_hash = t.hash
+             LEFT JOIN ticket_keymeld_registrations r
+                    ON r.ticket_id = t.id AND r.ticket_hash = t.hash
+             WHERE t.reserved_by = ?1 AND t.paid_at IS NOT NULL
+               AND (?2 IS NULL OR t.event_id = ?2)
+               AND NOT EXISTS (SELECT 1 FROM entries e WHERE e.ticket_id = t.id)
+             ORDER BY t.paid_at, t.id",
+        )
+        .bind(player)
+        .bind(competition_id.map(|id| id.to_string()))
+        .fetch_all(self.db_connection.read())
+        .await?
+        .iter()
+        .map(|row| {
+            let uuid = |column: &str| {
+                Uuid::parse_str(&row.try_get::<String, _>(column)?)
+                    .map_err(|e| sqlx::Error::Decode(Box::new(e)))
+            };
+            Ok(PaidUnenteredTicket {
+                ticket_id: uuid("id")?,
+                competition_id: uuid("event_id")?,
+                entry_pubkey: row.try_get("entry_pubkey")?,
+                payout_policy: row.try_get("policy_json")?,
+                registered: row.try_get("registered")?,
+            })
+        })
+        .collect()
+    }
+
     /// Keep `registration` for the ticket while `player` holds it under `ticket_hash`.
     ///
     /// Until the ticket is paid its player may send it again. Once it is paid, only the same

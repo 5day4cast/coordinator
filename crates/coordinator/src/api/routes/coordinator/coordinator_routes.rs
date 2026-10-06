@@ -26,8 +26,8 @@ use crate::{
     },
     domain::{
         AddEntry, Competition, CreateEvent, CreateQueuedCompetition, Error as DomainError,
-        FundedContract, PayoutClaimInfo, PayoutClaimReceipt, PayoutInfo, SearchBy, TicketRefund,
-        TicketRegistration, TicketResponse, TicketStatus, UnpaidTicket, UserEntry,
+        FundedContract, PaidTicket, PayoutClaimInfo, PayoutClaimReceipt, PayoutInfo, SearchBy,
+        TicketRefund, TicketRegistration, TicketResponse, TicketStatus, UnpaidTicket, UserEntry,
     },
     infra::{lnurl::LightningAddress, oracle::WeatherChoices},
     startup::AppState,
@@ -184,6 +184,26 @@ pub async fn get_unpaid_tickets(
         .map(Json)
         .map_err(|e| {
             log_failure("listing unpaid tickets", &e);
+            e.into()
+        })
+}
+
+/// The tickets the player paid for in the competition and has not entered yet, while it takes
+/// entries, the first paid first. The entry form enters the picks under the ticket's entry id,
+/// with the entry key the ticket was paid with, leaving out the Keymeld registration: the one
+/// sent before paying is used.
+pub async fn get_paid_tickets(
+    NostrAuth { pubkey, .. }: NostrAuth,
+    State(state): State<Arc<AppState>>,
+    Path(competition_id): Path<Uuid>,
+) -> Result<Json<Vec<PaidTicket>>, ApiError> {
+    state
+        .coordinator
+        .paid_tickets(&pubkey.to_hex(), Some(competition_id))
+        .await
+        .map(Json)
+        .map_err(|e| {
+            log_failure("listing paid tickets", &e);
             e.into()
         })
 }

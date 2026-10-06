@@ -41,6 +41,19 @@ impl ApiRejection {
     pub fn is_entries_closed(&self) -> bool {
         self.status == 400 && self.message == "Competition is no longer accepting entries"
     }
+
+    /// The player's unpaid ticket was reserved under another entry key or payout choice. The
+    /// coordinator released that reservation, so asking again gets a ticket.
+    pub fn is_ticket_conflict(&self) -> bool {
+        self.status == 409
+    }
+}
+
+/// A ticket the player holds unpaid in a queued competition. Its id is its entry's id, from
+/// which the entry key is derived.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UnpaidTicket {
+    pub ticket_id: Uuid,
 }
 
 pub enum EntrySubmission {
@@ -328,6 +341,36 @@ impl CoordinatorClient {
             anyhow::bail!("Register ticket failed ({}): {}", status, body);
         }
         Ok(())
+    }
+
+    /// The player's unpaid tickets in a queued competition, oldest entry first. Empty for a
+    /// single competition (requires Nostr auth).
+    pub async fn unpaid_tickets(
+        &self,
+        keys: &Keys,
+        competition_id: &Uuid,
+    ) -> Result<Vec<UnpaidTicket>> {
+        let url = format!(
+            "{}/api/v1/competitions/{}/tickets/unpaid",
+            self.base_url(),
+            competition_id
+        );
+        let auth = create_auth_header(keys, "GET", &url, None).await?;
+        let resp = self
+            .http()
+            .get(&url)
+            .header("Authorization", auth)
+            .send()
+            .await
+            .context("Failed to list unpaid tickets")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("List unpaid tickets failed ({}): {}", status, body);
+        }
+        resp.json()
+            .await
+            .context("Failed to parse unpaid tickets response")
     }
 
     /// Check ticket payment status

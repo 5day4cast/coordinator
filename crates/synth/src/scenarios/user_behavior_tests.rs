@@ -43,6 +43,12 @@ struct Protocol {
     others: usize,
     /// Refunds settle only from then, as an escrow opens its refund leaf.
     refunds_open: Option<OffsetDateTime>,
+    /// The player holds an unpaid ticket reserved under this entry key. A request with another
+    /// key is refused with 409 and releases it, as the coordinator does.
+    reserved_key: Option<String>,
+    /// The player's unpaid queued tickets, oldest first, and how often they were listed.
+    unpaid: Vec<Uuid>,
+    unpaid_lookups: usize,
 }
 
 type Shared = Arc<Mutex<Protocol>>;
@@ -65,6 +71,7 @@ impl Mock {
             .route("/api/v1/competitions", post(|Json(body): Json<Value>| async move { Json(json!({"id":body["id"],"created_at":"2026-01-01T00:00:00Z","event_submission":{}})) }))
             .route("/api/v1/competitions/{id}", get(competition))
             .route("/api/v1/competitions/{id}/ticket", post(ticket))
+            .route("/api/v1/competitions/{id}/tickets/unpaid", get(unpaid))
             .route("/api/v1/competitions/{id}/tickets/{ticket}/status", get(status))
             .route("/api/v1/competitions/{id}/tickets/{ticket}/refund", get(refund))
             .route("/admin/api/test/settle-invoice/{ticket}", post(pay))
@@ -92,12 +99,23 @@ async fn competition(State(state): State<Shared>, Path(id): Path<Uuid>) -> Json<
 async fn ticket(State(state): State<Shared>, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
     let mut state = state.lock().unwrap();
     state.attempts += 1;
+    let key = body["btc_pubkey"].clone();
     state.ticket_requests.push(body);
     if state.tickets_closed {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error":"Competition is no longer accepting entries"})),
         );
+    }
+    if let Some(reserved) = state.reserved_key.take() {
+        if key != reserved.as_str() {
+            return (
+                StatusCode::CONFLICT,
+                Json(
+                    json!({"error":"Your ticket was already requested with a different entry key or payout choice; that request has been cancelled, so request the ticket again"}),
+                ),
+            );
+        }
     }
     let id = if state.tickets.len() + state.others < state.capacity {
         Uuid::now_v7()
@@ -199,6 +217,16 @@ async fn pay(State(state): State<Shared>, Path(ticket): Path<Uuid>) -> (StatusCo
     }
     state.lock().unwrap().paid.insert(ticket);
     (StatusCode::OK, Json(json!({})))
+}
+
+async fn unpaid(State(state): State<Shared>) -> Json<Value> {
+    let mut state = state.lock().unwrap();
+    state.unpaid_lookups += 1;
+    Json(json!(state
+        .unpaid
+        .iter()
+        .map(|id| json!({"ticket_id":id,"competition_id":Uuid::nil(),"invoice_expires_at":null}))
+        .collect::<Vec<_>>()))
 }
 
 async fn status(
@@ -1495,4 +1523,116 @@ async fn restart_preserves_the_submission_wait_and_does_not_overrun_the_deadline
     .unwrap());
     assert_eq!(trace.submission_not_before, Some(target));
     assert!(mock.state.lock().unwrap().events.is_empty());
+}
+
+#[tokio::test]
+async fn a_ticket_reserved_under_a_lost_key_is_released_and_asked_for_again() {
+    let mock = Mock::new(Protocol {
+        capacity: 1,
+        reserved_key: Some("key-lost-in-the-restart".into()),
+        ..Default::default()
+    })
+    .await;
+    let user = SynthUser::new_random("alice").unwrap();
+    let mut trace = EntryTrace::new(&user);
+    let requested = full_lifecycle::request_entry(
+        &mock.client,
+        &user,
+        &Uuid::now_v7(),
+        None,
+        "user_alice_enter",
+        &mut trace,
+    )
+    .await
+    .unwrap();
+    assert_eq!(trace.ticket_id, Some(requested.ticket.ticket_id));
+    let protocol = mock.state.lock().unwrap();
+    assert_eq!(protocol.ticket_requests.len(), 2);
+    assert_eq!(
+        protocol.ticket_requests[0], protocol.ticket_requests[1],
+        "asked again under the same entry id and key"
+    );
+}
+
+#[tokio::test]
+async fn a_resumed_step_without_its_saved_key_pays_its_oldest_unpaid_ticket() {
+    let user = SynthUser::new_random("alice").unwrap();
+    let (oldest, newer) = (Uuid::now_v7(), Uuid::now_v7());
+    let mock = Mock::new(Protocol {
+        capacity: 1,
+        unpaid: vec![oldest, newer],
+        ..Default::default()
+    })
+    .await;
+    let mut trace = EntryTrace::new(&user);
+    full_lifecycle::request_entry_resuming(
+        &mock.client,
+        &user,
+        &Uuid::now_v7(),
+        None,
+        "user_alice_enter",
+        &mut trace,
+        // The step was running at the restart, and what it saved cannot be read.
+        Some(None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(trace.key_derivation_id, Some(oldest));
+    let protocol = mock.state.lock().unwrap();
+    assert_eq!(protocol.unpaid_lookups, 1);
+    assert_eq!(
+        protocol.ticket_requests[0]["payout"]["entry_id"],
+        json!(oldest)
+    );
+    assert_eq!(
+        protocol.ticket_requests[0]["btc_pubkey"],
+        json!(user.derive_ephemeral_key(&oldest).unwrap().public_key),
+        "the entry key is derived from the resumed ticket's entry id"
+    );
+}
+
+#[tokio::test]
+async fn unpaid_tickets_are_listed_only_for_a_resumed_step_that_lost_its_key() {
+    let user = SynthUser::new_random("alice").unwrap();
+    let held = Uuid::now_v7();
+    let mock = Mock::new(Protocol {
+        capacity: 2,
+        unpaid: vec![held],
+        ..Default::default()
+    })
+    .await;
+    // A new step starts a new entry.
+    let mut fresh = EntryTrace::new(&user);
+    full_lifecycle::request_entry_resuming(
+        &mock.client,
+        &user,
+        &Uuid::now_v7(),
+        None,
+        "user_alice_enter",
+        &mut fresh,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_ne!(fresh.key_derivation_id, Some(held));
+    // A resumed step keeps the key it saved.
+    let saved_key = Uuid::now_v7();
+    let saved = EntryTrace {
+        key_derivation_id: Some(saved_key),
+        ..EntryTrace::new(&user)
+    };
+    let mut resumed = EntryTrace::new(&user);
+    full_lifecycle::request_entry_resuming(
+        &mock.client,
+        &user,
+        &Uuid::now_v7(),
+        None,
+        "user_alice_enter",
+        &mut resumed,
+        Some(Some(saved)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resumed.key_derivation_id, Some(saved_key));
+    assert_eq!(mock.state.lock().unwrap().unpaid_lookups, 0);
 }

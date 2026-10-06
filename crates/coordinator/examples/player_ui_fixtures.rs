@@ -89,6 +89,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         &payout,
         NetworkFee::Estimate(437),
         None,
+        None,
     );
     let entry_queued = entry_form(
         &queued,
@@ -96,6 +97,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         None,
         &payout,
         NetworkFee::Estimate(437),
+        None,
         None,
     );
 

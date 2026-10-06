@@ -11,12 +11,12 @@ use crate::{
         admin_wallet_balance_fragment, admin_wallet_fragment, admin_wallet_outputs_fragment,
         change_password, claim_ticket_payout, competitions_fragment, create_competition,
         create_queued_competition, entries_fragment, entry_detail_fragment,
-        entry_forecasts_fragment, entry_form_fragment, entry_payout_fragment,
+        entry_forecasts_fragment, entry_form_fragment, entry_paid_fragment, entry_payout_fragment,
         entry_unpaid_fragment, forgot_password_challenge, forgot_password_reset,
         get_aggregate_nonces, get_balance, get_competition, get_competitions,
         get_contract_parameters, get_entries, get_estimated_fee_rates, get_next_address,
-        get_outputs, get_ticket_refund, get_ticket_status, get_unpaid_tickets, health,
-        leaderboard_fragment, leaderboard_rows_fragment, login, login_username, not_found,
+        get_outputs, get_paid_tickets, get_ticket_refund, get_ticket_status, get_unpaid_tickets,
+        health, leaderboard_fragment, leaderboard_rows_fragment, login, login_username, not_found,
         operator_competition, operator_competitions, operator_delete_competition,
         operator_payout_holds, operator_release_payout_hold, operator_write_off_refunds,
         payouts_fragment, public_page_handler, register, register_ticket, register_username,
@@ -1032,6 +1032,10 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Result<Router, anyhow
             get(entry_unpaid_fragment),
         )
         .route(
+            "/competitions/{competition_id}/entry-form/paid",
+            get(entry_paid_fragment),
+        )
+        .route(
             "/competitions/{competition_id}/tickets/{ticket_id}/status",
             get(ticket_status_fragment),
         )
@@ -1086,6 +1090,10 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Result<Router, anyhow
         .route(
             "/api/v1/competitions/{competition_id}/tickets/unpaid",
             get(get_unpaid_tickets),
+        )
+        .route(
+            "/api/v1/competitions/{competition_id}/tickets/paid",
+            get(get_paid_tickets),
         )
         .route(
             "/api/v1/competitions/{competition_id}/tickets/{ticket_id}/status",
