@@ -38,7 +38,7 @@ use bitcoin::hex::DisplayHex;
 use bitcoin::key::{Keypair, Secp256k1};
 use bitcoin::secp256k1::rand::rngs::OsRng;
 use bitcoin::taproot::LeafVersion;
-use bitcoin::{OutPoint, Psbt, Sequence, TapLeafHash, TxOut, Txid};
+use bitcoin::{OutPoint, Psbt, ScriptBuf, Sequence, TapLeafHash, TxOut, Txid};
 use coordinator_ark_escrow::{EscrowPath, RefundSwap};
 use futures::StreamExt;
 use tokio::time::{timeout_at, Instant};
@@ -76,6 +76,30 @@ pub async fn recover_escrow<T: ArkTransport + ?Sized>(
     coordinator: &dyn EscrowSigner,
     config: &KickoffConfig,
 ) -> Result<Recovery, Error> {
+    recover_escrow_into(
+        transport,
+        info,
+        input,
+        swap.script_pubkey(),
+        player,
+        coordinator,
+        config,
+    )
+    .await
+}
+
+/// [`recover_escrow`] into any VTXO script: the player's own Ark address, when the player
+/// recovers an escrow without the coordinator. Leftover intents can then only be deleted if
+/// `coordinator` still signs; the player's recovery goes ahead without that.
+pub async fn recover_escrow_into<T: ArkTransport + ?Sized>(
+    transport: &T,
+    info: &Info,
+    input: &EscrowInput,
+    script_pubkey: ScriptBuf,
+    player: &dyn EscrowSigner,
+    coordinator: &dyn EscrowSigner,
+    config: &KickoffConfig,
+) -> Result<Recovery, Error> {
     let outpoint = input.outpoint;
     // An earlier attempt, interrupted before its batch, may have left its intent queued. arkd
     // would refuse this one for spending the same escrow. If it cannot be deleted, registering
@@ -93,7 +117,7 @@ pub async fn recover_escrow<T: ArkTransport + ?Sized>(
     let escrow = &input.escrow;
     let paid = TxOut {
         value: input.amount,
-        script_pubkey: swap.script_pubkey(),
+        script_pubkey,
     };
     let cosigner = Keypair::new(&Secp256k1::new(), &mut OsRng);
 

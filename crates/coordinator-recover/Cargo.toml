@@ -1,0 +1,58 @@
+[package]
+name = "coordinator-recover"
+description = "Recover a player's entries from their nsec alone, without the coordinator, its database or Keymeld"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "coordinator-recover"
+path = "src/main.rs"
+required-features = ["native"]
+
+[features]
+default = ["native"]
+# The CLI: relays over WebSocket, Esplora and the oracle over HTTP, and Arkade over gRPC.
+# Without it the crate does no I/O, so the browser module (coordinator-wasm) can use it.
+native = [
+    "dep:ark-core",
+    "dep:clap",
+    "dep:coordinator-ark",
+    "dep:futures",
+    "dep:rand",
+    "dep:reqwest",
+    "dep:rustls",
+    "dep:tokio",
+    "dep:tokio-rustls",
+    "dep:webpki-roots",
+]
+
+[dependencies]
+base64 = { workspace = true }
+bitcoin = { workspace = true }
+coordinator-ark-escrow = { workspace = true }
+dlctix = { workspace = true }
+flate2 = "1"
+hex = { workspace = true }
+nostr = { version = "0.44.8", default-features = false, features = ["std", "nip44"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+zeroize = { workspace = true }
+
+ark-core = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+coordinator-ark = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["net", "io-util", "time"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"], optional = true }
+webpki-roots = { version = "1", optional = true }
+
+[dev-dependencies]
+rand = { workspace = true }

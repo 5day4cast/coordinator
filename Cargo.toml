@@ -12,12 +12,13 @@ members = [
     "crates/coordinator-ark-escrow",
     "crates/coordinator-ark",
     "crates/coordinator-ark-swap",
+    "crates/coordinator-recover",
 ]
 # Nitro enclave and VSock relay binaries build only when selected explicitly.
 default-members = [
     "crates/coordinator", "crates/coordinator-core", "crates/coordinator-wasm",
     "crates/synth", "crates/coordinator-escrow", "crates/coordinator-ark-escrow",
-    "crates/coordinator-ark", "crates/coordinator-ark-swap",
+    "crates/coordinator-ark", "crates/coordinator-ark-swap", "crates/coordinator-recover",
 ]
 resolver = "2"
 
@@ -36,6 +37,7 @@ coordinator-core = { path = "crates/coordinator-core" }
 coordinator-escrow = { path = "crates/coordinator-escrow" }
 coordinator-ark-escrow = { path = "crates/coordinator-ark-escrow" }
 coordinator-ark = { path = "crates/coordinator-ark" }
+coordinator-recover = { path = "crates/coordinator-recover", default-features = false }
 
 # Arkade: arkd's Rust SDK. The generated gRPC code is checked in, so no protoc is needed.
 ark-core = "0.11"

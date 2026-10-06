@@ -32,7 +32,7 @@ pub use kickoff::{
     delete_escrow_intent, delete_pool_intent, fund_pool, EscrowInput, Kickoff, KickoffConfig,
     KickoffHooks, PoolFunding,
 };
-pub use recover::{recover_escrow, Recovery};
+pub use recover::{recover_escrow, recover_escrow_into, Recovery};
 pub use refund::{build_refund, sign_refund_ark_tx, sign_refund_checkpoint, RefundTransactions};
 pub use server::{address_hrp, escrow_terms, server_rules, ArkServer};
 pub use signer::{
