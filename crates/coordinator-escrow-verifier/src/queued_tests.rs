@@ -999,7 +999,8 @@ mod capacity_bounds {
         let terms = QueuedTerms {
             number_of_places_win: places,
             multi_place_min_players: (places > 1).then_some(queued::MULTI_PLACE_MIN_PLAYERS),
-            pool_rules: PoolRules::new(10, players).unwrap(),
+            // The narrowest rules admitting one pool of `players`: at least 10, at most 19 or more.
+            pool_rules: PoolRules::new(10, players.max(19)).unwrap(),
             observation: large_observation(),
             ..queued_terms()
         };
