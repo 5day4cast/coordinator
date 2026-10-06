@@ -17,7 +17,7 @@ use crate::domain::competitions::{
     queued::{
         self, CompetitionKind, CreateQueuedCompetition, PoolSummary, QueueSummary, UnpaidTicket,
     },
-    queued_store::{QueueSettings, QueuedReservation},
+    queued_store::{PicksUpdate, QueueSettings, QueuedReservation},
 };
 use crate::infra::keymeld::DepositScopeRequest;
 use coordinator_core::PayoutRegistrationRequest;
@@ -295,6 +295,43 @@ impl Coordinator {
             .iter()
             .map(UnpaidTicket::from_ticket)
             .collect())
+    }
+
+    /// Replace the picks of `pubkey`'s entry while its competition still takes them (see
+    /// [`Competition::picks_lock`]), checked as a new entry's are. Only the picks change: the
+    /// entry id, which the contract, the Keymeld deposit and the payout policy name, stays.
+    pub async fn update_entry_picks(
+        &self,
+        pubkey: &str,
+        entry_id: Uuid,
+        picks: Vec<crate::infra::oracle::WeatherChoices>,
+    ) -> Result<(), Error> {
+        let entry = self
+            .competition_store
+            .get_entry_by_id(entry_id)
+            .await?
+            .filter(|entry| entry.pubkey == pubkey)
+            .ok_or_else(|| Error::NotFound("Entry not found".into()))?;
+        let competition = self
+            .competition_store
+            .get_competition(entry.event_id)
+            .await?;
+        if let Some(reason) = competition.picks_lock(OffsetDateTime::now_utc()) {
+            return Err(Error::BadRequest(reason.into()));
+        }
+        let deadline = competition.event_submission.start_observation_date;
+        let mut submission = entry.entry_submission;
+        submission.expected_observations = picks;
+        validate_entry(submission.clone(), competition).await?;
+        match self
+            .competition_store
+            .update_queued_entry_picks(pubkey, &submission, deadline)
+            .await?
+        {
+            PicksUpdate::Updated => Ok(()),
+            PicksUpdate::NotFound => Err(Error::NotFound("Entry not found".into())),
+            PicksUpdate::Locked => Err(Error::BadRequest(admission::PICKS_LOCKED_CLOSED.into())),
+        }
     }
 
     /// Fix a queued ticket's payout policy: the player's consent to the competition's terms and

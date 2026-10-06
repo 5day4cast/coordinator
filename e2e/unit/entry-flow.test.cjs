@@ -1114,3 +1114,70 @@ test("the payment dialog counts down to the invoice's expiry", async () => {
   await done;
   assert.ok(stopped, "the countdown stops with the dialog");
 });
+
+// The picks dialog's edit screen: Save sends the checked picks for the entry, signed.
+function editScreen({ checked = [{ name: "KPWM_temp_high", value: "under" }], post } = {}) {
+  const elements = {
+    editPicksForm: element({
+      dataset: { entryId: "0190b6a0-0000-7000-8000-0000000000ee", maxValues: "1", pickRows: "3", counter: "editPicksLeft" },
+      querySelectorAll: () => checked,
+    }),
+    savePicks: element(),
+    editPicksMessage: element({ classes: ["hidden"] }),
+    loginModal: element(),
+  };
+  const document = {
+    body: { dataset: { apiBase: "https://coordinator" } },
+    getElementById: (id) => elements[id] ?? null,
+    addEventListener: () => {},
+  };
+  const requests = [];
+  const page = loggedIn({
+    AuthorizedClient: class {
+      async post(url, body) {
+        requests.push({ url, body: JSON.parse(JSON.stringify(body)) });
+        const response = await post();
+        if (!response.ok) {
+          const error = new Error(`HTTP error! status: ${response.status}`);
+          error.response = response;
+          throw error;
+        }
+        return response;
+      }
+    },
+  });
+  const session = { nostrClient: page.nostrClient, dlcWallet: null, wasm: {} };
+  const sandbox = loadBundle(["fragments/entry_form/entry_form.js"],
+    { ...page, window: {}, document, fetch: async () => assert.fail("no fetch"), crypto: webcrypto,
+      TextEncoder, console, session, isLoggedIn: () => true },
+    ["savePicks"]);
+  return { sandbox, elements, requests };
+}
+
+test("saving edited picks sends them for the entry and says they were saved", async () => {
+  const { sandbox, elements, requests } = editScreen({ post: async () => ({ ok: true, status: 204 }) });
+  await sandbox.savePicks();
+  assert.deepEqual(requests, [{
+    url: "https://coordinator/api/v1/entries/0190b6a0-0000-7000-8000-0000000000ee/picks",
+    body: { expected_observations: [{ stations: "KPWM", temp_high: "Under" }] },
+  }]);
+  assert.equal(elements.editPicksMessage.textContent, "Picks saved.");
+  assert.ok(elements.editPicksMessage.classList.contains("is-success"));
+  assert.equal(elements.savePicks.disabled, false);
+});
+
+test("edited picks of the wrong count are refused before anything is sent", async () => {
+  const { sandbox, elements, requests } = editScreen({ checked: [], post: async () => assert.fail("nothing sent") });
+  await sandbox.savePicks();
+  assert.equal(requests.length, 0);
+  assert.equal(elements.editPicksMessage.textContent, "Make exactly 1 pick; you made 0.");
+});
+
+test("a locked entry's picks say why they were not saved", async () => {
+  const { sandbox, elements } = editScreen({
+    post: async () => ({ ok: false, status: 400, json: async () => ({ error: "Entries have closed, so these picks are locked" }) }),
+  });
+  await sandbox.savePicks();
+  assert.equal(elements.editPicksMessage.textContent, "Entries have closed, so these picks are locked");
+  assert.ok(elements.editPicksMessage.classList.contains("is-danger"));
+});

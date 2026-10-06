@@ -11,7 +11,7 @@ use crate::domain::{
 use crate::templates::{
     components::tip,
     format::{self, sats, thousands, tx_url, Explorers, TimeStyle},
-    fragments::picks::detail_url,
+    fragments::{entry_form::edit_picks_url, picks::detail_url},
     pages::competitions::{phase_badge, CompetitionView, Queue},
 };
 
@@ -219,11 +219,24 @@ fn entry_row(row: &EntryRow, explorers: Explorers) -> Markup {
             td class="has-text-right entry-links" {
                 (details(row, explorers))
                 button type="button" class="button is-small is-text picks-button" { "Picks" }
+                @if row.competition.is_some_and(picks_editable) {
+                    button type="button" class="button is-small is-text"
+                      hx-get=(edit_picks_url(&row.entry.entry_id)) hx-trigger="click consume"
+                      hx-target="#entryValues" hx-swap="innerHTML" { "Edit picks" }
+                }
                 a href=(leaderboard) hx-get=(leaderboard) hx-trigger="click consume"
                   hx-target="#main-content" hx-push-url="true" { "Leaderboard" }
             }
         }
     }
+}
+
+/// Whether an entry in `competition` may still change its picks, as far as the page can tell:
+/// a queued competition before entries close. The edit screen itself has the final say
+/// (`Competition::picks_lock`).
+fn picks_editable(competition: &CompetitionView) -> bool {
+    competition.phase == Phase::Upcoming
+        && matches!(&competition.queue, Queue::Queued(queue) if queue.pools.is_empty())
 }
 
 /// The all-in entry fee, its parts in a tip, and when it was paid.
@@ -857,6 +870,22 @@ mod tests {
         assert!(html.contains(r#"href="/competitions/next/entry-form""#));
         assert!(html.contains("Enter the next competition"));
         assert!(!html.contains("ledgerSummary"));
+    }
+
+    #[test]
+    fn entries_in_a_queue_taking_entries_can_edit_their_picks() {
+        use crate::templates::pages::competitions::tests::queued;
+        let edit = format!(
+            r##"hx-get="/entries/{ENTRY}/edit" hx-trigger="click consume" hx-target="#entryValues""##
+        );
+        let open = one_row(&entry(), &queued("c1", 3));
+        assert!(open.contains(&edit));
+        assert!(open.contains("Edit picks"));
+        // Not once entries close, nor in a single competition, whose picks are fixed once entered.
+        let mut started = queued("c1", 3);
+        started.phase = Phase::Live;
+        assert!(!one_row(&entry(), &started).contains("Edit picks"));
+        assert!(!one_row(&entry(), &view("c1", Phase::Upcoming, 60)).contains("Edit picks"));
     }
 
     #[test]

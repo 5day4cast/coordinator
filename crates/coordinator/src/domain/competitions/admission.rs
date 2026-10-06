@@ -8,6 +8,12 @@ use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 pub(super) const TICKETS_CLOSED: &str =
     "Ticket requests close one minute before observations start";
 pub(super) const ENTRIES_CLOSED: &str = "Competition is no longer accepting entries";
+/// Why an entry's picks can no longer change: its competition stopped taking entries. A queued
+/// competition's entries reach the oracle only once it forms its pools, at the start.
+pub const PICKS_LOCKED_CLOSED: &str = "Entries have closed, so these picks are locked";
+/// Why picks in a single competition never change: its entries go to the oracle as soon as its
+/// seats fill, which may be any time before the start.
+pub const PICKS_LOCKED_ENTERED: &str = "Picks in this competition are locked once entered";
 /// The fewest players a single competition's terms allow, as its kickoff check counts them.
 pub(super) const SINGLE_COMPETITION_MIN_PLAYERS: u64 = 2;
 
@@ -71,6 +77,22 @@ impl Competition {
                 queue.pool_rules.min_players() as u64
             });
         Some(settings.min_players_at(template_min, sat_per_vb))
+    }
+
+    /// Whether an entry's picks may still change at `now`, and why not when they may not. Picks
+    /// are held by the coordinator alone until the entries reach the oracle, which takes them
+    /// once and never again; nothing signed or committed names them (the contract, the Keymeld
+    /// deposit and the payout policy name the entry id). A queued competition sends its entries
+    /// only when it forms its pools at the start, so its picks change until entries close. A
+    /// single competition sends them when its seats fill, so its picks are fixed once entered.
+    pub fn picks_lock(&self, now: OffsetDateTime) -> Option<&'static str> {
+        if self.kind != CompetitionKind::Queued {
+            return Some(PICKS_LOCKED_ENTERED);
+        }
+        if self.require_entry_admission(now).is_err() || self.pools_formed_at.is_some() {
+            return Some(PICKS_LOCKED_CLOSED);
+        }
+        None
     }
 
     pub(super) fn require_entry_admission(&self, now: OffsetDateTime) -> Result<(), Error> {

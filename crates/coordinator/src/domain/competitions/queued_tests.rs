@@ -4,7 +4,7 @@
 //! disabled, so a kickoff forms pools but leaves their sessions for the pools to make.
 
 use super::queued::{self, CompetitionKind, CreateQueuedCompetition};
-use super::queued_store::QueuedReservation;
+use super::queued_store::{PicksUpdate, QueuedReservation};
 use super::*;
 use crate::{
     config::KeymeldSettings,
@@ -1377,4 +1377,146 @@ async fn a_player_s_unpaid_tickets_are_listed_oldest_first_while_they_can_be_pai
     let json = serde_json::to_value(&listed[1]).unwrap();
     assert_eq!(json["ticket_id"], invoiced.to_string());
     assert!(json["invoice_expires_at"].is_string());
+}
+
+#[test]
+fn picks_change_only_in_a_queued_competition_until_entries_close() {
+    let start = OffsetDateTime::now_utc() + Duration::hours(1);
+    let before = start - Duration::minutes(2);
+    let mut competition = Competition::new(&request(start).reference_event().unwrap());
+    // A single competition's entries go to the oracle when its seats fill.
+    assert_eq!(
+        competition.picks_lock(before),
+        Some(admission::PICKS_LOCKED_ENTERED)
+    );
+    competition.kind = CompetitionKind::Queued;
+    assert_eq!(competition.picks_lock(before), None);
+    // Not after the start, nor once its pools formed or it was cancelled.
+    assert_eq!(
+        competition.picks_lock(start),
+        Some(admission::PICKS_LOCKED_CLOSED)
+    );
+    competition.pools_formed_at = Some(before);
+    assert_eq!(
+        competition.picks_lock(before),
+        Some(admission::PICKS_LOCKED_CLOSED)
+    );
+    competition.pools_formed_at = None;
+    competition.cancelled_at = Some(before);
+    assert_eq!(
+        competition.picks_lock(before),
+        Some(admission::PICKS_LOCKED_CLOSED)
+    );
+}
+
+#[tokio::test]
+async fn a_queued_entry_s_picks_change_until_its_pools_form() {
+    use crate::infra::oracle::ValueOptions;
+    let start = OffsetDateTime::now_utc() + Duration::hours(3);
+    let queue = Queue::new(start, PoolRules::new(2, 25).unwrap(), 100).await;
+    let entry = queue.ticket("alice", true).await;
+    let picks = |high: ValueOptions| {
+        vec![
+            WeatherChoices {
+                stations: "KORD".into(),
+                temp_high: Some(high.clone()),
+                temp_low: None,
+                wind_speed: None,
+            },
+            WeatherChoices {
+                stations: "KSAW".into(),
+                temp_high: Some(high),
+                temp_low: None,
+                wind_speed: None,
+            },
+        ]
+    };
+    let coordinator = &queue.coordinator;
+    let stored = move || async move {
+        coordinator
+            .get_entry_by_id(entry)
+            .await
+            .unwrap()
+            .unwrap()
+            .entry_submission
+    };
+
+    queue
+        .coordinator
+        .update_entry_picks("alice", entry, picks(ValueOptions::Under))
+        .await
+        .unwrap();
+    let submission = stored().await;
+    assert_eq!(submission.id, entry, "the entry id stays");
+    assert_eq!(submission.event_id, queue.competition.id);
+    assert_eq!(submission.expected_observations, picks(ValueOptions::Under));
+
+    // Only the entry's owner, and only picks a new entry could make.
+    assert!(matches!(
+        queue
+            .coordinator
+            .update_entry_picks("bob", entry, picks(ValueOptions::Over))
+            .await,
+        Err(Error::NotFound(_))
+    ));
+    let mut one_pick = picks(ValueOptions::Over);
+    one_pick.pop();
+    assert!(matches!(
+        queue
+            .coordinator
+            .update_entry_picks("alice", entry, one_pick)
+            .await,
+        Err(Error::BadRequest(_))
+    ));
+    assert_eq!(
+        stored().await.expected_observations,
+        picks(ValueOptions::Under)
+    );
+
+    // Past the deadline the store refuses on its own, inside the write.
+    assert_eq!(
+        queue
+            .store()
+            .update_queued_entry_picks(
+                "alice",
+                &AddEventEntry {
+                    expected_observations: picks(ValueOptions::Par),
+                    ..stored().await
+                },
+                OffsetDateTime::now_utc() - Duration::seconds(1),
+            )
+            .await
+            .unwrap(),
+        PicksUpdate::Locked
+    );
+
+    // Once its pools formed, the picks went to the oracle with them: locked.
+    let id = queue.competition.id.to_string();
+    queue
+        .db
+        .execute_write(move |pool| async move {
+            sqlx::query(
+                "UPDATE competitions SET pools_formed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                 WHERE id = ?",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let refused = queue
+        .coordinator
+        .update_entry_picks("alice", entry, picks(ValueOptions::Over))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&refused, Error::BadRequest(reason) if reason == admission::PICKS_LOCKED_CLOSED),
+        "{refused:?}"
+    );
+    assert_eq!(
+        stored().await.expected_observations,
+        picks(ValueOptions::Under)
+    );
 }

@@ -1053,6 +1053,10 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Result<Router, anyhow
             "/entries/{entry_id}/detail/mine",
             get(crate::api::routes::own_entry_detail_fragment),
         )
+        .route(
+            "/entries/{entry_id}/edit",
+            get(crate::api::routes::edit_picks_fragment),
+        )
         .route("/payouts", get(payouts_fragment))
         .route("/help", get(crate::api::routes::help_fragment));
 
@@ -1126,6 +1130,10 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Result<Router, anyhow
         )
         .route("/api/v1/entries", post(add_event_entry))
         .route("/api/v1/entries", get(get_entries))
+        .route(
+            "/api/v1/entries/{entry_id}/picks",
+            post(crate::api::routes::update_entry_picks),
+        )
         .route(
             "/api/v1/recovery/info",
             get(crate::api::routes::get_recovery_info),
