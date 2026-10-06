@@ -1,6 +1,6 @@
 use crate::client::competitions::CreateCompetition;
 use crate::client::entries::{
-    AddEntry, TicketRegistration, TicketStatus, ValueOption, WeatherChoices,
+    AddEntry, ApiRejection, TicketRegistration, TicketStatus, ValueOption, WeatherChoices,
 };
 use crate::client::CoordinatorClient;
 use crate::crypto;
@@ -108,18 +108,56 @@ pub(super) async fn request_entry(
     step: &str,
     trace: &mut EntryTrace,
 ) -> Result<RequestedEntry> {
-    let prior: Option<EntryTrace> = crate::runner::prior_step(step)
-        .and_then(|row| row.details_json)
-        .and_then(|json| serde_json::from_str(&json).ok());
-    let entry_id = trace
+    // A step a restart cut short saved its entry key before asking for its ticket.
+    let prior = crate::runner::prior_step(step).map(|row| {
+        row.details_json
+            .and_then(|json| serde_json::from_str::<EntryTrace>(&json).ok())
+    });
+    request_entry_resuming(
+        client,
+        user,
+        competition_id,
+        lightning_address,
+        step,
+        trace,
+        prior,
+    )
+    .await
+}
+
+/// [`request_entry`], with `prior` Some for a step a restart cut short: the trace it saved, if
+/// it can be read.
+///
+/// The entry id is the ticket request's idempotency key, and the entry key is derived from it,
+/// so a player asking again for the ticket they hold unpaid must use the same entry id. The
+/// coordinator refuses another entry key with `409` and releases the reservation.
+pub(super) async fn request_entry_resuming(
+    client: &CoordinatorClient,
+    user: &SynthUser,
+    competition_id: &Uuid,
+    lightning_address: Option<&str>,
+    step: &str,
+    trace: &mut EntryTrace,
+    prior: Option<Option<EntryTrace>>,
+) -> Result<RequestedEntry> {
+    let saved = trace
         .key_derivation_id
         .or_else(|| {
             prior
                 .as_ref()
+                .and_then(Option::as_ref)
                 .and_then(|saved| saved.key_derivation_id.or(saved.entry_id))
         })
-        .or(trace.entry_id)
-        .unwrap_or_else(Uuid::now_v7);
+        .or(trace.entry_id);
+    let entry_id = match saved {
+        Some(entry_id) => entry_id,
+        // The step began before the restart without saving its key. A queued ticket's id is its
+        // entry id: pay the oldest one the player holds rather than starting another.
+        None if prior.is_some() => resumable_ticket(client, user, competition_id)
+            .await
+            .unwrap_or_else(Uuid::now_v7),
+        None => Uuid::now_v7(),
+    };
     trace.key_derivation_id = Some(entry_id);
     trace.entry_id = Some(entry_id);
     crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
@@ -133,15 +171,32 @@ pub(super) async fn request_entry(
         allow_invoice_fallback: true,
         release_entry_key_after_payment: true,
     };
-    let ticket = client
-        .request_ticket(
+    let ask = || {
+        client.request_ticket(
             &user.nostr_keys,
             competition_id,
             &ephemeral.public_key,
             Some(payout_choice.clone()),
         )
-        .await
-        .context("Failed to request ticket")?;
+    };
+    let ticket = match ask().await {
+        // An unpaid ticket reserved under a key this step no longer has. The coordinator released
+        // it with the refusal, so the same request now gets a ticket.
+        Err(error)
+            if error
+                .downcast_ref::<ApiRejection>()
+                .is_some_and(ApiRejection::is_ticket_conflict) =>
+        {
+            warn!(
+                "{}'s unpaid ticket in competition {competition_id} was reserved under another \
+                 entry key; asking again with entry {entry_id}: {error:#}",
+                user.name
+            );
+            ask().await
+        }
+        requested => requested,
+    }
+    .context("Failed to request ticket")?;
     ticket.check_price()?;
     trace.ticket_requested_at = Some(OffsetDateTime::now_utc());
     trace.ticket_id = Some(ticket.ticket_id);
@@ -159,6 +214,30 @@ pub(super) async fn request_entry(
         payout_preimage,
         payout_choice,
     })
+}
+
+/// The oldest unpaid ticket `user` holds in a queued competition: its id is the entry id the
+/// entry key was derived from. None for a single competition, without one, or when the
+/// coordinator cannot say.
+async fn resumable_ticket(
+    client: &CoordinatorClient,
+    user: &SynthUser,
+    competition_id: &Uuid,
+) -> Option<Uuid> {
+    match client
+        .unpaid_tickets(&user.nostr_keys, competition_id)
+        .await
+    {
+        Ok(tickets) => tickets.first().map(|ticket| ticket.ticket_id),
+        Err(error) => {
+            warn!(
+                "Cannot list {}'s unpaid tickets in competition {competition_id}; starting a new \
+                 entry: {error:#}",
+                user.name
+            );
+            None
+        }
+    }
 }
 
 // Keep registration's protocol context explicit, matching the surrounding actor helpers.
