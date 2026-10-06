@@ -931,3 +931,561 @@ async fn a_queued_refund_pays_the_players_own_address() {
             .unwrap();
     }
 }
+
+/// The real requests of the largest pools, measured against the capacity model the Coordinator
+/// admits competitions by. A pool is built as the Coordinator builds one, and every request is
+/// encoded as the Coordinator sends it; Keymeld's sealing is mirrored, since its states are its
+/// own: the state's JSON in a versioned envelope, deflated, then encrypted.
+mod capacity_bounds {
+    use super::*;
+    use coordinator_escrow::capacity::{self, CompetitionCapacity};
+    use keymeld_core::crypto::SessionSecret;
+    use keymeld_core::escrow::protocol::{BindEscrowRequest, PrepareEscrowRequest};
+    use serde_json::{json, Value};
+
+    /// Entry key of slot `slot`.
+    fn key(slot: usize) -> u8 {
+        100 + slot as u8
+    }
+
+    /// The most stations, metrics and lines a queued competition may carry.
+    fn large_observation() -> ObservationTerms {
+        let targets: Vec<String> = (0..capacity::MAX_QUEUED_TARGETS)
+            .map(|index| format!("K{index:03}"))
+            .collect();
+        let fields: Vec<String> = ["temp_high", "temp_low", "wind_speed"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let lines: Vec<LineTerms> = targets
+            .iter()
+            .flat_map(|target| {
+                fields.iter().map(|metric| LineTerms {
+                    target: target.clone(),
+                    metric: metric.clone(),
+                    lower: -2.25,
+                    upper: 1.75,
+                    window_hours: 24,
+                })
+            })
+            .collect();
+        ObservationTerms {
+            number_of_values_per_entry: lines.len() as u32,
+            targets,
+            scoring_fields: fields,
+            lines,
+            ..observation()
+        }
+    }
+
+    /// One full pool of `players` paying `places`, as its keygen session authorizes it: every
+    /// ranked outcome's subset of the market maker and its winners.
+    struct LargePool {
+        f: Fixture,
+        statement: SignedStatement,
+        subsets: BTreeMap<usize, Uuid>,
+    }
+
+    fn large_pool(players: usize, places: u32) -> LargePool {
+        let terms = QueuedTerms {
+            number_of_places_win: places,
+            multi_place_min_players: (places > 1).then_some(queued::MULTI_PLACE_MIN_PLAYERS),
+            pool_rules: PoolRules::new(10, players).unwrap(),
+            observation: large_observation(),
+            ..queued_terms()
+        };
+        let tickets: Vec<Uuid> = (0..players).map(|_| Uuid::now_v7()).collect();
+        let block_hash = BlockHash::from_byte_array([5; 32]);
+        let pools::Formation::Pools { pools, .. } = pools::form(
+            &terms.pool_rules,
+            terms.competition_id,
+            &tickets,
+            &block_hash,
+        )
+        .unwrap() else {
+            panic!("a full pool forms");
+        };
+        assert_eq!(pools.len(), 1);
+        let mut members = pools[0].clone();
+        members.sort_unstable();
+        let statement = sign_statement(statement_for(&terms, &members), ORACLE_SECRET);
+        let Outcomes::Ranking(ranking) = &statement.statement.outcomes;
+        assert_eq!(ranking.number_of_places_win, places);
+        let derived: Vec<_> = members
+            .iter()
+            .enumerate()
+            .map(|(slot, id)| {
+                queued::pool_authorization(&entry(&terms, *id, slot), &members, &statement).unwrap()
+            })
+            .collect();
+        let first = &derived[0];
+        let contract = ContractCommitment {
+            contract_parameters: ContractParameters {
+                market_maker: first.market_maker.clone(),
+                players: derived
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, terms)| Player {
+                        pubkey: Scalar::from_slice(&[key(slot); 32])
+                            .unwrap()
+                            .base_point_mul(),
+                        ticket_hash: terms.ticket_hash,
+                        payout_hash: terms.payout_hash,
+                    })
+                    .collect(),
+                event: first.event.clone(),
+                outcome_payouts: first.outcome_payouts.clone(),
+                fee_rate: FeeRate::from_sat_per_vb_u32(1),
+                funding_value: first.funding_value,
+                relative_locktime_block_delta: first.relative_locktime_block_delta,
+            },
+            funding_outpoint: OutPoint::null(),
+        };
+        let maker = UserId::new_v7();
+        let users: Vec<UserId> = members.iter().map(|id| UserId::from(*id)).collect();
+        // As `compute_dlc_subset_definitions` does: the market maker and each outcome's winners.
+        let mut subsets = BTreeMap::new();
+        let mut definitions = Vec::new();
+        for (outcome, weights) in &contract.contract_parameters.outcome_payouts {
+            let Outcome::Attestation(index) = outcome else {
+                continue;
+            };
+            let subset_id = Uuid::now_v7();
+            subsets.insert(*index, subset_id);
+            definitions.push(SubsetDefinition {
+                subset_id,
+                participants: std::iter::once(maker.clone())
+                    .chain(
+                        weights
+                            .iter()
+                            .filter(|(_, weight)| **weight > 0)
+                            .map(|(slot, _)| users[*slot].clone()),
+                    )
+                    .collect(),
+            });
+        }
+        let evidence = DepositEvidence::Pool {
+            competition_id: terms.competition_id,
+            tickets: tickets.clone(),
+            block_hash,
+            pool_index: 0,
+        };
+        let mut verifiers: BTreeMap<UserId, Vec<u8>> = users
+            .iter()
+            .enumerate()
+            .map(|(slot, user)| (user.clone(), public(30 + slot as u8)))
+            .collect();
+        verifiers.insert(maker.clone(), public(17));
+        let manifest = SignedSessionManifest::sign(
+            SessionAuthorizationManifest {
+                keygen_session_id: SessionId::from(statement.statement.event_id),
+                coordinator_user_id: maker.clone(),
+                creator_pubkey: public(11),
+                signing_pubkey: public(12),
+                session_public_key: public(10),
+                participant_verifiers: verifiers,
+                timeout_secs: 3600,
+                max_signing_sessions: None,
+                encrypted_taproot_tweak: "encrypted".into(),
+                subset_definitions: definitions,
+                deposit_scope: Some(deposit_scope(&terms, &evidence)),
+            },
+            &[11; 32],
+        )
+        .unwrap();
+        let policies: BTreeMap<_, _> = members
+            .iter()
+            .enumerate()
+            .map(|(slot, id)| {
+                (
+                    UserId::from(*id),
+                    deposit(&entry(&terms, *id, slot), key(slot), slot, true),
+                )
+            })
+            .collect();
+        let mut keys: BTreeMap<_, _> = users
+            .iter()
+            .enumerate()
+            .map(|(slot, user)| {
+                (
+                    user.clone(),
+                    PublicKeyBytes::new(&public(key(slot))).unwrap(),
+                )
+            })
+            .collect();
+        keys.insert(maker, PublicKeyBytes::new(&public(MAKER)).unwrap());
+        LargePool {
+            f: Fixture {
+                manifest,
+                policy: policies[&users[0]].clone(),
+                policies,
+                keys,
+                contract,
+            },
+            statement,
+            subsets,
+        }
+    }
+
+    impl LargePool {
+        /// The scope the Coordinator asks the first player's enclave to permit, as the SDK's
+        /// `scope_for_participant` builds it from the batch: each item the player signs, with
+        /// its signers in key order, its subset, and its adaptor point.
+        fn scope(&self) -> SigningScope {
+            let data = TicketedDLC::new(
+                self.f.contract.contract_parameters.clone(),
+                self.f.contract.funding_outpoint,
+            )
+            .unwrap()
+            .signing_data()
+            .unwrap();
+            let signers = |points: &[Point]| {
+                let mut signers: Vec<_> = points
+                    .iter()
+                    .map(|point| {
+                        let (user_id, public_key) = self
+                            .f
+                            .keys
+                            .iter()
+                            .find(|(_, key)| key.as_bytes() == point.serialize().as_slice())
+                            .unwrap();
+                        ScopeSigner {
+                            user_id: user_id.clone(),
+                            public_key: public_key.clone(),
+                        }
+                    })
+                    .collect();
+                signers.sort_by(|a, b| a.public_key.cmp(&b.public_key));
+                signers
+            };
+            let item = |sighash: &[u8; 32], signers, subset_id, adaptor| escrow::SigningItem {
+                item_id: Uuid::now_v7(),
+                message_digest: escrow::sha256(sighash),
+                subset_id,
+                signers,
+                tweak: KeyTweak::None,
+                adaptor,
+            };
+            let outcomes = data.outcome_sighashes.iter().map(|(outcome, sighash)| {
+                let adaptor = match outcome {
+                    Outcome::Attestation(index) => AdaptorContext::Single {
+                        adaptor_id: Uuid::now_v7(),
+                        point: PublicKeyBytes::new(&data.adaptor_points[index].serialize())
+                            .unwrap(),
+                    },
+                    Outcome::Expiry => AdaptorContext::None,
+                };
+                item(sighash, signers(&data.funding_signers), None, adaptor)
+            });
+            let splits = data.split_sighashes.iter().map(|(win, sighash)| {
+                let subset = match win.outcome {
+                    Outcome::Attestation(index) => Some(self.subsets[&index]),
+                    Outcome::Expiry => None,
+                };
+                item(
+                    sighash,
+                    signers(&data.split_signers[&win.outcome]),
+                    subset,
+                    AdaptorContext::None,
+                )
+            });
+            let player = &self.f.policy.policy.participant_public_key;
+            SigningScope {
+                session_tweak: KeyTweak::None,
+                batch: outcomes
+                    .chain(splits)
+                    .filter(|item| item.signers.iter().any(|s| &s.public_key == player))
+                    .collect(),
+            }
+        }
+
+        /// Every signature of the contract, at the sizes real ones have.
+        fn signatures(&self) -> ContractSignatures {
+            let sample = sign_contract(&fixture(false).contract);
+            let data = TicketedDLC::new(
+                self.f.contract.contract_parameters.clone(),
+                self.f.contract.funding_outpoint,
+            )
+            .unwrap()
+            .signing_data()
+            .unwrap();
+            let outcome = sample.outcome_tx_signatures.values().next().unwrap();
+            let split = sample.split_tx_signatures.values().next().unwrap();
+            ContractSignatures {
+                expiry_tx_signature: sample.expiry_tx_signature,
+                outcome_tx_signatures: data
+                    .outcome_sighashes
+                    .keys()
+                    .filter_map(|outcome_| match outcome_ {
+                        Outcome::Attestation(index) => Some((*index, outcome.to_owned())),
+                        Outcome::Expiry => None,
+                    })
+                    .collect(),
+                split_tx_signatures: data
+                    .split_sighashes
+                    .keys()
+                    .map(|win| (*win, split.to_owned()))
+                    .collect(),
+            }
+        }
+    }
+
+    /// Keymeld's sealed receipt of `state`, with the length of the JSON it seals.
+    fn seal(state: Value) -> (usize, Payload) {
+        let envelope = serde_json::to_vec(&json!({
+            "schema_version": escrow::SCHEMA_VERSION,
+            "enclave_id": 1,
+            "state": state,
+        }))
+        .unwrap();
+        let deflated = miniz_oxide::deflate::compress_to_vec(&envelope, 6);
+        let sealed = SessionSecret::from_bytes([3; 32])
+            .encrypt(&deflated, "escrow_state_v2")
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        (envelope.len(), Payload::new(sealed).unwrap())
+    }
+
+    /// A request's bytes as Keymeld's escrow command carries it, encrypted.
+    fn encrypted(request: &impl Serialize) -> usize {
+        SessionSecret::from_bytes([4; 32])
+            .encrypt(&serde_json::to_vec(request).unwrap(), "escrow-request-v1")
+            .unwrap()
+            .to_bytes()
+            .unwrap()
+            .len()
+    }
+
+    fn digest(value: &impl Serialize) -> [u8; 32] {
+        escrow::sha256(&serde_json::to_vec(value).unwrap())
+    }
+
+    /// What each request of `players` paying `places` really takes, against the model.
+    async fn measure(players: usize, places: u32) {
+        let model: CompetitionCapacity =
+            capacity::validate_competition_capacity(players, places as usize).unwrap();
+        let pool = large_pool(players, places);
+        let f = &pool.f;
+        let verifier = CoordinatorVerifier::default().with_test_ledger();
+        let binding_data = Payload::encode(&ContractBinding {
+            contract: f.contract.clone(),
+            statement: Some(pool.statement.clone()),
+        })
+        .unwrap();
+        let bind = encrypted(&BindEscrowRequest {
+            schema_version: escrow::SCHEMA_VERSION,
+            policy: f.policy.clone(),
+            application_context: f
+                .policy
+                .policy
+                .verifier
+                .as_ref()
+                .unwrap()
+                .policy_data
+                .clone(),
+            participant_policies: f.policies.clone(),
+            binding_data: binding_data.clone(),
+        });
+        let bound = verifier
+            .bind(
+                BindView {
+                    manifest: &f.manifest,
+                    policy: &f.policy,
+                    participant_policies: &f.policies,
+                    participant_public_keys: &f.keys,
+                },
+                &binding_data,
+            )
+            .unwrap();
+        let binding = json!({
+            "context": f.policy.policy.context,
+            "policy_digest": digest(&f.policy),
+            "enclave_id": 1,
+            "participant_policy_digests": f
+                .policies
+                .iter()
+                .map(|(user, policy)| (user.clone(), digest(policy)))
+                .collect::<BTreeMap<_, _>>(),
+            "application_state": bound,
+            "keygen_session_id": f.manifest.manifest.keygen_session_id,
+        });
+        let (_, binding_receipt) = seal(json!({"phase": "bound", "binding": binding}));
+
+        // Contract signing: the compact scope first, the full one to an older verifier, and a
+        // retry after a lost nonce round carrying the previous preparation.
+        let scope = pool.scope();
+        let attempt = ActionAttempt {
+            attempt_id: Uuid::now_v7(),
+            signing_session_id: Some(SessionId::new_v7()),
+        };
+        let compact = Payload::encode(&ActionParameters::SignContractCompact {
+            items: ContractItem::compact(&scope),
+            ark_funding: None,
+        })
+        .unwrap();
+        let full = Payload::encode(&ActionParameters::SignContract {
+            scope: scope.clone(),
+            ark_funding: None,
+        })
+        .unwrap();
+        let prepared = verifier
+            .prepare(
+                f.prepare_view(&bound, &attempt, SIGN_CONTRACT, &BTreeMap::new()),
+                &compact,
+            )
+            .await
+            .unwrap();
+        // The verifier permits exactly this scope, so it is the one the Coordinator sends.
+        assert_eq!(
+            prepared.action,
+            Action::Sign {
+                scope: scope.clone()
+            }
+        );
+        let (prepared_json, prepared_receipt) = seal(json!({"phase": "prepared", "prepared": {
+            "binding": binding,
+            "action_id": SIGN_CONTRACT,
+            "attempt": attempt,
+            "action": prepared.action,
+            "application_state": prepared.application_state,
+            "output": prepared.output,
+            "predecessor": digest(&"previous preparation"),
+            "generation": 1,
+        }}));
+        let signing = |parameters: &Payload, prior: Vec<Payload>| {
+            encrypted(&PrepareEscrowRequest {
+                schema_version: escrow::SCHEMA_VERSION,
+                binding_receipt: binding_receipt.clone(),
+                action_id: SIGN_CONTRACT.into(),
+                attempt: attempt.clone(),
+                action: None,
+                action_parameters: parameters.clone(),
+                prior_preparation_receipts: prior,
+            })
+        };
+        let compact_signing = signing(&compact, vec![]);
+        let compact_retry = signing(&compact, vec![prepared_receipt.clone()]);
+        let full_retry = signing(&full, vec![prepared_receipt.clone()]);
+
+        // Settlement: the entry key's release, renewed, carries both earlier preparations.
+        let claim = ActionAttempt {
+            attempt_id: Uuid::now_v7(),
+            signing_session_id: None,
+        };
+        let invoice = invoice();
+        let (_, consent) = policy(&f.policy).unwrap();
+        let contract_digest = payout::contract_digest(&f.contract).unwrap();
+        let authorization = SignedInvoiceAuthorization::sign(
+            &[key(0); 32],
+            InvoiceAuthorizationContext {
+                keygen_session_id: f.manifest.manifest.keygen_session_id.clone(),
+                user_id: f.policy.policy.context.user_id.clone(),
+                claim_id: claim.attempt_id,
+                competition_id: consent.competition_id(),
+                entry_id: consent.entry_id(),
+                contract_digest: contract_digest.clone(),
+                invoice_digest: payout::invoice_digest(&invoice),
+                amount_msat: 100_000_000,
+                expires_at: now().unwrap() + 600,
+            },
+        )
+        .unwrap();
+        let parameters = Payload::encode(&ActionParameters::PrepareSettlement {
+            claim_id: claim.attempt_id,
+            contract_signatures: serde_json::to_string(&pool.signatures()).unwrap(),
+            attestation: Some(hex::encode([4; 32])),
+            method: PayoutMethod::Invoice {
+                invoice: invoice.clone(),
+                authorization,
+            },
+            ark_funding: None,
+        })
+        .unwrap();
+        let settlement = PreparedSettlement {
+            claim_id: claim.attempt_id,
+            contract_digest,
+            invoice_digest: payout::invoice_digest(&invoice),
+            payment_hash: hex::encode([9; 32]),
+            invoice,
+            owed_sats: 100_000,
+        };
+        let settled = |action_id: &str| {
+            seal(json!({"phase": "prepared", "prepared": {
+                "binding": binding,
+                "action_id": action_id,
+                "attempt": claim,
+                "action": release_action(&f.policy, action_id).unwrap(),
+                "application_state": Payload::encode(&PreparedState::Settlement {
+                    request_digest: digest(&"settlement request"),
+                    settlement: settlement.clone(),
+                })
+                .unwrap(),
+                "output": Payload::encode(&settlement).unwrap(),
+                "predecessor": digest(&"previous preparation"),
+                "generation": 1,
+            }}))
+        };
+        let (preimage_json, preimage_receipt) = settled(RELEASE_PREIMAGE);
+        let (key_json, key_receipt) = settled(RELEASE_ENTRY_KEY);
+        let settlement_request = encrypted(&PrepareEscrowRequest {
+            schema_version: escrow::SCHEMA_VERSION,
+            binding_receipt: binding_receipt.clone(),
+            action_id: RELEASE_ENTRY_KEY.into(),
+            attempt: claim.clone(),
+            action: None,
+            action_parameters: parameters,
+            prior_preparation_receipts: vec![preimage_receipt, key_receipt],
+        });
+
+        println!(
+            "{players} players over {places} places: model {model:?}\n  real: {} items, bind \
+             {bind}, signing {compact_signing} compact, {compact_retry} compact retry, \
+             {full_retry} full retry, settlement {settlement_request}; prepared signing state \
+             {prepared_json} bytes sealed to {}",
+            scope.batch.len(),
+            prepared_receipt.as_bytes().len(),
+        );
+        assert_eq!(scope.batch.len(), model.participant_signing_items);
+        for (name, real, modelled) in [
+            ("bind request", bind, model.bind_request_bytes),
+            (
+                "signing request",
+                compact_signing,
+                model.signing_request_bytes,
+            ),
+            ("signing retry", compact_retry, model.signing_request_bytes),
+            (
+                "full signing retry",
+                full_retry,
+                model.signing_request_bytes,
+            ),
+            (
+                "settlement request",
+                settlement_request,
+                model.settlement_request_bytes,
+            ),
+            (
+                "largest state",
+                prepared_json.max(preimage_json).max(key_json),
+                model.largest_receipt_bytes,
+            ),
+        ] {
+            assert!(
+                real <= modelled,
+                "{name}: real {real} > modelled {modelled}"
+            );
+            assert!(modelled <= escrow::MAX_PAYLOAD_BYTES, "{name}: {modelled}");
+        }
+    }
+
+    #[tokio::test]
+    async fn twenty_players_over_two_places_send_no_more_than_the_model_admits() {
+        measure(capacity::MAX_TWO_PLACE_PLAYERS, 2).await;
+    }
+
+    #[tokio::test]
+    async fn twenty_five_players_over_one_place_send_no_more_than_the_model_admits() {
+        measure(capacity::MAX_COMPETITION_PLAYERS, 1).await;
+    }
+}

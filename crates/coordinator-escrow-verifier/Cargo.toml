@@ -16,8 +16,8 @@ test-support = ["lnurl", "dep:rcgen"]
 coordinator-escrow = { path = "../coordinator-escrow", features = ["networking"] }
 coordinator-ark-escrow = { path = "../coordinator-ark-escrow" }
 coordinator-payout-witness = { path = "../coordinator-payout-witness", optional = true }
-keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "9caa57575c1f0eed3d001235a1ce8121cce9474f", default-features = false, features = ["escrow", "enclave"] }
-keymeld-enclave = { git = "https://github.com/tee8z/keymeld", rev = "9caa57575c1f0eed3d001235a1ce8121cce9474f", default-features = false, features = ["escrow"] }
+keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "323110d805301bc8182515c6b3605957d7b0c6f0", default-features = false, features = ["escrow", "enclave"] }
+keymeld-enclave = { git = "https://github.com/tee8z/keymeld", rev = "323110d805301bc8182515c6b3605957d7b0c6f0", default-features = false, features = ["escrow"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -40,5 +40,7 @@ http-body-util = { version = "0.1", optional = true }
 bytes = { version = "1", optional = true }
 
 [dev-dependencies]
+# Seals states as Keymeld does, to measure real receipts against the capacity model.
+miniz_oxide = "0.9.1"
 rcgen = "0.13.2"
 secp256k1 = { version = "0.31", features = ["serde"] }

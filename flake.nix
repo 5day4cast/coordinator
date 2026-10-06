@@ -12,7 +12,7 @@
 
     # Match the SDK and verifier to the Keymeld 0.8.4 release.
     keymeld = {
-      url = "github:tee8z/keymeld/9caa57575c1f0eed3d001235a1ce8121cce9474f";
+      url = "github:tee8z/keymeld/323110d805301bc8182515c6b3605957d7b0c6f0";
     };
   };
 
