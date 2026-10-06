@@ -77,62 +77,19 @@ pub fn discovery(
                 },
                 Some(Err(error)) => div.notice role="alert" { (error) },
                 Some(Ok(candidates)) => {
-                    @if !candidates.is_empty() && filters.near.trim().is_empty() {
-                        h2 { "Start with a forecast" }
-                        div.metric-grid {
-                            @for (kind, label) in [("wind", "Follow stronger wind"), ("rain", "Compare wet-weather forecasts"), ("swing", "Explore temperature range")] {
-                                @let value = |c: &&crate::infra::admin_weather::Candidate| match kind {
-                                    "wind" => c.wind_knots,
-                                    "rain" => c.rain_chance,
-                                    _ => Some(c.high - c.low),
-                                };
-                                @if let Some(lead) = candidates.iter().filter(|c| value(c).is_some()).max_by_key(|c| value(c)) {
-                                    div.metric {
-                                        h3 { (label) }
-                                        p { (lead.eligible.station.station_name) }
-                                        p { @match kind {
-                                            "wind" => (format!("{:.0} mph forecast wind", lead.wind_knots.unwrap_or_default() as f64 * 1.15078)),
-                                            "rain" => (format!("{}% peak precipitation chance", lead.rain_chance.unwrap_or_default())),
-                                            _ => (format!("{}–{} °F forecast low and high", lead.low, lead.high)),
-                                        } }
-                                        a href=(nearby_link(filters, window, &lead.eligible.station.station_id, kind)) { "Compare nearby stations →" }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    h2 { (candidates.len()) " matching stations" }
-                    @if candidates.is_empty() { p { "No stations match this window and these filters. Try a wider area or a shorter window." } }
-                    @else {
+                    @if candidates.is_empty() {
+                        h2 { "0 matching stations" }
+                        p { "No stations match this window and these filters. Try a wider area or a shorter window." }
+                    } @else {
                         form id="game-creation" method="post" action="/admin/api/competitions" hx-post="/admin/api/competitions" hx-target="#competition-notification" hx-swap="innerHTML" hx-indicator="#creation-progress" {
                             input type="hidden" name="id" id="competitionIdInput" value=(uuid::Uuid::now_v7());
                             input type="hidden" name="start_observation_date" value=(window.start.format(&Rfc3339).unwrap_or_default());
                             input type="hidden" name="end_observation_date" value=(window.end.format(&Rfc3339).unwrap_or_default());
                             input type="hidden" name="signing_date" value=((window.end + time::Duration::HOUR).format(&Rfc3339).unwrap_or_default());
                             input type="hidden" name="history_days" value=(window.history_days);
-                            (super::weather_map::map_slot(filters, window))
-                            div id="map-selections" {}
-                            div.station-grid {
-                                @for c in candidates.iter().take(100) {
-                                    label.station-card {
-                                        div.station-heading { input type="checkbox" name="locations" value=(c.eligible.station.station_id) disabled[!usable];
-                                            strong { (c.eligible.station.station_name) }
-                                        }
-                                        p.note { (c.eligible.station.station_id) " · " (c.eligible.station.state) }
-                                        dl.weather-facts {
-                                            div { dt { "Low → high" } dd { (c.low) " → " (c.high) " °F" } }
-                                            div { dt { "Wind" } dd { (c.wind_knots.map(|v| format!("{:.0} mph", v as f64 * 1.15078)).unwrap_or_else(|| "Unknown".into())) } }
-                                            div { dt { "Precipitation" } dd { (c.rain_chance.map(|v| format!("{v}%")).unwrap_or_else(|| "Unknown".into())) } }
-                                        }
-                                        p.quality { (c.eligible.clean_days) "/" (c.eligible.days_checked) " clean observation days" }
-                                        p.note { "Latest report " (c.eligible.last_report) }
-                                    }
-                                }
-                            }
-                            @if candidates.len() > 100 { p.note { "Showing the first 100 matches. Narrow the location or radius to see others." } }
                             section.creation-panel {
                                 h2 { "Set up this game" }
-                                p { "Select up to 50 stations above. The server checks their current eligibility again when you create the competition." }
+                                p { "Select up to 50 stations below. The server checks their current eligibility again when you create the competition." }
                                 p { "Observation: " (window.start.format(&Rfc3339).unwrap_or_default()) " → " (window.end.format(&Rfc3339).unwrap_or_default()) ". Signing starts one hour later." }
                                 div.form-grid {
                                     label { "Stake per entry (sats)" input type="number" name="entry_fee" value="5000" min="1" required; }
@@ -158,6 +115,51 @@ pub fn discovery(
                                 span id="creation-progress" class="htmx-indicator" role="status" { " Checking eligibility and creating…" }
                                 div id="competition-notification" role="status" aria-live="polite" {}
                             }
+                            @if filters.near.trim().is_empty() {
+                                h2 { "Start with a forecast" }
+                                div.metric-grid {
+                                    @for (kind, label) in [("wind", "Follow stronger wind"), ("rain", "Compare wet-weather forecasts"), ("swing", "Explore temperature range")] {
+                                        @let value = |c: &&crate::infra::admin_weather::Candidate| match kind {
+                                            "wind" => c.wind_knots,
+                                            "rain" => c.rain_chance,
+                                            _ => Some(c.high - c.low),
+                                        };
+                                        @if let Some(lead) = candidates.iter().filter(|c| value(c).is_some()).max_by_key(|c| value(c)) {
+                                            div.metric {
+                                                h3 { (label) }
+                                                p { (lead.eligible.station.station_name) }
+                                                p { @match kind {
+                                                    "wind" => (format!("{:.0} mph forecast wind", lead.wind_knots.unwrap_or_default() as f64 * 1.15078)),
+                                                    "rain" => (format!("{}% peak precipitation chance", lead.rain_chance.unwrap_or_default())),
+                                                    _ => (format!("{}–{} °F forecast low and high", lead.low, lead.high)),
+                                                } }
+                                                a href=(nearby_link(filters, window, &lead.eligible.station.station_id, kind)) { "Compare nearby stations →" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            h2 { (candidates.len()) " matching stations" }
+                            (super::weather_map::map_slot(filters, window))
+                            div id="map-selections" {}
+                            div.station-grid {
+                                @for c in candidates.iter().take(100) {
+                                    label.station-card {
+                                        div.station-heading { input type="checkbox" name="locations" value=(c.eligible.station.station_id) disabled[!usable];
+                                            strong { (c.eligible.station.station_name) }
+                                        }
+                                        p.note { (c.eligible.station.station_id) " · " (c.eligible.station.state) }
+                                        dl.weather-facts {
+                                            div { dt { "Low → high" } dd { (c.low) " → " (c.high) " °F" } }
+                                            div { dt { "Wind" } dd { (c.wind_knots.map(|v| format!("{:.0} mph", v as f64 * 1.15078)).unwrap_or_else(|| "Unknown".into())) } }
+                                            div { dt { "Precipitation" } dd { (c.rain_chance.map(|v| format!("{v}%")).unwrap_or_else(|| "Unknown".into())) } }
+                                        }
+                                        p.quality { (c.eligible.clean_days) "/" (c.eligible.days_checked) " clean observation days" }
+                                        p.note { "Latest report " (c.eligible.last_report) }
+                                    }
+                                }
+                            }
+                            @if candidates.len() > 100 { p.note { "Showing the first 100 matches. Narrow the location or radius to see others." } }
                         }
                     }
                 }
@@ -278,6 +280,12 @@ mod tests {
         assert!(html.contains("id=\"game-creation\""));
         assert!(html.contains("name=\"locations\" value=\"KPDX\""));
         assert!(html.contains("Your current station choices stay in place"));
+        // Game rules and the create button come before the stations and map.
+        let create = html.find("Create competition</button>").unwrap();
+        assert!(html.find("Set up this game").unwrap() < create);
+        assert!(create < html.find("1 matching stations").unwrap());
+        assert!(create < html.find("/admin/competition/map?").unwrap());
+        assert!(create < html.find("name=\"locations\"").unwrap());
         assert!(!html.contains("every 2s"));
         assert!(html.contains("Refresh results</a>"));
         // The map loads once, after the cards, and is not polled.
