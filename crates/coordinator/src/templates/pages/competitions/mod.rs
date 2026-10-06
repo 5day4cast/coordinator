@@ -322,15 +322,23 @@ impl CompetitionView {
         })
     }
 
-    /// For a queue whose larger pools pay more than one place, what its smaller ones pay.
+    /// For a queue whose larger pools pay more than one place, what its smaller ones pay; for
+    /// one pool paying one place, that its winner takes the pot.
     pub fn prize_rule(&self) -> Option<String> {
         let queue = self.queue.queued()?;
-        (queue.pools.is_empty() && self.prize_split().is_some()).then(|| {
-            format!(
+        if !queue.pools.is_empty() {
+            return None;
+        }
+        match self.prize_split() {
+            Some(_) => Some(format!(
                 "Under {} players: winner takes all",
                 coordinator_escrow::queued::MULTI_PLACE_MIN_PLAYERS
-            )
-        })
+            )),
+            None if queue.seats().is_some() && self.has_ranked_prizes() => {
+                Some("Winner takes all".to_owned())
+            }
+            None => None,
+        }
     }
 
     /// What first place wins, as the pages show it: a range for a queue whose pools differ.
@@ -2202,6 +2210,15 @@ pub(crate) mod tests {
         // A queue that pays one place shows no split.
         assert!(queued("q", 3).prize_split().is_none());
         assert!(queued("q", 3).prize_rule().is_none());
+
+        // Twenty seats paying one place: its winner takes the pot, at any size.
+        let mut one = twenty_seats(3);
+        one.paid_places = 1;
+        assert!(one.prize_split().is_none());
+        assert_eq!(one.prize_rule().as_deref(), Some("Winner takes all"));
+        let row = competition_row(&one, NOW).into_string();
+        assert!(row.contains("Winner takes all"), "{row}");
+        assert!(!row.contains("Under 10 players"));
     }
 
     /// Seats left count what the entry cap counts: paid tickets and unexpired invoice holds. A

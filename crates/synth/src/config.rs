@@ -460,7 +460,7 @@ mod tests {
                 (shape.rules.min_players(), shape.rules.max_players()),
                 (3, 20)
             );
-            assert_eq!((shape.max_entries, shape.places), (Some(20), 2));
+            assert_eq!((shape.max_entries, shape.places), (Some(20), 1));
         }
     }
 

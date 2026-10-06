@@ -413,8 +413,8 @@ pub struct ScenarioConfig {
     /// `queued_one_pool` and the coordinator's default for the others.
     #[serde(default)]
     pub queue_max_entries: Option<u32>,
-    /// The places a queued scenario's pools of ten or more pay, instead of 2 for
-    /// `queued_one_pool` (70% and 30%) and 1 for the others. Smaller pools pay one.
+    /// The places a queued scenario's pools of ten or more pay, instead of 1. Smaller pools pay
+    /// one.
     #[serde(default)]
     pub places: Option<u32>,
     /// Draw the player count from this mix instead of using `users` (or the queued scenario's

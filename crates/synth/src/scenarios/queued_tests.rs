@@ -163,10 +163,10 @@ fn each_queued_scenario_has_its_own_shape_and_refuses_one_that_defeats_it() {
         );
     }
     assert!(shape(QUEUED_ONE_POOL, Some(26), None).is_err());
-    // The default competition: one pool of 20 seats, paying two places from ten players.
+    // The default competition: one pool of 20 seats whose winner takes the pot.
     assert_eq!(
         (one.rules.max_players(), one.max_entries, one.places),
-        (20, Some(20), 2)
+        (20, Some(20), 1)
     );
     assert!(shape(QUEUED_ONE_POOL, Some(21), None).is_err());
     assert_eq!((split.max_entries, split.places), (None, 1));
@@ -197,11 +197,11 @@ fn a_queue_takes_its_configured_entry_cap_and_places() {
         max_pool_players: max_pool,
         ..Default::default()
     };
-    // One place in the default competition's pool, as a lab may set until two-place signing ships.
-    let one_place = QueueShape::of(QUEUED_ONE_POOL, &configured(None, Some(1), None))
+    // Two places in the default competition's pool, where the coordinator allows them.
+    let two_places = QueueShape::of(QUEUED_ONE_POOL, &configured(None, Some(2), None))
         .unwrap()
         .unwrap();
-    assert_eq!((one_place.max_entries, one_place.places), (Some(20), 1));
+    assert_eq!((two_places.max_entries, two_places.places), (Some(20), 2));
     // Two places need pools of at most 20; a cap above one pool would split it.
     assert!(QueueShape::of(QUEUED_ONE_POOL, &configured(None, Some(2), Some(25))).is_err());
     assert!(QueueShape::of(QUEUED_ONE_POOL, &configured(Some(21), None, None)).is_err());
@@ -215,7 +215,7 @@ fn a_queue_takes_its_configured_entry_cap_and_places() {
 }
 
 #[tokio::test]
-async fn default_queue_requests_twenty_seats_three_minimum_and_two_places_before_any_payment() {
+async fn default_queue_requests_twenty_seats_three_minimum_and_one_place_before_any_payment() {
     use axum::{
         extract::State,
         routing::{get, post},
@@ -265,7 +265,7 @@ async fn default_queue_requests_twenty_seats_three_minimum_and_two_places_before
         assert_eq!(body["min_players"], 3);
         assert_eq!(body["max_pool_size"], 20);
         assert_eq!(body["max_entries"], 20);
-        assert_eq!(body["number_of_places_win"], 2);
+        assert_eq!(body["number_of_places_win"], 1);
     }
     check_queue(&client, &id, &shape).await.unwrap();
     // Refuse an older or misconfigured coordinator that silently ignored one of the terms.
@@ -273,7 +273,7 @@ async fn default_queue_requests_twenty_seats_three_minimum_and_two_places_before
         ("min_players", 2),
         ("max_pool_size", 25),
         ("max_entries", 21),
-        ("number_of_places_win", 1),
+        ("number_of_places_win", 2),
     ] {
         let original = state.lock().unwrap()[field].clone();
         state.lock().unwrap()[field] = json!(wrong);

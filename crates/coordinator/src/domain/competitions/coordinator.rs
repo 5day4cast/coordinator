@@ -282,6 +282,8 @@ pub struct Coordinator {
     settle_only: SettleOnly,
     /// Whether the reconciliation at start has run, which payouts wait for.
     reconciled: Reconciled,
+    /// The most winning places a new competition may pay; 1 until `with_max_winning_places`.
+    max_winning_places: usize,
 }
 
 type TicketRequestLocks =
@@ -353,9 +355,32 @@ impl Coordinator {
             ticket_requests: TicketRequestLocks::default(),
             settle_only: SettleOnly::default(),
             reconciled: Reconciled::default(),
+            max_winning_places: 1,
         };
         coordinator.validate_coordinator_metadata().await?;
         Ok(coordinator)
+    }
+
+    /// Let new competitions pay up to `places` winning places (1 or 2).
+    pub fn with_max_winning_places(mut self, places: usize) -> Self {
+        self.max_winning_places = places;
+        self
+    }
+
+    /// The most winning places a new competition may pay.
+    pub fn max_winning_places(&self) -> usize {
+        self.max_winning_places
+    }
+
+    /// Refuse a new competition that pays more winning places than this coordinator offers.
+    pub(super) fn require_winning_places_allowed(&self, places: usize) -> Result<(), Error> {
+        if places > self.max_winning_places {
+            return Err(Error::BadRequest(match self.max_winning_places {
+                1 => "new competitions pay one winning place".to_string(),
+                most => format!("new competitions pay at most {most} winning places"),
+            }));
+        }
+        Ok(())
     }
 
     /// Check if escrow transactions are enabled
@@ -3331,6 +3356,7 @@ impl Coordinator {
         mut create_event: CreateEvent,
     ) -> Result<Competition, Error> {
         self.require_new_money_allowed()?;
+        self.require_winning_places_allowed(create_event.number_of_places_win)?;
         // New competitions score against the oracle's lines unless they ask for fixed rules.
         create_event
             .scoring_rules

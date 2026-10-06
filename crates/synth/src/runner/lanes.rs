@@ -78,8 +78,7 @@ pub struct LaneConfig {
     /// `queued_one_pool`, its pool's seats.
     #[serde(default)]
     pub max_entries: Option<u32>,
-    /// The places its queued runs' pools of ten or more pay, instead of the scenario's own: two
-    /// (70% and 30%) for `queued_one_pool`, one for the others.
+    /// The places its queued runs' pools of ten or more pay, instead of the scenario's own (one).
     #[serde(default)]
     pub places: Option<u32>,
 }
@@ -489,7 +488,7 @@ mod tests {
     }
 
     /// The open lane's backfilled runs make the default competition: one pool of 20 seats that
-    /// pays two places from ten players. A lane may set its own cap and places.
+    /// pays its winner. A lane may set its own cap and places.
     #[test]
     fn a_backfilled_lane_makes_the_default_competition() {
         use crate::scenarios::queued::QueueShape;
@@ -504,12 +503,12 @@ mod tests {
         let shape = QueueShape::of(&scenario, &config).unwrap().unwrap();
         assert_eq!(
             (shape.rules.max_players(), shape.max_entries, shape.places),
-            (20, Some(20), 2)
+            (20, Some(20), 1)
         );
-        open.places = Some(1);
+        open.places = Some(2);
         open.max_entries = Some(12);
         let (scenario, config) = open.run_config(&base, 0, None);
         let shape = QueueShape::of(&scenario, &config).unwrap().unwrap();
-        assert_eq!((shape.max_entries, shape.places), (Some(12), 1));
+        assert_eq!((shape.max_entries, shape.places), (Some(12), 2));
     }
 }

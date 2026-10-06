@@ -1237,3 +1237,46 @@ async fn a_pool_that_cannot_get_its_session_retries_then_fails_to_be_refunded() 
         .unwrap()
         .contains(&pool_id));
 }
+
+/// New competitions pay one winning place unless the coordinator allows two, on the single
+/// and the queued create paths, before anything is made.
+#[tokio::test]
+async fn new_competitions_pay_one_place_unless_two_are_allowed() {
+    let start = OffsetDateTime::now_utc() + Duration::hours(6);
+    let Queue {
+        _directory: _kept,
+        coordinator,
+        ..
+    } = Queue::new(start, PoolRules::new(2, 3).unwrap(), 100).await;
+    let refused = |result: &Result<Competition, Error>| matches!(result, Err(Error::BadRequest(message)) if message.contains("one winning place"));
+    let mut queued = request(start);
+    queued.max_pool_size = 20;
+    queued.number_of_places_win = 2;
+    let mut single = queued.reference_event().unwrap();
+    single.id = Uuid::now_v7();
+
+    assert_eq!(coordinator.max_winning_places(), 1);
+    let created = coordinator.create_queued_competition(queued.clone()).await;
+    assert!(refused(&created), "{created:?}");
+    let created = coordinator.create_competition(single.clone()).await;
+    assert!(refused(&created), "{created:?}");
+    assert!(coordinator
+        .competition_store
+        .get_competition(single.id)
+        .await
+        .is_err());
+
+    // Allowing two places lets both requests past the gate to their usual checks.
+    let coordinator = coordinator.with_max_winning_places(2);
+    let created = coordinator.create_queued_competition(queued).await;
+    assert!(!refused(&created), "{created:?}");
+    let created = coordinator.create_competition(single).await;
+    assert!(!refused(&created), "{created:?}");
+    let mut three = request(start).reference_event().unwrap();
+    three.number_of_places_win = 3;
+    let created = coordinator.create_competition(three).await;
+    assert!(
+        matches!(&created, Err(Error::BadRequest(message)) if message.contains("at most 2 winning places")),
+        "{created:?}"
+    );
+}

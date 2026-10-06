@@ -101,6 +101,8 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
                                 @if let Some(rule) = competition.prize_rule() {
                                     span class="cell-note prize-note" { (rule) }
                                 }
+                            } @else if let Some(rule) = competition.prize_rule() {
+                                (rule)
                             } @else {
                                 "Each pool's winner"
                             }
@@ -576,6 +578,12 @@ mod tests {
         assert!(html.contains("Under 10 players: winner takes all"));
         assert!(html.contains("20 seats · 16 left"));
         assert!(html.contains(r#"data-tip="Up to 20 players, all in one pool.""#));
+
+        let mut one = crate::templates::pages::competitions::tests::twenty_seats(4);
+        one.paid_places = 1;
+        let html = leaderboard(&one, NOW).into_string();
+        assert!(html.contains("Winner takes all"), "{html}");
+        assert!(!html.contains("Under 10 players"));
     }
 
     #[test]

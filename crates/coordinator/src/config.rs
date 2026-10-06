@@ -715,6 +715,13 @@ impl CoordinatorSettings {
     }
 
     pub fn validate(&self, network: Network) -> Result<(), anyhow::Error> {
+        if !(1..=coordinator_escrow::capacity::MAX_COMPETITION_WINNING_PLACES)
+            .contains(&self.max_winning_places)
+        {
+            return Err(anyhow::anyhow!(
+                "coordinator_settings.max_winning_places must be 1 or 2"
+            ));
+        }
         if self.escrow_enabled && network == Network::Bitcoin {
             return Err(anyhow::anyhow!(
                 "coordinator_settings.escrow_enabled is refused on mainnet until the escrow flow has been exercised end to end on a test network"
@@ -1123,6 +1130,15 @@ pub struct CoordinatorSettings {
     /// entries are already paid start as usual.
     #[serde(default)]
     pub settle_only_unstarted: SettleOnlyUnstarted,
+
+    /// The most winning places a new competition or queued competition may pay: 1 (the
+    /// default) or 2. Competitions created earlier keep their places.
+    #[serde(default = "default_max_winning_places")]
+    pub max_winning_places: usize,
+}
+
+fn default_max_winning_places() -> usize {
+    1
 }
 
 /// Environment variable that sets `coordinator_settings.settle_only`, overriding the file.
@@ -1194,6 +1210,7 @@ impl Default for CoordinatorSettings {
             invoice_settlement_confirmations: 0,
             settle_only: false,
             settle_only_unstarted: SettleOnlyUnstarted::Refund,
+            max_winning_places: default_max_winning_places(),
         }
     }
 }
@@ -1468,6 +1485,31 @@ mod mainnet_guards {
         assert!(CoordinatorSettings::default()
             .validate(Network::Bitcoin)
             .is_ok());
+    }
+
+    #[test]
+    fn winning_places_default_to_one_and_allow_two() {
+        // A config written before the setting existed loads with one place.
+        let text = toml::to_string(&Settings::default()).unwrap();
+        let without: String = text
+            .lines()
+            .filter(|line| !line.starts_with("max_winning_places"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed: Settings = toml::from_str(&without).unwrap();
+        assert_eq!(parsed.coordinator_settings.max_winning_places, 1);
+
+        for (places, valid) in [(0, false), (1, true), (2, true), (3, false)] {
+            let settings = CoordinatorSettings {
+                max_winning_places: places,
+                ..Default::default()
+            };
+            assert_eq!(
+                settings.validate(Network::Signet).is_ok(),
+                valid,
+                "{places}"
+            );
+        }
     }
 }
 

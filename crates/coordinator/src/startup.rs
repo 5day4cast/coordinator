@@ -565,7 +565,8 @@ pub async fn build_app(
     .with_settle_only(
         config.coordinator_settings.settle_only,
         config.coordinator_settings.settle_only_unstarted,
-    );
+    )
+    .with_max_winning_places(config.coordinator_settings.max_winning_places);
     let (wakes, wake_requests) = CompetitionWakes::new();
     let coordinator = Arc::new(
         coordinator
