@@ -1641,6 +1641,108 @@ async fn a_paid_ticket_never_entered_is_refunded_with_the_registration_sent_befo
     f.database.close().await.unwrap();
 }
 
+/// A paid ticket that lapsed, its entry not made within the hour its entry id allows, is
+/// refunded once like any paid ticket never entered. In a single competition it keeps its seat
+/// and counts as its player's entry: they are told so rather than sold another seat.
+#[tokio::test]
+async fn a_lapsed_ticket_counts_as_its_players_entry_and_is_refunded_once() {
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    let lapsed = f.funded_after(&session, 23, Sent::Registration).await;
+    // The payout terms it was paid under name an entry started over an hour ago.
+    let json = f
+        .store()
+        .ticket_payout_policy(lapsed.id, &lapsed.hash)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut policy: PayoutPolicy = serde_json::from_str(&json).unwrap();
+    let started = OffsetDateTime::now_utc() - time::Duration::minutes(61);
+    policy.contract_terms = super::admission_tests::contract_terms(
+        f.competition_id,
+        super::queued_tests::entry_id_at(started),
+    );
+    let (ticket_id, json) = (
+        lapsed.id.to_string(),
+        serde_json::to_string(&policy).unwrap(),
+    );
+    f.database
+        .execute_write(move |pool| async move {
+            sqlx::query("UPDATE ticket_payout_policies SET policy_json = ? WHERE ticket_id = ?")
+                .bind(json)
+                .bind(ticket_id)
+                .execute(&pool)
+                .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let unentered = f
+        .coordinator
+        .unentered_tickets("player", Some(f.competition_id))
+        .await
+        .unwrap();
+    assert!(unentered.paid.is_empty());
+    assert_eq!(
+        unentered.lapsed,
+        vec![LapsedTicket {
+            ticket_id: lapsed.id,
+            competition_id: f.competition_id,
+        }]
+    );
+    assert!(
+        unentered.pay_refused,
+        "its one entry is taken, so the form shows no Pay"
+    );
+    // Another ticket asked for anyway, from a stale page, is refused with the form's sentence.
+    let key: bitcoin::PublicKey =
+        "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+            .parse()
+            .unwrap();
+    let refused = f
+        .coordinator
+        .request_ticket("player".into(), f.competition_id, key)
+        .await
+        .err();
+    assert!(
+        matches!(&refused, Some(Error::BadRequest(reason)) if reason == LAPSED_ENTRY),
+        "{refused:?}"
+    );
+    assert_eq!(
+        f.store()
+            .paid_ticket_count(f.competition_id, "player")
+            .await
+            .unwrap(),
+        1,
+        "no other ticket was paid for"
+    );
+    // The competition's other entry, on another seat.
+    let entered = f.funded(&session, 21, true).await;
+    f.cancel().await;
+
+    f.clean_up().await;
+    for ticket in [&lapsed, &entered] {
+        assert_eq!(
+            f.refund(ticket).await.unwrap().state,
+            ArkRefundState::Settled
+        );
+    }
+    assert_eq!(
+        f.spends(),
+        (2, 2),
+        "each escrow was spent into its swap once"
+    );
+    assert_eq!(f.ln.payments_sent(), 2);
+    assert!(!f.awaiting_cleanup().await);
+
+    // Later passes pay no one again.
+    f.coordinator.refund_ark_escrows(f.competition_id).await;
+    f.clean_up().await;
+    assert_eq!(f.spends(), (2, 2));
+    assert_eq!(f.ln.payments_sent(), 2, "no player is paid twice");
+    f.database.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_player_keymeld_cannot_register_holds_back_signing_but_not_a_refund_under_way() {
     let f = Fixture::new().await;

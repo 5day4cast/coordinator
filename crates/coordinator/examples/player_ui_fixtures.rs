@@ -13,7 +13,9 @@ use coordinator::{
     templates::{
         assets,
         fragments::{
-            entry_form::{entry_form, Forecasts, NetworkFee, PayoutDestination, StationForecast},
+            entry_form::{
+                entry_form, Forecasts, NetworkFee, PaidNotice, PayoutDestination, StationForecast,
+            },
             leaderboard::{leaderboard, leaderboard_scores, LeaderboardRow, LeaderboardView},
             picks::{picks_detail, PickView},
         },
@@ -89,7 +91,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         &payout,
         NetworkFee::Estimate(437),
         None,
-        None,
+        PaidNotice::default(),
     );
     let entry_queued = entry_form(
         &queued,
@@ -98,7 +100,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         &payout,
         NetworkFee::Estimate(437),
         None,
-        None,
+        PaidNotice::default(),
     );
 
     let rows: Vec<LeaderboardRow> = [

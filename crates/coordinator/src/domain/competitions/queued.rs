@@ -56,7 +56,8 @@ pub const TOO_MANY_UNPAID: &str =
 /// entry form. The oracle breaks an exact tie by entry id, so an id may not claim to be older
 /// than this, nor from the future. The entry is finished within the same window: once its id is
 /// older, the entry is refused and its paid ticket is refunded. A single competition's entry id,
-/// which its payout authorization names, is held to the same window.
+/// which its payout authorization names, is held to the same window. A paid ticket left without
+/// its entry past it no longer counts as its player's entry, nor takes a place in its competition.
 pub const MAX_ENTRY_ID_AGE: Duration = Duration::hours(1);
 pub const MAX_ENTRY_ID_SKEW: Duration = Duration::minutes(5);
 /// The end of [`MAX_ENTRY_ID_AGE`] kept for paying a ticket's invoice and finishing its entry: an
@@ -393,6 +394,13 @@ pub fn check_ticket_entry_id(entry_id: Uuid, now: OffsetDateTime) -> Result<(), 
 /// player's wallet made the id.
 pub fn entry_finish_by(entry_id: Uuid) -> Result<OffsetDateTime, String> {
     Ok(entry_id_time(entry_id)? + MAX_ENTRY_ID_AGE)
+}
+
+/// Whether the entry under `entry_id` can no longer be made at `now`: its id is older than
+/// [`MAX_ENTRY_ID_AGE`], so [`check_entry_id`] refuses it. A paid ticket still without its entry
+/// by then has lapsed (see `ticket_registration::LapsedTicket`).
+pub fn entry_window_passed(entry_id: Uuid, now: OffsetDateTime) -> bool {
+    entry_id_time(entry_id).is_ok_and(|made| now - made > MAX_ENTRY_ID_AGE)
 }
 
 fn check_entry_id_age(

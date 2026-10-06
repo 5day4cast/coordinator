@@ -226,6 +226,7 @@ async fn queued_reservation_registration_and_entry_cannot_cross_the_deadline() {
         ticket_id,
         Some("policy".into()),
         deadline,
+        None,
         1,
     ));
     assert!(poll!(reserve.as_mut()).is_pending());
@@ -294,6 +295,7 @@ async fn admission_before_close_preserves_registration_policy_and_one_entry_per_
                 ticket_id,
                 Some("policy".into()),
                 deadline,
+                None,
                 1
             ),
             store.add_entry_with_policy_before(
@@ -301,6 +303,7 @@ async fn admission_before_close_preserves_registration_policy_and_one_entry_per_
                 ticket_id,
                 Some("policy".into()),
                 deadline,
+                None,
                 1
             ),
         )
@@ -387,6 +390,7 @@ async fn stale_unfilled_snapshot_cannot_cancel_the_last_entry_committed_before_c
         ticket_id,
         None,
         snapshot.event_submission.start_observation_date,
+        None,
         1
     ))
     .await
@@ -535,6 +539,7 @@ async fn a_player_enters_only_as_often_as_the_competition_allows() {
                 ticket,
                 None,
                 entries,
+                None,
                 max,
             ))
             .await
@@ -588,4 +593,232 @@ fn the_entry_limit_says_so_in_plain_words() {
     );
     let two = super::coordinator::entry_limit_error(2);
     assert!(matches!(two, Error::BadRequest(message) if message.contains("the 2 entries")));
+}
+
+/// The contract terms a player accepts before paying for a seat of single competition
+/// `competition_id`, for the entry `entry_id`, as its payout authorization carries them: one seat
+/// of three.
+pub(super) fn contract_terms(competition_id: Uuid, entry_id: Uuid) -> String {
+    let point = |byte: u8| {
+        dlctix::secp::Scalar::from_slice(&[byte; 32])
+            .unwrap()
+            .base_point_mul()
+    };
+    serde_json::to_string(&coordinator_escrow::payout::ContractAuthorization {
+        competition_id,
+        entry_id,
+        network: dlctix::bitcoin::Network::Regtest,
+        player_index: 0,
+        player_count: 3,
+        ticket_hash: [1; 32],
+        payout_hash: [2; 32],
+        market_maker: dlctix::MarketMaker { pubkey: point(9) },
+        event: dlctix::EventLockingConditions {
+            locking_points: vec![point(10).into()],
+            expiry: None,
+        },
+        outcome_payouts: std::collections::BTreeMap::from([(
+            dlctix::Outcome::Attestation(0),
+            dlctix::PayoutWeights::from([(0, 1)]),
+        )]),
+        funding_value: dlctix::bitcoin::Amount::from_sat(3_000),
+        relative_locktime_block_delta: 72,
+        max_fee_rate: dlctix::bitcoin::FeeRate::from_sat_per_vb_u32(1),
+    })
+    .unwrap()
+}
+
+/// A paid ticket whose entry was not made within the hour its entry id allows has lapsed. In a
+/// single competition it keeps its seat, as every seat's ticket is named in the competition's
+/// payout terms and Keymeld session, so it still counts as its player's entry. It is no longer
+/// handed back for them to enter, and a player who may make one entry gets no new ticket, which
+/// would only pay for a seat in a competition that can no longer fill: they are told why. One who
+/// may make two can still take a second seat.
+#[tokio::test]
+async fn a_lapsed_paid_ticket_still_counts_as_its_players_entry_in_a_single_competition() {
+    use super::store::TicketReservation;
+    let (_dir, db, store, competition, _) =
+        fixture(OffsetDateTime::now_utc() + Duration::hours(1), 3).await;
+    let id = competition.id;
+    let more = [(Uuid::now_v7(), "hash2"), (Uuid::now_v7(), "hash3")];
+    bounded(db.execute_write(move |pool| async move {
+        for (ticket, hash) in more {
+            sqlx::query("INSERT INTO tickets(id, event_id, encrypted_preimage, hash) VALUES (?, ?, 'preimage', ?)")
+                .bind(ticket.to_string()).bind(id.to_string()).bind(hash).execute(&pool).await?;
+        }
+        Ok(())
+    }))
+    .await
+    .unwrap();
+    let deadline = competition.ticket_deadline();
+    let reserve = |player: &'static str, max: u32| {
+        let store = store.clone();
+        async move { bounded(store.get_and_reserve_ticket_before(id, player, deadline, max)).await }
+    };
+
+    // Alice pays for a seat, having accepted the payout terms for the entry she started.
+    let paid = reserve("alice", 1)
+        .await
+        .unwrap()
+        .reserved()
+        .unwrap()
+        .ticket;
+    assert!(bounded(store.mark_ticket_paid(&paid.hash, id))
+        .await
+        .unwrap());
+    let started = |minutes_ago: i64| {
+        let started = OffsetDateTime::now_utc() - Duration::minutes(minutes_ago);
+        let policy = serde_json::to_string(&coordinator_escrow::authorization::PayoutPolicy {
+            queued_entry: None,
+            automatic_lightning_address: Some("alice@example.org".into()),
+            allow_invoice_fallback: true,
+            release_entry_key_after_payment: true,
+            contract_terms: contract_terms(id, super::queued_tests::entry_id_at(started)),
+            ark_escrow: None,
+        })
+        .unwrap();
+        let (ticket, hash, db) = (paid.id.to_string(), paid.hash.clone(), db.clone());
+        async move {
+            bounded(db.execute_write(move |pool| async move {
+                sqlx::query(
+                    "INSERT INTO ticket_payout_policies(ticket_id, ticket_hash, entry_pubkey, policy_json)
+                     VALUES (?, ?, 'key', ?)
+                     ON CONFLICT(ticket_id) DO UPDATE SET policy_json = excluded.policy_json",
+                )
+                .bind(ticket)
+                .bind(hash)
+                .bind(policy)
+                .execute(&pool)
+                .await?;
+                Ok(())
+            }))
+            .await
+            .unwrap();
+        }
+    };
+    started(55).await;
+    // Within the hour the paid ticket is hers to enter, and her one entry.
+    assert_eq!(
+        reserve("alice", 1)
+            .await
+            .unwrap()
+            .reserved()
+            .unwrap()
+            .ticket
+            .id,
+        paid.id
+    );
+
+    // The hour passes without the entry: the ticket is not handed back, and is still her entry.
+    started(61).await;
+    assert!(matches!(
+        reserve("alice", 1).await.unwrap(),
+        TicketReservation::Lapsed
+    ));
+    let held: i64 = bounded(
+        sqlx::query_scalar("SELECT count(*) FROM tickets WHERE reserved_by = 'alice'")
+            .fetch_one(db.read()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(held, 1, "no other seat was reserved for her");
+
+    // Where one player may make two entries, the lapsed ticket is one of them.
+    let again = reserve("alice", 2)
+        .await
+        .unwrap()
+        .reserved()
+        .unwrap()
+        .ticket;
+    assert_ne!(again.id, paid.id, "a second seat, not the lapsed ticket");
+    // The lapsed ticket keeps its seat: with bob's, every seat is taken.
+    assert!(reserve("bob", 1).await.unwrap().reserved().is_some());
+    assert!(matches!(
+        reserve("carol", 1).await,
+        Err(crate::infra::db::DatabaseWriteError::Sqlx(
+            sqlx::Error::RowNotFound
+        ))
+    ));
+    // Paid and entered, the second seat is her other entry.
+    assert!(bounded(store.mark_ticket_paid(&again.hash, id))
+        .await
+        .unwrap());
+    assert!(bounded(store.add_entry_with_policy_before(
+        entry(id, again.id),
+        again.id,
+        None,
+        competition.event_submission.start_observation_date,
+        None,
+        2,
+    ))
+    .await
+    .unwrap()
+    .added()
+    .is_some());
+    assert!(matches!(
+        reserve("alice", 2).await.unwrap(),
+        TicketReservation::Lapsed
+    ));
+    bounded(db.close()).await.unwrap();
+}
+
+/// An entry checked within the hour its id allows can reach the writer after it, behind other
+/// writes. By then its ticket has lapsed and stopped counting as its player's entry, so the write
+/// refuses it: a ticket is never both refunded and entered.
+#[tokio::test]
+async fn an_entry_that_reaches_the_writer_after_its_hour_is_refused() {
+    let (_dir, db, store, competition, ticket_id) =
+        fixture(OffsetDateTime::now_utc() + Duration::hours(1), 3).await;
+    let deadline = competition.event_submission.start_observation_date;
+    let (started, start) = oneshot::channel();
+    let (release, released) = oneshot::channel();
+    let mut blocker = Box::pin(db.execute_write(move |_pool| async move {
+        started.send(()).unwrap();
+        released.await.unwrap();
+        Ok(())
+    }));
+    assert!(poll!(blocker.as_mut()).is_pending());
+    bounded(start).await.unwrap();
+    let finish_by = OffsetDateTime::now_utc() + Duration::milliseconds(100);
+    let mut enter = Box::pin(store.add_entry_with_policy_before(
+        entry(competition.id, ticket_id),
+        ticket_id,
+        Some("policy".into()),
+        deadline,
+        Some(finish_by),
+        1,
+    ));
+    assert!(poll!(enter.as_mut()).is_pending());
+    tokio::time::sleep(StdDuration::from_millis(110)).await;
+    assert!(OffsetDateTime::now_utc() > finish_by);
+    release.send(()).unwrap();
+    bounded(blocker).await.unwrap();
+    assert!(matches!(
+        bounded(enter).await.unwrap(),
+        super::store::EntryAdmission::Lapsed
+    ));
+    for table in ["entries", "entry_payout_policies"] {
+        let count: i64 = bounded(
+            sqlx::query_scalar(&format!("SELECT count(*) FROM {table}")).fetch_one(db.read()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "a lapsed entry changed {table}");
+    }
+
+    // Within its hour the entry goes in.
+    let finish_by = OffsetDateTime::now_utc() + Duration::minutes(1);
+    assert!(bounded(store.add_entry_with_policy_before(
+        entry(competition.id, ticket_id),
+        ticket_id,
+        Some("policy".into()),
+        deadline,
+        Some(finish_by),
+        1,
+    ))
+    .await
+    .unwrap()
+    .added()
+    .is_some());
+    bounded(db.close()).await.unwrap();
 }

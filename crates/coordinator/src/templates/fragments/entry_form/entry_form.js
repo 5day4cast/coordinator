@@ -891,12 +891,15 @@ function paidEntry(form, picks, paid) {
 }
 
 // Pay's label: "Enter" while the form shows a paid ticket to enter, the price otherwise. A busy
-// or finished button keeps its own.
+// or finished button keeps its own. Pay is hidden while the notice says no ticket would be issued
+// (a single competition's player whose paid entry lapsed), and shown again once it doesn't.
 function labelPay() {
   const button = document.getElementById("submitEntry");
+  const notice = document.getElementById("entryPaid");
+  button?.classList.toggle("is-hidden", Boolean(notice?.dataset.payRefused));
   const label = button?.dataset.payLabel;
   if (!label || button.disabled || ![label, "Enter"].includes(button.textContent.trim())) return;
-  button.textContent = document.getElementById("entryPaid")?.dataset.ticketId ? "Enter" : label;
+  button.textContent = notice?.dataset.ticketId ? "Enter" : label;
 }
 
 // A new entry for `picks`, checked against the terms the form showed, with its payout address.
