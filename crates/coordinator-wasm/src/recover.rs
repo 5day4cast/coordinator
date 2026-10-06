@@ -312,7 +312,7 @@ mod tests {
     fn walks_the_page_flow_without_records() {
         let mut core = RecoveryCore::new(&"01".repeat(32), "signet").unwrap();
         assert!(core.player_filter().is_err());
-        core.set_coordinator(&"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+        core.set_coordinator("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
             .unwrap();
         let filter: Value = serde_json::from_str(&core.player_filter().unwrap()).unwrap();
         assert_eq!(filter["kinds"], json!([30078]));
