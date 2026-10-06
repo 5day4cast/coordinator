@@ -85,7 +85,13 @@ async fn admin_discovery(
     let content = match filters.window(OffsetDateTime::now_utc()) {
         Ok(window) => {
             let data = state.admin_weather.read(window.clone()).await;
-            crate::templates::admin::discovery::discovery(filters, &window, &data, &state.network)
+            crate::templates::admin::discovery::discovery(
+                filters,
+                &window,
+                &data,
+                &state.network,
+                state.coordinator.max_winning_places(),
+            )
         }
         Err(error) => {
             maud::html! { main.admin-workspace { h1 { "Check the discovery filters" } p { (error) } a href="/admin/competition" { "Start again" } } }

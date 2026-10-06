@@ -48,6 +48,7 @@ sync_interval_secs = 5  # Faster for testing
 name = "e2e-coordinator"
 escrow_enabled = false
 mock_oracle = true  # Domain events/attestations use MockOracle; weather uses the fixture above
+max_winning_places = 2  # The e2e seed pays two places
 
 [bitcoin_settings]
 network = "regtest"

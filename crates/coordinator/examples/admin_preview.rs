@@ -55,7 +55,7 @@ fn main() -> anyhow::Result<()> {
         }))),
         refreshing: false,
     };
-    let content = maud::html! { div class="notification" { "Read-only layout preview · saved oracle data · creation is not connected" } (discovery(&filters, &window, &data, "signet")) };
+    let content = maud::html! { div class="notification" { "Read-only layout preview · saved oracle data · creation is not connected" } (discovery(&filters, &window, &data, "signet", 1)) };
     let page = admin_base(
         &AdminPageConfig {
             title: "Weather discovery preview",

@@ -11,6 +11,7 @@ pub fn discovery(
     window: &Window,
     data: &Cached<Discovery>,
     network: &str,
+    max_places: usize,
 ) -> Markup {
     let day = window.start.date().to_string();
     let refresh_path = nearby_link(filters, window, &filters.near, &filters.weather);
@@ -105,12 +106,16 @@ pub fn discovery(
                                     label { "Entries per player" input type="number" name="max_entries_per_player" value="1" min="1" required; }
                                     label { "Coordinator fee (%)" input type="number" name="coordinator_fee_percentage" value="5" min="0" max="100" step="0.01" required; }
                                     label { "Minimum pool size" input type="number" name="min_players" value="2" min="2" max="13" required; }
-                                    // The default game: one pool of 20 seats paying 70% and 30% from ten players.
+                                    // The default game: one pool of 20 seats.
                                     label { "Maximum pool size" input type="number" name="max_pool_size" value="20" min="3" max="25" required; }
                                     label { "Maximum queued entries" input type="number" name="max_entries" value="20" min="2" max="1500" required; }
-                                    label { "Winning places" input type="number" name="number_of_places_win" value="2" min="1" max="2" required; }
+                                    label { "Winning places" input type="number" name="number_of_places_win" value="1" min="1" max=(max_places) required; }
                                 }
-                                p.note { "Two places pay 70% and 30% in pools of 10 or more, and need pools of at most 20; smaller pools pay their winner the pot." }
+                                @if max_places > 1 {
+                                    p.note { "Two places pay 70% and 30% in pools of 10 or more, and need pools of at most 20; smaller pools pay their winner the pot." }
+                                } @else {
+                                    p.note { "Each pool pays its winner the pot." }
+                                }
                                 label.check { input type="checkbox" name="queued" value="true" checked; " Form pools when registration closes" }
                                 details {
                                     summary { "Advanced terms and fixed-size games" }
@@ -234,7 +239,7 @@ mod tests {
             latest: None,
             refreshing: true,
         };
-        let loading = discovery(&filters, &window, &data, "signet").into_string();
+        let loading = discovery(&filters, &window, &data, "signet", 1).into_string();
         assert!(loading.contains("hx-trigger=\"every 2s\""));
         assert!(loading.contains("hx-select=\"#weather-discovery-results\""));
         assert!(loading.contains("hx-sync=\"this:drop\""));
@@ -247,7 +252,7 @@ mod tests {
         );
 
         data.refreshing = false;
-        let failed = discovery(&filters, &window, &data, "signet").into_string();
+        let failed = discovery(&filters, &window, &data, "signet", 1).into_string();
         assert!(!failed.contains("hx-get="));
         assert!(failed.contains("Weather discovery is unavailable"));
         assert!(failed.contains("Refresh results</a>"));
@@ -257,7 +262,7 @@ mod tests {
             eligible_count: 0,
             missing_forecasts: 0,
         })));
-        let finished = discovery(&Filters::default(), &window, &data, "signet").into_string();
+        let finished = discovery(&Filters::default(), &window, &data, "signet", 1).into_string();
         assert!(!finished.contains("hx-get="));
         assert!(!finished.contains("hx-trigger="));
         assert!(finished.contains("0 matching stations"));
@@ -286,7 +291,7 @@ mod tests {
             }))),
             refreshing: true,
         };
-        let html = discovery(&Filters::default(), &window(), &data, "signet").into_string();
+        let html = discovery(&Filters::default(), &window(), &data, "signet", 1).into_string();
         assert!(html.contains("id=\"game-creation\""));
         assert!(html.contains("name=\"locations\" value=\"KPDX\""));
         // Picks per entry is optional: empty takes every category at every selected station.
@@ -308,5 +313,11 @@ mod tests {
         assert!(html.contains("hx-trigger=\"load\""));
         assert!(!html.contains("<svg"));
         assert!(html.contains("Open the station map</a>"));
+        // New games pay one place unless the coordinator allows two.
+        assert!(html.contains("name=\"number_of_places_win\" value=\"1\" min=\"1\" max=\"1\""));
+        assert!(html.contains("Each pool pays its winner the pot."));
+        let two = discovery(&Filters::default(), &window(), &data, "signet", 2).into_string();
+        assert!(two.contains("name=\"number_of_places_win\" value=\"1\" min=\"1\" max=\"2\""));
+        assert!(two.contains("Two places pay 70% and 30%"));
     }
 }

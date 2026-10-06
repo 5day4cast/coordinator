@@ -58,8 +58,9 @@ pub const QUEUED_LEFTOVER_REFUND: &str = "queued_leftover_refund";
 pub const DEFAULT_SEATS: usize = 20;
 /// Complete entries required before the default competition can form a pool.
 pub const DEFAULT_MIN_PLAYERS: usize = 3;
-/// The places the default competition pays once ten players entered: 70% and 30%.
-pub const DEFAULT_PLACES: u32 = 2;
+/// The places the default competition pays: its winner takes the pot. `places = 2` pays 70%
+/// and 30% once ten players entered, where the coordinator allows it.
+pub const DEFAULT_PLACES: u32 = 1;
 
 /// Whether `scenario` enters a queued competition.
 pub fn is_queued(scenario: &str) -> bool {
@@ -123,9 +124,7 @@ impl QueueShape {
         let players = config.queue_players.unwrap_or(default_players);
         // The default competition takes no more entries than its one pool seats.
         let max_entries = config.queue_max_entries.or(one_pool.then_some(max as u32));
-        let places = config
-            .places
-            .unwrap_or(if one_pool { DEFAULT_PLACES } else { 1 });
+        let places = config.places.unwrap_or(DEFAULT_PLACES);
         ensure!(
             supported_shape(max, places as usize),
             "{scenario}: pools of up to {max} cannot pay {places} places; two places need pools \

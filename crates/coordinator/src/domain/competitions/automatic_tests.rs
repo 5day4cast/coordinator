@@ -1267,7 +1267,7 @@ async fn oversized_automatic_competition_is_refused_before_any_oracle_or_ticket_
     let Error::BadRequest(message) = &error else {
         panic!("expected a capacity rejection, got {error:?}");
     };
-    assert!(message.contains("winning places"), "{message}");
+    assert!(message.contains("winning place"), "{message}");
     // Admission must precede every persisted or announced effect.
     let store = CompetitionStore::new(database.clone());
     assert!(store.get_competition(event_id).await.is_err());
