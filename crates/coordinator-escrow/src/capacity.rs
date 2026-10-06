@@ -8,6 +8,7 @@ use crate::payout::dlctix::{
     ContractParameters, EventLockingConditions, MarketMaker, Outcome, Player,
 };
 use crate::{
+    ark::ArkFunding,
     authorization::{ArkEscrowPolicy, PayoutPolicy},
     generic,
     oracle_statement::{
@@ -63,6 +64,10 @@ pub const MAX_QUEUED_NAME_BYTES: usize = 32;
 /// Longer than an Arkade escrow's tap tree and checkpoint exit script in hex.
 const MODELED_TAP_TREE_HEX_CHARS: usize = 4096;
 const MODELED_EXIT_SCRIPT_HEX_CHARS: usize = 512;
+/// An Arkade-funded pool's signing and settlement requests name its batch's commitment
+/// transaction. Bitcoin relays no transaction over 400,000 weight units, so an unsigned one
+/// serializes to at most 100,000 bytes.
+const MODELED_COMMITMENT_TX_HEX_CHARS: usize = 2 * 100_000;
 
 /// Keymeld's sealed-state context: it deflates a state's JSON, then encrypts it.
 const SEALED_STATE: &str = "escrow_state_v2";
@@ -443,13 +448,25 @@ pub fn validate_competition_capacity(
     let sign_action = worst(&Action::Sign {
         scope: scope.clone(),
     })?;
+    let ark_funding = ArkFunding {
+        commitment_tx: "f".repeat(MODELED_COMMITMENT_TX_HEX_CHARS),
+        vout: u32::MAX,
+    };
     // The Coordinator first sends the compact scope, and the full one only to a verifier that
     // predates it, so the full one bounds both.
     let sign_parameters = worst(&generic::ActionParameters::SignContract {
         scope,
-        ark_funding: None,
+        ark_funding: Some(ark_funding.clone()),
     })?;
-    let signing_state = bytes(&binding)? + bytes(&sign_action)? + METADATA_RESERVE;
+    // The verifier keeps the commitment in the prepared state.
+    let signing_application_state = Payload::encode(&json!({
+        "kind": "contract_signing",
+        "ark_funding": ark_funding,
+    }))?;
+    let signing_state = bytes(&binding)?
+        + bytes(&sign_action)?
+        + bytes(&signing_application_state)?
+        + METADATA_RESERVE;
     let signing_receipt = sealed("signing receipt", signing_state)?;
     // An invoice occurs in both authenticated application_state and public output.
     // Both are bounded Payloads; reserve full allowed invoice plus fixed fields.
@@ -478,7 +495,9 @@ pub fn validate_competition_capacity(
     )?;
     // At most one <=65-byte signature per DLC item plus bounded map keys/tags.
     // Double 256 bytes per item also covers quoting JSON signatures inside JSON.
-    let parameters = payload(2 * (signing_items * 256 + 1024) + MAX_INVOICE_BYTES + 4096)?;
+    let parameters = payload(
+        2 * (signing_items * 256 + 1024) + MAX_INVOICE_BYTES + bytes(&ark_funding)? + 4096,
+    )?;
     let settlement_request = PrepareEscrowRequest {
         schema_version: escrow::SCHEMA_VERSION,
         binding_receipt: payload(binding_receipt)?,

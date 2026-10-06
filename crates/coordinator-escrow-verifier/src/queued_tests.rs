@@ -939,6 +939,7 @@ async fn a_queued_refund_pays_the_players_own_address() {
 mod capacity_bounds {
     use super::*;
     use coordinator_escrow::capacity::{self, CompetitionCapacity};
+    use dlctix::bitcoin::{absolute::LockTime, transaction::Version, Transaction, TxIn, Txid};
     use keymeld_core::crypto::SessionSecret;
     use keymeld_core::escrow::protocol::{BindEscrowRequest, PrepareEscrowRequest};
     use serde_json::{json, Value};
@@ -946,6 +947,14 @@ mod capacity_bounds {
     /// Entry key of slot `slot`.
     fn key(slot: usize) -> u8 {
         100 + slot as u8
+    }
+
+    /// Slot `slot`'s entry. Its ticket hash stays clear of every payout hash in a pool of 25.
+    fn large_entry(terms: &QueuedTerms, entry_id: Uuid, slot: usize) -> QueuedEntryTerms {
+        QueuedEntryTerms {
+            ticket_hash: payout::sha256(&[200 + slot as u8; 32]),
+            ..entry(terms, entry_id, slot)
+        }
     }
 
     /// The most stations, metrics and lines a queued competition may carry.
@@ -1015,7 +1024,8 @@ mod capacity_bounds {
             .iter()
             .enumerate()
             .map(|(slot, id)| {
-                queued::pool_authorization(&entry(&terms, *id, slot), &members, &statement).unwrap()
+                queued::pool_authorization(&large_entry(&terms, *id, slot), &members, &statement)
+                    .unwrap()
             })
             .collect();
         let first = &derived[0];
@@ -1099,7 +1109,7 @@ mod capacity_bounds {
             .map(|(slot, id)| {
                 (
                     UserId::from(*id),
-                    deposit(&entry(&terms, *id, slot), key(slot), slot, true),
+                    deposit(&large_entry(&terms, *id, slot), key(slot), slot, true),
                 )
             })
             .collect();
@@ -1128,13 +1138,14 @@ mod capacity_bounds {
     }
 
     impl LargePool {
-        /// The scope the Coordinator asks the first player's enclave to permit, as the SDK's
+        /// The scope of `contract` the Coordinator asks the first player's enclave to permit, as
+        /// the SDK's
         /// `scope_for_participant` builds it from the batch: each item the player signs, with
         /// its signers in key order, its subset, and its adaptor point.
-        fn scope(&self) -> SigningScope {
+        fn scope(&self, contract: &ContractCommitment) -> SigningScope {
             let data = TicketedDLC::new(
-                self.f.contract.contract_parameters.clone(),
-                self.f.contract.funding_outpoint,
+                contract.contract_parameters.clone(),
+                contract.funding_outpoint,
             )
             .unwrap()
             .signing_data()
@@ -1314,19 +1325,40 @@ mod capacity_bounds {
 
         // Contract signing: the compact scope first, the full one to an older verifier, and a
         // retry after a lost nonce round carrying the previous preparation.
-        let scope = pool.scope();
+        // The pool is funded in an Arkade batch, whose commitment transaction fixes its outpoint.
+        let commitment = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([7; 32]), 0),
+                ..Default::default()
+            }],
+            output: vec![
+                funding_output(f),
+                TxOut {
+                    value: Amount::from_sat(330),
+                    script_pubkey: p2tr(31),
+                },
+            ],
+        };
+        let ark_funding = ArkFunding::new(&commitment, 0);
+        let funded = ContractCommitment {
+            contract_parameters: f.contract.contract_parameters.clone(),
+            funding_outpoint: OutPoint::new(commitment.compute_txid(), 0),
+        };
+        let scope = pool.scope(&funded);
         let attempt = ActionAttempt {
             attempt_id: Uuid::now_v7(),
             signing_session_id: Some(SessionId::new_v7()),
         };
         let compact = Payload::encode(&ActionParameters::SignContractCompact {
             items: ContractItem::compact(&scope),
-            ark_funding: None,
+            ark_funding: Some(ark_funding.clone()),
         })
         .unwrap();
         let full = Payload::encode(&ActionParameters::SignContract {
             scope: scope.clone(),
-            ark_funding: None,
+            ark_funding: Some(ark_funding.clone()),
         })
         .unwrap();
         let prepared = verifier
@@ -1375,7 +1407,7 @@ mod capacity_bounds {
         };
         let invoice = invoice();
         let (_, consent) = policy(&f.policy).unwrap();
-        let contract_digest = payout::contract_digest(&f.contract).unwrap();
+        let contract_digest = payout::contract_digest(&funded).unwrap();
         let authorization = SignedInvoiceAuthorization::sign(
             &[key(0); 32],
             InvoiceAuthorizationContext {
@@ -1399,7 +1431,7 @@ mod capacity_bounds {
                 invoice: invoice.clone(),
                 authorization,
             },
-            ark_funding: None,
+            ark_funding: Some(ark_funding),
         })
         .unwrap();
         let settlement = PreparedSettlement {
