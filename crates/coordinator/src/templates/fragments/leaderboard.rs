@@ -201,6 +201,12 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
                     ))
                 }
             }
+
+            @if let Some(funding) = &competition.funding {
+                p class="help contract-funding" {
+                    "Contract funding: " (format::chain_id(&funding.outpoint, funding.url.clone()))
+                }
+            }
         }
     }
 }
@@ -471,6 +477,34 @@ mod tests {
             owner: format!("owner-{player}"),
             score,
         }
+    }
+
+    #[test]
+    fn a_funded_contract_names_its_funding_output() {
+        use crate::templates::pages::competitions::FundingView;
+        let mut competition = view("c1", Phase::Live, -5);
+        assert!(!leaderboard(&competition, NOW)
+            .into_string()
+            .contains("Contract funding"));
+
+        let outpoint = format!("{}:1", "f".repeat(64));
+        competition.funding = Some(FundingView {
+            outpoint: outpoint.clone(),
+            url: Some(format!("https://mempool.example/tx/{}", "f".repeat(64))),
+        });
+        let html = leaderboard(&competition, NOW).into_string();
+        assert!(html.contains("Contract funding: "));
+        assert!(html.contains(&format!(r#"data-copy="{outpoint}""#)));
+        assert!(html.contains(&format!(
+            r#"href="https://mempool.example/tx/{}""#,
+            "f".repeat(64)
+        )));
+
+        // Without an explorer, the outpoint is there to copy.
+        competition.funding.as_mut().unwrap().url = None;
+        let html = leaderboard(&competition, NOW).into_string();
+        assert!(html.contains(&format!(r#"data-copy="{outpoint}""#)));
+        assert!(!html.contains("explorer-link"));
     }
 
     #[test]

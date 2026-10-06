@@ -271,6 +271,7 @@ fn competition(id: &str, phase: Phase, start: OffsetDateTime, entries: u64) -> C
         refund_shares: None,
         queue: Queue::Single,
         unlisted: false,
+        funding: None,
     }
 }
 

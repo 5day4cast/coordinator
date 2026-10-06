@@ -82,3 +82,16 @@
 .ledger-details dt {
   color: var(--bulma-text-weak);
 }
+
+/* Where the entry's money is on chain, under its references. */
+.ledger-details .ledger-chain {
+  margin-top: 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--bulma-text-weak);
+}
+
+.ledger-details .ledger-amount {
+  margin-left: 0.5rem;
+  color: var(--bulma-text-weak);
+}

@@ -35,7 +35,7 @@ use crate::{
     startup::AppState,
     templates::{
         components::menu_toggle,
-        format::short_npub,
+        format::{short_npub, Explorers},
         fragments::{
             entries_paused_banner,
             entry_form::{
@@ -269,7 +269,7 @@ async fn refund_status(
         })
 }
 
-/// One competition as the page shows it, with its refunds.
+/// One competition as the page shows it, with its refunds and its funding output.
 async fn competition_view(
     state: &AppState,
     competition: &Competition,
@@ -280,6 +280,7 @@ async fn competition_view(
         .await
         .remove(&competition.id)
         .unwrap_or_default();
+    view.add_funding(competition, &state.explorer_url);
     view
 }
 
@@ -448,8 +449,15 @@ pub async fn entries_fragment(
             returned,
         })
         .collect();
+    let explorers = Explorers {
+        chain: &state.explorer_url,
+        ark: &state.ark_explorer_url,
+    };
     if from > 0 {
-        return fragment(older_entries(&rows, from, ledger.len()), Caching::Private);
+        return fragment(
+            older_entries(&rows, from, ledger.len(), explorers),
+            Caching::Private,
+        );
     }
     let open = competitions
         .iter()
@@ -459,7 +467,7 @@ pub async fn entries_fragment(
         &headers,
         &state,
         title,
-        entries_page(&rows, &totals, ledger.len(), open),
+        entries_page(&rows, &totals, ledger.len(), open, explorers),
         Caching::Private,
     )
 }

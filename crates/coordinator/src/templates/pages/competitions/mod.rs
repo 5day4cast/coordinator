@@ -67,6 +67,17 @@ pub struct CompetitionView {
     pub queue: Queue,
     /// Reached by its link only: the public lists leave it out.
     pub unlisted: bool,
+    /// The contract's funding output, once broadcast, and its explorer link; none until
+    /// [`Self::add_funding`], which the lists leave out.
+    pub funding: Option<FundingView>,
+}
+
+/// A contract's funding output as its page shows it: on-chain, so public.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FundingView {
+    /// `txid:vout`.
+    pub outpoint: String,
+    pub url: Option<String>,
 }
 
 /// Where the entry fees of a competition that didn't run stand.
@@ -139,9 +150,22 @@ impl CompetitionView {
             refund_shares: None,
             queue,
             unlisted: !competition.is_listed(),
+            funding: None,
         };
         view.add_contract(competition);
         view
+    }
+
+    /// The output that funded the contract, once its funding was broadcast, linked to
+    /// `explorer` when there is one.
+    pub fn add_funding(&mut self, competition: &Competition, explorer: &str) {
+        self.funding = competition
+            .funding_outpoint
+            .filter(|_| competition.funding_broadcasted_at.is_some())
+            .map(|outpoint| FundingView {
+                outpoint: outpoint.to_string(),
+                url: format::tx_url(explorer, &outpoint.txid.to_string()),
+            });
     }
 
     /// Whether the pot went back to every entry, and in what shares, from the competition's
@@ -1248,6 +1272,7 @@ pub(crate) mod tests {
             refund_shares: None,
             queue: Queue::Single,
             unlisted: false,
+            funding: None,
         }
     }
 
