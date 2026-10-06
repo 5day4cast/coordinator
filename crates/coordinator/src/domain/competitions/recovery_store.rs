@@ -3,7 +3,7 @@
 //! The records are rebuilt from these rows whenever a competition changes; see
 //! `domain::recovery` and docs/RECOVERY.md.
 
-use super::CompetitionStore;
+use super::{ticket_preimage::stored_preimage, CompetitionStore, TicketCipher};
 use crate::infra::db::DatabaseWriteError;
 use sqlx::{sqlite::SqliteRow, Row};
 use std::collections::HashMap;
@@ -17,8 +17,8 @@ use uuid::Uuid;
 pub struct RecoveryTicketRow {
     pub ticket_id: Uuid,
     pub ticket_hash: String,
-    /// Plaintext hex despite the column's name; see `Ticket::encrypted_preimage`.
-    pub ticket_preimage: String,
+    /// The ticket's preimage, hex, once its payment settled and so reached the player.
+    pub ticket_preimage: Option<String>,
     /// When the ticket was reserved, in Unix seconds.
     pub reserved_at: Option<i64>,
     /// Hex Nostr pubkey of the player holding the reservation.
@@ -112,15 +112,36 @@ fn uuid(value: String) -> Result<Uuid, sqlx::Error> {
     Uuid::parse_str(&value).map_err(|e| sqlx::Error::Decode(Box::new(e)))
 }
 
-fn ticket_row(row: &SqliteRow) -> Result<RecoveryTicketRow, sqlx::Error> {
+fn ticket_row(
+    row: &SqliteRow,
+    cipher: Option<&TicketCipher>,
+) -> Result<RecoveryTicketRow, sqlx::Error> {
+    let ticket_id = uuid(row.try_get("ticket_id")?)?;
+    let ticket_hash: String = row.try_get("ticket_hash")?;
+    let settled: bool = row.try_get("settled")?;
+    let ticket_preimage = if settled {
+        let ciphertext: Option<Vec<u8>> = row.try_get("ticket_preimage_ciphertext")?;
+        let legacy: String = row.try_get("ticket_preimage")?;
+        let preimage = stored_preimage(
+            cipher,
+            ticket_id,
+            &ticket_hash,
+            ciphertext.as_deref(),
+            &legacy,
+        )
+        .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+        Some(hex::encode(preimage))
+    } else {
+        None
+    };
     Ok(RecoveryTicketRow {
-        ticket_id: uuid(row.try_get("ticket_id")?)?,
-        ticket_hash: row.try_get("ticket_hash")?,
-        ticket_preimage: row.try_get("ticket_preimage")?,
+        ticket_id,
+        ticket_hash,
+        ticket_preimage,
         reserved_at: row.try_get("reserved_at")?,
         reserved_by: row.try_get("reserved_by")?,
         paid: row.try_get("paid")?,
-        settled: row.try_get("settled")?,
+        settled,
         entry_id: row
             .try_get::<Option<String>, _>("entry_id")?
             .map(uuid)
@@ -148,6 +169,7 @@ impl CompetitionStore {
     ) -> Result<Vec<RecoveryTicketRow>, sqlx::Error> {
         sqlx::query(
             "SELECT t.id AS ticket_id, t.hash AS ticket_hash, t.encrypted_preimage AS ticket_preimage,
+                    t.preimage_ciphertext AS ticket_preimage_ciphertext,
                     unixepoch(t.reserved_at) AS reserved_at, t.reserved_by,
                     t.paid_at IS NOT NULL AS paid, t.settled_at IS NOT NULL AS settled,
                     e.id AS entry_id, e.pubkey AS entry_user, e.ephemeral_pubkey AS entry_pubkey,
@@ -167,7 +189,7 @@ impl CompetitionStore {
         .fetch_all(self.db_connection.read())
         .await?
         .iter()
-        .map(ticket_row)
+        .map(|row| ticket_row(row, self.ticket_cipher.as_deref()))
         .collect()
     }
 

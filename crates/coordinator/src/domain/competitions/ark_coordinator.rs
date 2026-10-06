@@ -207,10 +207,10 @@ impl Coordinator {
             .ticket_ark_escrow(ticket.id, &ticket.hash)
             .await?
             .ok_or_else(|| Error::BadRequest("The ticket has no escrow yet".into()))?;
-        let preimage: [u8; 32] = hex::decode(&ticket.encrypted_preimage)
-            .ok()
-            .and_then(|bytes| bytes.try_into().ok())
-            .ok_or_else(|| Error::BadRequest("Invalid ticket preimage".into()))?;
+        let preimage = self
+            .competition_store
+            .ticket_preimage(ticket)
+            .map_err(anyhow::Error::from)?;
         if !admission::before_deadline(Some(deadline)) {
             return Err(Error::BadRequest(admission::TICKETS_CLOSED.into()));
         }

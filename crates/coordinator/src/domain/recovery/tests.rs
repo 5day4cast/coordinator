@@ -316,7 +316,7 @@ fn an_entry_record_follows_the_entry() {
     let ticket = RecoveryTicketRow {
         ticket_id: Uuid::now_v7(),
         ticket_hash: hex::encode(params.players[1].ticket_hash),
-        ticket_preimage: hex::encode([11u8; 32]),
+        ticket_preimage: Some(hex::encode([11u8; 32])),
         reserved_at: Some(1_799_990_000),
         reserved_by: Some(player.public_key().to_hex()),
         paid: true,
@@ -469,7 +469,7 @@ fn a_ticket_before_its_entry_takes_the_entry_id_from_its_payout_policy() {
     let ticket = RecoveryTicketRow {
         ticket_id: Uuid::now_v7(),
         ticket_hash: "cd".repeat(32),
-        ticket_preimage: "ef".repeat(32),
+        ticket_preimage: Some("ef".repeat(32)),
         reserved_by: Some(player.public_key().to_hex()),
         policy_entry_pubkey: Some(hex::encode(scalar(4).base_point_mul().serialize())),
         policy_json: Some(json!({ "contract_terms": "", "queued_entry": terms }).to_string()),
@@ -638,7 +638,7 @@ fn a_twenty_player_two_place_contract_fits_in_events() {
     let ticket = RecoveryTicketRow {
         ticket_id: Uuid::now_v7(),
         ticket_hash: hex::encode(params.players[7].ticket_hash),
-        ticket_preimage: "ab".repeat(32),
+        ticket_preimage: Some("ab".repeat(32)),
         settled: true,
         entry_id: Some(Uuid::now_v7()),
         entry_user: Some(player.public_key().to_hex()),

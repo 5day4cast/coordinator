@@ -1568,6 +1568,7 @@ dependencies = [
 name = "coordinator"
 version = "2.18.5"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "argon2",
  "async-trait",

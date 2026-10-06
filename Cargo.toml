@@ -105,7 +105,8 @@ thiserror = "1.0.62"
 # Crypto
 blake2 = "0.10.6"
 sha2 = "0.10"
-aes-gcm = "0.10"
+# Already in the lock through Keymeld; no default features, so no OS RNG through aead.
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
 rand = "0.9"
 rand_chacha = "0.9"
 

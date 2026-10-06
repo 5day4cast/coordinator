@@ -261,11 +261,14 @@ impl InvoiceWatcher {
     }
 
     async fn settle_invoice_and_mark_ticket(&self, ticket: &Ticket) {
-        match self
-            .ln
-            .settle_hold_invoice(ticket.encrypted_preimage.clone())
-            .await
-        {
+        let preimage = match self.coordinator.competition_store.ticket_preimage(ticket) {
+            Ok(preimage) => preimage,
+            Err(e) => {
+                error!("Cannot settle HODL invoice for ticket {}: {}", ticket.id, e);
+                return;
+            }
+        };
+        match self.ln.settle_hold_invoice(hex::encode(preimage)).await {
             Ok(_) => {
                 match self
                     .coordinator
@@ -310,11 +313,9 @@ impl InvoiceWatcher {
                 .as_ref()
                 .ok_or_else(|| anyhow!("Ticket has no escrow public key"))?;
             let user_pubkey = PublicKey::from_str(key)?;
-            let preimage = hex::decode(&ticket.encrypted_preimage)?;
+            // The accessor refuses a preimage that does not match the ticket's hash.
+            let preimage = self.coordinator.competition_store.ticket_preimage(ticket)?;
             let payment_hash = sha256::Hash::hash(&preimage).to_byte_array();
-            if hex::encode(payment_hash) != ticket.hash {
-                return Err(anyhow!("Ticket preimage does not match its invoice hash"));
-            }
             let prepared = generate_escrow_tx(
                 self.coordinator.bitcoin.clone(),
                 ticket.id,

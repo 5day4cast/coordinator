@@ -553,7 +553,7 @@ async fn taking_over_a_stale_reservation_rotates_the_ticket_and_reports_the_old_
     assert_eq!(bob.ticket.id, ticket_id);
     assert_eq!(bob.ticket.reserved_by.as_deref(), Some("bob"));
     assert_ne!(bob.ticket.hash, "old-hash");
-    assert_ne!(bob.ticket.encrypted_preimage, "old-preimage");
+    assert_ne!(bob.ticket.legacy_preimage_hex, "old-preimage");
     assert!(bob.ticket.payment_request.is_none());
 
     // An in-flight request or watcher holding Alice's old snapshot must not
@@ -646,7 +646,7 @@ async fn releasing_an_invoice_rotates_the_hash_and_preserves_a_concurrently_issu
         .unwrap()
         .ticket;
     assert_ne!(next.hash, issued.hash);
-    assert_ne!(next.encrypted_preimage, issued.encrypted_preimage);
+    assert_ne!(next.legacy_preimage_hex, issued.legacy_preimage_hex);
     assert!(!bounded(store.mark_ticket_paid(&issued.hash, event_id))
         .await
         .unwrap());

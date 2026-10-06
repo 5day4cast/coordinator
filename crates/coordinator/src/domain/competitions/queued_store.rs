@@ -85,6 +85,7 @@ const TICKET_COLUMNS: &str = "tickets.id as id,
     entries.id as entry_id,
     tickets.ephemeral_pubkey as ephemeral_pubkey,
     encrypted_preimage,
+    preimage_ciphertext,
     hash,
     payment_request,
     invoice_expires_at,
@@ -270,6 +271,9 @@ impl CompetitionStore {
         let preimage = hashlock::preimage_random(&mut rand::rng());
         let preimage_hex = hex::encode(preimage);
         let hash_hex = hex::encode(hashlock::sha256(&preimage));
+        let ciphertext = self
+            .seal_preimage(ticket_id, &hash_hex, &preimage)
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
         self.db_connection
             .execute_write(move |pool| async move {
                 let mut tx = pool.begin().await?;
@@ -363,12 +367,14 @@ impl CompetitionStore {
                             let old_hash: String = row.try_get("hash")?;
                             sqlx::query(
                                 "UPDATE tickets
-                                 SET encrypted_preimage = ?, hash = ?, reserved_at = datetime('now'),
+                                 SET encrypted_preimage = ?, preimage_ciphertext = ?, hash = ?,
+                                     reserved_at = datetime('now'),
                                      payment_request = NULL, invoice_expires_at = NULL,
                                      escrow_transaction = NULL, ephemeral_pubkey = NULL
                                  WHERE id = ? AND paid_at IS NULL",
                             )
                             .bind(&preimage_hex)
+                            .bind(&ciphertext)
                             .bind(&hash_hex)
                             .bind(&ticket)
                             .execute(&mut *tx)
@@ -401,12 +407,14 @@ impl CompetitionStore {
                             return Ok(QueuedReservation::TooManyUnpaid);
                         }
                         sqlx::query(
-                            "INSERT INTO tickets (id, event_id, encrypted_preimage, hash, reserved_at, reserved_by)
-                             VALUES (?, ?, ?, ?, datetime('now'), ?)",
+                            "INSERT INTO tickets (id, event_id, encrypted_preimage, preimage_ciphertext, hash,
+                                                  reserved_at, reserved_by)
+                             VALUES (?, ?, ?, ?, ?, datetime('now'), ?)",
                         )
                         .bind(&ticket)
                         .bind(&competition)
                         .bind(&preimage_hex)
+                        .bind(&ciphertext)
                         .bind(&hash_hex)
                         .bind(&player)
                         .execute(&mut *tx)
