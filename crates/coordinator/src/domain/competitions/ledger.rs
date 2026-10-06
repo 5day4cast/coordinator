@@ -860,7 +860,8 @@ mod tests {
 
         run(
             &database,
-            "UPDATE competitions SET funding_broadcasted_at = datetime('now') WHERE id = ?",
+            "UPDATE competitions SET funding_broadcasted_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?",
             vec![event.to_string()],
         )
         .await;

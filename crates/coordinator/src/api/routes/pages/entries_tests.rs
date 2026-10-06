@@ -281,7 +281,7 @@ async fn only_the_owner_sees_their_escrow_and_everyone_the_contract_funding() {
         .execute_write(move |pool| async move {
             sqlx::query(
                 "UPDATE competitions SET funding_outpoint = ?, funding_transaction = ?,
-                     funding_broadcasted_at = datetime('now') WHERE id = ?",
+                     funding_broadcasted_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?",
             )
             .bind(outpoint)
             .bind(transaction)
