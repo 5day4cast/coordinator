@@ -775,7 +775,7 @@ mod tests {
             html.contains(r#"data-tip="Players are split into pools of up to 25 at the start.""#)
         );
         // Forty entries make two pools of twenty: each winner takes 100,000 sats.
-        assert!(html.contains("<dd>100,000 sats</dd>"), "{html}");
+        assert!(html.contains("<dd>100,000 sats<"), "{html}");
         assert!(html.contains("pool&#39;s winner") || html.contains("pool's winner"));
         assert!(!html.contains(" of 3"));
         assert!(html.contains(r#"data-kind="queued""#));

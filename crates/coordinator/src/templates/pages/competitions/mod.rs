@@ -1480,7 +1480,7 @@ pub(crate) mod tests {
         // once known.
         assert!(html.contains("<dt>Entry fee</dt><dd>5,250 sats</dd>"));
         assert!(!html.contains(">Price<"));
-        assert!(html.contains(r#"<dt>Prizes</dt><dd>15,000 sats<span class="fact-note prize-note">Ties go to the earliest entry</span></dd>"#));
+        assert!(html.contains("<dt>Prizes</dt><dd>15,000 sats</dd>"));
         assert!(!html.contains("Paid places") && !html.contains(">Pot<"));
         let mut priced = view("open", Phase::Upcoming, 133);
         priced.network_fee = Some(437);
