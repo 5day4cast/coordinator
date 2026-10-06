@@ -100,7 +100,7 @@ With only their nsec, or the recovery file and their nsec, a player can find eve
 1. The player's records: kind 30078 events by the coordinator's recovery key, tagged `["b", blind]`, from the relays the recovery file names (or `--relays`, or a few public relays). `blind = sha256("coordinator-recovery/v1" || coordinator_pubkey || user_pubkey)`. The recovery file holds the same ciphertexts.
 2. The wallet seed: the record is NIP-44 from the recovery key to the player; inside it, the browser wallet's backup is NIP-44 from the player to themselves. Entry keys and payout preimages are derived from the seed, the network and the entry id, exactly as the browser wallet derives them.
 3. Each competition's contract (tag `["c", id]`), whole, gzipped, or as a manifest and parts.
-4. The oracle's attestation: from the competition record, the oracle's Nostr events, or the oracle's API (`--oracle`). Any value is accepted only if it opens one of the contract's locking points, so where it came from does not matter.
+4. The oracle's attestation: from the competition record, the oracle's Nostr record (kind 30078, `d` = `oracle:<event id>`, see noaa-oracle's `docs/NOSTR.md`), or the oracle's API (`--oracle`). Any value is accepted only if it opens one of the contract's locking points, so where it came from does not matter.
 5. Chain state from any Esplora API: mempool.space on mainnet and Mutinynet's on signet by default (`--esplora`).
 
 Nothing is signed for an entry unless the key derived from the seed is the key its record names, and the contract has that key as a player with this wallet's payout hash. Every contract signature this player relies on is verified before it is used.

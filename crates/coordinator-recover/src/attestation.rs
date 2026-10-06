@@ -3,7 +3,7 @@
 //! An attestation is the scalar whose point is one of the event's locking points, so any value
 //! that opens a locking point of the signed contract is the attestation, whoever served it. That
 //! lets this read it from the competition record, the oracle's API (`/oracle/events/{id}`) or the
-//! oracle's Nostr events without knowing their exact format: it collects every 32-byte value
+//! oracle's Nostr record without relying on their exact format: it collects every 32-byte value
 //! they hold (and the `s` half of every 64-byte signature) and keeps the one that opens a point.
 
 use dlctix::secp::{MaybePoint, MaybeScalar};
@@ -11,16 +11,12 @@ use serde_json::{json, Value};
 
 use crate::spec::KIND_APP_DATA;
 
-/// NIP-88 attestation events.
-pub const KIND_NIP88_ATTESTATION: u16 = 89;
-
-/// The relay filters that may hold the attestation for oracle event `event_id`: the oracle's
-/// kind 30078 event (`d` = `oracle:<event_id>`), and NIP-88 attestations naming the event.
+/// The relay filter for the oracle's record of event `event_id`: a kind 30078 event with `d` =
+/// `oracle:<event_id>`, whose content carries the attestation once the oracle signs
+/// (noaa-oracle's `docs/NOSTR.md`). Its author is not needed: the attestation is checked
+/// against the contract.
 pub fn relay_filters(event_id: &str) -> Vec<Value> {
-    vec![
-        json!({"kinds": [KIND_APP_DATA], "#d": [format!("oracle:{event_id}")]}),
-        json!({"kinds": [KIND_NIP88_ATTESTATION], "#d": [event_id]}),
-    ]
+    vec![json!({"kinds": [KIND_APP_DATA], "#d": [format!("oracle:{event_id}")]})]
 }
 
 /// The first of `candidates` that opens one of `locking_points`.
@@ -115,6 +111,16 @@ mod tests {
             select(&candidates_in_text(&hex_attestation), &points),
             Some(attestation)
         );
+
+        // The oracle's Nostr record: other 32-byte values in it open nothing.
+        let record = json!({"v": 1, "type": "oracle-event", "oracle_pubkey": format!("02{}", "ab".repeat(32)),
+            "locking_points_sha256": "cd".repeat(32), "attestation": hex_attestation,
+            "outcome_index": 1, "winners": [0]});
+        assert_eq!(
+            select(&candidates_in_text(&record.to_string()), &points),
+            Some(attestation)
+        );
+        assert_eq!(relay_filters("e1")[0]["#d"], json!(["oracle:e1"]));
 
         // A value that opens no locking point is never used.
         let wrong = json!({"attestation": hex::encode(other.serialize())});
