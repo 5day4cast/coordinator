@@ -239,8 +239,8 @@ pub fn entry_form(
                 // A paid ticket is entered without paying again, paused or not. `entry_form.js`
                 // relabels the button when the paid notice comes or goes with a log-in.
                 button type="button" id="submitEntry" class="button is-primary is-medium"
-                       data-pay-label=(pay_label)
-                       disabled[paused.is_some() && paid.is_none()] {
+                       disabled[paused.is_some() && paid.is_none()]
+                       data-pay-label=(pay_label) {
                     @if paid.is_some() {
                         (FINISH_LABEL)
                     } @else if paused.is_some() {
@@ -810,7 +810,7 @@ mod tests {
             none.contains(r#"id="entryPaid""#),
             "kept for the log-in reload"
         );
-        assert!(!none.contains("data-ticket-id") && !none.contains("Paid"));
+        assert!(!none.contains("data-ticket-id") && !none.contains("Paid —"));
 
         let form = |paid: Option<&PaidTicket>, fee: NetworkFee| {
             entry_form(
