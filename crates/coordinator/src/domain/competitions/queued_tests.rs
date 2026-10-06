@@ -1495,10 +1495,13 @@ async fn a_queued_entry_s_picks_change_until_its_pools_form() {
     queue
         .db
         .execute_write(move |pool| async move {
-            sqlx::query("UPDATE competitions SET pools_formed_at = datetime('now') WHERE id = ?")
-                .bind(id)
-                .execute(&pool)
-                .await?;
+            sqlx::query(
+                "UPDATE competitions SET pools_formed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                 WHERE id = ?",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await?;
             Ok(())
         })
         .await
