@@ -304,7 +304,7 @@ impl Coordinator {
         &self,
         pubkey: &str,
         entry_id: Uuid,
-        picks: Vec<WeatherChoices>,
+        picks: Vec<crate::infra::oracle::WeatherChoices>,
     ) -> Result<(), Error> {
         let entry = self
             .competition_store
