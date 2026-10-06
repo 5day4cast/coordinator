@@ -11,6 +11,7 @@ name = "ark-swapd"
 path = "src/main.rs"
 
 [dependencies]
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
 anyhow = { workspace = true }
 ark-client = { version = "0.11", default-features = false, features = ["tls-webpki-roots"] }
 ark-core = { workspace = true }
