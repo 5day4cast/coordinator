@@ -1087,15 +1087,17 @@ async fn a_payment_lnd_made_that_the_database_lost_holds_the_payouts_it_could_be
         .send_payment(lost, owed, 60, 1_000)
         .await
         .unwrap();
-    // The pot does not split evenly, so only the winners owed exactly that amount are held.
+    // Only the winners owed exactly that amount are held, and not the one whose payout the
+    // database knows is under way.
     let owed_that = |entry: &UserEntry| {
-        winner_payout_sats(
-            settlement.contract.params(),
-            &Outcome::Attestation(0),
-            &entry.ephemeral_pubkey.parse::<Point>().unwrap(),
-        )
-        .unwrap()
-            == owed
+        entry.id != entries[2].id
+            && winner_payout_sats(
+                settlement.contract.params(),
+                &Outcome::Attestation(0),
+                &entry.ephemeral_pubkey.parse::<Point>().unwrap(),
+            )
+            .unwrap()
+                == owed
     };
     let matching: Vec<&UserEntry> = entries.iter().filter(|e| owed_that(e)).collect();
     assert!(
