@@ -203,7 +203,9 @@ test.describe("Full Entry Submission Flow", () => {
     // The fee cap and the winners' shares, in the Advanced section.
     const advanced = page.locator("#entryContainer details.entry-advanced");
     await expect(advanced).toContainText("On-chain fees for the contract are capped at 100 sat/vB");
-    await expect(advanced).toContainText("Winner shares by rank: 45%, 35%, 20%");
+    await expect(advanced).toContainText("Winner shares by rank: 70%, 30%");
+    // Beside the prize, how the two places share the pot; no fee breakdown.
+    await expect(page.locator("#entryContainer .entry-facts")).toContainText("1st 70% · 2nd 30%");
     await chooseRequiredPicks(page);
     await page.locator("#submitEntry").click();
     await expect(page.locator("#errorMessage")).toContainText("The ticket omitted the approved payout escrow policy");

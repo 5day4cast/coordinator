@@ -42,6 +42,7 @@ pub(super) fn request(start: OffsetDateTime) -> CreateQueuedCompetition {
         max_pool_size: 25,
         max_entries: None,
         max_entries_per_player: 1,
+        number_of_places_win: 1,
     }
 }
 
@@ -88,6 +89,14 @@ fn queued_creation_checks_pool_rules_the_cap_and_registration_length() {
             r.max_entries = Some(queued::MAX_ENTRIES + 1)
         }),
         ("no stake", |r| r.entry_fee = 0),
+        ("no places", |r| r.number_of_places_win = 0),
+        ("three places", |r| {
+            r.number_of_places_win = 3;
+            r.max_pool_size = 20
+        }),
+        ("two places in pools above 20", |r| {
+            r.number_of_places_win = 2
+        }),
     ];
     for (name, change) in invalid {
         let mut candidate = request(now + Duration::hours(6));
@@ -99,6 +108,24 @@ fn queued_creation_checks_pool_rules_the_cap_and_registration_length() {
     assert_eq!(capped.settings().unwrap().1, 40);
     let late = request(now + Duration::days(7));
     assert!(late.check_registration(now).is_err());
+
+    // The default competition: one pool of up to 20, paying two places from ten players.
+    let mut default = request(now + Duration::hours(6));
+    default.max_pool_size = 20;
+    default.max_entries = Some(20);
+    default.number_of_places_win = 2;
+    let (rules, cap) = default.settings().unwrap();
+    assert_eq!((rules.max_players(), cap), (20, 20));
+    assert_eq!(default.largest_pool_places(), 2);
+    let event = default.reference_event().unwrap();
+    assert_eq!(
+        (event.total_allowed_entries, event.number_of_places_win),
+        (20, 2)
+    );
+    event.validate_oracle_settings().unwrap();
+    // Pools of at most nine never pay a second place.
+    default.max_pool_size = 9;
+    assert_eq!(default.largest_pool_places(), 1);
 }
 
 #[test]
@@ -116,7 +143,7 @@ fn the_reference_event_has_one_winner_lines_and_room_for_the_largest_pool() {
     assert!(event.unlisted);
     event.validate_oracle_settings().unwrap();
 
-    let pool = queued::pool_event(&event, Uuid::now_v7(), 7, 5_000).unwrap();
+    let pool = queued::pool_event(&event, Uuid::now_v7(), 7, 5_000, 1).unwrap();
     assert_eq!(pool.total_allowed_entries, 7);
     assert_eq!(pool.total_competition_pool, 35_000);
     assert_eq!(pool.locations, event.locations);
@@ -157,7 +184,8 @@ fn queues_and_pools_are_listed_whatever_their_events_say() {
     let mut queue = Competition::new(&event);
     queue.kind = CompetitionKind::Queued;
     assert!(queue.is_listed());
-    let mut pool = Competition::new(&queued::pool_event(&event, Uuid::now_v7(), 7, 5_000).unwrap());
+    let mut pool =
+        Competition::new(&queued::pool_event(&event, Uuid::now_v7(), 7, 5_000, 1).unwrap());
     pool.kind = CompetitionKind::Pool;
     assert!(!pool.event_submission.unlisted && pool.is_listed());
 
@@ -240,6 +268,16 @@ pub(super) struct Queue {
 
 impl Queue {
     pub(super) async fn new(start: OffsetDateTime, rules: PoolRules, max_entries: u32) -> Self {
+        Self::paying(start, rules, max_entries, 1).await
+    }
+
+    /// A queue whose pools of ten or more pay `places`.
+    pub(super) async fn paying(
+        start: OffsetDateTime,
+        rules: PoolRules,
+        max_entries: u32,
+        places: usize,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let db = DBConnection::new(
             directory.path().to_str().unwrap(),
@@ -273,6 +311,7 @@ impl Queue {
         let mut request = request(start);
         request.min_players = rules.min_players();
         request.max_pool_size = rules.max_players();
+        request.number_of_places_win = places;
         let event = request.reference_event().unwrap();
         let created = oracle.create_event(event.clone()).await.unwrap();
         let reference = oracle.get_event_terms(&event.id).await.unwrap();
@@ -553,6 +592,7 @@ async fn queued_terms_come_from_the_reference_event_and_are_stored_with_their_di
     assert_eq!(json["kind"], "queued");
     assert_eq!(json["entries"], 0);
     assert_eq!(json["max_entries"], 40);
+    assert_eq!(json["held"], 0);
     assert_eq!(json["stake_sats"], 5_000);
     assert_eq!(
         json["pool_rules"],
@@ -645,6 +685,12 @@ async fn queued_tickets_are_made_on_demand_up_to_the_cap() {
         reserve(Uuid::now_v7(), "carol").await,
         QueuedReservation::Full
     ));
+    // The API counts the held tickets as the cap does, so the page can say the queue is full
+    // while none of them is paid yet.
+    let json = serde_json::to_value(queue.coordinator.get_competition(id).await.unwrap()).unwrap();
+    assert_eq!(json["entries"], 0);
+    assert_eq!(json["held"], 4);
+    assert_eq!(json["max_entries"], 4);
 
     // Tickets stop at the deadline.
     assert!(matches!(
@@ -685,6 +731,73 @@ async fn queued_tickets_are_made_on_demand_up_to_the_cap() {
     assert_ne!(rotated.ticket.hash, original);
     assert!(rotated.ticket.payment_request.is_none());
     assert!(rotated.superseded_payment_hash.is_some());
+
+    // A hold that lapsed stops counting toward the cap. Once someone else takes the place, the
+    // lapsed ticket is not held again: the queue is full.
+    let first_id = first.to_string();
+    queue
+        .db
+        .execute_write(move |pool| async move {
+            sqlx::query(
+                "UPDATE tickets SET reserved_at = datetime('now', '-20 minutes'),
+                     payment_request = 'lnbc1', invoice_expires_at = datetime('now', '-1 minute')
+                 WHERE id = ?",
+            )
+            .bind(first_id)
+            .execute(&pool)
+            .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        reserve(Uuid::now_v7(), "carol").await,
+        QueuedReservation::Reserved(_)
+    ));
+    assert!(matches!(
+        reserve(first, "alice").await,
+        QueuedReservation::Full
+    ));
+}
+
+/// The default competition takes 20 entries. Players asking at once get exactly 20 tickets: paid
+/// and payable tickets count, and the writes are serialized, so a 21st cannot slip in.
+#[tokio::test]
+async fn concurrent_entries_stop_at_the_cap() {
+    let start = OffsetDateTime::now_utc() + Duration::hours(3);
+    let queue = Queue::new(start, PoolRules::new(2, 20).unwrap(), 20).await;
+    let id = queue.competition.id;
+    let deadline = queue.competition.ticket_deadline();
+    // Five have paid already.
+    for index in 0..5 {
+        queue.ticket(&format!("paid{index}"), true).await;
+    }
+    let attempts = (0..30).map(|index| {
+        let store = queue.store().clone();
+        async move {
+            store
+                .reserve_queued_ticket(
+                    id,
+                    Uuid::now_v7(),
+                    &format!("player{index}"),
+                    20,
+                    1,
+                    deadline,
+                )
+                .await
+                .unwrap()
+        }
+    });
+    let results = futures::future::join_all(attempts).await;
+    let reserved = results
+        .iter()
+        .filter(|result| matches!(result, QueuedReservation::Reserved(_)))
+        .count();
+    let full = results
+        .iter()
+        .filter(|result| matches!(result, QueuedReservation::Full))
+        .count();
+    assert_eq!((reserved, full), (15, 15));
 }
 
 /// A player who paid for as many entries as the queue allows one player gets no new ticket.
@@ -1022,6 +1135,7 @@ async fn a_formation_that_does_not_match_the_tickets_writes_nothing() {
                 pool_id,
                 3,
                 5_000,
+                1,
             )
             .unwrap(),
         }],

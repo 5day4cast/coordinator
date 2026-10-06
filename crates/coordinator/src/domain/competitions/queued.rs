@@ -13,9 +13,10 @@
 //! `docs/QUEUED_COMPETITIONS.md`, `queued_coordinator.rs` and `queued_kickoff.rs`.
 
 use coordinator_escrow::{
+    capacity::{MAX_COMPETITION_WINNING_PLACES, MAX_TWO_PLACE_PLAYERS},
     oracle_statement::ObservationTerms,
     pools::{PoolRules, MAX_POOL_PLAYERS},
-    queued::QueuedTerms,
+    queued::{pool_places, QueuedTerms, MULTI_PLACE_MIN_PLAYERS},
 };
 use dlctix::{
     bitcoin::{FeeRate, Network},
@@ -89,6 +90,10 @@ pub struct QueueSummary {
     pub entries: u64,
     /// The most entries the queue takes.
     pub max_entries: u32,
+    /// What counts against `max_entries`: paid tickets and tickets held for an unexpired
+    /// invoice. When it reaches `max_entries`, no ticket is issued until a hold lapses.
+    #[serde(default)]
+    pub held: u64,
     /// Each player's share of a pool's funding value: the entry fee.
     pub stake_sats: u64,
     /// Hex of the digest of the terms every player consents to; key deposits are sealed under it.
@@ -109,8 +114,9 @@ pub struct PoolSummary {
 
 /// An admin's request for a queued competition.
 ///
-/// It fixes what a single competition's `CreateEvent` fixes except the seat count: every pool
-/// scores one winner, with lines, and pools hold `min_players` to `max_pool_size` players.
+/// It fixes what a single competition's `CreateEvent` fixes except the seat count: pools score
+/// with lines, hold `min_players` to `max_pool_size` players, and pay `number_of_places_win`
+/// places once they have `MULTI_PLACE_MIN_PLAYERS` players, one place below that.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateQueuedCompetition {
     /// A UUIDv7; also the reference oracle event's id.
@@ -140,10 +146,18 @@ pub struct CreateQueuedCompetition {
     /// How many entries one player may make; one if unset.
     #[serde(default = "one_entry_per_player")]
     pub max_entries_per_player: u32,
+    /// The places a pool of `MULTI_PLACE_MIN_PLAYERS` or more pays: 1, or 2 for pools of at most
+    /// 20. One if unset.
+    #[serde(default = "one_place")]
+    pub number_of_places_win: usize,
 }
 
 fn one_entry_per_player() -> u32 {
     super::ONE_ENTRY_PER_PLAYER
+}
+
+fn one_place() -> usize {
+    1
 }
 
 fn default_min_players() -> usize {
@@ -168,14 +182,26 @@ impl CreateQueuedCompetition {
         if self.entry_fee == 0 {
             return Err("the entry fee must be positive".into());
         }
+        if !(1..=MAX_COMPETITION_WINNING_PLACES).contains(&self.number_of_places_win)
+            || (self.number_of_places_win > 1 && rules.max_players() > MAX_TWO_PLACE_PLAYERS)
+        {
+            return Err(format!(
+                "pools pay one place, or two places in pools of at most {MAX_TWO_PLACE_PLAYERS}"
+            ));
+        }
         Ok((rules, max_entries))
     }
 
-    /// The reference oracle event: the competition's own id, one winner, lines scoring, off the
-    /// oracle's public list, and as many entries as the largest pool can hold. It never gets
+    /// The places the largest pool pays: what the confidential signing path must handle.
+    pub fn largest_pool_places(&self) -> usize {
+        pool_places(self.number_of_places_win as u32, self.max_pool_size) as usize
+    }
+
+    /// The reference oracle event: the competition's own id, its places, lines scoring, off the
+    /// oracle's public list, and as many entries as its largest pool can hold. It never gets
     /// entries; it freezes the lines every pool copies.
     pub fn reference_event(&self) -> Result<CreateEvent, String> {
-        let entries = MAX_POOL_PLAYERS;
+        let entries = self.max_pool_size;
         let total_competition_pool = self
             .entry_fee
             .checked_mul(entries)
@@ -187,7 +213,7 @@ impl CreateQueuedCompetition {
             end_observation_date: self.end_observation_date,
             locations: self.locations.clone(),
             number_of_values_per_entry: self.number_of_values_per_entry,
-            number_of_places_win: 1,
+            number_of_places_win: self.number_of_places_win,
             total_allowed_entries: entries,
             entry_fee: self.entry_fee,
             coordinator_fee: self.coordinator_fee,
@@ -217,14 +243,16 @@ impl CreateQueuedCompetition {
 }
 
 /// The event a pool of `players` players asks the oracle for: its queued competition's reference
-/// event with the pool's id, seat count and funding value, on the oracle's list. Every other
-/// field is the reference event's, so the pool's statement carries the terms its players
-/// consented to. The reference event stays off the list: nobody enters it.
+/// event with the pool's id, seat count, funding value and `places`, the places its size pays
+/// (`QueuedTerms::pool_places`). Pools appear on the oracle's list; the reference event stays
+/// off it because nobody enters that event. Every other field is the reference event's, so the
+/// pool's statement carries the terms its players consented to.
 pub fn pool_event(
     reference: &CreateEvent,
     pool_id: Uuid,
     players: usize,
     stake_sats: u64,
+    places: u32,
 ) -> Result<CreateEvent, String> {
     let total_competition_pool = usize::try_from(stake_sats)
         .ok()
@@ -234,6 +262,7 @@ pub fn pool_event(
         id: pool_id,
         total_allowed_entries: players,
         total_competition_pool,
+        number_of_places_win: places as usize,
         unlisted: false,
         ..reference.clone()
     })
@@ -262,8 +291,9 @@ pub fn build_terms(
     if reference.event.id != inputs.competition_id {
         return Err("the reference event has another id".into());
     }
-    if reference.number_of_places_win != 1 {
-        return Err("a queued competition's pools pay one winner".into());
+    let places = reference.number_of_places_win;
+    if !(1..=MAX_COMPETITION_WINNING_PLACES as u32).contains(&places) {
+        return Err("a queued competition's pools pay one or two places".into());
     }
     let observation: ObservationTerms =
         reference.observation().map_err(|error| error.to_string())?;
@@ -287,7 +317,8 @@ pub fn build_terms(
         signing_date: reference.signing_date.unix_timestamp(),
         expiry,
         observation,
-        number_of_places_win: 1,
+        number_of_places_win: places,
+        multi_place_min_players: (places > 1).then_some(MULTI_PLACE_MIN_PLAYERS),
         pool_rules: inputs.pool_rules,
         stake_sats: inputs.stake_sats,
         relative_locktime_block_delta: inputs.relative_locktime_block_delta,

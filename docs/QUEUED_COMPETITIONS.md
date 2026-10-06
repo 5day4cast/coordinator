@@ -222,7 +222,7 @@ The enclave checks at kickoff that each of these follows from the template.
 
 In the payout policy the template is `queued_entry`, a `QueuedEntryTerms`: the competition's `QueuedTerms`, identical for every player, plus the player's entry id, ticket hash, and payout hash.
 `contract_terms` stays empty.
-`QueuedTerms` holds the network, the market maker key, the oracle key, the pool events' signing date and expiry, the observation terms exactly as the oracle signs them (lines included), the places paid, the pool rules, each player's stake, the relative locktime, and the fee ceiling.
+`QueuedTerms` holds the network, the market maker key, the oracle key, the pool events' signing date and expiry, the observation terms exactly as the oracle signs them (lines included), the places paid with the rule for smaller pools (`multi_place_min_players`, present only when more than one place is paid), the pool rules, each player's stake, the relative locktime, and the fee ceiling.
 The wallet checks each of these against the competition page and the competition's oracle event, which it fetches from the oracle itself.
 `queued::pool_authorization` derives a member's concrete contract terms from the template, the pool's members, and the pool event's signed statement.
 A pool of `n` players funds `n` stakes, and the payout table follows the oracle's outcome order.
@@ -237,8 +237,12 @@ The competition's pool rules set the minimum and maximum pool size.
   The first N mod P pools receive floor(N / P) + 1 players, and the others receive floor(N / P).
 - The maximum must be at least twice the minimum, less one.
   Then any N at the minimum or above splits without a pool below the minimum.
-- One winner per pool is the current limit.
-  A pool must have more players than winners, so the minimum is at least 2.
+- A competition pays one place, or two (70% and 30%) in pools of at most 20 players.
+  A pool of fewer than 10 players pays one place whatever its competition pays, so a pool's places follow from its size when it forms.
+  The terms state that rule, the oracle event of each pool carries the places its size pays, and the enclave refuses a statement with any other count.
+  A pool must have more players than places, so the minimum is at least 2.
+- Two places need Keymeld to sign 1,182 items for a pool of 20, so they need its larger signing batch; until then the capacity check refuses them at creation.
+- The default competition is one pool: at most 20 entries and pools of up to 20, so it kicks off with whoever entered and never splits.
 
 A pool holds at most 25 players, for three reasons:
 
@@ -763,4 +767,3 @@ So the kickoff collects at most the lowest cap times the number of players, the 
   Escrow VTXOs expire at most 7 days after they are paid, and nothing renews them, so registration must stay shorter than the life `ark-swapd`'s coins have left.
 - The default minimum pool size, and whether to cap a competition's total entries.
 - The mainnet operator fees and the VTXO expiry, and who pays for renewal if kickoff is delayed.
-- Whether one winner per pool is enough, or whether raising the confidential signing limit is in scope.

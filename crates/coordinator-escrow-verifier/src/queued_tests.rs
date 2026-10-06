@@ -81,6 +81,7 @@ fn queued_terms() -> QueuedTerms {
         expiry: (START + 3 * 86_400) as u32,
         observation: observation(),
         number_of_places_win: 1,
+        multi_place_min_players: None,
         // Five tickets form a pool of three and a pool of two.
         pool_rules: PoolRules::new(2, 3).unwrap(),
         stake_sats: 20_000,
@@ -201,7 +202,7 @@ fn statement_for(terms: &QueuedTerms, members: &[Uuid]) -> Statement {
         expiry: terms.expiry,
         nonce_point: Scalar::from_slice(&[9; 32]).unwrap().base_point_mul(),
         outcomes: Outcomes::Ranking(RankingOutcomes {
-            number_of_places_win: 1,
+            number_of_places_win: terms.pool_places(members.len()),
             entry_ids: members.to_vec(),
         }),
         terms: Terms::Observation(terms.observation.clone()),
@@ -232,7 +233,10 @@ struct Pool {
 }
 
 fn pool_fixture(automatic: bool) -> Pool {
-    let terms = queued_terms();
+    pool_fixture_with(queued_terms(), automatic)
+}
+
+fn pool_fixture_with(terms: QueuedTerms, automatic: bool) -> Pool {
     let tickets: Vec<Uuid> = (0..5).map(|_| Uuid::now_v7()).collect();
     let block_hash = BlockHash::from_byte_array([5; 32]);
     let pools::Formation::Pools { pools, .. } = pools::form(
@@ -737,6 +741,50 @@ fn a_pool_binding_is_refused_unless_every_term_matches() {
             let mut terms = pool.terms.clone();
             terms.stake_sats += 1;
             let other = entry(&terms, pool.members[2], 2);
+            let context = EscrowContext {
+                keygen_session_id: pool.f.policy.policy.context.keygen_session_id.clone(),
+                manifest_digest: pool.f.policy.policy.context.manifest_digest,
+                ..deposit_context(&other)
+            };
+            inputs.policies.insert(
+                UserId::from(pool.members[2]),
+                register(
+                    context,
+                    KEYS[2],
+                    preimage(2),
+                    queued_policy(&other, KEYS[2], false),
+                ),
+            );
+        }),
+        "Deposit scope differs from the queued competition and its terms",
+    );
+}
+
+/// Terms paying two places state the place rule, so a pool of three pays its winner the pot:
+/// the enclave binds a statement of one place and refuses one of two.
+#[test]
+fn a_small_pool_of_two_place_terms_pays_one_place() {
+    let terms = QueuedTerms {
+        number_of_places_win: 2,
+        multi_place_min_players: Some(queued::MULTI_PLACE_MIN_PLAYERS),
+        ..queued_terms()
+    };
+    let pool = pool_fixture_with(terms, false);
+    let Outcomes::Ranking(ranking) = &pool.statement.statement.outcomes;
+    assert_eq!(ranking.number_of_places_win, 1);
+    pool.bind(|_, _| {}).unwrap();
+    refused(
+        pool.bind(|pool, inputs| {
+            inputs.statement = Some(resign(&pool.statement, |s| match &mut s.outcomes {
+                Outcomes::Ranking(ranking) => ranking.number_of_places_win = 2,
+            }))
+        }),
+        "the pool's oracle statement differs from the terms",
+    );
+    // Consent to one-place terms is consent to other terms.
+    refused(
+        pool.bind(|pool, inputs| {
+            let other = entry(&queued_terms(), pool.members[2], 2);
             let context = EscrowContext {
                 keygen_session_id: pool.f.policy.policy.context.keygen_session_id.clone(),
                 manifest_digest: pool.f.policy.policy.context.manifest_digest,

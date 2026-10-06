@@ -122,8 +122,11 @@ pub fn entry_form(
                     }
                     dd {
                         (competition.win())
-                        @if queue.is_none() && competition.paid_places > 1 {
-                            span class="fact-note" { "for 1st; top " (competition.paid_places) " paid" }
+                        @if let Some(split) = competition.prize_split() {
+                            span class="fact-note prize-note" { (split) }
+                        }
+                        @if let Some(rule) = competition.prize_rule() {
+                            span class="fact-note prize-note" { (rule) }
                         }
                     }
                 }
@@ -571,7 +574,34 @@ mod tests {
             NetworkFee::Estimate(50),
         )
         .into_string();
-        assert!(html.contains("10,500 sats") && html.contains("for 1st; top 2 paid"));
+        assert!(html.contains("10,500 sats") && html.contains("1st 70% · 2nd 30%"));
+        assert!(!html.contains("winner takes all"));
+    }
+
+    /// The default competition: one pool of 20 seats paying two places from ten players.
+    #[test]
+    fn a_one_pool_queue_shows_its_seats_and_how_the_prizes_split() {
+        let mut competition = crate::templates::pages::competitions::tests::queued("q", 3);
+        competition.paid_places = 2;
+        if let crate::templates::pages::competitions::Queue::Queued(queue) = &mut competition.queue
+        {
+            queue.max_players = 20;
+            queue.max_entries = Some(20);
+        }
+        let html = entry_form(
+            &competition,
+            &Forecasts::Pending(Pending::Loading),
+            None,
+            &PayoutDestination::LoggedOut,
+            NetworkFee::Estimate(50),
+        )
+        .into_string();
+        assert!(html.contains("20 seats · 17 left"), "{html}");
+        assert!(html.contains("1st 70% · 2nd 30%"));
+        assert!(html.contains("Under 10 players: winner takes all"));
+        assert!(html.contains("Up to 20 players, all in one pool"));
+        // Three players so far: first place takes their whole pot.
+        assert!(html.contains("<dd>15,000 sats"));
     }
 
     #[test]

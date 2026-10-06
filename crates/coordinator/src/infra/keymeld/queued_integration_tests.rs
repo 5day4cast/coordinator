@@ -151,6 +151,7 @@ fn queued_terms() -> QueuedTerms {
             ],
         },
         number_of_places_win: 1,
+        multi_place_min_players: None,
         // Four tickets form two pools of two. The verifier recomputes the pools under these
         // rules, so they are the rules the kickoff forms with.
         pool_rules: PoolRules::new(2, 3).unwrap(),

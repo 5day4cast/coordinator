@@ -17,6 +17,7 @@ use crate::{
     capacity::{
         MAX_COMPETITION_PLAYERS, MAX_COMPETITION_WINNING_PLACES, MAX_QUEUED_LINES,
         MAX_QUEUED_NAME_BYTES, MAX_QUEUED_SCORING_FIELDS, MAX_QUEUED_TARGETS,
+        MAX_TWO_PLACE_PLAYERS,
     },
     oracle_statement::{ObservationTerms, Outcomes, SignedStatement, Terms},
     payout::{ContractAuthorization, MAX_CONTRACT_BYTES},
@@ -35,6 +36,20 @@ use uuid::Uuid;
 
 /// Most bytes of [`DepositEvidence`]; Keymeld caps a deposit scope's evidence at 64 KiB.
 pub const MAX_EVIDENCE_BYTES: usize = 64 * 1024;
+
+/// A pool of fewer players than this pays one place, its winner taking the pot, whatever places
+/// its competition pays; a pool this size or larger pays them all.
+pub const MULTI_PLACE_MIN_PLAYERS: u32 = 10;
+
+/// The places a pool of `players` pays when its competition pays `places`: one below
+/// [`MULTI_PLACE_MIN_PLAYERS`] players, all of them from there.
+pub fn pool_places(places: u32, players: usize) -> u32 {
+    if players < MULTI_PLACE_MIN_PLAYERS as usize {
+        1
+    } else {
+        places
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum QueuedError {
@@ -73,7 +88,13 @@ pub struct QueuedTerms {
     pub expiry: u32,
     /// What every pool's event measures and how it is judged, lines included.
     pub observation: ObservationTerms,
+    /// The places a pool pays once it has [`MULTI_PLACE_MIN_PLAYERS`] players: 1 or 2.
     pub number_of_places_win: u32,
+    /// For terms paying more than one place, the smallest pool that pays them all,
+    /// [`MULTI_PLACE_MIN_PLAYERS`]; smaller pools pay one. Absent, and left out of the digest's
+    /// encoding, when every pool pays one place, so terms from before it keep their digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multi_place_min_players: Option<u32>,
     pub pool_rules: PoolRules,
     /// Each player's share of a pool's funding value: a pool of `n` funds `n * stake_sats`.
     pub stake_sats: u64,
@@ -96,7 +117,21 @@ impl QueuedTerms {
                 "a pool pays 1 to {MAX_COMPETITION_WINNING_PLACES} places"
             )));
         }
-        if places >= self.pool_rules.min_players() {
+        // The place rule is stated in the terms, so every player consents to it, and only the
+        // one rule is accepted.
+        let rule = (places > 1).then_some(MULTI_PLACE_MIN_PLAYERS);
+        if self.multi_place_min_players != rule {
+            return Err(terms_error(format!(
+                "a pool pays more than one place only from {MULTI_PLACE_MIN_PLAYERS} players"
+            )));
+        }
+        if places > 1 && self.pool_rules.max_players() > MAX_TWO_PLACE_PLAYERS {
+            return Err(terms_error(format!(
+                "pools paying two places hold at most {MAX_TWO_PLACE_PLAYERS} players"
+            )));
+        }
+        let smallest = self.pool_rules.min_players();
+        if self.pool_places(smallest) as usize >= smallest {
             return Err(terms_error("a pool needs more players than places"));
         }
         if i64::from(self.expiry) <= self.signing_date
@@ -112,6 +147,14 @@ impl QueuedTerms {
             .filter(|total| Amount::from_sat(*total) <= Amount::MAX_MONEY)
             .ok_or_else(|| terms_error("a full pool's funding value overflows"))?;
         check_observation_size(&self.observation)
+    }
+
+    /// The places a pool of `players` pays under these terms.
+    pub fn pool_places(&self, players: usize) -> u32 {
+        match self.multi_place_min_players {
+            Some(_) => pool_places(self.number_of_places_win, players),
+            None => self.number_of_places_win,
+        }
     }
 
     pub fn oracle_key(&self) -> Result<XOnlyPublicKey, QueuedError> {
@@ -446,7 +489,9 @@ pub fn pool_authorization(
     {
         return Err(formation_error("pool size outside the pool rules"));
     }
-    if ranking.number_of_places_win != terms.number_of_places_win || ranking.entry_ids != sorted {
+    // A pool's places follow from its size: one below the terms' threshold, all of them from it.
+    let places = terms.pool_places(sorted.len());
+    if ranking.number_of_places_win != places || ranking.entry_ids != sorted {
         return Err(statement_error("places or entries differ from the pool"));
     }
     let player_index = sorted
@@ -472,7 +517,7 @@ pub fn pool_authorization(
             locking_points: core.locking_points(terms.oracle_point()?),
             expiry: Some(core.expiry),
         },
-        outcome_payouts: pool_payouts(player_count, terms.number_of_places_win as usize)?,
+        outcome_payouts: pool_payouts(player_count, places as usize)?,
         funding_value,
         relative_locktime_block_delta: terms.relative_locktime_block_delta,
         max_fee_rate: terms.max_fee_rate,

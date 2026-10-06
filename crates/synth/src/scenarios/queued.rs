@@ -7,7 +7,9 @@
 //! - `queued_split`: more players than one pool holds, 27 against pools of 2 to 25 by default.
 //!   The queue forms `ceil(N / max)` pools whose sizes differ by at most one and which hold every
 //!   entry exactly once. Each pool then runs to funding and on to awaiting its attestation.
-//! - `queued_one_pool`: fewer players than a full pool, 5 by default: one pool of them all.
+//! - `queued_one_pool`: the default competition, one pool of up to 20 seats that pays 70% and
+//!   30% from ten players and its winner the pot below that; 5 players by default. It takes at
+//!   most 20 entries, so it never splits.
 //! - `queued_too_few`: 2 players against a minimum of 3. The queue is cancelled and both escrows
 //!   are refunded to the players' Lightning Address.
 //! - `queued_leftover_refund`: 3 players enter and a fourth pays but never submits an entry. The
@@ -15,7 +17,8 @@
 //!   from the queue.
 //!
 //! `--queue-players` sets how many players enter completely, and `--max-pool-players` the
-//! largest pool, so a split can be tried with fewer payments.
+//! largest pool, so a split can be tried with fewer payments. The `queue_max_entries` and
+//! `places` settings set the queue's entry cap and the places its pools of ten or more pay.
 //!
 //! Every queued entry waits in an Arkade escrow that a real payment funds, and names the
 //! Lightning Address it is refunded to if its queue never starts. So these scenarios pay from
@@ -41,12 +44,20 @@ use crate::client::competitions::{CompetitionKind, CreateQueuedCompetition, Pool
 use crate::client::CoordinatorClient;
 use crate::crypto::keys::SynthUser;
 use crate::trail::EntryTrace;
-use coordinator_core::keymeld::pools::{PoolRules, MAX_POOL_PLAYERS};
+use coordinator_core::keymeld::{
+    capacity::supported_shape,
+    pools::{PoolRules, MAX_POOL_PLAYERS},
+};
 
 pub const QUEUED_SPLIT: &str = "queued_split";
 pub const QUEUED_ONE_POOL: &str = "queued_one_pool";
 pub const QUEUED_TOO_FEW: &str = "queued_too_few";
 pub const QUEUED_LEFTOVER_REFUND: &str = "queued_leftover_refund";
+
+/// The default competition's seats: `queued_one_pool` plays as one pool of them.
+pub const DEFAULT_SEATS: usize = 20;
+/// The places the default competition pays once ten players entered: 70% and 30%.
+pub const DEFAULT_PLACES: u32 = 2;
 
 /// Whether `scenario` enters a queued competition.
 pub fn is_queued(scenario: &str) -> bool {
@@ -84,6 +95,10 @@ pub struct QueueShape {
     pub players: usize,
     /// Players who pay and never submit an entry.
     pub abandoned: usize,
+    /// The most entries the queue takes; the coordinator's default if None.
+    pub max_entries: Option<u32>,
+    /// The places its pools of ten or more pay.
+    pub places: u32,
 }
 
 impl QueueShape {
@@ -93,7 +108,8 @@ impl QueueShape {
         if !is_queued(scenario) {
             return Ok(None);
         }
-        let max = config.max_pool_players.unwrap_or(MAX_POOL_PLAYERS);
+        let max = Self::max_pool(scenario, config);
+        let one_pool = scenario == QUEUED_ONE_POOL;
         let (min, default_players, abandoned) = match scenario {
             QUEUED_SPLIT => (2, 27, 0),
             QUEUED_ONE_POOL => (2, 5, 0),
@@ -103,10 +119,22 @@ impl QueueShape {
         let rules = PoolRules::new(min, max)
             .with_context(|| format!("{scenario} needs pools of {min} to {max} players"))?;
         let players = config.queue_players.unwrap_or(default_players);
+        // The default competition takes no more entries than its one pool seats.
+        let max_entries = config.queue_max_entries.or(one_pool.then_some(max as u32));
+        let places = config
+            .places
+            .unwrap_or(if one_pool { DEFAULT_PLACES } else { 1 });
+        ensure!(
+            supported_shape(max, places as usize),
+            "{scenario}: pools of up to {max} cannot pay {places} places; two places need pools \
+             of at most 20"
+        );
         let shape = Self {
             rules,
             players,
             abandoned,
+            max_entries,
+            places,
         };
         ensure!(
             (1..=100).contains(&shape.users()),
@@ -118,8 +146,9 @@ impl QueueShape {
                 "{scenario} needs more players than a pool holds ({max})"
             ),
             QUEUED_ONE_POOL => ensure!(
-                (min..=max).contains(&players),
-                "{scenario} needs {min} to {max} players, for one pool"
+                (min..=max).contains(&players) && max_entries.is_none_or(|cap| cap as usize <= max),
+                "{scenario} needs {min} to {max} players, and an entry cap of at most {max}, for \
+                 one pool"
             ),
             QUEUED_TOO_FEW => ensure!(
                 players < min,
@@ -131,6 +160,18 @@ impl QueueShape {
             ),
         }
         Ok(Some(shape))
+    }
+
+    /// The largest pool of `scenario`'s queue: `config`'s, or for `queued_one_pool` the default
+    /// competition's seats, and for the others as large as the coordinator allows.
+    pub fn max_pool(scenario: &str, config: &ScenarioConfig) -> usize {
+        config
+            .max_pool_players
+            .unwrap_or(if scenario == QUEUED_ONE_POOL {
+                DEFAULT_SEATS
+            } else {
+                MAX_POOL_PLAYERS
+            })
     }
 
     /// Everyone who pays.
@@ -172,7 +213,8 @@ pub(super) async fn create_queue(
         coordinator_fee_percentage: 3,
         min_players: shape.rules.min_players(),
         max_pool_size: shape.rules.max_players(),
-        max_entries: None,
+        max_entries: shape.max_entries,
+        number_of_places_win: shape.places as usize,
     };
     let created = client.create_queued_competition(&queue).await?;
     ensure!(
@@ -200,6 +242,13 @@ pub(super) async fn check_queue(
         queue.pool_rules,
         shape.rules
     );
+    if let Some(cap) = shape.max_entries {
+        ensure!(
+            queue.max_entries == Some(cap),
+            "the queue takes {:?} entries, not {cap}",
+            queue.max_entries
+        );
+    }
     Ok(())
 }
 

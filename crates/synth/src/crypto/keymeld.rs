@@ -129,8 +129,8 @@ pub fn check_ticket_policy(
         "A queued entry must be its ticket"
     );
     ensure!(
-        entry.terms.number_of_places_win == 1,
-        "A queued competition's pools pay one winner"
+        (1..=2).contains(&entry.terms.number_of_places_win),
+        "A queued competition's pools pay one or two places"
     );
     let (session, digest) = deposit_scope(&entry.terms)?;
     ensure!(
@@ -228,6 +228,7 @@ mod tests {
                 }],
             },
             number_of_places_win: 1,
+            multi_place_min_players: None,
             pool_rules: PoolRules::new(2, 25).unwrap(),
             stake_sats: 1_000,
             relative_locktime_block_delta: 72,

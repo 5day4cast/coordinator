@@ -581,6 +581,7 @@ mod min_players_now_tests {
             pool_rules: PoolRules::new(min_players, 25).unwrap(),
             entries: 1,
             max_entries: 100,
+            held: 1,
             stake_sats: 1_000,
             terms_digest: String::new(),
             pools: Vec::new(),

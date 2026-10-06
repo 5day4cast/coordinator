@@ -265,7 +265,7 @@ impl Coordinator {
         let subsets = compute_dlc_subset_definitions(
             self.keymeld.coordinator_user_id(),
             &players,
-            settings.terms.number_of_places_win as usize,
+            settings.terms.pool_places(players.len()) as usize,
         );
         let session = self
             .keymeld
@@ -334,7 +334,7 @@ impl Coordinator {
 }
 
 /// The pools to create: each gets a new id, its members sorted, and its oracle event, which is
-/// the queued competition's reference event with the pool's id, size and funding value.
+/// the queued competition's reference event with the pool's id, size, funding value and places.
 fn pool_formation(
     competition: &Competition,
     settings: &QueueSettings,
@@ -357,6 +357,7 @@ fn pool_formation(
                     pool_id,
                     members.len(),
                     settings.stake_sats,
+                    settings.terms.pool_places(members.len()),
                 )?,
                 members,
             })
