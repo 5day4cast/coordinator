@@ -911,6 +911,29 @@ impl Coordinator {
             }
 
             CompetitionStatus::EventCreated(mut state) => {
+                if state
+                    .competition()
+                    .oracle_entries_due()
+                    .is_some_and(|due| OffsetDateTime::now_utc() < due)
+                {
+                    // A single competition's picks change until the start, so its entries go to
+                    // the oracle then (see `advance_competition`). The contract names none of
+                    // them: it is built now, as it was once the entries were sent.
+                    let building = EntriesSubmitted::from_competition(state.into_competition());
+                    return match Box::pin(
+                        self.process_status(CompetitionStatus::EntriesSubmitted(building)),
+                    )
+                    .await
+                    {
+                        // Stored without its entries at the oracle, it is still EventCreated.
+                        CompetitionStatus::EntriesSubmitted(waiting) => {
+                            CompetitionStatus::EventCreated(EventCreated::from_competition(
+                                waiting.into_competition(),
+                            ))
+                        }
+                        next => next,
+                    };
+                }
                 match self.submit_entries_to_oracle(state.competition_mut()).await {
                     Ok(_) => state.entries_submitted(),
                     Err(e) => {
@@ -1512,7 +1535,7 @@ impl Coordinator {
         Ok(competition)
     }
 
-    async fn submit_entries_to_oracle<'a>(
+    pub(super) async fn submit_entries_to_oracle<'a>(
         &self,
         competition: &'a mut Competition,
     ) -> Result<&'a mut Competition, anyhow::Error> {

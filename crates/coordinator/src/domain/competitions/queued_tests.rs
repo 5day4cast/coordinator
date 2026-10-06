@@ -1380,17 +1380,48 @@ async fn a_player_s_unpaid_tickets_are_listed_oldest_first_while_they_can_be_pai
 }
 
 #[test]
-fn picks_change_only_in_a_queued_competition_until_entries_close() {
+fn picks_change_until_entries_close_and_go_to_the_oracle() {
     let start = OffsetDateTime::now_utc() + Duration::hours(1);
     let before = start - Duration::minutes(2);
     let mut competition = Competition::new(&request(start).reference_event().unwrap());
-    // A single competition's entries go to the oracle when its seats fill.
+    // A single competition's entries go to the oracle at the start, so its picks change until
+    // then, after its seats filled and its contract was built as much as before.
+    assert_eq!(competition.picks_lock(before), None);
+    competition.event_created_at = Some(before);
+    competition.contracted_at = Some(before);
+    assert_eq!(competition.picks_lock(before), None);
+    assert_eq!(
+        competition.oracle_entries_due(),
+        Some(start + admission::ORACLE_ENTRIES_GRACE)
+    );
+    assert_eq!(
+        competition.picks_lock(start),
+        Some(admission::PICKS_LOCKED_CLOSED)
+    );
+    competition.entries_submitted_at = Some(before);
     assert_eq!(
         competition.picks_lock(before),
-        Some(admission::PICKS_LOCKED_ENTERED)
+        Some(admission::PICKS_LOCKED_CLOSED),
+        "once the entries are with the oracle"
     );
+    assert_eq!(competition.oracle_entries_due(), None);
+    competition.entries_submitted_at = None;
+    competition.cancelled_at = Some(before);
+    assert_eq!(
+        competition.picks_lock(before),
+        Some(admission::PICKS_LOCKED_CLOSED)
+    );
+    competition.cancelled_at = None;
+
     competition.kind = CompetitionKind::Queued;
+    competition.event_created_at = None;
+    competition.contracted_at = None;
     assert_eq!(competition.picks_lock(before), None);
+    assert_eq!(
+        competition.oracle_entries_due(),
+        None,
+        "a queue has no event"
+    );
     // Not after the start, nor once its pools formed or it was cancelled.
     assert_eq!(
         competition.picks_lock(start),
@@ -1407,6 +1438,15 @@ fn picks_change_only_in_a_queued_competition_until_entries_close() {
         competition.picks_lock(before),
         Some(admission::PICKS_LOCKED_CLOSED)
     );
+
+    // A pool's entries came from its queue after the start.
+    competition.cancelled_at = None;
+    competition.kind = CompetitionKind::Pool;
+    assert_eq!(
+        competition.picks_lock(before),
+        Some(admission::PICKS_LOCKED_CLOSED)
+    );
+    assert_eq!(competition.oracle_entries_due(), None);
 }
 
 #[tokio::test]
@@ -1477,7 +1517,7 @@ async fn a_queued_entry_s_picks_change_until_its_pools_form() {
     assert_eq!(
         queue
             .store()
-            .update_queued_entry_picks(
+            .update_entry_picks_before(
                 "alice",
                 &AddEventEntry {
                     expected_observations: picks(ValueOptions::Par),
