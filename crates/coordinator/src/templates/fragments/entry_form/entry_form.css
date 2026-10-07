@@ -12,8 +12,7 @@
 .entry-form .entry-facts dt,
 .entry-form .fact-note,
 .entry-form .station-code,
-.entry-form .pick-forecast.is-missing,
-.entry-form .entry-advanced summary {
+.entry-form .pick-forecast.is-missing {
   color: var(--entry-muted);
 }
 
@@ -292,20 +291,7 @@
   margin: 1rem 0;
 }
 
-.entry-advanced {
-  margin-bottom: 1.25rem;
-  font-size: 0.9rem;
-}
 
-.entry-advanced summary {
-  cursor: pointer;
-  color: var(--bulma-text-weak);
-}
-
-.entry-advanced ul {
-  list-style: disc;
-  margin: 0.5rem 0 0 1.25rem;
-}
 
 .entry-submit .notification {
   margin-top: 1rem;

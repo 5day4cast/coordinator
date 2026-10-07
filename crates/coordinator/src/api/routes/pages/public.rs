@@ -57,7 +57,7 @@ use crate::{
                 entries_page, older_entries, sign_in_required, EntryRow, PaidRow, UnpaidRow,
                 PAGE_SIZE,
             },
-            help::help_page,
+            help::{help_page, help_page_with_terms},
             payouts::payouts_page,
         },
     },
@@ -396,6 +396,29 @@ pub async fn competitions_fragment(
     )
 }
 
+/// Only the signed-in player's submitted entry counts. Never stored by a shared cache.
+pub async fn player_entry_counts(
+    State(state): State<Arc<AppState>>,
+    NostrAuth { pubkey, .. }: NostrAuth,
+) -> Response {
+    let result = state
+        .coordinator
+        .competition_store
+        .player_entry_counts(&pubkey.to_hex())
+        .await;
+    let mut response = match result {
+        Ok(counts) => axum::Json(counts).into_response(),
+        Err(error) => {
+            error!("failed to load player entry counts: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    };
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, Caching::Private.header());
+    response
+}
+
 /// `?from=25` on the entries page: the rows after the first 25, for "Show older entries".
 #[derive(Debug, Default, Deserialize)]
 pub struct EntriesPage {
@@ -563,6 +586,7 @@ pub async fn payouts_fragment(
 /// How it works: the rules and scoring the competition pages leave out.
 #[derive(Debug, Default, Deserialize)]
 pub struct HelpQuery {
+    competition: Option<Uuid>,
     /// `advanced` unfolds "How the tech works", for links into it.
     #[serde(default)]
     open: Option<String>,
@@ -574,11 +598,31 @@ pub async fn help_fragment(
     Query(query): Query<HelpQuery>,
 ) -> Response {
     let open_advanced = query.open.as_deref() == Some("advanced");
+    let content = if let Some(id) = query.competition {
+        let competition = match find_competition(&state, id).await {
+            Ok(Some(competition)) => competition,
+            Ok(None) => return not_found(&headers, &state, "Competition"),
+            Err(error) => {
+                error!("help terms for {id}: {error}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        let terms = state
+            .coordinator
+            .payout_terms_quote(id)
+            .await
+            .inspect_err(|error| warn!("help payout terms for {id}: {error}"))
+            .ok();
+        let view = CompetitionView::new(&competition, now());
+        help_page_with_terms(open_advanced, Some((&view, terms.as_ref())))
+    } else {
+        help_page(open_advanced)
+    };
     page(
         &headers,
         &state,
         "How it works - Fantasy Weather",
-        help_page(open_advanced),
+        content,
         Caching::Public,
     )
 }

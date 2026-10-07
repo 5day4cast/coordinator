@@ -3,7 +3,8 @@
 use maud::{html, Markup};
 use time::{format_description::well_known::Rfc3339, macros::format_description, OffsetDateTime};
 
-use crate::domain::leaderboard::Metric;
+use crate::domain::leaderboard::{Metric, Rule};
+use crate::infra::oracle::ValueOptions;
 
 /// `18000` → `18,000`.
 pub fn thousands(value: u64) -> String {
@@ -107,8 +108,6 @@ fn local_time(
 /// domain's (`domain::leaderboard::Metric`), as the oracle scores it.
 pub trait MetricText {
     fn label(self) -> &'static str;
-    /// The label in one word, for compact rows: `High`, `Low`, `Wind`.
-    fn short(self) -> &'static str;
     /// A value in the metric's unit, as the oracle reads it.
     fn value(self, value: f64) -> String;
     /// A Par range in the metric's unit, short enough for a pick button: `67.4–70.2°F`,
@@ -121,17 +120,9 @@ pub trait MetricText {
 impl MetricText for Metric {
     fn label(self) -> &'static str {
         match self {
-            Metric::TempHigh => "High temperature",
-            Metric::TempLow => "Low temperature",
-            Metric::WindSpeed => "Wind speed",
-        }
-    }
-
-    fn short(self) -> &'static str {
-        match self {
-            Metric::TempHigh => "High",
-            Metric::TempLow => "Low",
-            Metric::WindSpeed => "Wind",
+            Metric::TempHigh => "Highest temperature",
+            Metric::TempLow => "Lowest temperature",
+            Metric::WindSpeed => "Highest wind speed",
         }
     }
 
@@ -155,6 +146,38 @@ impl MetricText for Metric {
             Metric::TempHigh | Metric::TempLow => format!("{value:.1}°F"),
             Metric::WindSpeed => format!("{value:.1} kt"),
         }
+    }
+}
+
+/// The chosen threshold or inclusive range, shared by the form and saved picks.
+/// Unknown forecasts or rules must not imply a scoring threshold.
+pub fn pick_target(
+    metric: Metric,
+    forecast: Option<f64>,
+    rule: Option<Rule>,
+    pick: &ValueOptions,
+) -> String {
+    let (Some(forecast), Some(rule)) = (forecast, rule) else {
+        return match pick {
+            ValueOptions::Under => "< —",
+            ValueOptions::Par => "—",
+            ValueOptions::Over => "> —",
+        }
+        .to_owned();
+    };
+    match (rule, pick) {
+        (Rule::Line { lower, .. }, ValueOptions::Under) => {
+            format!("< {}", metric.bound(forecast + lower))
+        }
+        (Rule::Line { lower, upper }, ValueOptions::Par) => {
+            metric.range(forecast + lower, forecast + upper)
+        }
+        (Rule::Line { upper, .. }, ValueOptions::Over) => {
+            format!("> {}", metric.bound(forecast + upper))
+        }
+        (Rule::Fixed, ValueOptions::Under) => format!("< {}", metric.value(forecast)),
+        (Rule::Fixed, ValueOptions::Par) => metric.value(forecast),
+        (Rule::Fixed, ValueOptions::Over) => format!("> {}", metric.value(forecast)),
     }
 }
 

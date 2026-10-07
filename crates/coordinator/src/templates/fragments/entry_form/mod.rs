@@ -212,41 +212,9 @@ pub fn entry_form(
 
             (payout_line(&competition.id, terms, destination))
 
-            details class="entry-advanced" {
-                summary { "Advanced: how the entry is held and paid" }
-                ul {
-                    li {
-                        "Your picks and ticket are locked into a Bitcoin contract with the other entries"
-                        @if queue.is_some() { " in your pool" }
-                        ". "
-                        "A Keymeld enclave signs it for you, so you don't need to stay online."
-                    }
-                    @if let Some(terms) = terms {
-                        li {
-                            "If the result is never settled cooperatively, entrants can reclaim funds on-chain after "
-                            (terms.relative_locktime_block_delta) " blocks (about "
-                            (format::duration(time::Duration::minutes(i64::from(terms.relative_locktime_block_delta) * 10)))
-                            ")."
-                        }
-                        li { "On-chain fees for the contract are capped at " (terms.max_fee_rate_sat_vb) " sat/vB." }
-                        li {
-                            "Winner shares by rank: "
-                            @for (place, (percent, _)) in competition.prizes().iter().enumerate() {
-                                @if place > 0 { ", " }
-                                (percent) "%"
-                            }
-                            ". A tie at the last paid place is broken the way the oracle ranks entries."
-                        }
-                        @if !terms.enabled {
-                            li {
-                                "This older competition has no payout escrow: collecting winnings by invoice "
-                                "reveals the entry's keys before payment, and payment is not guaranteed."
-                            }
-                        }
-                    }
-                    // Filled from the WASM build's pinned enclave measurements once it loads.
-                    li id="keymeldTrust" class="is-hidden" {}
-                }
+            p class="how-to-pick" {
+                a href=(format!("/help?open=advanced&competition={}#advanced", competition.id))
+                  target="_blank" rel="noopener" { "How your entry is held and paid" }
             }
 
             div class="entry-submit" {
@@ -459,9 +427,11 @@ fn station_picks(station: &StationForecast) -> Markup {
             legend {
                 @if let Some(name) = &station.station_name {
                     (city_name(name)) " "
-                    (tip(&format!("Weather station: {name} ({})", station.station_id)))
                 }
                 span class="station-code" { (station.station_id) }
+                @if let Some(name) = &station.station_name {
+                    (tip(&format!("Weather station: {name} ({})", station.station_id)))
+                }
             }
             div class="pick-heading" aria-hidden="true" {
                 span class="pick-metric" { "NOAA forecast" }
@@ -536,9 +506,8 @@ pub fn ticket_status(url: &str, progress: TicketProgress) -> Markup {
     }
 }
 
-/// Under / Par / Over for one forecast, as radio buttons named `KPWM_temp_high`, none
-/// checked at first; choosing the checked one again takes the pick back (`entry_form.js`). With a Par
-/// band the buttons show the ranges themselves: `< 67.4°F`, `67.4–70.2°F`, `> 70.2°F`.
+/// Thresholds and a range for one forecast, as radio buttons named `KPWM_temp_high`, none
+/// checked at first; choosing the checked one again takes the pick back (`entry_form.js`).
 pub(crate) fn pick_row(
     station_id: &str,
     metric: Metric,
@@ -546,18 +515,13 @@ pub(crate) fn pick_row(
     rule: Option<Rule>,
 ) -> Markup {
     let name = format!("{station_id}_{}", metric.id());
-    let band = match (forecast, rule) {
-        (Some(value), Some(Rule::Line { lower, upper })) => Some((value + lower, value + upper)),
-        _ => None,
-    };
-    let options = [("under", "Under"), ("par", "Par"), ("over", "Over")].map(|(value, word)| {
-        let text = match band {
-            Some((low, _)) if value == "under" => format!("< {}", metric.bound(low)),
-            Some((low, high)) if value == "par" => metric.range(low, high),
-            Some((_, high)) => format!("> {}", metric.bound(high)),
-            None => word.to_owned(),
+    let options = ["under", "par", "over"].map(|value| {
+        let pick = match value {
+            "under" => crate::infra::oracle::ValueOptions::Under,
+            "over" => crate::infra::oracle::ValueOptions::Over,
+            _ => crate::infra::oracle::ValueOptions::Par,
         };
-        (value, word, text)
+        (value, format::pick_target(metric, forecast, rule, &pick))
     });
     html! {
         div class="pick-row" {
@@ -569,10 +533,10 @@ pub(crate) fn pick_row(
                 }
             }
             div class="pick-options" role="radiogroup" aria-label=(format!("{} at {station_id}", metric.label())) {
-                @for (value, word, text) in &options {
-                    label class="pick-option" title=[band.map(|_| word)] {
-                        input type="radio" name=(name) value=(value) disabled[forecast.is_none()]
-                              aria-label=[band.map(|_| format!("{word} ({text})"))];
+                @for (value, text) in &options {
+                    label class="pick-option" {
+                        input type="radio" name=(name) value=(value) disabled[forecast.is_none() || rule.is_none()]
+                              aria-label=(text);
                         span { (text) }
                     }
                 }
@@ -1141,6 +1105,7 @@ mod tests {
         let html = form(PayoutDestination::LoggedOut);
         assert!(html.contains("Portland International, ME"));
         assert!(!html.contains("Station KPWM"));
+        assert!(html.contains(r#"<span class="station-code">KPWM</span><span class="tip""#));
         assert!(html.contains("69°F") && html.contains("41°F") && html.contains("7 knots"));
         assert!(!html.contains("12.5") && !html.contains("75°F") && !html.contains("58°F"));
         assert!(html.contains(r#"name="KPWM_temp_high" value="over""#));
@@ -1188,7 +1153,7 @@ mod tests {
         assert!(html.contains(r#"data-pool-min-players="2""#));
         assert!(html.contains(r#"data-pool-max-players="25""#));
         assert!(html.contains(r#"data-entry-fee="5000""#));
-        assert!(html.contains("with the other entries in your pool."));
+        assert!(html.contains("How your entry is held and paid"));
         assert!(!html.contains(r#"type="checkbox""#));
         assert_eq!(html.matches("refund").count(), 1, "one line about refunds");
 
@@ -1205,15 +1170,20 @@ mod tests {
     }
 
     #[test]
-    fn contract_jargon_sits_under_advanced_in_plain_words() {
+    fn payment_terms_live_on_the_linked_help_page() {
         let html = form(PayoutDestination::NoAddress);
-        let advanced = html.find("<details").unwrap();
-        let delay = html.find("2880 blocks").unwrap();
-        assert!(delay > advanced);
-        assert!(html.contains("about 20 days"));
-        assert!(html.contains("capped at 100 sat/vB"));
-        // One paid place: the winner takes it all.
-        assert!(html.contains("Winner shares by rank: 100%"));
+        assert!(!html.contains("entry-advanced"));
+        assert!(!html.contains("2880 blocks"));
+        assert!(html.contains("/help?open=advanced&amp;competition=c1#advanced"));
+        let help = crate::templates::pages::help::help_page_with_terms(
+            true,
+            Some((&view("c1", Phase::Upcoming, 60), Some(&terms(true)))),
+        )
+        .into_string();
+        assert!(help.contains("2880 blocks"));
+        assert!(help.contains("about 20 days"));
+        assert!(help.contains("capped at 100 sat/vB"));
+        assert!(help.contains("Winner shares by rank: 100%"));
         assert!(html.contains(">add one</a>"));
     }
 
@@ -1251,10 +1221,10 @@ mod tests {
         let par = html.find("67.4–70.2°F").expect("par button");
         let over = html.find("&gt; 70.2°F").expect("over button");
         assert!(under < par && par < over);
-        assert!(html.contains(r#"aria-label="Par (67.4–70.2°F)""#));
+        assert!(html.contains(r#"aria-label="67.4–70.2°F""#));
         assert!(!html.contains("pick-par") && !html.contains("lately"));
-        // Without a band yet the buttons say Over, Par, Under.
-        assert!(html.contains("<span>Over</span>"));
+        // No forecast threshold is invented while the scoring range is unknown.
+        assert!(html.contains(r#"value="over" disabled aria-label="&gt; —""#));
     }
 
     #[test]

@@ -703,7 +703,7 @@ fn list_link(url: String, label: Markup) -> Markup {
 /// soonest first, a few live, those awaiting results, the latest finished, and the one to
 /// feature. The Live tab: every live one; the Finished tab: a page of the finished ones.
 struct Sections<'a> {
-    /// Soonest start first, those taking entries before those full.
+    /// Soonest start first.
     open: Vec<&'a CompetitionView>,
     /// Soonest start first.
     live: Vec<&'a CompetitionView>,
@@ -746,7 +746,7 @@ impl<'a> Sections<'a> {
         let mut finished = by_phase(competitions, finished_phases);
         let cancelled = by_phase(competitions, &[Phase::Cancelled]).len();
         // Soonest first: the next one to enter, the next to end, the next result due.
-        open.sort_by_key(|competition| (!competition.can_enter, competition.start));
+        open.sort_by_key(|competition| competition.start);
         live.sort_by_key(|competition| competition.start);
         waiting.sort_by_key(|competition| competition.start);
         finished.sort_by_key(|competition| std::cmp::Reverse(competition.end));
@@ -1150,14 +1150,17 @@ fn group(
 }
 
 fn list(competitions: &[&CompetitionView], now: OffsetDateTime) -> Markup {
+    let sortable = competitions
+        .iter()
+        .any(|competition| competition.phase == Phase::Upcoming);
     html! {
-        div class="competition-list" {
-            div class="competition-header" aria-hidden="true" {
+        div class="competition-list" data-sortable[sortable] {
+            div class=(if sortable { "competition-header is-sortable" } else { "competition-header" }) {
                 span { "Status" }
-                span { "Starts" }
+                (sort_heading("Starts", "start", sortable))
                 span { "Duration" }
-                span { "Entry fee" }
-                span { "Prizes" }
+                (sort_heading("Entry fee", "fee", sortable))
+                (sort_heading("Prizes", "prize", sortable))
                 span { "Entries" }
                 span {}
             }
@@ -1165,6 +1168,17 @@ fn list(competitions: &[&CompetitionView], now: OffsetDateTime) -> Markup {
                 (competition_row(competition, now))
             }
         }
+    }
+}
+
+fn sort_heading(label: &str, key: &str, sortable: bool) -> Markup {
+    html! {
+        @if sortable {
+            button type="button" class="competition-sort" data-sort=(key)
+                aria-label=(format!("Sort by {label}")) {
+                (label) " " span class="sort-direction" aria-hidden="true" { "↕" }
+            }
+        } @else { span { (label) } }
     }
 }
 
@@ -1200,6 +1214,8 @@ pub fn competition_row(competition: &CompetitionView, now: OffsetDateTime) -> Ma
     let facts = facts.join(" · ");
     html! {
         a class="competition-row" data-competition-id=(competition.id) data-facts=(facts)
+          data-start=(competition.start.unix_timestamp()) data-fee=(competition.price())
+          data-prize=[competition.top_prize()]
           href=(competition.url()) hx-get=(competition.url())
           hx-target="#main-content" hx-push-url="true" {
             span class="cell-status" { (list_badge(competition)) }
@@ -1238,7 +1254,15 @@ pub fn competition_row(competition: &CompetitionView, now: OffsetDateTime) -> Ma
                 @if let Some(split) = competition.prize_split() { span class="cell-note prize-note" { (split) } }
                 @if let Some(rule) = competition.prize_rule() { span class="cell-note prize-note" { (rule) } }
             }
-            span class="cell-entries" data-label="Entries" { (competition.entries()) }
+            span class="cell-entries" data-label="Entries" {
+                span class="entry-count" { (competition.entries()) }
+                @if competition.phase == Phase::Upcoming {
+                    span class="cell-note player-entries" data-player-entries=(competition.id)
+                      data-entry-limit=(competition.max_entries_per_player) {
+                        (competition.max_entries_per_player) " max per player"
+                    }
+                }
+            }
             span class="cell-action" { (action) " →" }
         }
     }
@@ -1333,7 +1357,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// Open competitions come soonest first, those taking entries before those full, and the
+    /// Open competitions come soonest first, including full competitions, and the
     /// soonest is featured; live ones and those awaiting results come by start, the earliest
     /// first.
     #[test]
@@ -1354,10 +1378,10 @@ pub(crate) mod tests {
         assert_eq!(
             row_ids(&html),
             [
+                "full",
                 "open-soon",
                 "open-middle",
                 "open-later",
-                "full",
                 "live-early",
                 "live-late",
                 "waiting-early",
@@ -1865,7 +1889,7 @@ pub(crate) mod tests {
         let queue = queued("q", 40);
         let row = competition_row(&queue, NOW).into_string();
         assert!(
-            row.contains(r#"data-label="Entries">40 entered</span>"#),
+            row.contains(r#"class="entry-count">40 entered</span>"#),
             "{row}"
         );
         assert!(row.contains("pools of up to 25"));
@@ -1997,7 +2021,7 @@ pub(crate) mod tests {
         };
         let row = competition_row(&pool(OTHER_POOL, 1, Phase::Live), NOW).into_string();
         assert!(row.contains(r#"<span class="cell-note">Pool 2</span>"#));
-        assert!(row.contains(r#"data-label="Entries">1 of 3</span>"#));
+        assert!(row.contains(r#"class="entry-count">1 of 3</span>"#));
 
         // The list shows the queue once, with its least advanced pool, and not its pools.
         let all = [
@@ -2192,7 +2216,7 @@ pub(crate) mod tests {
         assert_eq!(open.win(), "15,000 sats");
         let row = competition_row(&open, NOW).into_string();
         assert!(
-            row.contains(r#"data-label="Entries">20 seats · 17 left</span>"#),
+            row.contains(r#"class="entry-count">20 seats · 17 left</span>"#),
             "{row}"
         );
         assert!(row.contains("1st 70% · 2nd 30%"));
