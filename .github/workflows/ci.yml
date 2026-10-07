@@ -297,6 +297,15 @@ jobs:
         working-directory: e2e
         run: npm run test:unit
 
+      # The runners' Azure Ubuntu mirror has stalled apt until the job timed out.
+      # Use the main archive and give apt timeouts and retries instead.
+      - name: Point apt at the Ubuntu archive with timeouts
+        run: |
+          for f in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
+            if [ -f "$f" ]; then sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' "$f"; fi
+          done
+          printf 'Acquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Retries "3";\n' | sudo tee /etc/apt/apt.conf.d/99ci-timeouts >/dev/null
+
       - name: Install Playwright browsers
         if: steps.playwright-cache.outputs.cache-hit != 'true'
         working-directory: e2e
@@ -305,6 +314,7 @@ jobs:
       - name: Install Playwright system dependencies
         if: steps.playwright-cache.outputs.cache-hit == 'true'
         working-directory: e2e
+        timeout-minutes: 6
         run: npx playwright install-deps chromium
 
       - name: Verify browser security and mobile wallet login
