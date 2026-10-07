@@ -147,6 +147,7 @@ fn page(
                 Some(recovery) if recovery.relays().is_empty() => RecoveryHelp::File,
                 Some(_) => RecoveryHelp::FileAndRelays,
             },
+            satchel_url: state.satchel_url.as_deref(),
         };
         base(&config, content).into_string()
     };
@@ -553,6 +554,7 @@ pub async fn payouts_fragment(
         &payouts,
         lightning_address.as_deref(),
         state.recovery.is_some(),
+        state.satchel_url.as_deref(),
     );
     page(&headers, &state, title, content, Caching::Private)
 }

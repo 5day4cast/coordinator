@@ -17,7 +17,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(output.join("assets"))?;
     fs::write(
         output.join("csp.txt"),
-        coordinator::api::public_headers::content_security_policy(&[]),
+        coordinator::api::public_headers::content_security_policy(&[], &[]),
     )?;
     for asset in assets::ALL {
         fs::write(output.join(asset.url.trim_start_matches('/')), asset.bytes)?;
@@ -67,6 +67,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         network: "signet",
         wasm_version: "offline-fixture",
         recovery: coordinator::templates::components::RecoveryHelp::FileAndRelays,
+        satchel_url: None,
     };
     for (name, rows, default_address) in [
         ("payouts", payouts.as_slice(), Some(address)),
@@ -74,7 +75,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     ] {
         fs::write(
             output.join(format!("{name}.html")),
-            base(&config, payouts_page(rows, default_address, true)).into_string(),
+            base(&config, payouts_page(rows, default_address, true, None)).into_string(),
         )?;
     }
     Ok(())

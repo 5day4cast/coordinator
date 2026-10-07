@@ -32,6 +32,9 @@ pub struct PageConfig<'a> {
     pub wasm_version: &'a str,
     /// What the sign-up dialog says about the recovery key.
     pub recovery: RecoveryHelp,
+    /// Origin of the Satchel test-network wallet, when configured: the payment dialog and
+    /// account menu link to it, and `shared/satchel.js` signs the player in there.
+    pub satchel_url: Option<&'a str>,
 }
 
 pub fn base(config: &PageConfig, content: Markup) -> Markup {
@@ -54,10 +57,10 @@ pub fn base(config: &PageConfig, content: Markup) -> Markup {
             }
             body data-api-base=(config.api_base) data-oracle-base=(config.oracle_base)
                  data-network=(config.network) data-wasm-version=(config.wasm_version)
-                 data-login-worker=(LOGIN_WORKER_JS.url) {
+                 data-login-worker=(LOGIN_WORKER_JS.url) data-satchel-url=[config.satchel_url] {
                 // Shown while a navigation is loading (see base.css).
                 div class="page-loading" aria-hidden="true" {}
-                (navbar())
+                (navbar(config.satchel_url))
 
                 section class="section pt-3" {
                     // Back swaps in only the page content, fetched again
@@ -74,7 +77,7 @@ pub fn base(config: &PageConfig, content: Markup) -> Markup {
                     a href=(format!("mailto:{CONTACT_EMAIL}")) { (CONTACT_EMAIL) }
                 }
 
-                (auth_modals(config.recovery))
+                (auth_modals(config.recovery, config.satchel_url))
             }
         }
     }
@@ -85,6 +88,10 @@ mod tests {
     use super::*;
 
     fn page() -> String {
+        page_with(None)
+    }
+
+    fn page_with(satchel_url: Option<&str>) -> String {
         let config = PageConfig {
             title: "Fantasy Weather",
             api_base: "https://5day4cast.com",
@@ -92,8 +99,32 @@ mod tests {
             network: "signet",
             wasm_version: "abc123",
             recovery: RecoveryHelp::FileAndRelays,
+            satchel_url,
         };
         base(&config, html! { p { "content" } }).into_string()
+    }
+
+    /// Satchel's buttons, beside Zeus in the payment dialog and in the account menu, are on the
+    /// page only when it is configured.
+    #[test]
+    fn satchel_is_offered_only_when_configured() {
+        let html = page();
+        assert!(html.contains(r#"id="walletLinkZeus""#));
+        assert!(!html.contains("Satchel"));
+        assert!(!html.contains("data-satchel"));
+
+        let html = page_with(Some("https://wallet.5day4cast.com"));
+        assert!(html.contains(r#"data-satchel-url="https://wallet.5day4cast.com""#));
+        let zeus = html.find(r#"id="walletLinkZeus""#).unwrap();
+        let pay = html.find(r#"id="walletLinkSatchel""#).unwrap();
+        assert!(pay > zeus && html[zeus..pay].contains("Pay with Zeus"));
+        assert!(html[pay..].contains("Pay with Satchel"));
+        let menu = html.find(r#"id="logoutContainer""#).unwrap();
+        let open = html.find(r#"id="openSatchelNavClick""#).unwrap();
+        assert!(open > menu);
+        assert!(html.contains(r#"href="https://wallet.5day4cast.com/wallet""#));
+        assert!(html.contains(r#"data-satchel-next="/wallet""#));
+        assert!(html[open..].contains("Open Satchel"));
     }
 
     #[test]

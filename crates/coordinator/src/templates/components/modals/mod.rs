@@ -29,7 +29,8 @@ impl RecoveryHelp {
     }
 }
 
-pub fn auth_modals(recovery: RecoveryHelp) -> Markup {
+/// `satchel` is the Satchel wallet's origin, when configured: the payment dialog offers it.
+pub fn auth_modals(recovery: RecoveryHelp, satchel: Option<&str>) -> Markup {
     html! {
         // Login Modal
         (login_modal())
@@ -41,7 +42,7 @@ pub fn auth_modals(recovery: RecoveryHelp) -> Markup {
         (forgot_password_modal())
 
         // Payment Modal (for entry ticket payments)
-        (payment_modal())
+        (payment_modal(satchel.is_some()))
 
         // Payout Modal (for submitting lightning invoices)
         (payout_modal())
@@ -365,7 +366,7 @@ fn forgot_password_modal() -> Markup {
     }
 }
 
-fn payment_modal() -> Markup {
+fn payment_modal(satchel: bool) -> Markup {
     html! {
         div id="ticketPaymentModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="ticketPaymentModalTitle" tabindex="-1" {
             div class="modal-background" {}
@@ -389,6 +390,10 @@ fn payment_modal() -> Markup {
                         div id="walletLinks" class="buttons is-centered mb-4" {
                             a id="walletLinkLightning" class="button is-link is-light" { "Open in wallet" }
                             a id="walletLinkZeus" class="button is-light" { "Pay with Zeus" }
+                            // Opens the invoice in Satchel, signed in as the player (shared/satchel.js).
+                            @if satchel {
+                                a id="walletLinkSatchel" class="button is-light" target="_blank" rel="noopener" { "Pay with Satchel" }
+                            }
                             a id="walletLinkCashApp" class="button is-light" target="_blank" rel="noopener noreferrer" { "Pay with Cash App" }
                         }
 
@@ -466,7 +471,7 @@ mod tests {
             RecoveryHelp::File,
             RecoveryHelp::FileAndRelays,
         ] {
-            let html = auth_modals(help).into_string();
+            let html = auth_modals(help, None).into_string();
             assert!(html.contains(help.text()), "{help:?}");
             assert!(!html.contains("all you need"), "{help:?}");
             assert_eq!(

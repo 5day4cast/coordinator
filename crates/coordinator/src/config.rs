@@ -758,6 +758,7 @@ impl Settings {
     pub fn validate(&self) -> Result<(), anyhow::Error> {
         let network = self.bitcoin_settings.network;
         self.api_settings.validate(&self.ui_settings)?;
+        self.ui_settings.validate(network)?;
         self.ln_settings.validate(network)?;
         self.coordinator_settings.validate(network)?;
         self.admin_settings.validate(network)?;
@@ -1342,6 +1343,13 @@ pub struct UISettings {
     pub private_url: String,
     pub remote_url: String,
     pub ui_dir: String,
+    /// Optional Satchel wallet, a Lightning wallet for test networks, as an `https://` origin
+    /// such as `https://wallet.5day4cast.com`. Pages then offer "Pay with Satchel" beside the
+    /// invoice, "Open Satchel" in the account menu, and the player's Satchel Lightning Address
+    /// on the Payouts page, signing the player in there with their Nostr key. Refused on
+    /// mainnet.
+    #[serde(default)]
+    pub satchel_url: Option<String>,
 }
 
 impl Default for UISettings {
@@ -1350,8 +1358,51 @@ impl Default for UISettings {
             private_url: String::from("http://127.0.0.1:9991"),
             remote_url: String::from("http://127.0.0.1:9990"),
             ui_dir: String::from("./crates/public_ui"),
+            satchel_url: None,
         }
     }
+}
+
+impl UISettings {
+    /// Refuse a `satchel_url` that is not a bare `https://` origin, and any on mainnet:
+    /// Satchel pays only test-network invoices.
+    pub fn validate(&self, network: Network) -> Result<(), anyhow::Error> {
+        let Some(url) = &self.satchel_url else {
+            return Ok(());
+        };
+        if network == Network::Bitcoin {
+            anyhow::bail!("ui_settings.satchel_url is refused on mainnet: Satchel is a wallet for test networks");
+        }
+        satchel_origin(url).map(|_| ())
+    }
+
+    /// Satchel's origin as pages link to it, `https://host[:port]` with no trailing slash;
+    /// `None` when none is configured, or it is not valid (see [`Self::validate`]).
+    pub fn satchel_origin(&self) -> Option<String> {
+        self.satchel_url
+            .as_deref()
+            .and_then(|url| satchel_origin(url).ok())
+    }
+}
+
+/// `url` as a bare `https://` origin: no credentials, path, query or fragment.
+fn satchel_origin(url: &str) -> Result<String, anyhow::Error> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|error| anyhow!("ui_settings.satchel_url {url:?} is not a URL: {error}"))?;
+    if parsed.scheme() != "https" || parsed.host_str().is_none() {
+        anyhow::bail!("ui_settings.satchel_url must be an https:// origin, not {url:?}");
+    }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        anyhow::bail!(
+            "ui_settings.satchel_url must be an origin alone, with no credentials, path or query: {url:?}"
+        );
+    }
+    Ok(parsed.origin().ascii_serialization())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1684,5 +1735,98 @@ mod settle_only_settings_tests {
         assert!(settings
             .apply_settle_only_env(Some("maybe".into()))
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod satchel_settings_tests {
+    use super::*;
+
+    fn with_satchel(url: &str, network: Network) -> Settings {
+        let mut settings = Settings::default();
+        settings.ui_settings.satchel_url = Some(url.into());
+        settings.bitcoin_settings.network = network;
+        settings
+    }
+
+    #[test]
+    fn satchel_is_off_unless_configured() {
+        assert_eq!(UISettings::default().satchel_url, None);
+        assert_eq!(UISettings::default().satchel_origin(), None);
+        // A config written before the setting existed loads without it.
+        let text = toml::to_string(&Settings::default()).unwrap();
+        assert!(!text.contains("satchel_url"));
+        let parsed: Settings = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.ui_settings.satchel_url, None);
+
+        let configured: Settings = toml::from_str(&text.replace(
+            "[ui_settings]",
+            "[ui_settings]\nsatchel_url = \"https://wallet.5day4cast.com\"",
+        ))
+        .unwrap();
+        assert_eq!(
+            configured.ui_settings.satchel_origin().as_deref(),
+            Some("https://wallet.5day4cast.com")
+        );
+    }
+
+    #[test]
+    fn satchel_is_refused_on_mainnet() {
+        let url = "https://wallet.5day4cast.com";
+        let refused = with_satchel(url, Network::Bitcoin).validate().unwrap_err();
+        assert!(refused.to_string().contains("satchel_url"), "{refused}");
+        for network in [Network::Signet, Network::Testnet, Network::Regtest] {
+            assert!(with_satchel(url, network).validate().is_ok(), "{network}");
+        }
+        // Without Satchel, mainnet is not refused for it.
+        assert!(UISettings::default().validate(Network::Bitcoin).is_ok());
+    }
+
+    #[test]
+    fn satchel_must_be_a_bare_https_origin() {
+        for url in [
+            "http://wallet.5day4cast.com",
+            "ftp://wallet.5day4cast.com",
+            "wallet.5day4cast.com",
+            "https://",
+            "https://wallet.5day4cast.com/wallet",
+            "https://wallet.5day4cast.com/?next=/wallet",
+            "https://wallet.5day4cast.com/#wallet",
+            "https://alice:secret@wallet.5day4cast.com",
+            "https://alice@wallet.5day4cast.com",
+            "not a url",
+        ] {
+            assert!(
+                with_satchel(url, Network::Signet).validate().is_err(),
+                "{url}"
+            );
+            let ui = UISettings {
+                satchel_url: Some(url.into()),
+                ..Default::default()
+            };
+            assert_eq!(ui.satchel_origin(), None, "{url}");
+        }
+        for (url, origin) in [
+            (
+                "https://wallet.5day4cast.com",
+                "https://wallet.5day4cast.com",
+            ),
+            (
+                "https://wallet.5day4cast.com/",
+                "https://wallet.5day4cast.com",
+            ),
+            (
+                "https://Wallet.Example.org:8443",
+                "https://wallet.example.org:8443",
+            ),
+        ] {
+            let settings = with_satchel(url, Network::Signet);
+            assert!(settings.validate().is_ok(), "{url}");
+            assert_eq!(
+                settings.ui_settings.satchel_origin().as_deref(),
+                Some(origin),
+                "{url}"
+            );
+        }
     }
 }

@@ -202,6 +202,13 @@ class Entry {
     const mainnet = /^lnbc(?!rt)/i.test(invoice);
     $cashApp.classList.toggle("is-hidden", !mainnet);
     if (mainnet) $cashApp.href = `https://cash.app/launch/lightning/${invoice}`;
+    // Satchel, a test-network wallet, when this site offers it; shared/satchel.js signs the
+    // player in there before it opens the invoice.
+    const $satchel = document.getElementById("walletLinkSatchel");
+    if ($satchel) {
+      $satchel.dataset.satchelNext = `/launch/lightning/${invoice}`;
+      $satchel.href = `${document.body.dataset.satchelUrl}${$satchel.dataset.satchelNext}`;
+    }
 
     const hint = "Tap the QR code to copy the invoice";
     $copyFeedback.textContent = hint;

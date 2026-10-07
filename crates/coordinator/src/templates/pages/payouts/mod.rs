@@ -5,18 +5,20 @@ use crate::templates::format::{copyable_id, sats};
 
 /// Payout status and invoice fallback. Each entry retains its authorized address;
 /// the profile address is a default for future entries only. `recovery_file` offers the
-/// player's recovery file.
+/// player's recovery file; `satchel`, the Satchel wallet's origin when configured, a
+/// Lightning Address from it.
 pub fn payouts_page(
     payouts: &[EligiblePayout],
     lightning_address: Option<&str>,
     recovery_file: bool,
+    satchel: Option<&str>,
 ) -> Markup {
     html! {
         div id="payouts" class="account-page" {
             div {
                 h1 class="title is-4 mb-4" { "Payouts" }
 
-                (lightning_address_panel(lightning_address))
+                (lightning_address_panel(lightning_address, satchel))
 
                 @if recovery_file {
                     (recovery_file_link())
@@ -88,7 +90,7 @@ pub fn payouts_page(
 }
 
 /// The account's payout address with an inline form to change it.
-fn lightning_address_panel(lightning_address: Option<&str>) -> Markup {
+fn lightning_address_panel(lightning_address: Option<&str>, satchel: Option<&str>) -> Markup {
     html! {
         div class="content mb-4" id="payoutAddressPanel" {
             @match lightning_address {
@@ -122,8 +124,24 @@ fn lightning_address_panel(lightning_address: Option<&str>) -> Markup {
                                data-payout-action="save-address" { "Save" }
                     }
                 }
+                @if let Some(satchel) = satchel {
+                    (satchel_address(satchel))
+                }
             }
             p class="help is-danger" id="lightningAddressError" role="alert" {}
+        }
+    }
+}
+
+/// One line under the address field: a link that signs the player in to Satchel for a
+/// Lightning Address there. `shared/satchel.js` replaces it with a button that fills in the
+/// address once Satchel says the player has one.
+fn satchel_address(satchel: &str) -> Markup {
+    html! {
+        p class="help" id="satchelAddress" {
+            a href=(format!("{satchel}/wallet")) target="_blank" rel="noopener" data-satchel-next="/wallet" {
+                "Get a Lightning Address with Satchel"
+            }
         }
     }
 }
@@ -162,7 +180,7 @@ mod tests {
             allow_invoice_fallback: true,
             escrow_enabled: true,
         };
-        let html = payouts_page(&[payout], Some("freya@lnurl.example"), false).into_string();
+        let html = payouts_page(&[payout], Some("freya@lnurl.example"), false, None).into_string();
         // The page's CSP allows no inline script, handlers included.
         assert!(!html.contains("onclick"));
         assert!(html.contains(r#"data-payout-action="invoice""#));
@@ -190,12 +208,35 @@ mod tests {
             allow_invoice_fallback: false,
             escrow_enabled: false,
         };
-        let closed = payouts_page(&[payout.clone()], None, false).into_string();
+        let closed = payouts_page(&[payout.clone()], None, false, None).into_string();
         assert!(!closed.contains("Legacy recovery"));
         payout.status = "Awaiting invoice".into();
         payout.allow_invoice_fallback = true;
-        assert!(payouts_page(&[payout], None, false)
+        assert!(payouts_page(&[payout], None, false, None)
             .into_string()
             .contains("Legacy recovery"));
+    }
+
+    /// With Satchel configured, one line under the address field offers it; without, nothing.
+    #[test]
+    fn satchel_is_offered_under_the_address_field_only_when_configured() {
+        for address in [None, Some("freya@lnurl.example")] {
+            let html = payouts_page(&[], address, false, None).into_string();
+            assert!(!html.contains("Satchel"), "{address:?}");
+
+            let html = payouts_page(&[], address, false, Some("https://wallet.5day4cast.com"))
+                .into_string();
+            let field = html.find(r#"id="payoutLightningAddress""#).unwrap();
+            let line = html.find(r#"id="satchelAddress""#).unwrap();
+            assert!(line > field, "{address:?}");
+            assert!(html[line..].contains(
+                r#"href="https://wallet.5day4cast.com/wallet" target="_blank" rel="noopener" data-satchel-next="/wallet""#
+            ));
+            assert_eq!(
+                html.matches("Get a Lightning Address with Satchel").count(),
+                1
+            );
+            assert!(!html.contains("network fee"));
+        }
     }
 }

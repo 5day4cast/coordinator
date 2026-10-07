@@ -14,8 +14,9 @@ pub fn menu_toggle(out_of_band: bool) -> Markup {
 /// Public UI navigation bar with integrated branding
 ///
 /// Links load pages with htmx; `htmx_auth.js` signs requests for account
-/// pages. Bulma v1's burger needs its four spans.
-pub fn navbar() -> Markup {
+/// pages. Bulma v1's burger needs its four spans. `satchel` is the Satchel
+/// wallet's origin, when configured: the signed-in player's menu opens it.
+pub fn navbar(satchel: Option<&str>) -> Markup {
     html! {
         nav class="navbar is-light" role="navigation" aria-label="main navigation" {
             (menu_toggle(false))
@@ -126,6 +127,14 @@ pub fn navbar() -> Markup {
                         // Logout button (shown when logged in, hidden by default)
                         div class="navbar-item is-hidden" id="logoutContainer" {
                             div class="buttons" {
+                                // Signs the player in to Satchel in its own tab (shared/satchel.js).
+                                @if let Some(satchel) = satchel {
+                                    a class="button is-light" id="openSatchelNavClick"
+                                      href=(format!("{satchel}/wallet")) target="_blank" rel="noopener"
+                                      data-satchel-next="/wallet" {
+                                        "Open Satchel"
+                                    }
+                                }
                                 button type="button" class="button is-light" id="logoutNavClick" {
                                     "Log out"
                                 }
