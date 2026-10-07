@@ -85,6 +85,17 @@ impl NostrClientWrapper {
     pub async fn sign_challenge(&self, challenge: &str) -> Result<String, JsValue> {
         Ok(self.inner.sign_challenge(challenge).await?.as_json())
     }
+
+    /// Signed event JSON that signs the player in to another app (the Satchel wallet) by a
+    /// form POST to its handoff `url`, suggesting `name` as the username of a new account.
+    #[wasm_bindgen(js_name = "signHandoff")]
+    pub async fn sign_handoff(&self, url: &str, name: Option<String>) -> Result<String, JsValue> {
+        Ok(self
+            .inner
+            .handoff_event(url, name.as_deref())
+            .await?
+            .as_json())
+    }
 }
 
 /// Keys derived from a username and password; the vault key never leaves WASM.

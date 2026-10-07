@@ -92,6 +92,17 @@ impl NostrClientCore {
             .sign(self.signer()?)
             .await?)
     }
+
+    /// The event that signs the player in to another app, such as the Satchel wallet: NIP-98
+    /// for a form POST to that app's handoff `url`, with `name`, when given, suggested as the
+    /// username of an account it creates.
+    pub async fn handoff_event(&self, url: &str, name: Option<&str>) -> Result<Event, NostrError> {
+        let mut builder = auth_event_builder("POST", url, None)?;
+        if let Some(name) = name.filter(|name| !name.is_empty()) {
+            builder = builder.tag(Tag::custom(TagKind::Name, [name]));
+        }
+        Ok(builder.sign(self.signer()?).await?)
+    }
 }
 
 fn auth_event_builder(
@@ -161,6 +172,44 @@ mod tests {
             http.payload,
             Some(Sha256Hash::hash(br#"{"invoice":"changed"}"#))
         );
+    }
+
+    #[test]
+    fn handoff_events_name_the_handoff_url_and_the_suggested_username() {
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let client = NostrClientCore {
+            signer: Some(CustomSigner::Keys(keys)),
+        };
+        let url = "https://wallet.example.org/auth/nostr/handoff";
+        for name in [Some("alice"), None, Some("")] {
+            let mut signing = std::pin::pin!(client.handoff_event(url, name));
+            let Poll::Ready(event) = signing
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+            else {
+                panic!("local signing unexpectedly waited for I/O");
+            };
+            let event = event.unwrap();
+            event.verify().unwrap();
+            assert_eq!(event.pubkey, pubkey);
+            assert_eq!(event.kind, Kind::HttpAuth);
+            assert!(event.content.is_empty());
+            let http = HttpData::try_from(event.tags.clone().to_vec()).unwrap();
+            assert_eq!(http.url.as_str(), url);
+            assert_eq!(http.method, HttpMethod::POST);
+            assert_eq!(http.payload, None);
+            let named: Vec<&[String]> = event
+                .tags
+                .iter()
+                .map(Tag::as_slice)
+                .filter(|tag| tag[0] == "name")
+                .collect();
+            match name.filter(|name| !name.is_empty()) {
+                Some(name) => assert_eq!(named, [&["name".to_owned(), name.to_owned()][..]]),
+                None => assert!(named.is_empty()),
+            }
+        }
     }
 
     #[test]

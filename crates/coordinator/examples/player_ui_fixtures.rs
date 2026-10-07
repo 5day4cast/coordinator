@@ -226,6 +226,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         network: "signet",
         wasm_version: "offline-fixture",
         recovery: coordinator::templates::components::RecoveryHelp::FileAndRelays,
+        satchel_url: None,
     };
     for (name, content) in pages {
         let page = without_scripts(&base(&config, content).into_string());

@@ -336,6 +336,8 @@ pub struct AppState {
     pub explorer_url: String,
     /// Arkade explorer for VTXOs and Arkade transactions; empty when none is configured.
     pub ark_explorer_url: String,
+    /// Origin of the Satchel test-network wallet pages offer, when one is configured.
+    pub satchel_url: Option<String>,
     pub network: String,
     pub bitcoin: Arc<dyn Bitcoin>,
     pub coordinator: Arc<Coordinator>,
@@ -920,6 +922,7 @@ pub async fn build_app(
             config.ui_settings.ui_dir
         );
     }
+    let satchel_url = config.ui_settings.satchel_origin();
     let app_state = AppState {
         admin_monitoring,
         admin_weather,
@@ -933,6 +936,7 @@ pub async fn build_app(
             .clone()
             .unwrap_or_default(),
         ark_explorer_url: config.ark_settings.explorer_url.clone().unwrap_or_default(),
+        satchel_url,
         oracle_url: config.coordinator_settings.oracle_url,
         keymeld_public_url: config
             .keymeld_settings
@@ -1153,12 +1157,18 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Result<Router, anyhow
         api.rate_limit.burst,
     )?;
 
-    // The wallet also fetches the assigned enclave's attestation from Keymeld.
-    let public_headers = Arc::new(PublicHeaders::new(&[
-        app_state.remote_url.as_str(),
-        app_state.oracle_url.as_str(),
-        app_state.keymeld_public_url.as_deref().unwrap_or_default(),
-    ]));
+    // The wallet also fetches the assigned enclave's attestation from Keymeld. Pages look up
+    // the player's Satchel address and post the Satchel sign-in form, when it is configured.
+    let satchel = app_state.satchel_url.as_deref().unwrap_or_default();
+    let public_headers = Arc::new(PublicHeaders::new(
+        &[
+            app_state.remote_url.as_str(),
+            app_state.oracle_url.as_str(),
+            app_state.keymeld_public_url.as_deref().unwrap_or_default(),
+            satchel,
+        ],
+        &[satchel],
+    ));
 
     Ok(Router::new()
         .merge(api_routes)

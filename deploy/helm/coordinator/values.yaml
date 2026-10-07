@@ -172,6 +172,9 @@ config:
     privateUrl: "http://localhost:9991"
     remoteUrl: "http://localhost:8080"
     uiDir: "/app/ui"
+    # Optional Satchel test-network wallet origin, e.g. "https://wallet.5day4cast.com".
+    # Refused on mainnet.
+    satchelUrl: ""
   coordinator:
     name: "local-coordinator"
     relativeLockTimeBlockDelta: 144
