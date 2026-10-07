@@ -65,6 +65,8 @@ pub struct Settings {
     pub pow_settings: PowSettings,
     #[serde(default)]
     pub http_context: HttpContextSettings,
+    #[serde(default)]
+    pub telemetry: TelemetrySettings,
 }
 
 /// Environment variable that sets `http_context.trusted_proxies`, overriding the file.
@@ -174,6 +176,55 @@ mod http_context_settings_tests {
         settings.trusted_proxies.clear();
         settings.client_ip_header = "X-Forwarded-For".into();
         assert!(settings.validate().is_err());
+    }
+}
+
+/// Environment variable that sets `telemetry.enabled`, overriding the file.
+pub const TELEMETRY_ENABLED_ENV: &str = "COORDINATOR_TELEMETRY_ENABLED";
+
+/// Browser telemetry: `shared/telemetry.js` and `POST /api/v1/telemetry`. Off by default.
+/// See docs/REQUEST_CONTEXT.md.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TelemetrySettings {
+    pub enabled: bool,
+}
+
+impl TelemetrySettings {
+    /// Apply `COORDINATOR_TELEMETRY_ENABLED` (`true` or `false`), when set.
+    pub fn apply_env_override(&mut self, value: Option<String>) -> Result<(), anyhow::Error> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        self.enabled = match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" => true,
+            "false" | "0" | "" => false,
+            _ => return Err(anyhow!("{TELEMETRY_ENABLED_ENV} must be true or false")),
+        };
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod telemetry_settings_tests {
+    use super::*;
+
+    #[test]
+    fn telemetry_is_off_unless_configured() {
+        assert!(!TelemetrySettings::default().enabled);
+        let text = toml::to_string(&Settings::default()).unwrap();
+        let without: String = text.split("[telemetry]").next().unwrap().to_string();
+        let parsed: Settings = toml::from_str(&without).unwrap();
+        assert!(!parsed.telemetry.enabled);
+
+        let mut settings = TelemetrySettings::default();
+        settings.apply_env_override(Some("true".into())).unwrap();
+        assert!(settings.enabled);
+        settings.apply_env_override(None).unwrap();
+        assert!(settings.enabled);
+        settings.apply_env_override(Some("false".into())).unwrap();
+        assert!(!settings.enabled);
+        assert!(settings.apply_env_override(Some("yes".into())).is_err());
     }
 }
 
@@ -1704,6 +1755,9 @@ pub fn get_settings() -> Result<Settings, anyhow::Error> {
     settings
         .coordinator_settings
         .apply_settle_only_env(env::var(SETTLE_ONLY_ENV).ok())?;
+    settings
+        .telemetry
+        .apply_env_override(env::var(TELEMETRY_ENABLED_ENV).ok())?;
     settings.http_context.apply_env_overrides(
         env::var(TRUSTED_PROXIES_ENV).ok(),
         env::var(CLIENT_IP_HEADER_ENV).ok(),

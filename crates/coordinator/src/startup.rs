@@ -61,7 +61,7 @@ use anyhow::anyhow;
 #[cfg(test)]
 use axum::{body::Body, extract::Request};
 use axum::{
-    extract::{connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, State},
+    extract::{connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, DefaultBodyLimit, State},
     http::{header, Extensions, HeaderValue, StatusCode, Uri},
     middleware::{self, AddExtension},
     response::{IntoResponse, Response},
@@ -360,6 +360,8 @@ pub struct AppState {
     pub signup_pow: Arc<SignupPow>,
     /// Which proxies may vouch for client addresses and request ids.
     pub http_context: Arc<HttpContext>,
+    /// Per-session and global caps on browser telemetry events.
+    pub telemetry_caps: Arc<crate::api::telemetry::TelemetryCaps>,
 }
 
 async fn create_bitcoin_client(config: &Settings) -> Result<Arc<dyn Bitcoin>, anyhow::Error> {
@@ -931,6 +933,7 @@ pub async fn build_app(
         );
     }
     let satchel_url = config.ui_settings.satchel_origin();
+    crate::api::telemetry::set_enabled(config.telemetry.enabled);
     let app_state = AppState {
         admin_monitoring,
         admin_weather,
@@ -962,6 +965,7 @@ pub async fn build_app(
         recovery,
         signup_pow: Arc::new(SignupPow::new(config.pow_settings)),
         http_context: Arc::new(HttpContext::from_settings(&config.http_context)?),
+        telemetry_caps: Arc::default(),
     };
     Ok((
         app_state,
@@ -1168,6 +1172,14 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Result<Router, anyhow
         api.rate_limit.burst,
     )?;
 
+    // Browser telemetry has its own caps, so beacons never use up a client's request limit.
+    let telemetry = Router::new()
+        .route(
+            "/api/v1/telemetry",
+            post(crate::api::telemetry::post_telemetry),
+        )
+        .layer(DefaultBodyLimit::max(crate::api::telemetry::MAX_BODY_BYTES));
+
     // The wallet also fetches the assigned enclave's attestation from Keymeld. Pages look up
     // the player's Satchel address and post the Satchel sign-in form, when it is configured.
     let satchel = app_state.satchel_url.as_deref().unwrap_or_default();
@@ -1184,6 +1196,7 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Result<Router, anyhow
     let http_context = app_state.http_context.clone();
     Ok(Router::new()
         .merge(api_routes)
+        .merge(telemetry)
         .merge(static_files(&app_state))
         .layer(compression())
         .layer(Extension(replay))

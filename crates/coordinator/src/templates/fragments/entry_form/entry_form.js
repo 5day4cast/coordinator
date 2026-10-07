@@ -253,6 +253,7 @@ class Entry {
     $error.classList.add("is-hidden");
     this.awaitingPayment = true;
     openModal($modal);
+    window.fdcMark?.("pay_shown");
 
     return new Promise((resolve, reject) => {
       let finished = false;
@@ -278,6 +279,7 @@ class Entry {
           reject(error);
         } else {
           this.paid = true;
+          window.fdcMark?.("pay_ok");
           this.onPaid?.();
           resolve(true);
         }
@@ -652,6 +654,7 @@ function showEntrySuccess(competitionId) {
   clearPaidNotice();
   document.getElementById("errorMessage")?.classList.add("hidden");
   document.getElementById("successMessage")?.classList.remove("hidden");
+  window.fdcMark?.("entry_done");
   button.textContent = "Entered";
   button.disabled = true;
   button.classList.remove("is-loading");

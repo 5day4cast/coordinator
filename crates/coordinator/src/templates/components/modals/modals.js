@@ -273,6 +273,7 @@ class AuthManager {
       return;
     }
 
+    window.fdcMark?.("login_start");
     // The password stays in the browser: the server only sees the derived
     // auth key, and the nsec is unsealed inside WASM.
     const credentials = await deriveLoginCredentials(username, password);
@@ -287,6 +288,7 @@ class AuthManager {
       );
 
       if (response.status === 401) {
+        window.fdcMark?.("login_fail");
         if (errorElement)
           errorElement.textContent = "Invalid username or password";
         return;
@@ -318,6 +320,7 @@ class AuthManager {
 
       this.onLoginSuccess();
     } catch (error) {
+      window.fdcMark?.("login_fail");
       console.error("Username login failed:", error);
       if (errorElement) {
         errorElement.textContent = String(error.message ?? error).includes(
@@ -336,6 +339,7 @@ class AuthManager {
     if (errorElement) errorElement.textContent = "";
     if (!(await this.walletReady(errorElement))) return;
 
+    window.fdcMark?.("login_start");
     try {
       await session.nostrClient.initialize(session.wasm.SignerType.NIP07, null);
       this.authorizedClient = new AuthorizedClient(
@@ -344,6 +348,7 @@ class AuthManager {
       );
       await this.performLogin();
     } catch (error) {
+      window.fdcMark?.("login_fail");
       console.error("Extension login failed:", error);
       if (errorElement) {
         if (error.message === "UNAUTHORIZED") {
@@ -483,6 +488,7 @@ class AuthManager {
         return;
       }
 
+      window.fdcMark?.("signup_ok");
       // Registration is idempotent: a retry may have kept an earlier seed.
       // Always use the persisted backup before deriving any entry keys.
       wallet.free();
@@ -530,6 +536,7 @@ class AuthManager {
         this.apiBase,
       );
       await this.performRegistration(lightningAddress);
+      window.fdcMark?.("signup_ok");
       await this.performLogin();
     } catch (error) {
       console.error("Extension registration failed:", error);
@@ -814,6 +821,7 @@ class AuthManager {
 
   // `remember` is false for a login restored from the remembered one.
   onLoginSuccess({ remember = true } = {}) {
+    window.fdcMark?.("login_ok");
     if (remember) this.rememberSigner();
     document.getElementById("authButtons")?.classList.add("is-hidden");
     document.getElementById("logoutContainer")?.classList.remove("is-hidden");
