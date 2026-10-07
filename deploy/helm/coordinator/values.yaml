@@ -167,6 +167,14 @@ config:
       burst: 60
       authPerSecond: 2
       authBurst: 10
+  # Proxies (addresses or CIDR ranges) whose client address header and X-Request-Id are
+  # trusted; see docs/REQUEST_CONTEXT.md. Nobody is trusted by default.
+  httpContext:
+    trustedProxies: []
+    clientIpHeader: "X-Real-IP"
+  # Browser telemetry (shared/telemetry.js and POST /api/v1/telemetry).
+  telemetry:
+    enabled: false
   ui:
     # Origin the operator's browser uses to reach the operator listener (tunnel name).
     privateUrl: "http://localhost:9991"

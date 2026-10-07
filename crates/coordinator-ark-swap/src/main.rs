@@ -13,6 +13,7 @@ mod lnd;
 mod onchain_wallet;
 mod preimages;
 mod refund;
+mod request_context;
 mod store;
 mod swap;
 mod wallet;
@@ -65,15 +66,25 @@ const LEASE_TTL: Duration = Duration::from_secs(15);
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     fern::Dispatch::new()
-        .format(|out, message, record| {
-            out.finish(format_args!(
-                "{} {} {}: {}",
-                time::OffsetDateTime::now_utc(),
-                record.level(),
-                record.target(),
-                message
-            ))
-        })
+        .format(
+            |out, message, record| match request_context::log_suffix(record.target()) {
+                Some(rid) => out.finish(format_args!(
+                    "{} {} {}: {} rid={}",
+                    time::OffsetDateTime::now_utc(),
+                    record.level(),
+                    record.target(),
+                    message,
+                    rid
+                )),
+                None => out.finish(format_args!(
+                    "{} {} {}: {}",
+                    time::OffsetDateTime::now_utc(),
+                    record.level(),
+                    record.target(),
+                    message
+                )),
+            },
+        )
         .level(log::LevelFilter::Info)
         .chain(std::io::stdout())
         .apply()?;
@@ -169,19 +180,24 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     log::info!("listening on {} as {holder}", config.listen);
-    axum::serve(listener, api::router(swapper, token, holder))
-        .with_graceful_shutdown(async move {
-            let mut terminate =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("SIGTERM handler");
-            tokio::select! {
-                _ = terminate.recv() => {}
-                _ = tokio::signal::ctrl_c() => {}
-            }
-            log::info!("stopping: finishing the current swap tick, then handing over");
-            let _ = stop.send(true);
-        })
-        .await?;
+    // The peer address goes into each request's log line (request_context.rs).
+    axum::serve(
+        listener,
+        api::router(swapper, token, holder)
+            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("SIGTERM handler");
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+        log::info!("stopping: finishing the current swap tick, then handing over");
+        let _ = stop.send(true);
+    })
+    .await?;
     worker_task.await?;
     lease_task.await?;
     Ok(())

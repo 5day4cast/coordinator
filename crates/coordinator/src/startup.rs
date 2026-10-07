@@ -48,6 +48,9 @@ use crate::{
 // Mock implementations only available with e2e-testing feature or debug builds
 use crate::api::nip98_origins::Nip98Origins;
 use crate::api::public_headers::{public_response_headers, PublicHeaders};
+use crate::api::request_context::{
+    request_context_middleware, HttpContext, ParentRequestIdMiddleware,
+};
 use crate::config::{APISettings, RateLimitSettings};
 #[cfg(any(feature = "e2e-testing", debug_assertions))]
 use crate::infra::{
@@ -55,11 +58,12 @@ use crate::infra::{
     oracle_mock::MockOracle,
 };
 use anyhow::anyhow;
+#[cfg(test)]
+use axum::{body::Body, extract::Request};
 use axum::{
-    body::Body,
-    extract::{connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, Request, State},
+    extract::{connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, DefaultBodyLimit, State},
     http::{header, Extensions, HeaderValue, StatusCode, Uri},
-    middleware::{self, AddExtension, Next},
+    middleware::{self, AddExtension},
     response::{IntoResponse, Response},
     routing::{get, post},
     serve::Serve,
@@ -354,6 +358,10 @@ pub struct AppState {
     pub recovery: Option<Arc<Recovery>>,
     /// Issues and checks the proofs of work new accounts carry.
     pub signup_pow: Arc<SignupPow>,
+    /// Which proxies may vouch for client addresses and request ids.
+    pub http_context: Arc<HttpContext>,
+    /// Per-session and global caps on browser telemetry events.
+    pub telemetry_caps: Arc<crate::api::telemetry::TelemetryCaps>,
 }
 
 async fn create_bitcoin_client(config: &Settings) -> Result<Arc<dyn Bitcoin>, anyhow::Error> {
@@ -925,6 +933,7 @@ pub async fn build_app(
         );
     }
     let satchel_url = config.ui_settings.satchel_origin();
+    crate::api::telemetry::set_enabled(config.telemetry.enabled);
     let app_state = AppState {
         admin_monitoring,
         admin_weather,
@@ -955,6 +964,8 @@ pub async fn build_app(
         forgot_password_challenges: Arc::new(RwLock::new(HashMap::new())),
         recovery,
         signup_pow: Arc::new(SignupPow::new(config.pow_settings)),
+        http_context: Arc::new(HttpContext::from_settings(&config.http_context)?),
+        telemetry_caps: Arc::default(),
     };
     Ok((
         app_state,
@@ -1161,6 +1172,14 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Result<Router, anyhow
         api.rate_limit.burst,
     )?;
 
+    // Browser telemetry has its own caps, so beacons never use up a client's request limit.
+    let telemetry = Router::new()
+        .route(
+            "/api/v1/telemetry",
+            post(crate::api::telemetry::post_telemetry),
+        )
+        .layer(DefaultBodyLimit::max(crate::api::telemetry::MAX_BODY_BYTES));
+
     // The wallet also fetches the assigned enclave's attestation from Keymeld. Pages look up
     // the player's Satchel address and post the Satchel sign-in form, when it is configured.
     let satchel = app_state.satchel_url.as_deref().unwrap_or_default();
@@ -1174,8 +1193,10 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Result<Router, anyhow
         &[satchel],
     ));
 
+    let http_context = app_state.http_context.clone();
     Ok(Router::new()
         .merge(api_routes)
+        .merge(telemetry)
         .merge(static_files(&app_state))
         .layer(compression())
         .layer(Extension(replay))
@@ -1184,7 +1205,10 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Result<Router, anyhow
             public_headers,
             public_response_headers,
         ))
-        .layer(middleware::from_fn(log_request))
+        .layer(middleware::from_fn_with_state(
+            http_context,
+            request_context_middleware,
+        ))
         .with_state(app_state)
         .layer(cors))
 }
@@ -1337,6 +1361,7 @@ pub fn admin_app(app_state: Arc<AppState>, access: Arc<AdminAccess>, network: Ne
         .route("/admin/login", get(admin_login_page).post(admin_login))
         .with_state(access);
 
+    let http_context = app_state.http_context.clone();
     Router::new()
         .merge(operator_routes)
         .merge(sign_in)
@@ -1344,7 +1369,10 @@ pub fn admin_app(app_state: Arc<AppState>, access: Arc<AdminAccess>, network: Ne
         .with_state(app_state)
         .layer(middleware::from_fn(operator_response_headers))
         .layer(compression())
-        .layer(middleware::from_fn(log_request))
+        .layer(middleware::from_fn_with_state(
+            http_context,
+            request_context_middleware,
+        ))
 }
 
 /// A page for any path the public site does not serve, with status 404. Paths
@@ -1363,22 +1391,6 @@ async fn public_fallback(
         return StatusCode::NOT_FOUND.into_response();
     }
     not_found(&headers, &state, "Page")
-}
-
-async fn log_request(request: Request<Body>, next: Next) -> impl IntoResponse {
-    let now = time::OffsetDateTime::now_utc();
-    let path = request
-        .uri()
-        .path_and_query()
-        .map(|p| p.as_str())
-        .unwrap_or_default();
-    info!(target: "http_request","new request, {} {}", request.method().as_str(), path);
-
-    let response = next.run(request).await;
-    let response_time = time::OffsetDateTime::now_utc() - now;
-    info!(target: "http_response", "response, code: {}, time: {}", response.status().as_str(), response_time);
-
-    response
 }
 
 /// The WASM package (`/ui`) and the embedded scripts and styles (`/assets`).
@@ -1441,6 +1453,7 @@ fn spawn_supervised(
     })
 }
 
+/// The LND client. Its calls carry no `X-Parent-Request-Id`; see [`build_oracle_reqwest_client`].
 pub fn build_reqwest_client(client: Client) -> ClientWithMiddleware {
     let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
     ClientBuilder::new(client)
@@ -1481,6 +1494,7 @@ pub fn build_oracle_reqwest_client(client: Client) -> ClientWithMiddleware {
     ClientBuilder::new(client)
         .with(RetryTransientMiddleware::new_with_policy(retry_policy))
         .with(LoggingMiddleware)
+        .with(ParentRequestIdMiddleware)
         .build()
 }
 

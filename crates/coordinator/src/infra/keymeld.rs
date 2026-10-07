@@ -692,6 +692,8 @@ impl KeymeldService {
             jitter: 0.25,
         };
 
+        // TODO: send `X-Parent-Request-Id` (request_context::current_rid) through the SDK's
+        // per-request header hook once the pinned Keymeld release has it.
         let builder = KeyMeldClient::builder(&settings.gateway_url, user_id.clone())
             .credentials(credentials)
             .polling_config(polling_config);

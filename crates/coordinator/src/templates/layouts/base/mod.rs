@@ -1,5 +1,6 @@
 use maud::{html, Markup, DOCTYPE};
 
+use crate::api::{request_context, telemetry};
 use crate::templates::{
     assets::{APP_JS, BULMA_CSS, HTMX_JS, LOGIN_WORKER_JS, STYLES_CSS, THEME_JS},
     components::{auth_modals, navbar, RecoveryHelp},
@@ -45,6 +46,13 @@ pub fn base(config: &PageConfig, content: Markup) -> Markup {
                 meta charset="UTF-8";
                 meta name="viewport" content="width=device-width, initial-scale=1.0";
                 meta name="htmx-config" content=(HTMX_CONFIG);
+                // The page's request id joins the browser's telemetry to the server's log.
+                @if let Some(context) = request_context::current() {
+                    meta name="request-id" content=(context.rid);
+                }
+                @if telemetry::enabled() {
+                    meta name="telemetry" content="on";
+                }
                 title { (config.title) }
 
                 link rel="stylesheet" href=(BULMA_CSS.url);
@@ -125,6 +133,25 @@ mod tests {
         assert!(html.contains(r#"href="https://wallet.5day4cast.com/wallet""#));
         assert!(html.contains(r#"data-satchel-next="/wallet""#));
         assert!(html[open..].contains("Open Satchel"));
+    }
+
+    #[test]
+    fn pages_name_their_request_and_telemetry_only_when_on() {
+        let html = page();
+        assert!(!html.contains(r#"name="request-id""#));
+        assert!(!html.contains(r#"name="telemetry""#));
+
+        let context = crate::api::request_context::RequestContext {
+            rid: "0192f1e0-aaaa-7bbb-8ccc-123456789abc".into(),
+            prid: None,
+            sid: None,
+            ip: std::net::Ipv4Addr::LOCALHOST.into(),
+            user: Default::default(),
+        };
+        let html = request_context::REQUEST_CONTEXT.sync_scope(context, page);
+        assert!(html.contains(
+            r#"<meta name="request-id" content="0192f1e0-aaaa-7bbb-8ccc-123456789abc">"#
+        ));
     }
 
     #[test]

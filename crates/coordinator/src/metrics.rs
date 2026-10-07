@@ -150,6 +150,16 @@ pub static COMPETITION_STEP_FAILURES: LazyLock<IntCounter> = LazyLock::new(|| {
     .expect("valid metric")
 });
 
+/// Browser telemetry events dropped by the per-session or global caps, or because the
+/// endpoint does not know their type. See api/telemetry.rs.
+pub static TELEMETRY_EVENTS_DROPPED: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "coordinator_telemetry_events_dropped_total",
+        "Browser telemetry events dropped by caps or as unknown",
+    )
+    .expect("valid metric")
+});
+
 /// Recovery events offered to a relay, by whether the relay took them (`accepted`) or not
 /// (`failed`: refused, no answer, or unreachable).
 pub static RECOVERY_RELAY_PUBLISHES: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -664,6 +674,9 @@ impl Metrics {
         metrics.registry.register(Box::new(ESCROW_EVENTS.clone()))?;
         metrics.registry.register(Box::new(CPFP_BUMPS.clone()))?;
         metrics.registry.register(Box::new(CPFP_FEES_SAT.clone()))?;
+        metrics
+            .registry
+            .register(Box::new(TELEMETRY_EVENTS_DROPPED.clone()))?;
         for tx in CPFP_TXS {
             for result in CPFP_RESULTS {
                 CPFP_BUMPS.with_label_values(&[tx, result]);
@@ -898,6 +911,7 @@ mod tests {
             "coordinator_payout_attempts_total",
             "coordinator_payout_send_failures_total",
             "coordinator_competition_step_failures_total",
+            "coordinator_telemetry_events_dropped_total",
             "coordinator_arkade_unavailable",
             "coordinator_settle_only",
             "coordinator_signup_pow_checks_total",

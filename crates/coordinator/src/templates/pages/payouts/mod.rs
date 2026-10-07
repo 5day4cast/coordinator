@@ -92,7 +92,8 @@ pub fn payouts_page(
 /// The account's payout address with an inline form to change it.
 fn lightning_address_panel(lightning_address: Option<&str>, satchel: Option<&str>) -> Markup {
     html! {
-        div class="content mb-4" id="payoutAddressPanel" {
+        // Telemetry ignores the address and its form (shared/telemetry.js).
+        div class="content mb-4" id="payoutAddressPanel" data-telemetry="off" {
             @match lightning_address {
                 Some(address) => {
                     p id="payoutAddress" {

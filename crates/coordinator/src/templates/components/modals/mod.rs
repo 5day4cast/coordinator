@@ -99,7 +99,8 @@ fn extension_note() -> Markup {
 
 fn login_modal() -> Markup {
     html! {
-        div id="loginModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="loginModalTitle" tabindex="-1" {
+        // Telemetry ignores the auth dialogs (shared/telemetry.js).
+        div id="loginModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="loginModalTitle" tabindex="-1" data-telemetry="off" {
             div class="modal-background" {}
             div class="modal-card" {
                 header class="modal-card-head" {
@@ -167,7 +168,7 @@ fn login_modal() -> Markup {
 /// input from the winner.
 fn lightning_address_field(id: &str) -> Markup {
     html! {
-        div class="field" {
+        div class="field" data-telemetry="off" {
             label class="label" for=(id) { "Lightning Address" }
             div class="control" {
                 input class="input" type="text" id=(id) placeholder="you@cash.app"
@@ -184,7 +185,7 @@ fn register_modal(recovery: RecoveryHelp) -> Markup {
     html! {
         // The worker that solves the sign-up proof of work (signup_pow.js).
         div id="registerModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="registerModalTitle" tabindex="-1"
-            data-pow-worker=(POW_WORKER_JS.url) {
+            data-pow-worker=(POW_WORKER_JS.url) data-telemetry="off" {
             div class="modal-background" {}
             div class="modal-card" {
                 header class="modal-card-head" {
@@ -294,7 +295,7 @@ fn register_modal(recovery: RecoveryHelp) -> Markup {
 
 fn forgot_password_modal() -> Markup {
     html! {
-        div id="forgotPasswordModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="forgotPasswordModalTitle" tabindex="-1" {
+        div id="forgotPasswordModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="forgotPasswordModalTitle" tabindex="-1" data-telemetry="off" {
             div class="modal-background" {}
             div class="modal-card" {
                 header class="modal-card-head" {
@@ -422,7 +423,7 @@ fn payout_modal() -> Markup {
                 div class="box" {
                     h3 id="payoutModalTitle" class="title is-4" { "Submit Lightning Invoice" }
                     p id="payoutAmountSummary" class="mb-3" {}
-                    div class="field" {
+                    div class="field" data-telemetry="off" {
                         label class="label" for="lightningInvoice" { "Lightning Invoice" }
                         div class="control" {
                             textarea class="textarea" id="lightningInvoice"

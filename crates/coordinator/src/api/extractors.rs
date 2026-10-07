@@ -137,6 +137,7 @@ where
                 ReplayRejection::Full | ReplayRejection::Unavailable => AuthError::ReplayGuardFull,
             })?;
 
+        super::request_context::record_user(&event.pubkey.to_hex());
         Ok(Self {
             pubkey: event.pubkey,
             event,

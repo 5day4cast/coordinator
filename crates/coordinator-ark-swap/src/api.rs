@@ -53,6 +53,7 @@ pub fn router(swapper: Arc<Swapper>, token: String, holder: String) -> Router {
         .route("/health", get(|| async { "ok" }))
         .merge(authenticated)
         .with_state(state)
+        .layer(middleware::from_fn(crate::request_context::request_context))
 }
 
 async fn authenticate(State(state): State<AppState>, request: Request, next: Next) -> Response {

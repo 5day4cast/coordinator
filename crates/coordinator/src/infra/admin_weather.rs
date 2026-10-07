@@ -1,6 +1,7 @@
 //! Weather discovery uses the oracle's settlement eligibility and the requested forecast window.
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use crate::api::request_context::ParentRequestId;
 use anyhow::{ensure, Context};
 use serde::{Deserialize, Serialize};
 use time::{format_description::well_known::Rfc3339, Date, OffsetDateTime};
@@ -261,6 +262,7 @@ impl WeatherDiscovery {
                 ("days", i64::from(window.history_days)),
                 ("window_hours", hours),
             ])
+            .parent_request_id()
             .send()
             .await?
             .error_for_status()?
@@ -285,6 +287,7 @@ impl WeatherDiscovery {
                 ("start", window.start.format(&Rfc3339)?),
                 ("end", window.end.format(&Rfc3339)?),
             ])
+            .parent_request_id()
             .send()
             .await?
             .error_for_status()?

@@ -1,6 +1,7 @@
 //! Optional, bounded Grafana reads. Credentials and queries stay on the server.
 use std::{io::Read, sync::Arc, time::Duration};
 
+use crate::api::request_context::ParentRequestId;
 use anyhow::{ensure, Context};
 use futures::{stream, StreamExt};
 use maud::{html, Markup};
@@ -222,7 +223,12 @@ impl AdminMonitoring {
                     .context("Grafana is not configured")?;
                 let requests: Vec<_> = QUERIES
                     .iter()
-                    .map(|(_, query, _)| client.get(&service.query_url).query(&[("query", query)]))
+                    .map(|(_, query, _)| {
+                        client
+                            .get(&service.query_url)
+                            .query(&[("query", query)])
+                            .parent_request_id()
+                    })
                     .collect();
                 let metrics = tokio::time::timeout(
                     Duration::from_secs(8),

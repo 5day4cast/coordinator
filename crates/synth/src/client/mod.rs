@@ -10,6 +10,9 @@ use reqwest::{Client, RequestBuilder};
 use std::{path::Path, sync::Arc};
 use zeroize::Zeroizing;
 
+/// Sent on every synthetic request, so the operator pages can tell synthetic traffic apart.
+pub const USER_AGENT: &str = concat!("5day4cast-synth/", env!("CARGO_PKG_VERSION"));
+
 /// HTTP client for the coordinator API
 #[derive(Clone)]
 pub struct CoordinatorClient {
@@ -26,6 +29,7 @@ impl CoordinatorClient {
             // A page or the tracker waiting on the coordinator must give up eventually. Its
             // lists run to a megabyte, so every request says it takes gzip.
             http: Client::builder()
+                .user_agent(USER_AGENT)
                 .connect_timeout(std::time::Duration::from_secs(5))
                 .timeout(std::time::Duration::from_secs(30))
                 .gzip(true)

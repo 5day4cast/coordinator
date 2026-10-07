@@ -79,6 +79,13 @@ data:
     invoice_watch_interval = {{ .Values.lightning.invoiceWatchIntervalSecs }}
     payout_watch_interval = {{ .Values.lightning.payoutWatchIntervalSecs }}
 
+    [http_context]
+    trusted_proxies = [{{ range $i, $proxy := .Values.config.httpContext.trustedProxies }}{{ if $i }}, {{ end }}{{ $proxy | quote }}{{ end }}]
+    client_ip_header = {{ .Values.config.httpContext.clientIpHeader | quote }}
+
+    [telemetry]
+    enabled = {{ .Values.config.telemetry.enabled }}
+
     [admin_settings]
     listen_addr = "0.0.0.0:{{ .Values.service.adminPort }}"
     token_file = "/etc/coordinator-admin/token"
