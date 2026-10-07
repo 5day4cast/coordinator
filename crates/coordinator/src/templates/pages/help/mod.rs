@@ -5,7 +5,9 @@
 use maud::{html, Markup};
 
 use crate::domain::leaderboard::{progress::LINE_POINTS, Metric, PickState, Rule};
+use crate::domain::PayoutTermsQuote;
 use crate::templates::fragments::{entry_form::pick_row, picks::state_badge};
+use crate::templates::{format, pages::competitions::CompetitionView};
 
 /// A numbered marker tying a spot in the walkthrough to its note.
 fn callout(number: u8) -> Markup {
@@ -15,6 +17,13 @@ fn callout(number: u8) -> Markup {
 /// `open_advanced` renders "How the tech works" unfolded: links into it say so in
 /// their address, since a fragment alone cannot open a `details`.
 pub fn help_page(open_advanced: bool) -> Markup {
+    help_page_with_terms(open_advanced, None)
+}
+
+pub fn help_page_with_terms(
+    open_advanced: bool,
+    competition_terms: Option<(&CompetitionView, Option<&PayoutTermsQuote>)>,
+) -> Markup {
     html! {
         div class="help-page" {
             a class="back-link" href="/competitions" hx-get="/competitions"
@@ -42,8 +51,8 @@ pub fn help_page(open_advanced: bool) -> Markup {
                 h2 { "Scoring" }
                 p {
                     "Each competition lists its cities and weather categories. For each category — high temperature, "
-                    "low temperature or sustained wind speed — choose one of three ranges: " strong { "Under" } ", in " strong { "Par" }
-                    " or " strong { "Over" } "."
+                    "low temperature or sustained wind speed — choose below (<), within the displayed range, "
+                    "or above (>)."
                 }
                 ul {
                     li {
@@ -51,14 +60,14 @@ pub fn help_page(open_advanced: bool) -> Markup {
                         "and checks it before you pay."
                     }
                     li {
-                        strong { "Par is a range" } " around the forecast, set from how recent forecasts "
+                        strong { "The middle choice is a range" } " around the forecast, set from how recent forecasts "
                         "have missed: that airport's own once it has enough history, and all airports' "
-                        "together until then. Under, Par and Over are about equally likely. A right pick "
+                        "together until then. The three choices are about equally likely. A right pick "
                         "scores " (LINE_POINTS) " points."
                     }
                     li {
-                        "Par includes both ends of the range, and the reading is compared before rounding: "
-                        "with Par 80.4–83.0°F, 83.0°F is Par and 83.1°F is Over."
+                        "The middle range includes both ends, and the reading is compared before rounding: "
+                        "with 80.4–83.0°F, 83.0°F is within the range and 83.1°F is above it."
                     }
                     li { "An incorrect pick scores 0. There are no negative points." }
                 }
@@ -67,9 +76,9 @@ pub fn help_page(open_advanced: bool) -> Markup {
             section id="readings" class="content" {
                 h2 { "Readings" }
                 ul {
-                    li { strong { "High" } ": the highest temperature observed during the window." }
-                    li { strong { "Low" } ": the lowest temperature observed during the window." }
-                    li { strong { "Wind" } ": the highest sustained wind speed observed during the window, in knots." }
+                    li { strong { "Highest temperature" } ": the highest temperature observed during the window." }
+                    li { strong { "Lowest temperature" } ": the lowest temperature observed during the window." }
+                    li { strong { "Highest wind speed" } ": the highest sustained wind speed observed during the window, in knots." }
                 }
                 p {
                     "All observations come from NOAA's reports for the airport station named beside each city. "
@@ -208,10 +217,19 @@ pub fn help_page(open_advanced: bool) -> Markup {
                         }
                         li {
                             "If the result is never settled cooperatively, entrants can reclaim their funds "
-                            "on-chain after a timelock. Each competition's page lists its timelock and fee cap "
-                            "under Advanced."
+                            "on-chain after a timelock. Follow the entry page's “How your entry is held and paid” "
+                            "link to see that competition's timelock and fee cap here."
                         }
                     }
+                    @if let Some((competition, terms)) = competition_terms {
+                        h3 { "This competition's payment terms" }
+                        p { a href=(competition.url()) { "Back to this competition" } }
+                        @if terms.is_none() {
+                            p { "Payment terms are unavailable. Try again shortly." }
+                        }
+                        (payment_terms(competition, terms))
+                    }
+                    p id="keymeldTrust" class="is-hidden" {}
                 }
             }
         }
@@ -253,10 +271,47 @@ fn walkthrough() -> Markup {
                     li { "What first place wins once the result is final." }
                     li { "The city and NOAA forecast: here, a 77°F high for Chicago. The city tooltip identifies the airport station." }
                     li {
-                        "Your pick, left to right: Under, Par (73.4–76.0°F, both ends included) or Over. "
+                        "Your pick, left to right: < 73.4°F, 73.4–76.0°F (both ends included), or > 76.0°F. "
                         "Choose one range for each category. You can change a pick before paying."
                     }
                     li { "Pay the Lightning invoice and you're in. Your picks show on the leaderboard once entries close." }
+                }
+            }
+        }
+    }
+}
+
+fn payment_terms(competition: &CompetitionView, terms: Option<&PayoutTermsQuote>) -> Markup {
+    let queue = competition.queue.queued();
+    html! {
+        ul {
+            li {
+                "Your picks and ticket are locked into a Bitcoin contract with the other entries"
+                @if queue.is_some() { " in your pool" }
+                ". "
+                "A Keymeld enclave signs it for you, so you don't need to stay online."
+            }
+            @if let Some(terms) = terms {
+                li {
+                    "If the result is never settled cooperatively, entrants can reclaim funds on-chain after "
+                    (terms.relative_locktime_block_delta) " blocks (about "
+                    (format::duration(time::Duration::minutes(i64::from(terms.relative_locktime_block_delta) * 10)))
+                    ")."
+                }
+                li { "On-chain fees for the contract are capped at " (terms.max_fee_rate_sat_vb) " sat/vB." }
+                li {
+                    "Winner shares by rank: "
+                    @for (place, (percent, _)) in competition.prizes().iter().enumerate() {
+                        @if place > 0 { ", " }
+                        (percent) "%"
+                    }
+                    ". A tie at the last paid place is broken the way the oracle ranks entries."
+                }
+                @if !terms.enabled {
+                    li {
+                        "This older competition has no payout escrow: collecting winnings by invoice "
+                        "reveals the entry's keys before payment, and payment is not guaranteed."
+                    }
                 }
             }
         }

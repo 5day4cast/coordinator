@@ -104,6 +104,62 @@ async fn entries(coordinator: &Coordinator, competition: Uuid, pubkey: &str, cou
 }
 
 #[tokio::test]
+async fn entry_counts_are_private_and_count_only_the_authenticated_players_submissions() {
+    let coordinator = Coordinator::start("http://127.0.0.1:9".into()).await;
+    let competition = coordinator
+        .competition(
+            OffsetDateTime::now_utc() + time::Duration::days(1),
+            &["KPWM"],
+            10,
+        )
+        .await;
+    let owner = Keys::generate();
+    let other = Keys::generate();
+    entries(
+        &coordinator,
+        competition.id,
+        &owner.public_key().to_hex(),
+        2,
+    )
+    .await;
+    entries(
+        &coordinator,
+        competition.id,
+        &other.public_key().to_hex(),
+        1,
+    )
+    .await;
+
+    let path = "/competitions/entry-counts";
+    assert_eq!(
+        get(&coordinator, path, false, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    for (keys, count) in [(&owner, 2), (&other, 1)] {
+        let (status, caching, body) = get(&coordinator, path, false, Some(keys)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(caching, "private, no-store");
+        let counts: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            counts,
+            serde_json::json!({ competition.id.to_string(): count })
+        );
+    }
+    let (_, _, body) = get(&coordinator, path, false, Some(&Keys::generate())).await;
+    assert_eq!(body, "{}");
+
+    // The form's Help link still exposes this competition's concrete payment terms.
+    let path = format!("/help?open=advanced&competition={}", competition.id);
+    let (status, _, body) = get(&coordinator, &path, false, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("<details open>"));
+    assert!(body.contains("This competition's payment terms"));
+    assert!(body.contains("blocks (about"));
+    assert!(body.contains("sat/vB"));
+    coordinator.stop().await;
+}
+
+#[tokio::test]
 async fn only_the_signed_in_owner_gets_their_ledger() {
     let coordinator = Coordinator::start("http://127.0.0.1:9".into()).await;
     let competition = coordinator

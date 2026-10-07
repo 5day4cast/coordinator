@@ -1065,6 +1065,10 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Result<Router, anyhow
     let htmx_routes = Router::new()
         .route("/competitions", get(competitions_fragment))
         .route(
+            "/competitions/entry-counts",
+            get(crate::api::routes::player_entry_counts),
+        )
+        .route(
             "/competitions/{competition_id}/entry-form",
             get(entry_form_fragment),
         )

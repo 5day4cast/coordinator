@@ -842,6 +842,20 @@ impl CompetitionStore {
         Ok(user_entries)
     }
 
+    /// Submitted entries per competition, without loading picks, keys or payment records.
+    pub async fn player_entry_counts(
+        &self,
+        pubkey: &str,
+    ) -> Result<HashMap<String, i64>, sqlx::Error> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT event_id, COUNT(*) FROM entries WHERE pubkey = ? GROUP BY event_id",
+        )
+        .bind(pubkey)
+        .fetch_all(self.db_connection.read())
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
     pub async fn get_user_entries(
         &self,
         pubkey: String,
