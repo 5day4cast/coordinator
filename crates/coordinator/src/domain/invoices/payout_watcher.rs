@@ -534,9 +534,7 @@ async fn send_eligibility(
                 .map(|signed| signed.params())
         })
         .ok_or_else(|| anyhow::anyhow!("Payout has no persisted contract parameters"))?;
-    let [output] = outcome.output.as_slice() else {
-        return Err(anyhow::anyhow!("DLC outcome must have exactly one output"));
-    };
+    let output = outcome_contract_output(outcome)?;
     let status = tokio::time::timeout(
         Duration::from_secs(20),
         chain.payout_output_status(
@@ -553,6 +551,21 @@ async fn send_eligibility(
         params.relative_locktime_block_delta,
         invoice.min_final_cltv_expiry_delta(),
     ))
+}
+
+/// The contract output of an outcome or expiry transaction: its first output. Contracts built
+/// with anchors (dlctix 0.2) put a pay-to-anchor output after it; any other shape is not this
+/// contract's outcome.
+fn outcome_contract_output(
+    outcome: &bitcoin::Transaction,
+) -> Result<&bitcoin::TxOut, anyhow::Error> {
+    match outcome.output.as_slice() {
+        [output] => Ok(output),
+        [output, anchor] if dlctix::anchor::is_anchor_script(&anchor.script_pubkey) => Ok(output),
+        _ => Err(anyhow::anyhow!(
+            "DLC outcome must have one contract output, optionally followed by its anchor"
+        )),
+    }
 }
 
 #[derive(Debug)]
@@ -669,6 +682,60 @@ mod tests {
             classify_output(confirmed, 1, 18),
             SendEligibility::Closed(_)
         ));
+    }
+
+    /// Contracts built with anchors put a pay-to-anchor output after the outcome transaction's
+    /// contract output. Their winners are paid like any other's.
+    #[tokio::test]
+    async fn an_anchored_outcome_is_ready_for_payouts() {
+        let (_directory, database, store, event_id, entry_id) = fixture().await;
+        let outcome = |output: Vec<bitcoin::TxOut>| bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output,
+        };
+        let contract_output = bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(99_000),
+            script_pubkey: bitcoin::ScriptBuf::new(),
+        };
+        let anchor = dlctix::AnchorParams::default().output();
+        let anchored = outcome(vec![contract_output.clone(), anchor.clone()]);
+        assert_eq!(
+            outcome_contract_output(&anchored).unwrap(),
+            &contract_output
+        );
+        assert!(outcome_contract_output(&outcome(vec![contract_output.clone()])).is_ok());
+        // Two contract outputs, an anchor first, or no output at all are not an outcome.
+        for output in [
+            vec![contract_output.clone(), contract_output.clone()],
+            vec![anchor.clone(), contract_output.clone()],
+            vec![],
+        ] {
+            assert!(outcome_contract_output(&outcome(output)).is_err());
+        }
+
+        let stored = serde_json::to_vec(&anchored).unwrap();
+        database
+            .execute_write(move |pool| async move {
+                sqlx::query("UPDATE competitions SET outcome_transaction = ? WHERE id = ?")
+                    .bind(stored)
+                    .bind(event_id.to_string())
+                    .execute(&pool)
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let chain = crate::infra::bitcoin_mock::MockBitcoinClient::new(bitcoin::Network::Regtest);
+        let invoice = fresh_invoice(7).parse::<Bolt11Invoice>().unwrap();
+        assert!(matches!(
+            send_eligibility(&store, &chain, entry_id, &invoice)
+                .await
+                .unwrap(),
+            SendEligibility::Ready(_)
+        ));
+        database.close().await.unwrap();
     }
 
     /// A competition with a confirmed outcome and one entry owed a payout.
