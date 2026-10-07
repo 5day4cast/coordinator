@@ -88,10 +88,14 @@ function loadWallet() {
 // in later, carry data-open-modal; clicking one loads the wallet. A dialog the
 // page opens itself (an account page opened while signed out) loads it only
 // once the visitor types in it, so a visitor who doesn't log in never
-// downloads it; sending the form loads it in any case.
+// downloads it; sending the form loads it in any case. The sign-up dialog
+// starts its proof of work as it opens (signup_pow.js).
 function openAuthModal(id, opener = document.activeElement) {
   if (id === "loginModal") resetLoginModal();
-  if (id === "registerModal") resetRegisterModal();
+  if (id === "registerModal") {
+    resetRegisterModal();
+    startSignupPow();
+  }
   const modal = document.getElementById(id);
   openModal(modal, opener);
   modal?.addEventListener("input", loadWallet, { once: true });
@@ -131,6 +135,7 @@ function setupAuthModals(authManager) {
       closeModal(document.getElementById("loginModal"));
       resetRegisterModal();
       openModal(document.getElementById("registerModal"));
+      startSignupPow();
     });
 
   document.getElementById("goToLoginButton")?.addEventListener("click", (event) => {
@@ -453,16 +458,21 @@ class AuthManager {
       // Signed with the new Nostr key: the server takes the account pubkey
       // from the NIP-98 header, never from the body.
       try {
-        await this.authorizedClient.post(
-          `${this.apiBase}/api/v1/users/username/register`,
-          {
-            username: pending.username,
-            auth_key: pending.authKey,
-            encrypted_nsec: pending.sealedNsec,
-            encrypted_bitcoin_private_key,
-            network: this.network,
-            lightning_address: pending.lightningAddress,
-          },
+        await sendWithSignupPow(
+          document.getElementById("usernameRegisterStep2Button"),
+          (proof) =>
+            this.authorizedClient.post(
+              `${this.apiBase}/api/v1/users/username/register`,
+              {
+                username: pending.username,
+                auth_key: pending.authKey,
+                encrypted_nsec: pending.sealedNsec,
+                encrypted_bitcoin_private_key,
+                network: this.network,
+                lightning_address: pending.lightningAddress,
+                ...proof,
+              },
+            ),
         );
       } catch (error) {
         wallet.free();
@@ -523,10 +533,13 @@ class AuthManager {
       await this.performLogin();
     } catch (error) {
       console.error("Extension registration failed:", error);
+      const data = await error.response?.json().catch(() => null);
       if (errorElement) {
         errorElement.textContent = error.message.includes("No NIP-07")
           ? "No Nostr extension found. Please install nos2x, Alby, or another NIP-07 compatible extension."
-          : "Registration failed. If you have already registered, please log in.";
+          : data?.code === "pow_rejected"
+            ? data.error
+            : "Registration failed. If you have already registered, please log in.";
       }
     }
   }
@@ -726,9 +739,14 @@ class AuthManager {
     const wallet = session.wasm.DlcWallet.create(session.nostrClient, this.network);
     try {
       const payload = await wallet.encryptedBackup();
-      const response = await this.authorizedClient.post(
-        `${this.apiBase}/api/v1/users/register`,
-        { ...payload, lightning_address: lightningAddress },
+      const response = await sendWithSignupPow(
+        document.getElementById("extensionRegisterButton"),
+        (proof) =>
+          this.authorizedClient.post(`${this.apiBase}/api/v1/users/register`, {
+            ...payload,
+            lightning_address: lightningAddress,
+            ...proof,
+          }),
       );
       if (!response.ok) throw new Error("Registration failed");
     } finally {

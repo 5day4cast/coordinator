@@ -11,7 +11,11 @@ use hyper::StatusCode;
 use serde_json::json;
 use std::borrow::Borrow;
 
-use crate::{api::extractors::AuthError, domain::Error, infra::db::DatabaseWriteError};
+use crate::{
+    api::extractors::AuthError,
+    domain::{Error, PowRejection},
+    infra::db::DatabaseWriteError,
+};
 
 pub use coordinator::*;
 pub use pages::*;
@@ -24,6 +28,10 @@ pub enum ApiError {
     Domain(#[from] Error),
     #[error(transparent)]
     Auth(#[from] AuthError),
+    /// An account creation without a valid proof of work. The body names it with
+    /// `"code": "pow_rejected"`, so the page can solve a fresh challenge and send again.
+    #[error(transparent)]
+    Pow(#[from] PowRejection),
     #[error("{0}")]
     Status(StatusCode),
 }
@@ -33,6 +41,11 @@ impl IntoResponse for ApiError {
         match self {
             Self::Domain(error) => error.into_response(),
             Self::Auth(error) => error.into_response(),
+            Self::Pow(rejection) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": rejection.to_string(), "code": "pow_rejected" })),
+            )
+                .into_response(),
             Self::Status(status) => status.into_response(),
         }
     }
@@ -175,6 +188,21 @@ mod tests {
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body, json!({ "error": message }));
         }
+    }
+
+    #[tokio::test]
+    async fn a_refused_proof_of_work_says_so_and_names_its_code() {
+        let response = ApiError::from(PowRejection::Expired).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "error": "The sign-up proof of work expired; try again",
+                "code": "pow_rejected",
+            })
+        );
     }
 
     #[tokio::test]

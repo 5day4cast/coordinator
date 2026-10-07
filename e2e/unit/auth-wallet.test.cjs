@@ -13,6 +13,9 @@ for (const retried of [false, true]) {
     const register = (url, body) => {
       assert.ok(url.endsWith("/users/username/register"));
       assert.equal(body.encrypted_bitcoin_private_key, candidateBackup);
+      // The sign-up carries its proof of work (signup_pow.js).
+      assert.equal(body.pow_challenge, "challenge");
+      assert.equal(body.pow_nonce, "7");
       return { ok: true };
     };
     const window = {
@@ -55,6 +58,7 @@ for (const retried of [false, true]) {
       document: { querySelector: () => null, getElementById: () => null },
       fetch: async (url, options) => register(url, JSON.parse(options.body)),
       setTimeout: () => {},
+      sendWithSignupPow: async (button, send) => send({ pow_challenge: "challenge", pow_nonce: "7" }),
     }, ["AuthManager"]);
     const manager = new AuthManager("https://coordinator.example", "signet");
     manager.pendingRegistration = { username: "alice", authKey: "credential", sealedNsec: "sealed" };

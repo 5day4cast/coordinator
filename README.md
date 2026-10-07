@@ -199,6 +199,23 @@ satchel_url = "https://wallet.5day4cast.com"
 
 For Helm, set `config.ui.satchelUrl`.
 
+### Sign-up proof of work
+
+Off by default. When enabled, every new account (username and password, or a
+Nostr extension) carries a small proof of work that the sign-up dialog solves
+in the background, about a second on a phone at 18 bits. The difficulty is
+global, never per client address, and rises one bit for every `step_signups`
+accounts created in the last hour, up to `max_bits`. Signing in never needs it.
+See [Request controls](docs/REQUEST_HARDENING.md#sign-up-proof-of-work).
+
+```toml
+[pow]
+enabled = true
+base_bits = 18
+max_bits = 22
+step_signups = 200
+```
+
 ### Operator access
 
 Operator routes are served only by the admin listener and require the token in

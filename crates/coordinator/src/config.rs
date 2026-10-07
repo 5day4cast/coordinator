@@ -61,6 +61,121 @@ pub struct Settings {
     pub kickoff_check_settings: KickoffCheckSettings,
     #[serde(default, rename = "recovery")]
     pub recovery_settings: RecoverySettings,
+    #[serde(default, rename = "pow")]
+    pub pow_settings: PowSettings,
+}
+
+/// Proof of work for new accounts. Off by default. See docs/REQUEST_HARDENING.md.
+///
+/// When enabled, every account creation (username and password, or a Nostr extension) must
+/// carry a solved challenge from `POST /api/v1/users/pow`: a nonce whose SHA-256 with the
+/// challenge starts with `base_bits` zero bits, plus one bit for every `step_signups` accounts
+/// created in the last hour across the whole service, up to `max_bits`. The difficulty is the
+/// same for every client address, so a crowd behind one address pays what anyone else does.
+/// 18 bits take a phone about a second; each bit doubles it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PowSettings {
+    pub enabled: bool,
+    pub base_bits: u8,
+    pub max_bits: u8,
+    pub step_signups: u64,
+}
+
+/// The most leading zero bits a proof of work may be asked for: four billion hashes on average.
+pub const MAX_POW_BITS: u8 = 32;
+
+impl Default for PowSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_bits: 18,
+            max_bits: 22,
+            step_signups: 200,
+        }
+    }
+}
+
+impl PowSettings {
+    pub fn validate(&self) -> Result<(), anyhow::Error> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.max_bits > MAX_POW_BITS {
+            return Err(anyhow!("pow.max_bits must be at most {MAX_POW_BITS}"));
+        }
+        if self.base_bits > self.max_bits {
+            return Err(anyhow!("pow.base_bits must not exceed pow.max_bits"));
+        }
+        if self.step_signups == 0 {
+            return Err(anyhow!("pow.step_signups must be at least 1"));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod pow_settings_tests {
+    use super::*;
+
+    #[test]
+    fn proof_of_work_is_off_unless_configured_and_settings_are_checked() {
+        let defaults = PowSettings::default();
+        assert!(!defaults.enabled);
+        assert_eq!(
+            (defaults.base_bits, defaults.max_bits, defaults.step_signups),
+            (18, 22, 200)
+        );
+
+        // A config written before the section existed loads with it off.
+        let text = toml::to_string(&Settings::default()).unwrap();
+        let without: String = text.split("[pow]").next().unwrap().to_string();
+        let parsed: Settings = toml::from_str(&without).unwrap();
+        assert_eq!(parsed.pow_settings, PowSettings::default());
+
+        let configured: Settings = toml::from_str(&format!(
+            "{without}\n[pow]\nenabled = true\nbase_bits = 20\n"
+        ))
+        .unwrap();
+        assert!(configured.pow_settings.enabled);
+        assert_eq!(configured.pow_settings.base_bits, 20);
+        assert_eq!(configured.pow_settings.max_bits, 22);
+        configured.validate().unwrap();
+
+        let enabled = PowSettings {
+            enabled: true,
+            ..PowSettings::default()
+        };
+        enabled.validate().unwrap();
+        for invalid in [
+            PowSettings {
+                max_bits: MAX_POW_BITS + 1,
+                ..enabled.clone()
+            },
+            PowSettings {
+                base_bits: 23,
+                ..enabled.clone()
+            },
+            PowSettings {
+                step_signups: 0,
+                ..enabled.clone()
+            },
+        ] {
+            assert!(invalid.validate().is_err(), "{invalid:?}");
+            // Nothing is checked while proofs are off.
+            PowSettings {
+                enabled: false,
+                ..invalid.clone()
+            }
+            .validate()
+            .unwrap();
+            let settings = Settings {
+                pow_settings: invalid,
+                ..Settings::default()
+            };
+            assert!(settings.validate().is_err());
+        }
+    }
 }
 
 /// Recovery records published to Nostr relays, and the recovery file players download. Off by
@@ -767,6 +882,7 @@ impl Settings {
         self.kickoff_check_settings.validate()?;
         self.recovery_settings
             .validate(&self.coordinator_settings)?;
+        self.pow_settings.validate()?;
         self.keymeld_settings.validate(network)
     }
 }

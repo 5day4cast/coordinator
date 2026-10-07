@@ -21,7 +21,7 @@ use crate::{
         operator_delete_competition, operator_owed_winners, operator_payout_holds,
         operator_release_payout_hold, operator_settle_owed_winner, operator_write_off_refunds,
         payouts_fragment, public_page_handler, register, register_ticket, register_username,
-        request_competition_ticket, send_to_address, set_lightning_address,
+        request_competition_ticket, send_to_address, set_lightning_address, signup_pow_challenge,
         submit_final_signatures, submit_public_nonces, submit_ticket_payout,
         ticket_status_fragment,
     },
@@ -30,8 +30,8 @@ use crate::{
         leaderboard::Leaderboards,
         recovery::{Recovery, RecoveryPublisher},
         CompetitionRunners, CompetitionStore, CompetitionWakes, Coordinator, InvoiceSubscriber,
-        InvoiceWatcher, PaymentSubscriber, PayoutWatcher, SubscriptionHealth, UserInfo, UserStore,
-        ARK_SWAP_BOARDS_EVERY, TICKET_PREIMAGE_BATCH,
+        InvoiceWatcher, PaymentSubscriber, PayoutWatcher, SignupPow, SubscriptionHealth, UserInfo,
+        UserStore, ARK_SWAP_BOARDS_EVERY, TICKET_PREIMAGE_BATCH,
     },
     infra::{
         bitcoin::{Bitcoin, BitcoinClient, BitcoinSyncWatcher, ElectrumHeaders},
@@ -352,6 +352,8 @@ pub struct AppState {
     pub forgot_password_challenges: Arc<RwLock<HashMap<String, (String, std::time::Instant)>>>,
     /// Recovery records and the recovery file, when enabled.
     pub recovery: Option<Arc<Recovery>>,
+    /// Issues and checks the proofs of work new accounts carry.
+    pub signup_pow: Arc<SignupPow>,
 }
 
 async fn create_bitcoin_client(config: &Settings) -> Result<Arc<dyn Bitcoin>, anyhow::Error> {
@@ -952,6 +954,7 @@ pub async fn build_app(
         background_threads: Arc::new(threads),
         forgot_password_challenges: Arc::new(RwLock::new(HashMap::new())),
         recovery,
+        signup_pow: Arc::new(SignupPow::new(config.pow_settings)),
     };
     Ok((
         app_state,
@@ -1011,7 +1014,8 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Result<Router, anyhow
         .route("/username/login", post(login_username))
         .route("/username/change-password", post(change_password))
         .route("/username/forgot-password", post(forgot_password_challenge))
-        .route("/username/reset-password", post(forgot_password_reset));
+        .route("/username/reset-password", post(forgot_password_reset))
+        .route("/pow", post(signup_pow_challenge));
     let users_endpoints = limited(
         users_endpoints,
         &api.rate_limit,
@@ -2364,6 +2368,271 @@ mod startup_tests {
         let (status, _, _) = send(&admin, request("GET", "/admin/wallet/fees", &[], "")).await;
         assert_eq!(status, StatusCode::OK);
         test.stop().await;
+    }
+
+    /// A JSON POST to `path` signed by `keys` with NIP-98, as the browser sends it.
+    async fn signed_post(
+        test: &TestState,
+        keys: &nostr::Keys,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Request<Body> {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+        use nostr::hashes::{sha256::Hash as Sha256Hash, Hash};
+        let body = body.to_string();
+        let url = format!("{}{path}", test.state.remote_url);
+        let auth = crate::api::extractors::create_auth_event(
+            "POST",
+            &url,
+            Some(Sha256Hash::hash(body.as_bytes())),
+            keys,
+        )
+        .await
+        .unwrap();
+        let header = format!(
+            "Nostr {}",
+            BASE64.encode(serde_json::to_string(&auth).unwrap())
+        );
+        request(
+            "POST",
+            path,
+            &[
+                ("authorization", &header),
+                ("content-type", "application/json"),
+            ],
+            &body,
+        )
+    }
+
+    /// Whether SHA-256(challenge ‖ nonce big-endian) starts with `difficulty` zero bits; written
+    /// apart from `domain::users::SignupPow` to check it.
+    fn solves_pow(challenge: &[u8], nonce: u64, difficulty: u64) -> bool {
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::new()
+            .chain_update(challenge)
+            .chain_update(nonce.to_be_bytes())
+            .finalize();
+        let zeros = hash.iter().position(|byte| *byte != 0).map_or(256, |at| {
+            at as u64 * 8 + u64::from(hash[at].leading_zeros())
+        });
+        zeros >= difficulty
+    }
+
+    /// A challenge from the public API, its bytes, and the first nonce solving it.
+    async fn solved_pow(public: &Router) -> (serde_json::Value, Vec<u8>, u64) {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let (status, _, body) = send(public, request("POST", "/api/v1/users/pow", &[], "")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let issued: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let bytes = URL_SAFE_NO_PAD
+            .decode(issued["challenge"].as_str().unwrap())
+            .unwrap();
+        let difficulty = issued["difficulty"].as_u64().unwrap();
+        let nonce = (0u64..)
+            .find(|nonce| solves_pow(&bytes, *nonce, difficulty))
+            .unwrap();
+        (issued, bytes, nonce)
+    }
+
+    /// `account` with the proof of work fields for `issued` and `nonce`.
+    fn with_pow(
+        mut account: serde_json::Value,
+        issued: &serde_json::Value,
+        nonce: u64,
+    ) -> serde_json::Value {
+        account["pow_challenge"] = issued["challenge"].clone();
+        account["pow_nonce"] = serde_json::Value::String(nonce.to_string());
+        account
+    }
+
+    fn extension_account(key: &str) -> serde_json::Value {
+        serde_json::json!({
+            "encrypted_bitcoin_private_key": key,
+            "network": "regtest",
+            "lightning_address": "player@mock-wallet.dev",
+        })
+    }
+
+    /// A username sign-up whose Lightning Address is refused after the proof of work, so a test
+    /// sees how far it got without waiting for Argon2.
+    fn username_account(username: &str) -> serde_json::Value {
+        serde_json::json!({
+            "username": username,
+            "auth_key": "ab".repeat(32),
+            "encrypted_nsec": "sealed",
+            "encrypted_bitcoin_private_key": format!("{username} key"),
+            "network": "regtest",
+            "lightning_address": "unknown@mock-wallet.dev",
+        })
+    }
+
+    const NO_ADDRESS: &str = "has no Lightning Address unknown@mock-wallet.dev";
+
+    #[tokio::test]
+    async fn sign_ups_need_no_proof_of_work_while_it_is_off() {
+        let test = TestState::start().await;
+        let public = test.public();
+        let (status, _, body) = send(&public, request("POST", "/api/v1/users/pow", &[], "")).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+        let (status, _, body) = send(
+            &public,
+            signed_post(
+                &test,
+                &nostr::Keys::generate(),
+                "/api/v1/users/register",
+                &extension_account("alice key"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        // The username sign-up gets past the proof of work to the address check.
+        let (status, _, body) = send(
+            &public,
+            signed_post(
+                &test,
+                &nostr::Keys::generate(),
+                "/api/v1/users/username/register",
+                &username_account("bob"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains(NO_ADDRESS), "{body}");
+        test.stop().await;
+    }
+
+    #[tokio::test]
+    async fn every_sign_up_spends_a_proof_of_work_when_it_is_on() {
+        use nostr::ToBech32;
+        let test = TestState::start_with(|settings| {
+            settings.pow_settings = crate::config::PowSettings {
+                enabled: true,
+                base_bits: 4,
+                max_bits: 8,
+                step_signups: 1,
+            };
+        })
+        .await;
+        let public = test.public();
+        // Two accounts created in the last hour add two bits.
+        for i in 0..2 {
+            test.state
+                .users_info
+                .register(
+                    format!("earlier {i}"),
+                    crate::api::routes::RegisterPayload {
+                        encrypted_bitcoin_private_key: format!("earlier key {i}"),
+                        network: "regtest".into(),
+                        lightning_address: "player@mock-wallet.dev".into(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let (issued, bytes, nonce) = solved_pow(&public).await;
+        assert_eq!(issued["difficulty"], 6);
+        assert!(issued["expires_at"].as_u64().unwrap() > unix_now());
+
+        // Without a proof, neither kind of sign-up creates an account.
+        let alice = nostr::Keys::generate();
+        for (path, account) in [
+            ("/api/v1/users/register", extension_account("alice key")),
+            ("/api/v1/users/username/register", username_account("alice")),
+        ] {
+            let (status, _, body) =
+                send(&public, signed_post(&test, &alice, path, &account).await).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["code"], "pow_rejected", "{path}");
+            assert_eq!(
+                body["error"],
+                "Signing up needs a proof of work from this page; reload it and try again"
+            );
+        }
+        let alice_npub = alice.public_key().to_bech32().unwrap();
+        assert!(test
+            .state
+            .users_info
+            .login(alice_npub.clone())
+            .await
+            .is_err());
+
+        // A wrong nonce is refused without spending the challenge.
+        let wrong = (nonce + 1..)
+            .find(|nonce| !solves_pow(&bytes, *nonce, 6))
+            .unwrap();
+        let (status, _, body) = send(
+            &public,
+            signed_post(
+                &test,
+                &alice,
+                "/api/v1/users/register",
+                &with_pow(extension_account("alice key"), &issued, wrong),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("does not solve its challenge"), "{body}");
+
+        // A solved one creates one account.
+        let (status, _, body) = send(
+            &public,
+            signed_post(
+                &test,
+                &alice,
+                "/api/v1/users/register",
+                &with_pow(extension_account("alice key"), &issued, nonce),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(test.state.users_info.login(alice_npub).await.is_ok());
+        let (status, _, body) = send(
+            &public,
+            signed_post(
+                &test,
+                &nostr::Keys::generate(),
+                "/api/v1/users/register",
+                &with_pow(extension_account("carol key"), &issued, nonce),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("already used"), "{body}");
+
+        // The username sign-up takes a fresh proof to its address check, and spends it.
+        let (issued, _, nonce) = solved_pow(&public).await;
+        let bob = nostr::Keys::generate();
+        for refused in [NO_ADDRESS, "already used"] {
+            let (status, _, body) = send(
+                &public,
+                signed_post(
+                    &test,
+                    &bob,
+                    "/api/v1/users/username/register",
+                    &with_pow(username_account("bob"), &issued, nonce),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains(refused), "{body}");
+        }
+        test.stop().await;
+    }
+
+    fn unix_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
     }
 }
 
