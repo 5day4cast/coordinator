@@ -97,7 +97,7 @@ With only their nsec, or the recovery file and their nsec, a player can find eve
 
 ### What it reads
 
-1. The player's records: kind 30078 events by the coordinator's recovery key, tagged `["b", blind]`, from the relays the recovery file names (or `--relays`, or a few public relays). `blind = sha256("coordinator-recovery/v1" || coordinator_pubkey || user_pubkey)`. The recovery file holds the same ciphertexts.
+1. The player's records: kind 30078 events by the coordinator's recovery key, tagged `["b", blind]`, from the relays the recovery file names, plus `--relays` or else the relays this build carries (below). `blind = sha256("coordinator-recovery/v1" || coordinator_pubkey || user_pubkey)`. The recovery file holds the same ciphertexts.
 2. The wallet seed: the record is NIP-44 from the recovery key to the player; inside it, the browser wallet's backup is NIP-44 from the player to themselves. Entry keys and payout preimages are derived from the seed, the network and the entry id, exactly as the browser wallet derives them.
 3. Each competition's contract (tag `["c", id]`), whole, gzipped, or as a manifest and parts.
 4. The oracle's attestation: from the competition record, the oracle's Nostr record (kind 30078, `d` = `oracle:<event id>`, see noaa-oracle's `docs/NOSTR.md`), or the oracle's API (`--oracle`). Any value is accepted only if it opens one of the contract's locking points, so where it came from does not matter.
@@ -108,30 +108,86 @@ Nothing is signed for an entry unless the key derived from the seed is the key i
 ### The CLI
 
 ```sh
+coordinator-recover inspect                                   # nsec only, with this build's keys and relays
 coordinator-recover --kit coordinator-recovery-npub1….json inspect
-coordinator-recover --network signet --coordinator-pubkey <hex> inspect   # nsec only
+coordinator-recover --network signet --coordinator-pubkey <hex> inspect
 coordinator-recover claim --to bc1q… [--fee-rate 5] [--ticket-preimage <hex>] [--dry-run]
+coordinator-recover claim --to bc1q… --fee-utxo <txid>:<vout> [--fee-change bc1q…]   # key from COORDINATOR_RECOVER_FEE_KEY
 coordinator-recover refund-escrow --entry <id> --to <ark address> [--dry-run]
-coordinator-recover unroll --entry <id> [--to bc1q…] [--dry-run]
+coordinator-recover unroll --entry <id> [--to bc1q…] [--fee-utxo …] [--dry-run]
 ```
 
-The nsec comes from `--nsec`, `COORDINATOR_RECOVER_NSEC`, or a prompt that does not echo it. It is never printed. Without the recovery file, the coordinator's recovery pubkey is needed (`--coordinator-pubkey`); `GET /api/v1/recovery/info` serves it while the coordinator is up.
+The nsec comes from `--nsec`, `COORDINATOR_RECOVER_NSEC`, or a prompt that does not echo it. It is never printed.
 
-- **`inspect`**: per entry, where the money is (escrow VTXO, funding output, outcome or split output, spent), what can be done now, and when the next step opens, by block height or time. It warns when the market maker's reclaim (`2·delta` blocks after an outcome or split transaction confirms) is near or open.
-- **`claim`**: broadcasts, skipping what is already on chain, the outcome transaction (the attestation adapts its signature) or, past the event's expiry, the expiry transaction (equal shares); then the split transaction with the player's ticket preimage; then, `delta` blocks after the split confirms, the win transaction, signed with the entry key, to `--to`. Run it again as each step confirms. `--dry-run` prints the raw transactions instead.
+**Whose records, on which network.** The coordinator's recovery pubkey comes from `--coordinator-pubkey`, else the recovery file, else the keys this build carries (below); `GET /api/v1/recovery/info` serves it while the coordinator is up. The network comes from `--network`, else the recovery file, else the player's own records: with no flag the tool tries each built-in key, keeps the one that has records for this nsec, and takes the network those records name, so a Mutinynet player need not pass `--network signet`. If the records name more than one network, it asks for `--network`.
+
+- **`inspect`**: per entry, where the money is (escrow VTXO, funding output, outcome or split output, spent), what can be done now, and when the next step opens, by block height (with about how long that is, from the chain's recent block times) or time. It warns when the market maker's reclaim (`2·delta` blocks after an outcome or split transaction confirms) is near or open.
+- **`claim`**: broadcasts, skipping what is already on chain, the outcome transaction (the attestation adapts its signature) or, past the event's expiry, the expiry transaction (equal shares); then the split transaction with the player's ticket preimage; then the win transaction, signed with the entry key, to `--to`. The split's input waits `delta` blocks after the outcome (or expiry) transaction confirms, and the win's `delta` blocks after the split confirms, and nodes refuse either before that. So each run broadcasts only what nodes take now and says from which block the next step opens; run it again then. It also says by when a step must confirm: an attested outcome transaction before the contract's expiry, when the expiry transaction becomes valid; the split and the win before the market maker's reclaim opens. One entry's failure does not stop the others; the run then ends with an error naming them. `--dry-run` prints the raw transactions instead.
 - **`refund-escrow`**: from the refund locktime `T` on, moves the whole escrow through its refund leaf with the Arkade server's signature to the player's Ark address. If the VTXO has expired and been swept, it registers a recovery intent instead and signs the batch that pays it.
 - **`unroll`**: without the Arkade server's cooperation, puts the escrow on chain and then sweeps it through the player's own leaf once its delay has passed.
 
+#### Built-in coordinator keys and relays
+
+A release carries the coordinator's recovery keys and relays, so a player needs nothing but their nsec. They are committed in [`crates/coordinator-recover/recovery-defaults.json`](../crates/coordinator-recover/recovery-defaults.json) and compiled into the CLI and the recovery page, like the browser wallet's Keymeld measurements, and every release's `RELEASE.json` records the file's sha256:
+
+```json
+{
+  "coordinator_pubkeys": { "signet": "<the recovery key's hex x-only pubkey or npub>" },
+  "relays": ["wss://relay.example.org", "wss://nos.lol"]
+}
+```
+
+- `coordinator_pubkeys`: the recovery key by network (`bitcoin`, `signet` for Mutinynet, `testnet4`, `regtest`), exactly as `GET /api/v1/recovery/info` returns it. List a key only once that coordinator publishes records with it, and keep a retired key listed while its records may still be needed.
+- `relays`: `wss://` relays to read records from when the recovery file and `--relays` name none. List the relays the coordinator publishes to (`[recovery].relays`), so the tool reads where records are written; the oracle's Nostr relays should overlap them, for attestations.
+- The crate's tests parse the file, so a malformed key, an unknown network, a second key for one network or a non-`wss://` relay fails CI before a release.
+- `--coordinator-pubkey` and `--relays` override them; a recovery file adds its own relays. The recovery page uses them when its form and the file name none.
+
+#### Fee bumping
+
+Contracts built with dlctix 0.2's anchors (every competition created with the default contract options) carry a 240 sat pay-to-anchor output on every outcome, expiry and split transaction. Those transactions still pay the contract's fee rate and relay on their own; in a fee spike, a child spending the anchor can pay for both (CPFP). Contracts built before anchors cannot be bumped: the tool says each of their transactions "has no anchor and cannot be fee bumped", and never uses a fee coin on them.
+
+**The CLI.** When a transaction it is about to broadcast, or one already in the mempool and not yet confirmed, has an anchor and pays less than the claim's fee rate on its own, `claim` builds a child that spends the anchor and a coin of the player's, so that the two together pay the rate, and broadcasts them as a package through Esplora's `POST /txs/package`, or one after the other where the Esplora has none.
+
+- **The rate.** `--fee-rate` if given; otherwise Esplora's six-block estimate, or its next-block estimate when the step's deadline is within six blocks (or two hours, for the expiry). The final win transaction pays the same rate.
+- **The coin.** `--fee-utxo <txid>:<vout>` and its private key in WIF, from `COORDINATOR_RECOVER_FEE_KEY` (or `--fee-key`, which leaves it in the shell history). The coin must be confirmed and pay that key's P2WPKH address or its single-key P2TR address (BIP 86, no script tree), as single-key wallets make them. The tool reads the coin's value and script from Esplora, refuses a spent or unconfirmed coin or a key that does not match, and never prints the key. Use a small coin set aside for this: the key signs only the child's own input. One coin pays for one child; give `--fee-utxo` again (or comma separated) for more, all paying the same key.
+- **The change.** By default back to the coin's own address, so the same key pays for the next child once it confirms; `--fee-change <address>` sends it elsewhere. The anchor's 240 sats go with it.
+- `--dry-run` prints each child after its parent instead of broadcasting either.
+- An anchor has no key, so anyone may attach a large low-rate child to it (pinning). Bump early, well before the deadline the tool prints.
+
+`unroll` uses the same coin to pay for each Arkade virtual transaction, which pays no fee and has a zero-value anchor. Those are TRUC (version 3) transactions, so the child is version 3 too, and the pair must go out as a package.
+
+The recovery page says which transactions have an anchor and which are waiting in the mempool, but builds no child: it holds no coin of the player's. Use the CLI for that.
+
+**The coordinator.** Settlement bumps the outcome, expiry and split transactions it broadcast itself, from its LND wallet, as `[cpfp_settings]` says (on by default):
+
+```toml
+[cpfp_settings]
+enabled = true
+after_secs = 1800          # wait this long after broadcasting before a bump
+conf_target = 6            # the estimate a bump aims for, in blocks
+urgent_conf_target = 1     # ...near a deadline:
+urgent_within_secs = 21600 # an attested outcome transaction within 6 h of the contract's expiry
+max_fee_percent = 10       # no child pays more than this share of what its parent spends
+```
+
+- Each settlement step of a competition whose outcome, expiry or split transaction is out and unconfirmed looks at it, at most every two minutes. Only an anchored transaction that has waited `after_secs` is considered.
+- The target is the local fee estimate for `conf_target` blocks, with the margin settlement adds to every time-critical transaction. An attested outcome transaction within `urgent_within_secs` of the contract's expiry, or past it, aims for `urgent_conf_target`: from the expiry on, the pre-signed expiry transaction is valid too and could take its place. A transaction that already pays the target is left alone.
+- The child spends the anchor and the smallest confirmed wallet coin that covers it, leased while the child is built so a funding transaction cannot take it, and pays its change to a new wallet address. LND signs the coin; the anchor needs no signature.
+- A transaction is bumped again only once the target is a quarter above its last bump, so the new child can replace the old one. No child pays more than `max_fee_percent` of the value its parent spends; past that it pays the rate that budget allows, and if that is no more than the parent pays, nothing.
+- An outcome or expiry transaction the mempool lost is broadcast again first. One below the mempool's minimum fee needs a package (`bitcoin-cli submitpackage`), which LND cannot send; that is reported as `parent_rejected`.
+- Metrics: `coordinator_cpfp_bumps_total{tx="outcome"|"expiry"|"split", result="broadcast"|"capped"|"over_budget"|"no_coin"|"parent_rejected"|"failed"}` and `coordinator_cpfp_fees_sat_total`. Alert on any `no_coin`, `parent_rejected` or `failed`: the wallet needs a confirmed coin of about (parent + 200 vB) × the estimate, plus 1,000 sats.
+- Spending a P2A anchor is standard from Bitcoin Core 28 on; LND's chain backend must relay it.
+
 #### What the CLI cannot do yet
 
-- **Fee bumping.** dlctix 0.1's outcome, expiry and split transactions pay the fee rate fixed at signing and have no anchor output; nobody can bump them, and the tool says so for each one. The win and unroll sweep transactions are the player's own and can be signed again at a higher `--fee-rate`. `crates/coordinator-recover/src/fees.rs` detects pay-to-anchor outputs and defines the `AnchorBumper` hook for when contracts carry them.
+- **Fee bumping contracts without anchors.** Contracts built before anchors have outcome, expiry and split transactions that pay the fee rate fixed at signing and no anchor output; nobody can bump them, and the tool says so for each one. The win and unroll sweep transactions are the player's own and can be signed again at a higher `--fee-rate`.
 - **On-chain refunds of a live escrow.** A live VTXO is refunded offchain to an Ark address; leaving Arkade from there is any Arkade wallet's offboard. (Offboarding directly needs a forfeit through the refund leaf in a batch, which is not built.)
 - **Unroll without arkd.** The escrow's virtual transactions come from arkd's indexer; the records do not carry them. With arkd down, an escrow can be unrolled only if its ancestry was saved elsewhere.
-- **Unroll fees.** Each virtual transaction pays no fee and needs a child spending its anchor, broadcast with it as a package. The tool prints each transaction and its anchor; the child comes from the player's own wallet (for example `bitcoin-cli submitpackage`) until an `AnchorBumper` is built in.
+- **Unroll fees without a fee coin.** Without `--fee-utxo`, the tool prints each virtual transaction and its anchor, and the child comes from the player's own wallet (for example `bitcoin-cli submitpackage`).
 
 ### The recovery page
 
-The page does the DLC flows of the CLI (find records, inspect, build and broadcast the outcome or expiry, split and win transactions) in the browser. Escrow refunds and unrolls need arkd's gRPC API and stay in the CLI. The page's script only fetches what the WASM module asks for and shows its answers; the nsec goes into the module and the form field is cleared.
+The page does the DLC flows of the CLI (find records, inspect, build and broadcast the outcome or expiry, split and win transactions) in the browser, with the same step timing. Without a coordinator key or relays in its form or the recovery file, it uses the ones the release was built with. Escrow refunds and unrolls need arkd's gRPC API and stay in the CLI. The page's script only fetches what the WASM module asks for and shows its answers; the nsec goes into the module and the form field is cleared.
 
 On the coordinator, `/recover` is a server-rendered shell around `templates/static/recover.js` and the WASM package the site already serves. Its Content-Security-Policy is the public pages' own, except that it may connect to any `https:` or `wss:` origin, for the relays and Esplora the player chooses.
 
