@@ -17,9 +17,14 @@ enabled = true
 relays = ["wss://relay.example.org", "wss://nos.lol", "wss://relay.damus.io"]
 # Signs and encrypts the records, and nothing else. Created on first start.
 key_file = "./creds/coordinator_recovery_key.pem"
+# Delete a record from the relays once the money it describes is settled (see Retention).
+delete_settled = true
+# Days a record stays on the relays after its money is settled.
+settled_retention_days = 7
 ```
 
 - The recovery key is not the coordinator's market-maker key, and the coordinator refuses to start if `key_file` names `coordinator_settings.private_key_file`.
+- Every relay in `relays` must accept kind 30078 and kind 5 (NIP-09 deletions) signed by the recovery key. A relay that refuses kind 5 keeps settled records until it prunes them itself, and the deletions keep being retried every five minutes.
 - Players find their records by this key: back the file up with the other credentials, and give every instance of one deployment (both blue/green slots) the same file. A new key starts a new set of records; the old ones stay readable with the old key's public key.
 - `GET /api/v1/recovery/info` returns the key's public key, the network and the relays, and 404 while recovery is off.
 
@@ -70,14 +75,60 @@ Where the nsec is shown once at sign-up, one line tells the player that the nsec
 
 A background task, under a worker lease so one instance publishes at a time, reads the competitions changed since its last look every 5 seconds, plus a few competitions and wallets per tick from a full pass. The full pass starts at launch, which backfills records for competitions created before this ran, and repeats every 30 minutes.
 
-New versions wait in the `recovery_outbox` table. Each event is offered to every relay that has not taken it yet; a refusal or an unreachable relay is retried after a minute, doubling up to an hour. After 8 attempts an event that at least one relay took is not offered again; one no relay took keeps being retried hourly. Nothing in the entry, kickoff, payout or refund paths waits for this task or for a relay.
+New versions wait in the `recovery_outbox` table. Each event is offered to every relay that has not taken it yet, at most 50 per tick; a refusal or an unreachable relay is retried after a minute, doubling up to five minutes. After 8 attempts an event that at least one relay took is not offered again to a relay that refuses it; one no relay took keeps being retried every five minutes, and so does one waiting for a relay that cannot be reached, however long it is down. A relay that could not be reached is tried again once a minute, and the events due for it meanwhile count as failed without a connection. When it answers again, every event waiting out a retry is offered at once, and so is every one when the coordinator starts, so a relay outage does not leave a backlog waiting on old retries. Events not tried yet go out before retries, so new versions do not queue behind a relay that is down. Remove a relay that is gone for good from `[recovery].relays`: until then every event waits for it. Nothing in the entry, kickoff, payout or refund paths waits for this task or for a relay.
 
 Metrics:
 
 - `coordinator_recovery_relay_publishes_total{result="accepted"|"failed"}`: events offered to a relay, by result.
-- `coordinator_recovery_outbox_depth`: events not yet taken by every relay.
+- `coordinator_recovery_outbox_depth`: events not yet taken by every relay, deletions included.
+- `coordinator_recovery_records_live{kind="wallet"|"entry"|"competition"}`: records kept on the relays.
+- `coordinator_recovery_records_settled{kind}`: live records whose money is settled, waiting out the grace period.
+- `coordinator_recovery_deletions_total{kind}`: deletions every relay took.
+- `coordinator_recovery_relay_missing{relay}`: live records a relay has not taken; a republish to it brings this to 0.
+- `coordinator_recovery_republish_queued_total`: records an operator queued again.
 
-The outbox table is additive: an older coordinator running beside a newer one ignores it.
+The record gauges are read about once a minute. The outbox table is additive: an older coordinator running beside a newer one ignores it, and the retention columns are kept so that it neither offers a retired record again nor leaves a live one out of a recovery file.
+
+### Adding a relay
+
+A relay added to `[recovery].relays` receives new versions only: records that every other relay took before it was added are not offered to it. To backfill it:
+
+1. Add the relay to `[recovery].relays` (and to `recovery-defaults.json`, so the next release's tools read from it) and restart the coordinators. `GET /api/v1/recovery/info` lists it.
+2. Republish to it, from the Services page ("Republish" on its row), or:
+
+   ```sh
+   coordinator admin recovery status
+   coordinator admin recovery republish --relay wss://relay.example.org --yes
+   ```
+
+   or `POST /api/v1/admin/recovery/republish` with `{"relays": ["wss://relay.example.org"]}`. No `--relay` (an empty list) republishes to every relay.
+3. Watch `coordinator admin recovery status` or `coordinator_recovery_relay_missing{relay="wss://relay.example.org"}` fall to 0.
+
+A republish forgets that the named relays took each live record, along with its attempts and retry delay, and makes the records due 20 every 5 seconds, wallets first and then newest first, so new versions keep going out meanwhile; a restart or a relay coming back does not undo that pace. A relay that already holds a record answers it as a duplicate, which counts as taken. Retired records are not sent again. Use the same for a relay that lost its data.
+
+## Retention
+
+Records are kept only while a player could need them. Once the money a record describes is settled, it stays on the relays for `settled_retention_days` (7 by default), then the coordinator publishes a NIP-09 deletion for it and stops publishing it.
+
+- **Entry record**: settled once its competition is over (completed, or cancelled before its contract was funded) and none of the entry's money can still move: no Lightning payment held and not cancelled, no on-chain escrow left unreclaimed, no funded Arkade escrow that neither a batch spent into the contract nor a refund returned (a written-off refund leaves the escrow to the player, so it counts as held), no winner still owed (`owed_winners` neither settled nor claimed on chain), and no payout held for an operator. A record whose ticket went to another player is settled once its competition is over.
+- **Competition contract** (and its parts): settled once the competition is over and every entry record of it is.
+- **Wallet backup**: settled once its player has no entry record whose money is not. A player who never entered is settled from the first look, so their wallet backup is deleted after the grace period too.
+
+The publisher notes when each record is first found settled (`recovery_outbox.settled_at`) on every look at its competition: on any change to the competition's entries, tickets or payouts, and every half hour for competitions not completed, completed ones with records not yet found settled, and ones with a winner still owed or a payout held. About once a minute it retires up to 200 records settled for longer than the grace period whose current version every relay took. Each gets a kind 5 event signed by the recovery key:
+
+```json
+{ "kind": 5, "content": "settled",
+  "tags": [["e", "<id of the record's current version>"],
+           ["a", "30078:<recovery pubkey>:<d tag>"],
+           ["k", "30078"]] }
+```
+
+The `a` tag deletes every version up to the deletion's `created_at`, as NIP-09 asks; the `e` tag names the version the relays hold, for relays that act only on `e` tags (nostr-rs-relay hides the event). The deletion goes through the outbox like any event and its `created_at` follows the record's. A retired record is left out of the recovery file and is not published again, unless its money moves again (a winner turns up owed, an operator reopens a competition): then a new version is published after the deletion, and the player's wallet backup with it. `delete_settled = false` keeps every record.
+
+For the relay this means:
+
+- It must accept kind 5 from the recovery key, alongside kind 30078.
+- Deletion bounds what it serves, not what it stores: nostr-rs-relay only hides deleted events, and keeps deletion events. Prune hidden events and kind 5 events older than the grace period plus a margin. Do not prune live kind 30078 events by age: a record of a long-running competition, an unrefunded escrow or an owed winner can stay live for months, and the coordinator republishes a record only when it changes or on a republish.
 
 ## Threat model
 
@@ -86,7 +137,8 @@ The outbox table is additive: an older coordinator running beside a newer one ig
 - The ticket preimage is published only after the player paid, when they hold it already.
 - The wallet blob is the one the browser stored at sign-up, encrypted to the player's nsec. Publishing it adds no exposure beyond a relay seeing a second ciphertext of it.
 - Competition events are public data the API already serves; the contract names entry keys but no Nostr identities.
-- A relay can drop or withhold events. Several relays and the downloadable file cover that. A relay cannot forge an event: every event is signed by the recovery key, whose public key the tool takes from the file or `/api/v1/recovery/info`.
+- A relay can drop or withhold events. Several relays and the downloadable file cover that.
+- Deletions reveal when a player's records stopped mattering, which their timing already showed; they carry no more than the `d` tag the record had. A relay cannot forge an event: every event is signed by the recovery key, whose public key the tool takes from the file or `/api/v1/recovery/info`.
 
 ## Recovering without the coordinator
 
@@ -136,6 +188,8 @@ A release carries the coordinator's recovery keys and relays, so a player needs 
   "relays": ["wss://relay.example.org", "wss://nos.lol"]
 }
 ```
+
+This release carries the signet (Mutinynet) recovery key that `https://5day4cast.com/api/v1/recovery/info` serves, and that coordinator's own relay, `wss://5day4cast.com/relay`, the only one it publishes to for now.
 
 - `coordinator_pubkeys`: the recovery key by network (`bitcoin`, `signet` for Mutinynet, `testnet4`, `regtest`), exactly as `GET /api/v1/recovery/info` returns it. List a key only once that coordinator publishes records with it, and keep a retired key listed while its records may still be needed.
 - `relays`: `wss://` relays to read records from when the recovery file and `--relays` name none. List the relays the coordinator publishes to (`[recovery].relays`), so the tool reads where records are written; the oracle's Nostr relays should overlap them, for attestations.

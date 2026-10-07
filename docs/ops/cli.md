@@ -81,6 +81,15 @@ coordinator admin owed-winners approve-sweep <entry-id> --yes
 coordinator admin owed-winners settle <entry-id> --note "<payment hash>" --yes
 ```
 
+```sh
+# Recovery records on the Nostr relays (see ../RECOVERY.md): what each relay lacks, what waits to
+# be published, and the records by kind.
+coordinator admin recovery status
+# Offer every live record again to a relay added to [recovery].relays, which gets no backfill
+# otherwise; give --relay again for more, or none for every relay. They go out 20 every 5 s.
+coordinator admin recovery republish --relay wss://relay.example.org --yes
+```
+
 The commands use these operator-listener endpoints, which scripts may call directly with the same
 bearer token:
 
@@ -96,6 +105,8 @@ bearer token:
 | `GET` | `/api/v1/admin/owed-winners` | winners owed after their Lightning window closed unpaid; `?all=true` includes resolved ones |
 | `POST` | `/api/v1/admin/owed-winners/{entry_id}/approve-sweep` | approve sweeping a winner's split output |
 | `POST` | `/api/v1/admin/owed-winners/{entry_id}/settle` | record a winner paid (JSON `note`); approves the sweep too |
+| `GET` | `/api/v1/admin/recovery` | recovery records: each relay with the live records it lacks, the outbox, the records by kind |
+| `POST` | `/api/v1/admin/recovery/republish` | offer every live recovery record again (JSON `relays`, from `[recovery].relays`; empty for all) |
 
 ## `synth`
 

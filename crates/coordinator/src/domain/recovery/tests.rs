@@ -1,4 +1,7 @@
-use super::publisher::{publish_due, retry_delay, MAX_ATTEMPTS};
+use super::publisher::{
+    publish_due, retry_delay, RelayHealth, DOWN_RELAY_PROBE_SECS, MAX_ATTEMPTS,
+    MAX_RETRY_DELAY_SECS,
+};
 use super::*;
 use crate::domain::{CompetitionStore, RecoveryOutboxEvent};
 use crate::infra::db::{DBConnection, DatabasePoolConfig, DatabaseType};
@@ -723,7 +726,10 @@ async fn the_outbox_retries_until_every_relay_takes_an_event() {
     assert_eq!(store.recovery_outbox_depth().await.unwrap(), 1);
 
     // One relay took it and the other refused, so it waits for its retry.
-    publish_due(&store, &relays, now).await.unwrap();
+    let mut health = RelayHealth::default();
+    publish_due(&store, &relays, now, &mut health)
+        .await
+        .unwrap();
     assert_eq!(store.recovery_outbox_depth().await.unwrap(), 1);
     assert!(store.due_recovery_events(now, 10).await.unwrap().is_empty());
     let retry_at = now + retry_delay(1);
@@ -733,7 +739,9 @@ async fn the_outbox_retries_until_every_relay_takes_an_event() {
     assert_eq!(due[0].accepted_relays, vec![steady.clone()]);
 
     // The retry goes only to the relay that refused.
-    publish_due(&store, &relays, retry_at).await.unwrap();
+    publish_due(&store, &relays, retry_at, &mut health)
+        .await
+        .unwrap();
     assert_eq!(store.recovery_outbox_depth().await.unwrap(), 0);
     assert_eq!(steady_seen.load(SeqCst), 1);
     assert_eq!(flaky_seen.load(SeqCst), 2);
@@ -754,6 +762,9 @@ async fn the_outbox_retries_until_every_relay_takes_an_event() {
         .record_recovery_attempts(vec![crate::domain::RecoveryAttempt {
             d_tag: d_tag.clone(),
             content_sha256: content_digest(&event.content),
+            deletion: None,
+            attempts: 0,
+            accepted_before: Vec::new(),
             accepted_relays: relays.clone(),
             published_at: Some(retry_at),
             next_attempt_at: retry_at,
@@ -768,42 +779,239 @@ async fn the_outbox_retries_until_every_relay_takes_an_event() {
     assert!(due[0].event_json.contains(&newer.id.to_hex()));
 }
 
+/// An event one relay keeps refusing stops after its attempts once another relay took it; one
+/// waiting for a relay that cannot be reached keeps waiting, so a long outage leaves no gap.
 #[tokio::test]
-async fn an_event_one_relay_never_takes_stops_after_its_attempts() {
+async fn an_event_one_relay_refuses_stops_after_its_attempts_but_waits_for_an_unreachable_one() {
     let (store, _directory) = store().await;
     let steady = super::relay::test_relay::spawn(Arc::new(|_: &serde_json::Value| {
         Some((true, String::new()))
     }))
     .await;
+    let refusing = super::relay::test_relay::spawn(Arc::new(|_: &serde_json::Value| {
+        Some((false, "blocked: not here".to_string()))
+    }))
+    .await;
     // Nothing listens here.
     let unreachable = "ws://127.0.0.1:1".to_string();
-    let relays = vec![steady, unreachable];
-    let recovery = recovery(relays.clone());
-    let player = Keys::new(secret(2)).public_key();
-    let event = recovery
-        .wallet_event(&player, &recovery.wallet_record("blob"), 100)
-        .unwrap();
-    store
-        .put_recovery_events(
-            vec![outbox(
-                recovery.wallet_d_tag(&player),
-                "wallet",
-                Some(&player),
-                None,
-                &event,
-            )],
-            0,
+    let recovery = recovery(vec![steady.clone()]);
+    let wallet = |byte: u8| {
+        let player = Keys::new(secret(byte)).public_key();
+        let event = recovery
+            .wallet_event(&player, &recovery.wallet_record("blob"), 100)
+            .unwrap();
+        outbox(
+            recovery.wallet_d_tag(&player),
+            "wallet",
+            Some(&player),
             None,
+            &event,
         )
+    };
+    let mut health = RelayHealth::default();
+
+    let relays = vec![steady.clone(), refusing];
+    store
+        .put_recovery_events(vec![wallet(2)], 0, None)
         .await
         .unwrap();
     let mut now = 0;
     for attempt in 1..=MAX_ATTEMPTS {
         assert_eq!(store.recovery_outbox_depth().await.unwrap(), 1, "{attempt}");
-        publish_due(&store, &relays, now).await.unwrap();
+        publish_due(&store, &relays, now, &mut health)
+            .await
+            .unwrap();
         now += retry_delay(attempt);
     }
     assert_eq!(store.recovery_outbox_depth().await.unwrap(), 0);
+
+    let relays = vec![steady, unreachable.clone()];
+    store
+        .put_recovery_events(vec![wallet(3)], now, None)
+        .await
+        .unwrap();
+    for attempt in 1..=MAX_ATTEMPTS + 2 {
+        publish_due(&store, &relays, now, &mut health)
+            .await
+            .unwrap();
+        now += retry_delay(attempt);
+    }
+    assert_eq!(store.recovery_outbox_depth().await.unwrap(), 1);
+    assert!(health.is_down(&unreachable));
+}
+
+/// A relay that was down for a while used to leave most of the outbox waiting out hour-long
+/// retries once it came back. Retries now wait at most five minutes, and a relay that answers
+/// again has everything waiting offered at once.
+#[tokio::test]
+async fn a_relay_that_answers_again_gets_the_backlog_at_once() {
+    let (store, _directory) = store().await;
+    let up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let relay = super::relay::test_relay::spawn_switchable(
+        Arc::new(|_: &serde_json::Value| Some((true, String::new()))),
+        up.clone(),
+    )
+    .await;
+    let relays = vec![relay.clone()];
+    let recovery = recovery(relays.clone());
+    let wallet = |byte: u8, created_at: i64| {
+        let player = Keys::new(secret(byte)).public_key();
+        let event = recovery
+            .wallet_event(&player, &recovery.wallet_record("blob"), created_at)
+            .unwrap();
+        outbox(
+            recovery.wallet_d_tag(&player),
+            "wallet",
+            Some(&player),
+            None,
+            &event,
+        )
+    };
+    let mut now = 1_000;
+    store
+        .put_recovery_events(vec![wallet(2, 1_000), wallet(3, 1_000)], now, None)
+        .await
+        .unwrap();
+
+    // While the relay is down each retry waits longer, but never more than five minutes.
+    let mut health = RelayHealth::default();
+    for wait in [60, 120, 240, MAX_RETRY_DELAY_SECS, 300, 300] {
+        publish_due(&store, &relays, now, &mut health)
+            .await
+            .unwrap();
+        assert!(health.is_down(&relay));
+        assert!(
+            store
+                .due_recovery_events(now + wait - 1, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{wait}"
+        );
+        assert_eq!(
+            store
+                .due_recovery_events(now + wait, 10)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        now += wait;
+    }
+
+    // The relay is back a minute after the last failure, long before the two records' next
+    // retry. A new record goes out at once, and the two waiting are made due with it.
+    up.store(true, std::sync::atomic::Ordering::SeqCst);
+    let now = now - MAX_RETRY_DELAY_SECS + DOWN_RELAY_PROBE_SECS;
+    assert!(store.due_recovery_events(now, 10).await.unwrap().is_empty());
+    store
+        .put_recovery_events(vec![wallet(4, now)], now, None)
+        .await
+        .unwrap();
+    publish_due(&store, &relays, now, &mut health)
+        .await
+        .unwrap();
+    assert!(!health.is_down(&relay));
+    assert_eq!(store.recovery_outbox_depth().await.unwrap(), 2);
+    assert_eq!(store.due_recovery_events(now, 10).await.unwrap().len(), 2);
+    publish_due(&store, &relays, now, &mut health)
+        .await
+        .unwrap();
+    assert_eq!(store.recovery_outbox_depth().await.unwrap(), 0);
+}
+
+/// A republish forgets that the named relays took each live record, and the records come due a
+/// few per tick; a publish that read a record before the republish does not undo it.
+#[tokio::test]
+async fn a_republish_offers_every_live_record_again_at_a_pace() {
+    let (store, _directory) = store().await;
+    let old = "wss://old.example".to_string();
+    let new = "wss://new.example".to_string();
+    let recovery = recovery(vec![old.clone(), new.clone()]);
+    let mut events = Vec::new();
+    for byte in 2..7u8 {
+        let player = Keys::new(secret(byte)).public_key();
+        let event = recovery
+            .wallet_event(&player, &recovery.wallet_record("blob"), 10)
+            .unwrap();
+        events.push(outbox(
+            recovery.wallet_d_tag(&player),
+            "wallet",
+            Some(&player),
+            None,
+            &event,
+        ));
+    }
+    store.put_recovery_events(events, 10, None).await.unwrap();
+    // Both relays took everything, as before the new relay was added.
+    let due = store.due_recovery_events(10, 10).await.unwrap();
+    store
+        .record_recovery_attempts(
+            due.iter()
+                .map(|event| crate::domain::RecoveryAttempt {
+                    d_tag: event.d_tag.clone(),
+                    content_sha256: event.content_sha256.clone(),
+                    deletion: None,
+                    attempts: event.attempts,
+                    accepted_before: event.accepted_relays.clone(),
+                    accepted_relays: vec![old.clone()],
+                    published_at: Some(10),
+                    next_attempt_at: 10,
+                    error: None,
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.recovery_outbox_depth().await.unwrap(), 0);
+    assert_eq!(store.recovery_relay_missing(&old).await.unwrap(), 0);
+    assert_eq!(store.recovery_relay_missing(&new).await.unwrap(), 5);
+
+    let queued = store
+        .requeue_recovery_records(vec![new.clone()], 100, 2, 5)
+        .await
+        .unwrap();
+    assert_eq!(queued, 5);
+    assert_eq!(store.recovery_outbox_depth().await.unwrap(), 5);
+    // A relay coming back, or a restart, does not undo the pace.
+    assert_eq!(store.reset_recovery_backoff(100).await.unwrap(), 0);
+    // Two per tick of five seconds.
+    assert_eq!(store.due_recovery_events(100, 10).await.unwrap().len(), 2);
+    assert_eq!(store.due_recovery_events(105, 10).await.unwrap().len(), 4);
+    let due = store.due_recovery_events(110, 10).await.unwrap();
+    assert_eq!(due.len(), 5);
+    // The relay that already had them keeps them; only the new one is offered them.
+    assert!(due
+        .iter()
+        .all(|event| event.accepted_relays == [old.clone()]));
+    assert!(due.iter().all(|event| event.attempts == 0));
+
+    // An attempt recorded from a read made before a re-queue changes nothing.
+    let first = &due[0];
+    store
+        .record_recovery_attempts(vec![crate::domain::RecoveryAttempt {
+            d_tag: first.d_tag.clone(),
+            content_sha256: first.content_sha256.clone(),
+            deletion: None,
+            attempts: 3,
+            accepted_before: vec![old.clone()],
+            accepted_relays: vec![old.clone(), new.clone()],
+            published_at: Some(110),
+            next_attempt_at: 400,
+            error: None,
+        }])
+        .await
+        .unwrap();
+    assert_eq!(store.recovery_outbox_depth().await.unwrap(), 5);
+
+    // Republishing to every relay forgets them all.
+    store
+        .requeue_recovery_records(Vec::new(), 200, 50, 5)
+        .await
+        .unwrap();
+    let due = store.due_recovery_events(200, 10).await.unwrap();
+    assert_eq!(due.len(), 5);
+    assert!(due.iter().all(|event| event.accepted_relays.is_empty()));
 }
 
 #[tokio::test]

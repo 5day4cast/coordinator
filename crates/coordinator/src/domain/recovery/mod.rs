@@ -12,12 +12,14 @@
 //! the player can compute, so relays never learn who entered. The same events make up the
 //! recovery file a player downloads from their account. See docs/RECOVERY.md for the formats.
 
+mod admin;
 mod publisher;
 mod relay;
 #[cfg(test)]
 mod tests;
 
-pub use publisher::{publish_due, RecoveryPublisher};
+pub use admin::{recovery_status, republish, RecoveryStatus, RelayStatus, RepublishReport};
+pub use publisher::{publish_due, RecoveryPublisher, RelayHealth, Retention};
 pub use relay::publish as publish_to_relay;
 
 use crate::domain::{RecoveryCompetitionRow, RecoveryTicketRow};
@@ -43,6 +45,9 @@ use uuid::Uuid;
 
 /// NIP-78 application data, replaceable by the `d` tag.
 pub const RECOVERY_EVENT_KIND: Kind = Kind::ApplicationSpecificData;
+
+/// NIP-09 deletion request, which retires a record whose money is settled.
+pub const DELETION_EVENT_KIND: Kind = Kind::EventDeletion;
 
 /// Prefix of the blind tag's preimage.
 const BLIND_TAG_DOMAIN: &[u8] = b"coordinator-recovery/v1";
@@ -393,6 +398,29 @@ impl Recovery {
         )
     }
 
+    /// The NIP-09 deletion of the record under `d_tag`, whose current version is `event_id`.
+    ///
+    /// It names the record both ways: by its address (`a`, every version up to the deletion's
+    /// `created_at`) as NIP-09 asks, and by the version's id (`e`), the only form some relays
+    /// (nostr-rs-relay among them) act on. `created_at` must follow the version's own.
+    pub fn deletion_event(
+        &self,
+        d_tag: &str,
+        event_id: &str,
+        created_at: i64,
+    ) -> Result<Event, anyhow::Error> {
+        let kind = RECOVERY_EVENT_KIND.as_u16().to_string();
+        let address = format!("{kind}:{}:{d_tag}", self.public_key().to_hex());
+        Ok(EventBuilder::new(DELETION_EVENT_KIND, "settled")
+            .tags(vec![
+                Tag::parse(["e", event_id])?,
+                Tag::parse(["a", address.as_str()])?,
+                Tag::parse(["k", kind.as_str()])?,
+            ])
+            .custom_created_at(Timestamp::from(created_at.max(0) as u64))
+            .sign_with_keys(&self.keys)?)
+    }
+
     /// A competition event: public, tagged with the competition id.
     pub fn competition_event(
         &self,
@@ -438,7 +466,7 @@ impl Recovery {
     ) -> Option<(PublicKey, EntryRecord)> {
         let user = ticket.entry_user.as_ref().or(ticket.reserved_by.as_ref())?;
         let user = PublicKey::from_hex(user).ok()?;
-        let entry_id = ticket.entry_id.or_else(|| policy_entry_id(ticket))?;
+        let entry_id = ticket_entry_id(ticket)?;
         let entry_pubkey = ticket
             .entry_pubkey
             .as_ref()
@@ -774,6 +802,12 @@ impl ContractView {
             outcome,
         }))
     }
+}
+
+/// The entry id a ticket's record is published under: its entry's, or the one its payout policy
+/// names before the entry is submitted.
+pub fn ticket_entry_id(ticket: &RecoveryTicketRow) -> Option<Uuid> {
+    ticket.entry_id.or_else(|| policy_entry_id(ticket))
 }
 
 /// The entry id a ticket's payout policy names, for a ticket no entry used yet.

@@ -625,6 +625,39 @@ pub async fn admin_settle_owed_winner_handler(
     )
 }
 
+/// Form data naming the relay to republish the recovery records to; none means every relay.
+#[derive(Debug, Default, Deserialize)]
+pub struct RepublishRecoveryForm {
+    #[serde(default)]
+    pub relay: String,
+}
+
+/// Offer every live recovery record again, from the Services page.
+pub async fn admin_republish_recovery_handler(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<RepublishRecoveryForm>,
+) -> Html<String> {
+    use crate::templates::admin::recovery::{republish_error, republish_result};
+    let relays: Vec<String> = Some(form.relay.trim().to_owned())
+        .filter(|relay| !relay.is_empty())
+        .into_iter()
+        .collect();
+    Html(
+        match crate::domain::recovery::republish(
+            state.recovery.as_deref(),
+            &state.coordinator.competition_store,
+            &relays,
+            OffsetDateTime::now_utc().unix_timestamp(),
+        )
+        .await
+        {
+            Ok(report) => republish_result(&report),
+            Err(e) => republish_error(&e.to_string()),
+        }
+        .into_string(),
+    )
+}
+
 /// Test-only: Settle a ticket's HODL invoice without real Lightning payment.
 /// Used by the synthetic testing tool. Marks the ticket as both paid and settled.
 /// The admin router never registers this route on mainnet.

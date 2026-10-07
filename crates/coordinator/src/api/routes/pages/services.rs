@@ -1,4 +1,5 @@
-//! Read-only operator dependency views. No signing or payment actions live here.
+//! Read-only operator dependency views. No signing or payment actions live here; the one
+//! action, republishing recovery records, sends again events that are signed already.
 use super::admin::render_admin_fragment;
 use crate::{
     api::admin_auth::AdminCsrf,
@@ -30,9 +31,13 @@ pub async fn services_page(
     Extension(csrf): Extension<AdminCsrf>,
     headers: HeaderMap,
 ) -> Html<String> {
-    let (data, competitions) = tokio::join!(
+    let (data, competitions, recovery) = tokio::join!(
         state.admin_monitoring.read_signals(Panel::Services),
-        state.coordinator.list_competitions()
+        state.coordinator.list_competitions(),
+        crate::domain::recovery::recovery_status(
+            state.recovery.as_deref(),
+            &state.coordinator.competition_store,
+        )
     );
     // Counted from the coordinator's own contracts: the oracle's metrics do not count every
     // reason an event cannot be signed.
@@ -59,6 +64,7 @@ pub async fn services_page(
             }
         }
         (signals(&state, Panel::Services, &data, "/admin/services", None))
+        (crate::templates::admin::recovery::recovery_section(recovery.as_ref().ok()))
     }};
     render_admin_fragment(&headers, &state, &csrf, "Services", content)
 }

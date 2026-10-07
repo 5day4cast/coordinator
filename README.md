@@ -173,7 +173,11 @@ enabled = true
 relays = ["wss://relay.example.org"]
 # Its own key, created on first start; every instance must share it.
 key_file = "./creds/coordinator_recovery_key.pem"
+# Records whose money is settled are deleted from the relays (NIP-09) after this many days.
+settled_retention_days = 7
 ```
+
+A relay added later gets the existing records with `coordinator admin recovery republish`.
 
 ### Operator access
 

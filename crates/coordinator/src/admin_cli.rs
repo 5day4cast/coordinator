@@ -1,6 +1,7 @@
 //! `coordinator admin`: drive competitions, write off escrow refunds that can never finish,
-//! release held payouts and settle owed winners, from a terminal or a script, through the operator listener and its bearer token. A client
-//! only; everything it does, the operator listener's HTTP API does.
+//! release held payouts, settle owed winners and republish recovery records, from a terminal or
+//! a script, through the operator listener and its bearer token. A client only; everything it
+//! does, the operator listener's HTTP API does.
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand};
@@ -15,8 +16,11 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
-    api::routes::{OperatorCompetition, SettleOwedWinnerRequest, WriteOffRequest},
+    api::routes::{
+        OperatorCompetition, RepublishRecoveryRequest, SettleOwedWinnerRequest, WriteOffRequest,
+    },
     domain::{
+        recovery::{RecoveryStatus, RepublishReport},
         CoordinatorFee, CreateEvent, CreateQueuedCompetition, OwedWinner, PayoutHold,
         WriteOffReport,
     },
@@ -71,6 +75,30 @@ pub enum AdminCommand {
     OwedWinners {
         #[command(subcommand)]
         action: OwedWinnerCommand,
+    },
+    /// Players' recovery records on the Nostr relays: what each relay lacks, and republishing
+    /// them to a relay added to `[recovery].relays`, which gets no backfill otherwise.
+    Recovery {
+        #[command(subcommand)]
+        action: RecoveryCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RecoveryCommand {
+    /// Each relay with the live records it has not taken, what waits to be published, and the
+    /// records by kind.
+    Status,
+    /// Offer every live record again to the relays given, each one of `[recovery].relays`, or
+    /// to every relay. They go out a few every few seconds; `status` shows what is left.
+    /// Records whose money settled and that were deleted are not sent again.
+    Republish {
+        /// A relay to republish to; give it again for more. None means every relay.
+        #[arg(long = "relay")]
+        relays: Vec<String>,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -543,6 +571,29 @@ impl AdminClient {
         Ok(checked(response).await?.json().await?)
     }
 
+    /// Where the recovery records stand.
+    pub async fn recovery_status(&self) -> Result<RecoveryStatus> {
+        let response = self
+            .request(reqwest::Method::GET, "/api/v1/admin/recovery")
+            .send()
+            .await
+            .context("reach the operator listener")?;
+        Ok(checked(response).await?.json().await?)
+    }
+
+    /// Offer every live recovery record again to `relays`, or to every relay.
+    pub async fn republish_recovery(&self, relays: &[String]) -> Result<RepublishReport> {
+        let response = self
+            .request(reqwest::Method::POST, "/api/v1/admin/recovery/republish")
+            .json(&RepublishRecoveryRequest {
+                relays: relays.to_vec(),
+            })
+            .send()
+            .await
+            .context("reach the operator listener")?;
+        Ok(checked(response).await?.json().await?)
+    }
+
     pub async fn delete(&self, id: Uuid) -> Result<()> {
         let response = self
             .request(
@@ -769,8 +820,77 @@ pub async fn run(args: AdminArgs) -> Result<()> {
                 }
             }
         },
+        AdminCommand::Recovery { action } => match action {
+            RecoveryCommand::Status => {
+                let status = client.recovery_status().await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&status)?);
+                } else {
+                    print!("{}", recovery_status_text(&status));
+                }
+            }
+            RecoveryCommand::Republish { relays, yes } => {
+                let to = if relays.is_empty() {
+                    String::from("every relay")
+                } else {
+                    relays.join(", ")
+                };
+                confirm(
+                    &format!("Offer every live recovery record to {to} again"),
+                    yes,
+                )?;
+                let report = client.republish_recovery(&relays).await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print!("{}", republish_text(&report));
+                }
+            }
+        },
     }
     Ok(())
+}
+
+/// Where the recovery records stand, a few lines.
+pub fn recovery_status_text(status: &RecoveryStatus) -> String {
+    let mut out = String::new();
+    if !status.enabled {
+        out.push_str("Recovery records are off ([recovery].enabled)\n");
+        return out;
+    }
+    let _ = writeln!(
+        out,
+        "Recovery key {} on {}; {} events waiting to publish",
+        status.coordinator_pubkey, status.network, status.outbox_depth
+    );
+    if status.relays.is_empty() {
+        out.push_str("No relay is configured: records are kept for the recovery file only\n");
+    }
+    for relay in &status.relays {
+        let _ = writeln!(
+            out,
+            "Relay {}: lacks {} live records",
+            relay.url, relay.missing
+        );
+    }
+    for kind in &status.records {
+        let _ = writeln!(
+            out,
+            "{} records: {} live ({} settled, awaiting deletion), {} deleted",
+            kind.kind, kind.live, kind.settled, kind.retired
+        );
+    }
+    out
+}
+
+/// What a republish queued, one line.
+pub fn republish_text(report: &RepublishReport) -> String {
+    format!(
+        "Queued {} recovery records for {}; the last goes out in about {} s\n",
+        report.queued,
+        report.relays.join(", "),
+        report.seconds
+    )
 }
 
 /// The owed winners, one line each.
@@ -1386,5 +1506,76 @@ mod tests {
         assert!(text.contains("9000 sats"), "{text}");
         assert!(text.contains("still owed"), "{text}");
         assert!(text.contains("from block 500"), "{text}");
+    }
+
+    #[test]
+    fn recovery_commands_parse_and_report() {
+        use crate::domain::{recovery::RelayStatus, RecoveryKindCount};
+        match parse(&[
+            "recovery",
+            "republish",
+            "--relay",
+            "wss://a.example",
+            "--relay",
+            "wss://b.example",
+            "--yes",
+        ])
+        .command
+        {
+            AdminCommand::Recovery {
+                action: RecoveryCommand::Republish { relays, yes },
+            } => {
+                assert_eq!(relays, ["wss://a.example", "wss://b.example"]);
+                assert!(yes);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            parse(&["recovery", "republish"]).command,
+            AdminCommand::Recovery {
+                action: RecoveryCommand::Republish { ref relays, yes: false }
+            } if relays.is_empty()
+        ));
+        assert!(matches!(
+            parse(&["recovery", "status"]).command,
+            AdminCommand::Recovery {
+                action: RecoveryCommand::Status
+            }
+        ));
+
+        assert_eq!(
+            recovery_status_text(&RecoveryStatus::default()),
+            "Recovery records are off ([recovery].enabled)\n"
+        );
+        let text = recovery_status_text(&RecoveryStatus {
+            enabled: true,
+            coordinator_pubkey: "bd".repeat(32),
+            network: "signet".into(),
+            relays: vec![RelayStatus {
+                url: "wss://a.example".into(),
+                missing: 12,
+            }],
+            outbox_depth: 3,
+            records: vec![RecoveryKindCount {
+                kind: "entry".into(),
+                live: 20,
+                settled: 5,
+                retired: 9,
+            }],
+        });
+        assert!(
+            text.contains("Relay wss://a.example: lacks 12 live records"),
+            "{text}"
+        );
+        assert!(text.contains("3 events waiting"), "{text}");
+        assert!(text.contains("entry records: 20 live (5 settled"), "{text}");
+        assert_eq!(
+            republish_text(&RepublishReport {
+                relays: vec!["wss://a.example".into()],
+                queued: 40,
+                seconds: 10,
+            }),
+            "Queued 40 recovery records for wss://a.example; the last goes out in about 10 s\n"
+        );
     }
 }

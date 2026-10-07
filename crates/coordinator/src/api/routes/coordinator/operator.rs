@@ -1,8 +1,8 @@
 //! Competition views for the operator listener's scripts and command line
 //! (`coordinator admin`): what state each competition is in, how far it has settled, the errors
 //! it kept, and how far its escrow refunds have got; writing off escrow refunds that can never
-//! finish; the Lightning payouts held after a restore; and the winners owed because their
-//! Lightning payout window closed unpaid.
+//! finish; the Lightning payouts held after a restore; the winners owed because their
+//! Lightning payout window closed unpaid; and the recovery records on the Nostr relays.
 
 use axum::{
     body::Bytes,
@@ -303,6 +303,47 @@ pub async fn operator_settle_owed_winner(
             .coordinator
             .settle_owed_winner(entry_id, &request.note)
             .await?,
+    ))
+}
+
+/// Where the recovery records stand (`coordinator admin recovery status`): each relay with the
+/// live records it has not taken, the outbox, and the records by kind. `enabled` is false, and
+/// nothing else is filled in, while recovery records are off.
+pub async fn operator_recovery_status(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<crate::domain::recovery::RecoveryStatus>, ApiError> {
+    Ok(Json(
+        crate::domain::recovery::recovery_status(
+            state.recovery.as_deref(),
+            &state.coordinator.competition_store,
+        )
+        .await?,
+    ))
+}
+
+/// Which relays a republish offers the recovery records to again.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RepublishRecoveryRequest {
+    /// Relays from `[recovery].relays`; none means every one of them.
+    #[serde(default)]
+    pub relays: Vec<String>,
+}
+
+/// Offer every live recovery record again (`coordinator admin recovery republish`), to the
+/// relays named or to all of them, at a limited pace: how a relay added to `[recovery].relays`
+/// gets the records published before it was.
+pub async fn operator_republish_recovery(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<RepublishRecoveryRequest>,
+) -> Result<Json<crate::domain::recovery::RepublishReport>, ApiError> {
+    Ok(Json(
+        crate::domain::recovery::republish(
+            state.recovery.as_deref(),
+            &state.coordinator.competition_store,
+            &request.relays,
+            OffsetDateTime::now_utc().unix_timestamp(),
+        )
+        .await?,
     ))
 }
 

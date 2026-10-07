@@ -8,3 +8,4 @@ pub mod transactions;
 
 pub mod funds;
 pub mod owed_winners;
+pub mod recovery;
