@@ -231,6 +231,18 @@ impl UserStore {
         Ok(result)
     }
 
+    /// Accounts created at or after `since`. The sign-up proof of work grows harder with it.
+    pub async fn count_signups_since(&self, since: OffsetDateTime) -> Result<u64, Error> {
+        // julianday reads both the RFC 3339 timestamps rows are written with and SQLite's own.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM user WHERE julianday(created_at) >= julianday(?)",
+        )
+        .bind(since)
+        .fetch_one(self.db_connection.read())
+        .await?;
+        Ok(u64::try_from(count).unwrap_or_default())
+    }
+
     pub async fn get_username_by_pubkey(
         &self,
         nostr_pubkey: &str,
@@ -667,6 +679,53 @@ mod tests {
 
         let recent_users = store.get_recent_users(3).await.unwrap();
         assert_eq!(recent_users.len(), 3);
+    }
+
+    #[sqlx::test(migrations = "./migrations/users")]
+    async fn signups_are_counted_from_a_time_on(pool: SqlitePool) {
+        let store = create_store(pool.clone());
+        for i in 0..3 {
+            let payload = RegisterPayload {
+                encrypted_bitcoin_private_key: format!("key_{}", i),
+                network: "testnet".to_string(),
+                lightning_address: "tester@mock-wallet.dev".to_string(),
+            };
+            store
+                .register_user(format!("pubkey_{}", i), payload)
+                .await
+                .unwrap();
+        }
+        let now = OffsetDateTime::now_utc();
+        sqlx::query("UPDATE user SET created_at = ? WHERE nostr_pubkey = 'pubkey_0'")
+            .bind(now - time::Duration::hours(2))
+            .execute(&pool)
+            .await
+            .unwrap();
+        // A row stamped by SQLite's own CURRENT_TIMESTAMP counts too.
+        sqlx::query(
+            "INSERT INTO user (nostr_pubkey, encrypted_bitcoin_private_key, network)
+             VALUES ('sqlite_default', 'key_default', 'testnet')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let hour_ago = now - time::Duration::hours(1);
+        assert_eq!(store.count_signups_since(hour_ago).await.unwrap(), 3);
+        assert_eq!(
+            store
+                .count_signups_since(now - time::Duration::hours(3))
+                .await
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            store
+                .count_signups_since(now + time::Duration::minutes(1))
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[sqlx::test(migrations = "./migrations/users")]

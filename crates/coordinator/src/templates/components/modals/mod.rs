@@ -1,5 +1,7 @@
 use maud::{html, Markup};
 
+use crate::templates::assets::POW_WORKER_JS;
+
 /// What a player is told about their recovery key at sign-up, which depends on whether this
 /// deployment keeps recovery records (`[recovery]`) and publishes them to relays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,7 +182,9 @@ fn lightning_address_field(id: &str) -> Markup {
 
 fn register_modal(recovery: RecoveryHelp) -> Markup {
     html! {
-        div id="registerModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="registerModalTitle" tabindex="-1" {
+        // The worker that solves the sign-up proof of work (signup_pow.js).
+        div id="registerModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="registerModalTitle" tabindex="-1"
+            data-pow-worker=(POW_WORKER_JS.url) {
             div class="modal-background" {}
             div class="modal-card" {
                 header class="modal-card-head" {
@@ -485,5 +489,17 @@ mod tests {
                 "{help:?}"
             );
         }
+    }
+
+    /// The sign-up dialog names the proof-of-work worker's hashed asset, the one URL its
+    /// Trusted Types policy admits.
+    #[test]
+    fn sign_up_names_its_proof_of_work_worker() {
+        let html = auth_modals(RecoveryHelp::Off).into_string();
+        assert!(POW_WORKER_JS.url.starts_with("/assets/pow-worker."));
+        assert!(html.contains(&format!(
+            r#"id="registerModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="registerModalTitle" tabindex="-1" data-pow-worker="{}""#,
+            POW_WORKER_JS.url
+        )));
     }
 }

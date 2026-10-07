@@ -1,4 +1,9 @@
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
 use blake2::{
     digest::{consts::U32, KeyInit, Mac},
     Blake2bMac,
@@ -15,7 +20,9 @@ use crate::{
     },
     domain::{
         self,
-        users::{hash_auth_key, verify_auth_key, AuthKey, NewUsernameUser, PasswordError},
+        users::{
+            hash_auth_key, verify_auth_key, AuthKey, NewUsernameUser, PasswordError, PowProof,
+        },
     },
     infra::lnurl::{LightningAddress, LnurlError, LnurlPay},
     startup::AppState,
@@ -68,6 +75,38 @@ async fn verify_auth_key_blocking(
     .map_err(|e| ApiError::from(credential_error(e)))
 }
 
+fn unix_now() -> u64 {
+    u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap_or_default()
+}
+
+/// A proof-of-work challenge for creating an account (see `domain::users::SignupPow`), or 204
+/// when sign-ups need none. Signing in never needs one.
+pub async fn signup_pow_challenge(
+    State(state): State<Arc<AppState>>,
+) -> Result<Response, ApiError> {
+    let pow = &state.signup_pow;
+    if !pow.enabled() {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+    let difficulty = pow.required_bits(&state.users_info).await?;
+    Ok(Json(pow.issue(difficulty, unix_now())).into_response())
+}
+
+/// Spend the proof of work an account creation carries, when sign-ups need one. Checked before
+/// the Lightning Address, so the server makes no outbound request for an unpaid sign-up.
+async fn spend_signup_pow(state: &AppState, proof: &PowProof) -> Result<(), ApiError> {
+    let pow = &state.signup_pow;
+    if !pow.enabled() {
+        return Ok(());
+    }
+    let required = pow.required_bits(&state.users_info).await?;
+    pow.verify(proof, required, unix_now())
+        .map_err(|rejection| {
+            info!("Sign-up proof of work refused: {}", rejection.label());
+            ApiError::from(rejection)
+        })
+}
+
 pub async fn login(
     NostrAuth { pubkey, .. }: NostrAuth,
     State(state): State<Arc<AppState>>,
@@ -95,6 +134,15 @@ pub struct RegisterPayload {
     pub network: String,
     /// LUD-16 address winnings are paid to.
     pub lightning_address: String,
+}
+
+/// What a Nostr-extension sign-up sends: the account and its proof of work.
+#[derive(Deserialize)]
+pub struct RegisterRequest {
+    #[serde(flatten)]
+    pub account: RegisterPayload,
+    #[serde(flatten)]
+    pub pow: PowProof,
 }
 
 /// How long saving a Lightning Address waits for its provider, resolving it and making an
@@ -191,12 +239,13 @@ pub async fn register(
     State(state): State<Arc<AppState>>,
     AuthedJson {
         auth: NostrAuth { pubkey, .. },
-        body,
-    }: AuthedJson<RegisterPayload>,
+        body: RegisterRequest { account: body, pow },
+    }: AuthedJson<RegisterRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let pubkey = pubkey.to_bech32().unwrap_or_else(|never| match never {});
 
     debug!("registering user: {}", pubkey);
+    spend_signup_pow(&state, &pow).await?;
     let address = checked_lightning_address(&state, &body.lightning_address).await?;
     let body = RegisterPayload {
         lightning_address: address.to_string(),
@@ -221,6 +270,11 @@ pub struct UsernameRegisterPayload {
     pub encrypted_bitcoin_private_key: String,
     pub network: String,
     pub lightning_address: String,
+    /// The sign-up's proof of work; see [`PowProof`].
+    #[serde(default)]
+    pub pow_challenge: Option<String>,
+    #[serde(default)]
+    pub pow_nonce: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,7 +315,7 @@ pub async fn register_username(
     State(state): State<Arc<AppState>>,
     AuthedJson {
         auth: NostrAuth { pubkey, .. },
-        body,
+        mut body,
     }: AuthedJson<UsernameRegisterPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
     let nostr_pubkey = pubkey.to_bech32().unwrap_or_else(|never| match never {});
@@ -270,6 +324,11 @@ pub async fn register_username(
     if let Err(e) = validate_username(&body.username) {
         return Err(ApiError::from(domain::Error::BadRequest(e)));
     }
+    let pow = PowProof {
+        pow_challenge: body.pow_challenge.take(),
+        pow_nonce: body.pow_nonce.take(),
+    };
+    spend_signup_pow(&state, &pow).await?;
     let lightning_address = checked_lightning_address(&state, &body.lightning_address)
         .await?
         .to_string();

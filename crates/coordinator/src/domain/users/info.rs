@@ -26,6 +26,11 @@ impl UserInfo {
         self.user_store.login(pubkey).await
     }
 
+    /// Accounts created at or after `since`.
+    pub async fn count_signups_since(&self, since: time::OffsetDateTime) -> Result<u64, Error> {
+        self.user_store.count_signups_since(since).await
+    }
+
     pub async fn register_username_user(&self, user: NewUsernameUser) -> Result<User, Error> {
         self.user_store.register_username_user(user).await
     }

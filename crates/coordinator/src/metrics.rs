@@ -234,6 +234,42 @@ pub static RECOVERY_REPUBLISHED: LazyLock<IntCounter> = LazyLock::new(|| {
     .expect("valid metric")
 });
 
+/// Proofs of work account creations carried, by result: `verified`, or why one was refused
+/// (`missing`, `malformed`, `forged`, `expired`, `too_easy`, `wrong_nonce`, `reused`). See
+/// `domain::users::SignupPow`.
+pub static SIGNUP_POW_CHECKS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "coordinator_signup_pow_checks_total",
+            "Proofs of work checked on account creation, by result",
+        ),
+        &["result"],
+    )
+    .expect("valid metric")
+});
+
+/// Every result [`SIGNUP_POW_CHECKS`] counts, so each series reads 0 from the start.
+pub const SIGNUP_POW_RESULTS: [&str; 8] = [
+    "verified",
+    "missing",
+    "malformed",
+    "forged",
+    "expired",
+    "too_easy",
+    "wrong_nonce",
+    "reused",
+];
+
+/// Leading zero bits a new account's proof of work needs now; 0 while proofs are off. Set when
+/// a challenge is issued or a proof is checked.
+pub static SIGNUP_POW_DIFFICULTY: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "coordinator_signup_pow_difficulty_bits",
+        "Leading zero bits a new account's proof of work needs, 0 while proofs are off",
+    )
+    .expect("valid metric")
+});
+
 /// Whether entries to Arkade competitions are paused because the Arkade server is failing
 /// batch steps (1) or not (0). Set where the pause is decided (`ArkadeHealth`).
 pub static ARKADE_UNAVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
@@ -582,6 +618,15 @@ impl Metrics {
             .registry
             .register(Box::new(ARKADE_UNAVAILABLE.clone()))?;
         metrics.registry.register(Box::new(SETTLE_ONLY.clone()))?;
+        metrics
+            .registry
+            .register(Box::new(SIGNUP_POW_CHECKS.clone()))?;
+        metrics
+            .registry
+            .register(Box::new(SIGNUP_POW_DIFFICULTY.clone()))?;
+        for result in SIGNUP_POW_RESULTS {
+            SIGNUP_POW_CHECKS.with_label_values(&[result]);
+        }
         metrics.registry.register(Box::new(PAYOUT_HOLDS.clone()))?;
         metrics
             .registry
@@ -855,6 +900,8 @@ mod tests {
             "coordinator_competition_step_failures_total",
             "coordinator_arkade_unavailable",
             "coordinator_settle_only",
+            "coordinator_signup_pow_checks_total",
+            "coordinator_signup_pow_difficulty_bits",
             "coordinator_payout_holds",
             "coordinator_recovery_relay_publishes_total",
             "coordinator_recovery_outbox_depth",
@@ -890,6 +937,7 @@ mod tests {
             "coordinator_payout_attempts_total{result=\"failed\"}",
             "coordinator_recovery_relay_publishes_total{result=\"failed\"}",
             "coordinator_recovery_deletions_total{kind=\"entry\"}",
+            "coordinator_signup_pow_checks_total{result=\"too_easy\"}",
             "coordinator_payout_send_failures_total{reason=\"FAILURE_REASON_NO_ROUTE\"}",
             "coordinator_payout_send_failures_total{reason=\"other\"}",
         ] {

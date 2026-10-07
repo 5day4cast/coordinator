@@ -119,6 +119,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             content_type: "text/javascript; charset=utf-8",
             bytes: bundle_scripts(&[static_dir.join("login-worker.js")], "login-worker")?,
         },
+        // Solves the sign-up proof of work; see components/modals/signup_pow.js.
+        Asset {
+            constant: "POW_WORKER_JS",
+            stem: "pow-worker",
+            extension: "js",
+            content_type: "text/javascript; charset=utf-8",
+            bytes: bundle_scripts(
+                &[
+                    static_dir.join("sha256.js"),
+                    static_dir.join("pow-worker.js"),
+                ],
+                "pow-worker",
+            )?,
+        },
         // The recovery page's only script; also shipped in its standalone copy.
         Asset {
             constant: "RECOVER_JS",
