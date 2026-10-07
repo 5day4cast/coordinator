@@ -1381,12 +1381,17 @@ impl CompetitionStore {
     }
 
     /// Competitions with lifecycle work left, as the runners' sweep sees them. A queued
-    /// competition that formed its pools has none: its pools run instead.
+    /// competition that formed its pools has none: its pools run instead. A cancelled one whose
+    /// contract holds the pot has: its funding confirmed, or an Arkade batch funded it.
     pub async fn active_competition_ids(&self) -> Result<Vec<Uuid>, sqlx::Error> {
         let ids = sqlx::query_scalar::<_, String>(
             "SELECT id FROM competitions
              WHERE completed_at IS NULL
-               AND (cancelled_at IS NULL OR funding_confirmed_at IS NOT NULL)
+               AND (cancelled_at IS NULL OR funding_confirmed_at IS NOT NULL
+                    OR (funding_broadcasted_at IS NOT NULL
+                        AND EXISTS (SELECT 1 FROM ark_funded_competitions a
+                                    WHERE a.event_id = competitions.id
+                                      AND a.commitment_tx IS NOT NULL)))
                AND NOT (kind = 'queued' AND pools_formed_at IS NOT NULL)",
         )
         .fetch_all(self.db_connection.read())

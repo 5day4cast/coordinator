@@ -29,15 +29,32 @@ pub struct StoreCounts {
     pub oldest_open_payout_job_age_secs: i64,
 }
 
-impl CompetitionStore {
+/// Competitions by state, from one read of them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompetitionCounts {
     /// Competitions by the state name their runner reports.
-    pub async fn competition_state_counts(&self) -> Result<Vec<(&'static str, i64)>, sqlx::Error> {
-        let mut counts: Vec<(&'static str, i64)> = Vec::new();
+    pub states: Vec<(&'static str, i64)>,
+    /// Competitions waiting for their funding to confirm whose last check could not read the
+    /// chain. They are tried again, backing off, and never fail for it.
+    pub funding_checks_failing: i64,
+}
+
+impl CompetitionStore {
+    /// Competitions by the state name their runner reports, and those whose funding checks fail.
+    pub async fn competition_state_counts(&self) -> Result<CompetitionCounts, sqlx::Error> {
+        let mut counts = CompetitionCounts::default();
         for competition in self.get_competitions(false).await? {
-            let state = CompetitionStatus::from(competition).state_name();
-            match counts.iter_mut().find(|(name, _)| *name == state) {
+            let status = CompetitionStatus::from(competition);
+            let state = status.state_name();
+            if let CompetitionStatus::FundingBroadcasted(waiting) = &status {
+                use super::states::HasCompetitionData;
+                if waiting.competition().failed_funding_checks() > 0 {
+                    counts.funding_checks_failing += 1;
+                }
+            }
+            match counts.states.iter_mut().find(|(name, _)| *name == state) {
                 Some((_, count)) => *count += 1,
-                None => counts.push((state, 1)),
+                None => counts.states.push((state, 1)),
             }
         }
         Ok(counts)

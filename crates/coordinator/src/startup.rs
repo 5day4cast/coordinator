@@ -445,7 +445,7 @@ pub async fn build_app(
     let http_client = Client::new();
     let reqwest_client = build_reqwest_client(http_client.clone());
     let ln = create_lightning_client(&config, reqwest_client.clone()).await?;
-    let oracle_client = create_oracle_client(&config, http_client.clone())?;
+    let oracle_client = create_oracle_client(&config, oracle_http_client()?)?;
     create_folder(&config.db_settings.data_folder.clone());
 
     let pool_config: DatabasePoolConfig = config.db_settings.clone().into();
@@ -1401,6 +1401,28 @@ pub fn build_reqwest_client(client: Client) -> ClientWithMiddleware {
         .with(RetryTransientMiddleware::new_with_policy(retry_policy))
         .with(LoggingMiddleware)
         .build()
+}
+
+/// The longest one request to the oracle may take, from connecting to the end of its body.
+/// Without a limit, a connection the oracle, or the network on the way to it, accepted and then
+/// never answered held a competition step, and one of the few step slots, indefinitely. A
+/// request that times out is retried within the bound of [`build_oracle_reqwest_client`].
+pub const ORACLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// The longest connecting to the oracle may take.
+pub const ORACLE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The HTTP client the coordinator reaches the oracle with: every request is bounded by
+/// [`ORACLE_CONNECT_TIMEOUT`] and [`ORACLE_REQUEST_TIMEOUT`].
+pub fn oracle_http_client() -> Result<Client, anyhow::Error> {
+    oracle_http_client_with(ORACLE_CONNECT_TIMEOUT, ORACLE_REQUEST_TIMEOUT)
+}
+
+fn oracle_http_client_with(connect: Duration, request: Duration) -> Result<Client, anyhow::Error> {
+    Client::builder()
+        .connect_timeout(connect)
+        .timeout(request)
+        .build()
+        .map_err(|error| anyhow!("Failed to build the oracle HTTP client: {error}"))
 }
 
 /// Build a reqwest client for the oracle with more forgiving retry policy.

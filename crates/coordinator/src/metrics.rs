@@ -412,6 +412,8 @@ pub struct Metrics {
     payout_jobs_failed: IntGauge,
     payout_jobs_retrying: IntGauge,
     payout_job_oldest_open_age: IntGauge,
+    /// Competitions waiting for funding to confirm whose last check could not read the chain.
+    funding_checks_failing: IntGauge,
     background_thread_up: IntGaugeVec,
 }
 
@@ -464,6 +466,10 @@ impl Metrics {
             payout_job_oldest_open_age: gauge(
                 "coordinator_payout_job_oldest_open_age_seconds",
                 "Age of the oldest open automatic payout job, 0 when none is open",
+            )?,
+            funding_checks_failing: gauge(
+                "coordinator_funding_checks_failing",
+                "Competitions waiting for their funding to confirm whose last check could not read the chain",
             )?,
             background_thread_up: gauge_vec(
                 "coordinator_background_thread_up",
@@ -606,9 +612,11 @@ impl Metrics {
                 for state in COMPETITION_STATES {
                     self.competitions.with_label_values(&[state]).set(0);
                 }
-                for (state, count) in counts {
+                for (state, count) in counts.states {
                     self.competitions.with_label_values(&[state]).set(count);
                 }
+                self.funding_checks_failing
+                    .set(counts.funding_checks_failing);
             }
             Err(error) => {
                 warn!("Cannot count competitions for metrics: {error}");
@@ -731,6 +739,7 @@ mod tests {
             "coordinator_payout_jobs_failed",
             "coordinator_payout_jobs_retrying",
             "coordinator_payout_job_oldest_open_age_seconds",
+            "coordinator_funding_checks_failing",
             "coordinator_background_thread_up",
             "coordinator_payout_attempts_total",
             "coordinator_payout_send_failures_total",

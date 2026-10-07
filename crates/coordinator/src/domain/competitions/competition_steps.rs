@@ -69,6 +69,27 @@ impl Coordinator {
             return self.advance_queued_competition(competition, lease).await;
         }
 
+        // An Arkade batch moves the pot into the contract before the batch confirms. A pool an
+        // earlier version failed, then cancelled, while it waited for that confirmation is picked
+        // up again, as a stranded settlement is: nothing else would ever move its pot.
+        if competition.funding_broadcasted_at.is_some()
+            && competition.funding_confirmed_at.is_none()
+            && (competition.failed_at.is_some() || competition.cancelled_at.is_some())
+            && self
+                .competition_store
+                .ark_commitment(competition_id)
+                .await
+                .map_err(|e| {
+                    anyhow!("Failed to read competition {competition_id}'s Arkade commitment: {e}")
+                })?
+                .is_some()
+            && competition.resume_funded_kickoff()
+        {
+            warn!(
+                "Resuming competition {competition_id}: an Arkade batch funded its contract, but \
+                 it was stopped as failed or cancelled while its funding confirmed"
+            );
+        }
         if competition.resume_stranded_settlement() {
             warn!(
                 "Resuming settlement of competition {competition_id}: its contract holds the pot \
@@ -1118,5 +1139,244 @@ mod tests {
             .unwrap()
             .is_cancelled());
         database.close().await.unwrap();
+    }
+
+    /// A funded competition waiting for its funding to confirm, with no funding transaction to
+    /// look up, so every check of it fails as a chain outage does.
+    fn funding_unreadable() -> Competition {
+        let mut competition = funded_competition();
+        competition.funding_confirmed_at = None;
+        competition.funding_settled_at = None;
+        competition.awaiting_attestation_at = None;
+        competition.funding_transaction = None;
+        competition
+    }
+
+    /// Chain checks that fail while the funding confirms are retried, backing off, and never
+    /// fail the competition: six in a row used to fail it for good with the pot in the contract.
+    #[tokio::test]
+    async fn funding_checks_that_cannot_read_the_chain_keep_retrying_and_back_off() {
+        let directory = tempfile::tempdir().unwrap();
+        let (coordinator, database) = test_coordinator(directory.path()).await;
+        let idle = std::time::Duration::from_secs(15);
+
+        let mut status = CompetitionStatus::from(funding_unreadable());
+        assert_eq!(status.state_name(), "funding_broadcasted");
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(status.next_check(now, idle), now + idle);
+        for _ in 0..(KEPT_SETTLEMENT_ERRORS + 4) {
+            status = coordinator.process_status(status).await;
+            assert_eq!(status.state_name(), "funding_broadcasted");
+        }
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            status.next_check(now, idle),
+            now + crate::domain::competitions::states::MAX_FUNDING_CHECK_BACKOFF,
+            "repeated failures back off to the longest wait"
+        );
+        let competition = status.into_competition();
+        assert!(competition.failed_at.is_none() && competition.cancelled_at.is_none());
+        assert_eq!(competition.errors.len(), KEPT_SETTLEMENT_ERRORS);
+        assert_eq!(competition.failed_funding_checks(), KEPT_SETTLEMENT_ERRORS);
+        assert_eq!(
+            CompetitionStatus::from(competition.clone()).state_name(),
+            "funding_broadcasted",
+            "it reloads in the state it retries from"
+        );
+
+        // The gauge counts it while its checks fail.
+        let store = &coordinator.competition_store;
+        store
+            .add_competition_with_tickets(competition.clone(), vec![])
+            .await
+            .unwrap();
+        store
+            .update_competitions(vec![competition.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .competition_state_counts()
+                .await
+                .unwrap()
+                .funding_checks_failing,
+            1
+        );
+        database.close().await.unwrap();
+    }
+
+    #[test]
+    fn funding_checks_back_off_from_idle_to_five_minutes() {
+        use crate::domain::competitions::states::{funding_check_retry, MAX_FUNDING_CHECK_BACKOFF};
+        let now = OffsetDateTime::now_utc();
+        let idle = std::time::Duration::from_secs(15);
+        assert_eq!(funding_check_retry(now, idle, 0), now + idle);
+        assert_eq!(funding_check_retry(now, idle, 1), now + idle * 2);
+        assert_eq!(funding_check_retry(now, idle, 3), now + idle * 8);
+        assert_eq!(
+            funding_check_retry(now, idle, 5),
+            now + MAX_FUNDING_CHECK_BACKOFF
+        );
+        assert_eq!(
+            funding_check_retry(now, idle, usize::MAX),
+            now + MAX_FUNDING_CHECK_BACKOFF
+        );
+        // An idle period longer than the cap is never shortened.
+        let long = std::time::Duration::from_secs(3600);
+        assert_eq!(funding_check_retry(now, long, 4), now + long);
+    }
+
+    /// A pool an Arkade batch funded, that an earlier version failed and cancelled while its
+    /// funding confirmed, is swept again and resumes: its pot is in the contract. One without a
+    /// stored commitment stays cancelled.
+    #[tokio::test]
+    async fn a_cancelled_pool_whose_batch_funded_it_resumes() {
+        let directory = tempfile::tempdir().unwrap();
+        let (coordinator, database) = test_coordinator(directory.path()).await;
+        let store = &coordinator.competition_store;
+        let now = OffsetDateTime::now_utc();
+
+        let stranded_pool = |id_hint: u8| {
+            let mut pool = funding_unreadable();
+            pool.funding_transaction = Some(Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![],
+                output: vec![TxOut {
+                    value: Amount::from_sat(100_000 + u64::from(id_hint)),
+                    script_pubkey: ScriptBuf::new(),
+                }],
+            });
+            pool.failed_at = Some(now - time::Duration::hours(2));
+            pool.cancelled_at = Some(now - time::Duration::hours(1));
+            pool
+        };
+        let funded = stranded_pool(1);
+        let unfunded = stranded_pool(2);
+        for pool in [&funded, &unfunded] {
+            store
+                .add_competition_with_tickets(pool.clone(), vec![])
+                .await
+                .unwrap();
+            store.update_competitions(vec![pool.clone()]).await.unwrap();
+            store.mark_ark_funded(pool.id).await.unwrap();
+        }
+        let commitment = funded.funding_transaction.clone().unwrap();
+        store
+            .store_ark_commitment(
+                funded.id,
+                crate::domain::ArkCommitment {
+                    batch_id: "batch".into(),
+                    commitment_tx: bitcoin::consensus::encode::serialize_hex(&commitment),
+                    funding_vout: 0,
+                },
+            )
+            .await
+            .unwrap();
+
+        let active = store.active_competition_ids().await.unwrap();
+        assert!(
+            active.contains(&funded.id),
+            "the funded pool is swept again"
+        );
+        assert!(!active.contains(&unfunded.id));
+
+        let step = coordinator
+            .advance_competition(
+                funded.id,
+                &lease(&coordinator, funded.id).await,
+                &Pacing::default(),
+            )
+            .await
+            .unwrap();
+        assert!(!matches!(step, Step::Finished));
+        let resumed = store.get_competition(funded.id).await.unwrap();
+        assert!(resumed.failed_at.is_none() && resumed.cancelled_at.is_none());
+        assert!(
+            resumed.funding_confirmed_at.is_some(),
+            "it carries on from its funding confirmation"
+        );
+
+        let mut unfunded = store.get_competition(unfunded.id).await.unwrap();
+        let mut settled = unfunded.clone();
+        settled.completed_at = Some(now);
+        assert!(!settled.resume_funded_kickoff());
+        assert!(
+            unfunded.resume_funded_kickoff(),
+            "only the caller checks the batch"
+        );
+        database.close().await.unwrap();
+    }
+
+    /// A competition's oracle steps are tried again until a pool's setup deadline after it
+    /// became ready for them, then it fails. It used to fail at the first oracle error.
+    #[tokio::test]
+    async fn oracle_steps_retry_until_their_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let (coordinator, database) = test_coordinator(directory.path()).await;
+        let now = OffsetDateTime::now_utc();
+        let ready = |created: OffsetDateTime| {
+            let mut competition = open_competition();
+            competition.total_entries = 3;
+            competition.total_paid_entries = 3;
+            competition.escrow_funds_confirmed_at = Some(created);
+            competition.event_created_at = Some(created);
+            competition
+        };
+
+        // No entry reaches the oracle: there is none in the database.
+        let mut status = CompetitionStatus::from(ready(now - time::Duration::minutes(10)));
+        assert_eq!(status.state_name(), "event_created");
+        for _ in 0..(KEPT_SETTLEMENT_ERRORS + 2) {
+            status = coordinator.process_status(status).await;
+            assert_eq!(status.state_name(), "event_created");
+        }
+        let competition = status.into_competition();
+        assert!(competition.failed_at.is_none());
+        assert_eq!(competition.errors.len(), KEPT_SETTLEMENT_ERRORS);
+
+        let late = coordinator
+            .process_status(CompetitionStatus::from(ready(
+                now - super::super::queued_kickoff::POOL_SETUP_DEADLINE
+                    - time::Duration::minutes(1),
+            )))
+            .await;
+        assert_eq!(late.state_name(), "failed");
+        let reason = late.into_competition().errors.last().unwrap().to_string();
+        assert!(reason.contains("No paid entries"), "{reason}");
+        database.close().await.unwrap();
+    }
+
+    #[test]
+    fn an_oracle_step_deadline_counts_from_when_the_competition_was_ready() {
+        let now = OffsetDateTime::now_utc();
+        let mut competition = open_competition();
+        competition.created_at = now - time::Duration::days(3);
+        assert_eq!(
+            oracle_step_deadline(&competition),
+            competition.created_at + super::super::queued_kickoff::POOL_SETUP_DEADLINE
+        );
+        competition.escrow_funds_confirmed_at = Some(now - time::Duration::minutes(5));
+        assert_eq!(
+            oracle_step_deadline(&competition),
+            now - time::Duration::minutes(5) + super::super::queued_kickoff::POOL_SETUP_DEADLINE
+        );
+        competition.event_created_at = Some(now);
+        assert_eq!(
+            oracle_step_deadline(&competition),
+            now + super::super::queued_kickoff::POOL_SETUP_DEADLINE
+        );
+
+        let status = CompetitionStatus::from(competition.clone());
+        let error = CompetitionError::FailedSubmitEntries("oracle unreachable".into());
+        let kept = oracle_step_failed(
+            status.clone(),
+            error.clone(),
+            now + time::Duration::MINUTE,
+            now,
+        );
+        assert_eq!(kept.state_name(), status.state_name());
+        let failed = oracle_step_failed(status, error, now, now);
+        assert_eq!(failed.state_name(), "failed");
     }
 }

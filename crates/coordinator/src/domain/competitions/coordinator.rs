@@ -134,6 +134,47 @@ fn retry_settlement(status: CompetitionStatus, error: CompetitionError) -> Compe
     CompetitionStatus::from(competition)
 }
 
+/// What a failed oracle step leaves its competition in: creating its oracle event, or sending
+/// the oracle its entries.
+///
+/// Until `deadline` the competition stays where it is, keeping the latest errors, and its next
+/// step tries again, as a pool waits for its oracle event. After it, the competition fails and
+/// every entry is refunded. A single competition used to fail at the first oracle error, so an
+/// oracle unreachable for a minute refunded a full competition.
+fn oracle_step_failed(
+    status: CompetitionStatus,
+    error: CompetitionError,
+    deadline: OffsetDateTime,
+    now: OffsetDateTime,
+) -> CompetitionStatus {
+    let competition_id = status.competition_id();
+    if now < deadline {
+        warn!(
+            "Competition {competition_id} oracle step failed, and is tried again until \
+             {deadline}: {error}"
+        );
+        return retry_settlement(status, error);
+    }
+    error!(
+        "Competition {competition_id} oracle step failed, and it fails: its deadline, {deadline}, \
+         has passed: {error}"
+    );
+    status.fail(error)
+}
+
+/// Until when a competition's oracle steps are tried again: a pool's setup deadline
+/// (`POOL_SETUP_DEADLINE`) after the competition became ready for them.
+fn oracle_step_deadline(competition: &Competition) -> OffsetDateTime {
+    [
+        competition.escrow_funds_confirmed_at,
+        competition.event_created_at,
+    ]
+    .into_iter()
+    .flatten()
+    .fold(competition.created_at, |latest, at| latest.max(at))
+        + queued_kickoff::POOL_SETUP_DEADLINE
+}
+
 /// What a failed Arkade kickoff leaves its competition in.
 ///
 /// A failed batch spends nothing, and the Arkade server's outages pass. So while `deadline` is
@@ -905,12 +946,13 @@ impl Coordinator {
                         }
                     }
                     Err(e) => {
-                        error!(
-                            "Competition {} failed to create oracle event: {}",
-                            competition_id, e
-                        );
-                        CompetitionStatus::EscrowConfirmed(state)
-                            .fail(CompetitionError::FailedCreateEvent(e.to_string()))
+                        let deadline = oracle_step_deadline(state.competition());
+                        oracle_step_failed(
+                            CompetitionStatus::EscrowConfirmed(state),
+                            CompetitionError::FailedCreateEvent(format!("{e:#}")),
+                            deadline,
+                            OffsetDateTime::now_utc(),
+                        )
                     }
                 }
             }
@@ -919,12 +961,13 @@ impl Coordinator {
                 match self.submit_entries_to_oracle(state.competition_mut()).await {
                     Ok(_) => state.entries_submitted(),
                     Err(e) => {
-                        error!(
-                            "Competition {} failed to submit entries: {}",
-                            competition_id, e
-                        );
-                        CompetitionStatus::EventCreated(state)
-                            .fail(CompetitionError::FailedSubmitEntries(e.to_string()))
+                        let deadline = oracle_step_deadline(state.competition());
+                        oracle_step_failed(
+                            CompetitionStatus::EventCreated(state),
+                            CompetitionError::FailedSubmitEntries(format!("{e:#}")),
+                            deadline,
+                            OffsetDateTime::now_utc(),
+                        )
                     }
                 }
             }
@@ -1224,21 +1267,21 @@ impl Coordinator {
                             CompetitionStatus::FundingBroadcasted(state)
                         }
                     }
+                    // A chain read that fails while the funding confirms is an outage of the chain
+                    // backends, not a fault of the competition, and its funding may already have
+                    // spent the escrows: an Arkade batch's always has. So it is tried again,
+                    // backing off (`CompetitionStatus::next_check`), as after confirmation, and
+                    // never fails the competition. Six failures in a row used to fail it for good,
+                    // and nothing resumed it while the pot sat in the contract.
                     Err(e) => {
-                        error!(
-                            "Competition {} funding confirmation failed: {}",
-                            competition_id, e
+                        warn!(
+                            "Competition {competition_id} cannot check its funding confirmation, \
+                             and tries again: {e:#}"
                         );
-                        state
-                            .competition_mut()
-                            .errors
-                            .push(CompetitionError::FailedFundingConfirmation(e.to_string()));
-                        if state.competition().should_abort() {
-                            CompetitionStatus::FundingBroadcasted(state)
-                                .fail(CompetitionError::FailedFundingConfirmation(e.to_string()))
-                        } else {
-                            CompetitionStatus::FundingBroadcasted(state)
-                        }
+                        retry_settlement(
+                            CompetitionStatus::FundingBroadcasted(state),
+                            CompetitionError::FailedFundingConfirmation(format!("{e:#}")),
+                        )
                     }
                 }
             }

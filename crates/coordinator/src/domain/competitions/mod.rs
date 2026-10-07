@@ -1904,6 +1904,32 @@ impl Competition {
         true
     }
 
+    /// Undo a failure or cancellation that stopped a competition while the batch that funded
+    /// its contract confirmed. The caller checks that an Arkade batch did fund it: its commitment
+    /// is stored. Returns whether it resumed.
+    pub fn resume_funded_kickoff(&mut self) -> bool {
+        if self.funding_broadcasted_at.is_none()
+            || self.funding_confirmed_at.is_some()
+            || self.completed_at.is_some()
+            || (self.failed_at.is_none() && self.cancelled_at.is_none())
+        {
+            return false;
+        }
+        self.failed_at = None;
+        self.cancelled_at = None;
+        true
+    }
+
+    /// How many of the latest steps could not read the funding's confirmation from the chain:
+    /// the funding-confirmation errors at the end of the kept errors.
+    pub fn failed_funding_checks(&self) -> usize {
+        self.errors
+            .iter()
+            .rev()
+            .take_while(|error| matches!(error, CompetitionError::FailedFundingConfirmation(_)))
+            .count()
+    }
+
     pub fn should_abort(&self) -> bool {
         self.errors.len() > 5
     }
