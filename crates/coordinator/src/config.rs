@@ -1756,27 +1756,34 @@ impl Default for RateLimitSettings {
 }
 
 pub fn get_settings() -> Result<Settings, anyhow::Error> {
-    let mut settings: Settings = get_settings_with_cli(Cli::parse().into())?;
+    get_server_settings_with_cli(Cli::parse().into())
+}
+
+/// Load server settings after command dispatch, including runtime environment overrides.
+/// Keep this distinct from the generic loader used by the wallet CLI.
+pub fn get_server_settings_with_cli(cli: CliSettings) -> Result<Settings, anyhow::Error> {
+    server_settings_with_env(cli, |name| env::var(name).ok())
+}
+
+fn server_settings_with_env(
+    cli: CliSettings,
+    var: impl Fn(&str) -> Option<String>,
+) -> Result<Settings, anyhow::Error> {
+    let mut settings: Settings = get_settings_with_cli(cli)?;
     settings
         .metrics_settings
-        .apply_env_override(env::var(METRICS_LISTEN_ADDR_ENV).ok())?;
+        .apply_env_override(var(METRICS_LISTEN_ADDR_ENV))?;
     settings
         .coordinator_settings
-        .apply_settle_only_env(env::var(SETTLE_ONLY_ENV).ok())?;
+        .apply_settle_only_env(var(SETTLE_ONLY_ENV))?;
     settings
         .telemetry
-        .apply_env_override(env::var(TELEMETRY_ENABLED_ENV).ok())?;
-    settings.http_context.apply_env_overrides(
-        env::var(TRUSTED_PROXIES_ENV).ok(),
-        env::var(CLIENT_IP_HEADER_ENV).ok(),
-    );
+        .apply_env_override(var(TELEMETRY_ENABLED_ENV))?;
     settings
-        .feedback_settings
-        .apply_env(|name| env::var(name).ok())?;
-    settings
-        .admin_settings
-        .logs
-        .apply_env(|name| env::var(name).ok());
+        .http_context
+        .apply_env_overrides(var(TRUSTED_PROXIES_ENV), var(CLIENT_IP_HEADER_ENV));
+    settings.feedback_settings.apply_env(&var)?;
+    settings.admin_settings.logs.apply_env(var);
     Ok(settings)
 }
 
@@ -2326,6 +2333,50 @@ mod feedback_settings_tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |name| map.get(name).cloned()
+    }
+
+    #[test]
+    fn server_loader_applies_runtime_environment_after_file_and_cli() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), toml::to_string(&Settings::default()).unwrap()).unwrap();
+        let settings = server_settings_with_env(
+            CliSettings {
+                config: Some(file.path().to_string_lossy().into_owned()),
+                level: Some("debug".into()),
+            },
+            env(&[
+                (METRICS_LISTEN_ADDR_ENV, "127.0.0.1:9989"),
+                (SETTLE_ONLY_ENV, "true"),
+                (TELEMETRY_ENABLED_ENV, "true"),
+                (TRUSTED_PROXIES_ENV, "127.0.0.1/32"),
+                (CLIENT_IP_HEADER_ENV, "X-Real-IP"),
+                ("COORDINATOR_FEEDBACK_ENABLED", "true"),
+                (
+                    "COORDINATOR_FEEDBACK_NTFY_URL",
+                    "https://notify.example.com",
+                ),
+                ("COORDINATOR_LOGS_URL", "https://monitoring.example.com"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(settings.level.as_deref(), Some("debug"));
+        assert_eq!(
+            settings.metrics_settings.listen_addr,
+            Some("127.0.0.1:9989".parse().unwrap())
+        );
+        assert!(settings.coordinator_settings.settle_only);
+        assert!(settings.telemetry.enabled);
+        assert_eq!(settings.http_context.trusted_proxies, ["127.0.0.1/32"]);
+        assert_eq!(settings.http_context.client_ip_header, "X-Real-IP");
+        assert!(settings.feedback_settings.enabled);
+        assert_eq!(
+            settings.feedback_settings.ntfy_url.as_deref(),
+            Some("https://notify.example.com")
+        );
+        assert_eq!(
+            settings.admin_settings.logs.url.as_deref(),
+            Some("https://monitoring.example.com")
+        );
     }
 
     #[test]
