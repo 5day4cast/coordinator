@@ -8,6 +8,7 @@ function initApp() {
   setupEntryForm();
   setupPayoutModal();
   setupSatchel();
+  setupFeedback();
 
   const body = document.body;
   // Not on window: it holds the signer once someone logs in.

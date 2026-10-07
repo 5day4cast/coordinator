@@ -5,6 +5,7 @@ pub mod ark_swap;
 pub mod bitcoin;
 pub mod db;
 pub mod escrow;
+pub mod feedback_alerts;
 pub mod file_utils;
 pub mod keymeld;
 pub mod lightning;
@@ -13,6 +14,7 @@ pub mod oracle;
 pub mod oracle_weather;
 pub mod refresh_cache;
 pub mod secrets;
+pub mod visitor_logs;
 
 // Mock implementations only available with e2e-testing feature or debug builds
 #[cfg(any(feature = "e2e-testing", debug_assertions))]

@@ -73,6 +73,9 @@ client_ip_header = "X-Real-IP"
 [telemetry]
 enabled = true  # Exercise the beacon and POST /api/v1/telemetry
 
+[feedback]
+enabled = true  # Exercise the form; without an ntfy URL no alert is sent
+
 [admin_settings]
 listen_addr = "127.0.0.1:9991"
 token_file = "./config/e2e_admin_token"  # Test-only token; Playwright's global setup sends it

@@ -3,7 +3,11 @@ use maud::{html, Markup, DOCTYPE};
 use crate::api::{request_context, telemetry};
 use crate::templates::{
     assets::{APP_JS, BULMA_CSS, HTMX_JS, LOGIN_WORKER_JS, STYLES_CSS, THEME_JS},
-    components::{auth_modals, navbar, RecoveryHelp},
+    components::{
+        auth_modals,
+        feedback::{feedback_link, feedback_modal},
+        navbar, RecoveryHelp,
+    },
 };
 
 /// htmx 4 settings for the public pages, stated in full so they hold whatever
@@ -36,6 +40,8 @@ pub struct PageConfig<'a> {
     /// Origin of the Satchel test-network wallet, when configured: the payment dialog and
     /// account menu link to it, and `shared/satchel.js` signs the player in there.
     pub satchel_url: Option<&'a str>,
+    /// The footer links to the feedback form, when it is on.
+    pub feedback: bool,
 }
 
 pub fn base(config: &PageConfig, content: Markup) -> Markup {
@@ -83,9 +89,16 @@ pub fn base(config: &PageConfig, content: Markup) -> Markup {
                     a href="/help" hx-get="/help" hx-target="#main-content" hx-push-url="true" { "How it works" }
                     " · Contact "
                     a href=(format!("mailto:{CONTACT_EMAIL}")) { (CONTACT_EMAIL) }
+                    @if config.feedback {
+                        " · "
+                        (feedback_link())
+                    }
                 }
 
                 (auth_modals(config.recovery, config.satchel_url))
+                @if config.feedback {
+                    (feedback_modal())
+                }
             }
         }
     }
@@ -108,6 +121,7 @@ mod tests {
             wasm_version: "abc123",
             recovery: RecoveryHelp::FileAndRelays,
             satchel_url,
+            feedback: false,
         };
         base(&config, html! { p { "content" } }).into_string()
     }
@@ -152,6 +166,34 @@ mod tests {
         assert!(html.contains(
             r#"<meta name="request-id" content="0192f1e0-aaaa-7bbb-8ccc-123456789abc">"#
         ));
+    }
+
+    #[test]
+    fn the_footer_links_to_feedback_beside_contact_only_when_it_is_on() {
+        let html = page();
+        assert!(!html.contains("data-feedback-open"));
+        assert!(!html.contains(r#"id="feedbackModal""#));
+
+        let config = PageConfig {
+            title: "Fantasy Weather",
+            api_base: "https://5day4cast.com",
+            oracle_base: "https://4casttruth.win",
+            network: "signet",
+            wasm_version: "abc123",
+            recovery: RecoveryHelp::FileAndRelays,
+            satchel_url: None,
+            feedback: true,
+        };
+        let html = base(&config, html! { p { "content" } }).into_string();
+        let footer = &html[html.find(r#"<footer class="site-footer">"#).unwrap()..];
+        let contact = footer.find("mailto:").unwrap();
+        let link = footer
+            .find(r#"<a href="/feedback" data-feedback-open"#)
+            .unwrap();
+        assert!(link > contact && footer[..footer.find("</footer>").unwrap()].contains("Feedback"));
+        assert!(html.contains(r#"id="feedbackModal""#));
+        // Still no inline style.
+        assert!(!html.contains(" style="));
     }
 
     #[test]

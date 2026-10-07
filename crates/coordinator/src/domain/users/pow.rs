@@ -124,6 +124,9 @@ pub struct SignupPow {
     spent: Mutex<Spent>,
     /// Accounts created in the last hour as last counted, and when.
     signups: Mutex<Option<(Instant, u64)>>,
+    /// Whether checks count on the sign-up metrics. A fixed-difficulty instance, like the
+    /// feedback form's, leaves them to sign-ups.
+    signup_metrics: bool,
 }
 
 impl SignupPow {
@@ -131,6 +134,28 @@ impl SignupPow {
         let mut secret = [0u8; 32];
         rand::rng().fill(&mut secret);
         Self::with_secret(settings, secret)
+    }
+
+    /// An enabled instance whose challenges always take `bits`, outside the sign-up metrics.
+    pub fn fixed(bits: u8) -> Self {
+        let mut secret = [0u8; 32];
+        rand::rng().fill(&mut secret);
+        Self::fixed_with_secret(bits, secret)
+    }
+
+    fn fixed_with_secret(bits: u8, secret: [u8; 32]) -> Self {
+        Self {
+            settings: PowSettings {
+                enabled: true,
+                base_bits: bits,
+                max_bits: bits,
+                step_signups: 1,
+            },
+            secret,
+            spent: Mutex::new(Spent::default()),
+            signups: Mutex::new(None),
+            signup_metrics: false,
+        }
     }
 
     fn with_secret(settings: PowSettings, secret: [u8; 32]) -> Self {
@@ -144,6 +169,7 @@ impl SignupPow {
             secret,
             spent: Mutex::new(Spent::default()),
             signups: Mutex::new(None),
+            signup_metrics: true,
         }
     }
 
@@ -218,11 +244,13 @@ impl SignupPow {
                 .and_then(|nonce| self.check(challenge, nonce, required, now)),
             _ => Err(PowRejection::Missing),
         };
-        let label = match checked {
-            Ok(()) => "verified",
-            Err(rejection) => rejection.label(),
-        };
-        SIGNUP_POW_CHECKS.with_label_values(&[label]).inc();
+        if self.signup_metrics {
+            let label = match checked {
+                Ok(()) => "verified",
+                Err(rejection) => rejection.label(),
+            };
+            SIGNUP_POW_CHECKS.with_label_values(&[label]).inc();
+        }
         checked
     }
 
@@ -536,6 +564,31 @@ mod tests {
         let spent = pow.spent.lock().unwrap();
         assert_eq!(spent.challenges.len(), 1);
         assert_eq!(spent.challenges.values().next(), Some(&fresh.expires_at));
+    }
+
+    #[test]
+    fn a_fixed_instance_keeps_its_difficulty_and_spends_each_challenge_once() {
+        let fixed = SignupPow::fixed_with_secret(6, [0x17; 32]);
+        assert!(fixed.enabled());
+        assert_eq!(fixed.difficulty(0), 6);
+        assert_eq!(fixed.difficulty(u64::MAX), 6);
+        let challenge = fixed.issue(fixed.difficulty(0), NOW);
+        let nonce = solve(&challenge);
+        assert_eq!(
+            fixed.verify(&proof(&challenge.challenge, nonce), 6, NOW),
+            Ok(())
+        );
+        assert_eq!(
+            fixed.verify(&proof(&challenge.challenge, nonce), 6, NOW),
+            Err(PowRejection::Reused)
+        );
+        // Challenges from the sign-up instance are not its own.
+        let signups = pow(6);
+        let theirs = signups.issue(6, NOW);
+        assert_eq!(
+            fixed.verify(&proof(&theirs.challenge, solve(&theirs)), 6, NOW),
+            Err(PowRejection::Forged)
+        );
     }
 
     #[test]

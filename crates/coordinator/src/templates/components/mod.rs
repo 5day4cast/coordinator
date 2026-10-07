@@ -1,3 +1,4 @@
+pub mod feedback;
 mod modals;
 mod navbar;
 mod tip;

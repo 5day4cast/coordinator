@@ -1,6 +1,6 @@
 import { test, expect, Page } from "@playwright/test";
 
-// The log-in and sign-up dialogs follow the page's theme, and every piece of
+// The log-in, sign-up and feedback dialogs follow the page's theme, and every piece of
 // text in them is readable: WCAG AA, 4.5:1 or better against the dialog.
 
 type Reading = { text: string; ratio: number; color: string; background: string };
@@ -55,6 +55,7 @@ for (const colorScheme of ["light", "dark"] as const) {
     for (const [opener, dialog] of [
       ["#loginNavClick", "#loginModal"],
       ["#registerNavClick", "#registerModal"],
+      ["footer [data-feedback-open]", "#feedbackModal"],
     ]) {
       test(`${dialog} follows the page and its text reads at 4.5:1`, async ({ page }) => {
         await page.setViewportSize({ width: 1280, height: 800 });
