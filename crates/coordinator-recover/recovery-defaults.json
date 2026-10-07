@@ -1,9 +1,8 @@
 {
-  "coordinator_pubkeys": {},
+  "coordinator_pubkeys": {
+    "signet": "bda164c9ae173df837d9e1bb19149204656b8732d6e60c66a41884a7c8d73a7f"
+  },
   "relays": [
-    "wss://relay.damus.io",
-    "wss://nos.lol",
-    "wss://relay.primal.net",
-    "wss://relay.nostr.band"
+    "wss://5day4cast.com/relay"
   ]
 }

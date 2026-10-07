@@ -299,6 +299,7 @@ pub(super) mod test_relay {
     //! A relay on a local port that answers every event it is sent.
 
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::net::TcpListener;
 
     /// How the test relay answers an event.
@@ -307,6 +308,12 @@ pub(super) mod test_relay {
     /// Serve connections until the test ends; returns the relay's `ws://` URL. `answer` decides
     /// each event's `OK`, or no answer at all.
     pub async fn spawn(answer: Answer) -> String {
+        spawn_switchable(answer, Arc::new(AtomicBool::new(true))).await
+    }
+
+    /// As [`spawn`], but while `up` is false every connection is closed at once, as an
+    /// unreachable relay's would fail.
+    pub async fn spawn_switchable(answer: Answer, up: Arc<AtomicBool>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
@@ -314,6 +321,10 @@ pub(super) mod test_relay {
                 let Ok((socket, _)) = listener.accept().await else {
                     return;
                 };
+                if !up.load(Ordering::SeqCst) {
+                    drop(socket);
+                    continue;
+                }
                 let answer = answer.clone();
                 tokio::spawn(async move {
                     let _ = serve(socket, answer).await;

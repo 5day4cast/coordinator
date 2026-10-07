@@ -172,6 +172,68 @@ pub static RECOVERY_OUTBOX_DEPTH: LazyLock<IntGauge> = LazyLock::new(|| {
     .expect("valid metric")
 });
 
+/// The kinds of recovery record, as the record gauges label them.
+pub const RECOVERY_RECORD_KINDS: [&str; 3] = ["wallet", "entry", "competition"];
+
+/// Recovery records kept on the relays, by kind: every record not retired. Set by the recovery
+/// publisher about once a minute.
+pub static RECOVERY_RECORDS_LIVE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "coordinator_recovery_records_live",
+            "Recovery records kept on the relays, by kind",
+        ),
+        &["kind"],
+    )
+    .expect("valid metric")
+});
+
+/// Live recovery records whose money is settled, waiting out the grace period before their
+/// deletion, by kind.
+pub static RECOVERY_RECORDS_SETTLED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "coordinator_recovery_records_settled",
+            "Live recovery records whose money is settled, waiting to be deleted, by kind",
+        ),
+        &["kind"],
+    )
+    .expect("valid metric")
+});
+
+/// NIP-09 deletions of settled recovery records that every relay took, by the kind of record.
+pub static RECOVERY_DELETIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "coordinator_recovery_deletions_total",
+            "Deletions of settled recovery records published to every relay, by kind",
+        ),
+        &["kind"],
+    )
+    .expect("valid metric")
+});
+
+/// Live recovery records a configured relay has not taken: what a republish to it has left.
+pub static RECOVERY_RELAY_MISSING: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "coordinator_recovery_relay_missing",
+            "Live recovery records a relay has not taken",
+        ),
+        &["relay"],
+    )
+    .expect("valid metric")
+});
+
+/// Recovery records an operator queued again with a republish.
+pub static RECOVERY_REPUBLISHED: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "coordinator_recovery_republish_queued_total",
+        "Recovery records queued again by an operator's republish",
+    )
+    .expect("valid metric")
+});
+
 /// Whether entries to Arkade competitions are paused because the Arkade server is failing
 /// batch steps (1) or not (0). Set where the pause is decided (`ArkadeHealth`).
 pub static ARKADE_UNAVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
@@ -529,6 +591,21 @@ impl Metrics {
             .register(Box::new(RECOVERY_OUTBOX_DEPTH.clone()))?;
         metrics
             .registry
+            .register(Box::new(RECOVERY_RECORDS_LIVE.clone()))?;
+        metrics
+            .registry
+            .register(Box::new(RECOVERY_RECORDS_SETTLED.clone()))?;
+        metrics
+            .registry
+            .register(Box::new(RECOVERY_DELETIONS.clone()))?;
+        metrics
+            .registry
+            .register(Box::new(RECOVERY_RELAY_MISSING.clone()))?;
+        metrics
+            .registry
+            .register(Box::new(RECOVERY_REPUBLISHED.clone()))?;
+        metrics
+            .registry
             .register(Box::new(LN_INVOICE_SUBSCRIPTION_UP.clone()))?;
         metrics
             .registry
@@ -573,6 +650,9 @@ impl Metrics {
         }
         for result in ["accepted", "failed"] {
             RECOVERY_RELAY_PUBLISHES.with_label_values(&[result]);
+        }
+        for kind in RECOVERY_RECORD_KINDS {
+            RECOVERY_DELETIONS.with_label_values(&[kind]);
         }
         Ok(metrics)
     }
@@ -778,6 +858,8 @@ mod tests {
             "coordinator_payout_holds",
             "coordinator_recovery_relay_publishes_total",
             "coordinator_recovery_outbox_depth",
+            "coordinator_recovery_deletions_total",
+            "coordinator_recovery_republish_queued_total",
             "coordinator_escrow_subscription_up",
             "coordinator_escrow_subscription_escrows",
             "coordinator_entry_form_unavailable",
@@ -807,6 +889,7 @@ mod tests {
             "coordinator_background_thread_up{thread=\"stopped_worker\"} 0",
             "coordinator_payout_attempts_total{result=\"failed\"}",
             "coordinator_recovery_relay_publishes_total{result=\"failed\"}",
+            "coordinator_recovery_deletions_total{kind=\"entry\"}",
             "coordinator_payout_send_failures_total{reason=\"FAILURE_REASON_NO_ROUTE\"}",
             "coordinator_payout_send_failures_total{reason=\"other\"}",
         ] {

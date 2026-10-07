@@ -69,6 +69,10 @@ pub struct Settings {
 /// The key in `key_file` signs and encrypts the records and is used for nothing else. It is
 /// created on first start. Every coordinator of one deployment must use the same file:
 /// players find their records by this key.
+///
+/// Once the money a record describes is settled, the record stays on the relays for
+/// `settled_retention_days` and is then deleted with a NIP-09 deletion signed by the same key,
+/// so the relays must accept kind 5 from it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RecoverySettings {
@@ -76,7 +80,14 @@ pub struct RecoverySettings {
     /// `wss://` relays the records go to. Empty keeps them for the recovery file only.
     pub relays: Vec<String>,
     pub key_file: String,
+    /// Delete records from the relays once their money is settled. On by default.
+    pub delete_settled: bool,
+    /// Days a record stays on the relays after its money is settled.
+    pub settled_retention_days: u32,
 }
+
+/// The longest `settled_retention_days` allowed: ten years.
+pub const MAX_SETTLED_RETENTION_DAYS: u32 = 3650;
 
 impl Default for RecoverySettings {
     fn default() -> Self {
@@ -84,6 +95,8 @@ impl Default for RecoverySettings {
             enabled: false,
             relays: Vec::new(),
             key_file: String::from("./creds/coordinator_recovery_key.pem"),
+            delete_settled: true,
+            settled_retention_days: 7,
         }
     }
 }
@@ -107,7 +120,20 @@ impl RecoverySettings {
                 ));
             }
         }
+        if self.settled_retention_days > MAX_SETTLED_RETENTION_DAYS {
+            return Err(anyhow!(
+                "recovery.settled_retention_days must be at most {MAX_SETTLED_RETENTION_DAYS}"
+            ));
+        }
         Ok(())
+    }
+
+    /// When the publisher deletes records whose money is settled.
+    pub fn retention(&self) -> crate::domain::recovery::Retention {
+        crate::domain::recovery::Retention {
+            delete_settled: self.delete_settled,
+            grace_secs: i64::from(self.settled_retention_days) * 24 * 60 * 60,
+        }
     }
 }
 

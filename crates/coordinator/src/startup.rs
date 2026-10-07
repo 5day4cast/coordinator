@@ -900,6 +900,7 @@ pub async fn build_app(
             users_info.clone(),
             recovery_oracle,
             coordinator.worker_leases().clone(),
+            config.recovery_settings.retention(),
             cancel_token.clone(),
         );
         let recovery_handle = spawn_supervised(
@@ -1211,7 +1212,8 @@ fn limited<S: Clone + Send + Sync + 'static>(
 }
 
 /// Admin listener: operator pages, the LND wallet API, competition creation, viewing and
-/// deletion, and escrow refund write-offs, for scripts and `coordinator admin`.
+/// deletion, escrow refund write-offs, and republishing recovery records, for scripts and
+/// `coordinator admin`.
 ///
 /// Everything except the sign-in form and static assets sits behind `require_operator`.
 /// No CORS layer: operator pages call only their own origin. The test-settle route,
@@ -1253,6 +1255,10 @@ pub fn admin_app(app_state: Arc<AppState>, access: Arc<AdminAccess>, network: Ne
         .route(
             "/api/owed-winners/settle",
             post(admin_settle_owed_winner_handler),
+        )
+        .route(
+            "/api/recovery/republish",
+            post(crate::api::routes::admin_republish_recovery_handler),
         );
     if network != Network::Bitcoin {
         admin_htmx_routes = admin_htmx_routes.route(
@@ -1298,6 +1304,14 @@ pub fn admin_app(app_state: Arc<AppState>, access: Arc<AdminAccess>, network: Ne
         .route(
             "/api/v1/admin/owed-winners/{entry_id}/settle",
             post(operator_settle_owed_winner),
+        )
+        .route(
+            "/api/v1/admin/recovery",
+            get(crate::api::routes::operator_recovery_status),
+        )
+        .route(
+            "/api/v1/admin/recovery/republish",
+            post(crate::api::routes::operator_republish_recovery),
         )
         .route_layer(middleware::from_fn_with_state(
             access.clone(),
@@ -1559,6 +1573,9 @@ mod startup_tests {
         ("GET", "/api/v1/admin/owed-winners"),
         ("POST", OWED_WINNER_APPROVE_PATH),
         ("POST", OWED_WINNER_SETTLE_PATH),
+        ("POST", "/admin/api/recovery/republish"),
+        ("GET", "/api/v1/admin/recovery"),
+        ("POST", "/api/v1/admin/recovery/republish"),
     ];
 
     fn protected_routes() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
@@ -1867,6 +1884,137 @@ mod startup_tests {
         .unwrap();
         assert_eq!(plaintext, alice.public_key().to_hex());
         assert!(!body.contains(&bob.public_key().to_hex()));
+        test.stop().await;
+    }
+
+    #[tokio::test]
+    async fn operators_see_what_each_relay_lacks_and_republish_to_one() {
+        use crate::domain::{
+            recovery::{RecoveryStatus, RepublishReport},
+            RecoveryOutboxEvent,
+        };
+        const ONE: &str = "wss://relay.one.example";
+        const TWO: &str = "wss://relay.two.example";
+        let test = TestState::start_with(|settings| {
+            settings.recovery_settings.enabled = true;
+            settings.recovery_settings.relays = vec![ONE.into(), TWO.into()];
+        })
+        .await;
+        let admin = test.admin(token_access(), Network::Regtest);
+        let recovery = test.state.recovery.clone().unwrap();
+        let mut events = Vec::new();
+        for _ in 0..2 {
+            let keys = nostr::Keys::generate();
+            let user = keys.public_key();
+            let event = nostr::EventBuilder::new(nostr::Kind::ApplicationSpecificData, "x")
+                .sign_with_keys(&keys)
+                .unwrap();
+            events.push(RecoveryOutboxEvent {
+                d_tag: recovery.wallet_d_tag(&user),
+                kind: "wallet",
+                user_pubkey: Some(user.to_hex()),
+                competition_id: None,
+                content_sha256: String::new(),
+                event_json: serde_json::to_string(&event).unwrap(),
+                created_at: 0,
+            });
+        }
+        test.state
+            .coordinator
+            .competition_store
+            .put_recovery_events(events, 0, Some(0))
+            .await
+            .unwrap();
+        let bearer = [("authorization", BEARER)];
+        let json = [
+            ("authorization", BEARER),
+            ("content-type", "application/json"),
+        ];
+
+        let (status, _, body) = send(
+            &admin,
+            request("GET", "/api/v1/admin/recovery", &bearer, ""),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let status: RecoveryStatus = serde_json::from_str(&body).unwrap();
+        assert!(status.enabled);
+        assert_eq!(status.coordinator_pubkey, recovery.public_key().to_hex());
+        assert_eq!(status.relays.len(), 2);
+        assert_eq!(status.relays[1].url, TWO);
+        assert_eq!(status.relays[1].missing, 2);
+
+        let (status, _, body) = send(
+            &admin,
+            request(
+                "POST",
+                "/api/v1/admin/recovery/republish",
+                &json,
+                r#"{"relays":["wss://elsewhere.example"]}"#,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("not one of [recovery].relays"), "{body}");
+
+        let (status, _, body) = send(
+            &admin,
+            request(
+                "POST",
+                "/api/v1/admin/recovery/republish",
+                &json,
+                &format!(r#"{{"relays":["{TWO}"]}}"#),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let report: RepublishReport = serde_json::from_str(&body).unwrap();
+        assert_eq!(report.queued, 2);
+        assert_eq!(report.relays, [TWO]);
+
+        let (status, _, body) = send(
+            &admin,
+            request(
+                "POST",
+                "/admin/api/recovery/republish",
+                &[("authorization", BEARER), ("content-type", FORM)],
+                "relay=wss%3A%2F%2Frelay.two.example",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.contains("Queued 2 records for wss://relay.two.example"),
+            "{body}"
+        );
+
+        let (status, _, body) = send(&admin, request("GET", "/admin/services", &bearer, "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("Recovery records"), "{body}");
+        assert!(body.contains("value=\"wss://relay.two.example\""), "{body}");
+        test.stop().await;
+
+        // While recovery records are off there is nothing to republish.
+        let test = TestState::start().await;
+        let admin = test.admin(token_access(), Network::Regtest);
+        let (status, _, body) = send(
+            &admin,
+            request("GET", "/api/v1/admin/recovery", &bearer, ""),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !serde_json::from_str::<RecoveryStatus>(&body)
+                .unwrap()
+                .enabled
+        );
+        let (status, _, body) = send(
+            &admin,
+            request("POST", "/api/v1/admin/recovery/republish", &json, "{}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("recovery records are off"), "{body}");
         test.stop().await;
     }
 
