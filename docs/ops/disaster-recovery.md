@@ -15,9 +15,16 @@ coordinator, with the coordinator stopped until step 4.
 | `competitions.db`, `users.db` | `db_settings.data_folder` | Litestream, to object storage |
 | Market-maker key | `coordinator_settings.private_key_file` and `bitcoin_settings.seed_path` (by default both `./creds/coordinator_private_key.pem`) | A separate, offline copy of the creds directory |
 | LND macaroon and TLS certificate | `ln_settings.macaroon_file_path`, `ln_settings.tls_cert_path` | The creds backup, or new ones from LND |
+| Recovery key, when recovery records are on | `recovery.key_file` (by default `./creds/coordinator_recovery_key.pem`) | The creds backup |
 | Operator token | `admin_settings.token_file` | The creds backup, or a new one |
 | ark-swapd token | `ark_settings.swap_token_file` | The creds backup, or a new one from ark-swapd |
 | `Settings.toml` | The deployment's configuration | The deployment repository |
+
+The recovery key cannot be replaced either. Players find their recovery records by its public
+key, and the recovery tool and page are built with it. The coordinator creates a new key when the
+file is missing, without an error: every record published before then is orphaned, and players
+holding the old key's records cannot be told apart from new ones. Restore it before the first start,
+with the market-maker key.
 
 The market-maker key is the one secret that cannot be replaced. It signs every contract the
 coordinator is in, reclaims unpaid winners' outputs and the coordinator's escrows, and the
@@ -77,6 +84,16 @@ up, or says what still works when one is not.
    Do this **before the first start**. The coordinator creates a new key when the file is
    missing. A restored database then refuses it, since its stored public key differs, and the
    coordinator does not start. If that happens, delete the generated file and restore the backup.
+
+   When recovery records are on, restore the recovery key the same way, before the first start:
+
+   ```sh
+   install -m 600 /backup/creds/coordinator_recovery_key.pem /path/to/creds/coordinator_recovery_key.pem
+   ```
+
+   Nothing refuses a new recovery key: the coordinator starts and publishes under it, and the
+   records published under the old key are orphaned. Check that
+   `GET /api/v1/recovery/info` reports the same `coordinator_pubkey` as before the loss.
 2. Put back, or issue again, the LND macaroon and TLS certificate, the operator token and the
    ark-swapd token. These can be replaced; the market-maker key cannot.
 3. Check the key matches the database before going further:
@@ -177,11 +194,16 @@ What the reconciliation cannot repair, and how to handle it:
 
 ## 5. What players can do meanwhile
 
-Players do not need the coordinator to get their money back. With their nsec, or the recovery
-file from their account page, the recovery tool ([RECOVERY.md](../RECOVERY.md)) can:
+Only if recovery records were on before the disaster can players get their money back without
+the coordinator: the records, published to the relays or saved as the recovery file from their
+account page, hold what the player's nsec alone does not. Entries made while recovery was off
+have no records, and their players depend on this restore.
 
-- refund an Arkade escrow that never kicked off, with the player's key alone once its refund
-  locktime has passed;
+With their nsec and their records, the recovery tool ([RECOVERY.md](../RECOVERY.md)) can:
+
+- refund an Arkade escrow that never kicked off, once its refund locktime has passed: through its
+  refund leaf, which the player's key and the Arkade server sign together, or, without the server,
+  through its unilateral refund leaf once the escrow is unrolled on chain and its delay has passed;
 - broadcast a contract's outcome transaction, or its expiry transaction once the contract has
   expired unattested, and then the split transaction;
 - claim a win on chain once the split transaction has the required confirmations.

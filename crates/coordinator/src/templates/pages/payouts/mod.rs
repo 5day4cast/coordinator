@@ -133,7 +133,7 @@ fn recovery_file_link() -> Markup {
     html! {
         p class="help mb-4" id="recoveryFile" {
             a href="/api/v1/recovery/kit" data-payout-action="recovery-file" { "Download recovery file" }
-            ". With your recovery key (nsec), it is all you need to get your funds back if this site is ever gone."
+            ". With your recovery key (nsec), it is what you need to recover your funds with our recovery tool if this site is ever gone."
         }
     }
 }
@@ -169,6 +169,14 @@ mod tests {
         assert!(html.contains(r#"data-payout-action="edit-address""#));
         assert!(html.contains(r#"data-payout-action="save-address""#));
         assert!(html.contains("10,500 sats"));
+    }
+
+    #[test]
+    fn the_recovery_file_link_says_what_it_and_the_key_are_for() {
+        let html = recovery_file_link().into_string();
+        assert!(html.contains("recovery key (nsec)"));
+        assert!(html.contains("recovery tool"));
+        assert!(!html.contains("all you need"));
     }
 
     #[test]

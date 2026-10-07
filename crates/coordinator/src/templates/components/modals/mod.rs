@@ -1,12 +1,41 @@
 use maud::{html, Markup};
 
-pub fn auth_modals() -> Markup {
+/// What a player is told about their recovery key at sign-up, which depends on whether this
+/// deployment keeps recovery records (`[recovery]`) and publishes them to relays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryHelp {
+    /// No recovery records: the key signs the player in, and nothing more.
+    Off,
+    /// Records kept for the recovery file only.
+    File,
+    /// Records kept for the recovery file and published to Nostr relays.
+    FileAndRelays,
+}
+
+impl RecoveryHelp {
+    pub fn text(self) -> &'static str {
+        match self {
+            Self::Off => "Keep this key safe: it is the only way back into your account.",
+            Self::File => {
+                "Your recovery key and the recovery file from your Payouts page are what you \
+                 need to recover your funds with our recovery tool."
+            }
+            Self::FileAndRelays => {
+                "Your recovery key and the recovery file from your Payouts page are what you \
+                 need to recover your funds with our recovery tool. Your recovery records are \
+                 also published to our Nostr relay."
+            }
+        }
+    }
+}
+
+pub fn auth_modals(recovery: RecoveryHelp) -> Markup {
     html! {
         // Login Modal
         (login_modal())
 
         // Registration Modal
-        (register_modal())
+        (register_modal(recovery))
 
         // Forgot Password Modal
         (forgot_password_modal())
@@ -148,7 +177,7 @@ fn lightning_address_field(id: &str) -> Markup {
     }
 }
 
-fn register_modal() -> Markup {
+fn register_modal(recovery: RecoveryHelp) -> Markup {
     html! {
         div id="registerModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="registerModalTitle" tabindex="-1" {
             div class="modal-background" {}
@@ -208,7 +237,7 @@ fn register_modal() -> Markup {
                                 }
                             }
                             p class="help" {
-                                "This key, with the recovery file from your Payouts page (or the Nostr relays it is published to), is all you need to recover your funds."
+                                (recovery.text())
                             }
                             button class="button is-info is-fullwidth mt-2" id="copyUsernameNsec" {
                                 "Copy to clipboard"
@@ -419,6 +448,37 @@ fn entry_score_modal() -> Markup {
                 }
             }
             button class="modal-close is-large" aria-label="close" {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sign-up help says what this deployment's recovery offers: the key and the recovery
+    /// file, and the relay only when records are published. It no longer claims the key is all a
+    /// player needs, nor offers a file a deployment without recovery records does not have.
+    #[test]
+    fn sign_up_says_what_recovery_this_deployment_offers() {
+        for help in [
+            RecoveryHelp::Off,
+            RecoveryHelp::File,
+            RecoveryHelp::FileAndRelays,
+        ] {
+            let html = auth_modals(help).into_string();
+            assert!(html.contains(help.text()), "{help:?}");
+            assert!(!html.contains("all you need"), "{help:?}");
+            assert_eq!(
+                html.contains("recovery file"),
+                help != RecoveryHelp::Off,
+                "{help:?}"
+            );
+            assert_eq!(
+                html.contains("Nostr relay"),
+                help == RecoveryHelp::FileAndRelays,
+                "{help:?}"
+            );
         }
     }
 }
