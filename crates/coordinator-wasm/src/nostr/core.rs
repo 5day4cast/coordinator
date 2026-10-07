@@ -206,7 +206,7 @@ mod tests {
                 .filter(|tag| tag[0] == "name")
                 .collect();
             match name.filter(|name| !name.is_empty()) {
-                Some(name) => assert_eq!(named, vec![&["name".to_owned(), name.to_owned()][..]]),
+                Some(name) => assert_eq!(named, [&["name".to_owned(), name.to_owned()][..]]),
                 None => assert!(named.is_empty()),
             }
         }
