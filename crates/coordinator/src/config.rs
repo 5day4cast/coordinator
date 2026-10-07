@@ -63,6 +63,118 @@ pub struct Settings {
     pub recovery_settings: RecoverySettings,
     #[serde(default, rename = "pow")]
     pub pow_settings: PowSettings,
+    #[serde(default)]
+    pub http_context: HttpContextSettings,
+}
+
+/// Environment variable that sets `http_context.trusted_proxies`, overriding the file.
+pub const TRUSTED_PROXIES_ENV: &str = "COORDINATOR_TRUSTED_PROXIES";
+/// Environment variable that sets `http_context.client_ip_header`, overriding the file.
+pub const CLIENT_IP_HEADER_ENV: &str = "COORDINATOR_CLIENT_IP_HEADER";
+
+/// Who may vouch for a request's client address and id. See docs/REQUEST_CONTEXT.md.
+///
+/// A request whose TCP peer is in `trusted_proxies` takes its client address from
+/// `client_ip_header` and its request id from `X-Request-Id`. Every other request is logged
+/// with the peer address and a fresh id. Nobody is trusted by default.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HttpContextSettings {
+    /// Addresses or CIDR ranges of the reverse proxies in front of the listeners.
+    pub trusted_proxies: Vec<String>,
+    /// The header a trusted proxy puts the client address in.
+    pub client_ip_header: String,
+}
+
+impl Default for HttpContextSettings {
+    fn default() -> Self {
+        Self {
+            trusted_proxies: Vec::new(),
+            client_ip_header: String::from("X-Real-IP"),
+        }
+    }
+}
+
+impl HttpContextSettings {
+    pub fn validate(&self) -> Result<(), anyhow::Error> {
+        for proxy in &self.trusted_proxies {
+            crate::api::request_context::Cidr::parse(proxy)
+                .map_err(|e| anyhow!("http_context.trusted_proxies: {e}"))?;
+        }
+        let header = self.client_ip_header.trim();
+        axum::http::HeaderName::try_from(header)
+            .map_err(|_| anyhow!("http_context.client_ip_header is not a header name"))?;
+        // Clients can send these themselves, and the first one may hold a list.
+        if ["x-forwarded-for", "cf-connecting-ip", "forwarded"]
+            .iter()
+            .any(|name| header.eq_ignore_ascii_case(name))
+        {
+            return Err(anyhow!(
+                "http_context.client_ip_header must be a header the proxy overwrites, such as X-Real-IP"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Apply `COORDINATOR_TRUSTED_PROXIES` (comma-separated; empty trusts nobody) and
+    /// `COORDINATOR_CLIENT_IP_HEADER`, when set.
+    pub fn apply_env_overrides(
+        &mut self,
+        trusted_proxies: Option<String>,
+        client_ip_header: Option<String>,
+    ) {
+        if let Some(value) = trusted_proxies {
+            self.trusted_proxies = value
+                .split(',')
+                .map(str::trim)
+                .filter(|proxy| !proxy.is_empty())
+                .map(str::to_owned)
+                .collect();
+        }
+        if let Some(value) = client_ip_header.filter(|value| !value.trim().is_empty()) {
+            self.client_ip_header = value.trim().to_owned();
+        }
+    }
+}
+
+#[cfg(test)]
+mod http_context_settings_tests {
+    use super::*;
+
+    #[test]
+    fn nobody_is_trusted_unless_configured() {
+        let settings = HttpContextSettings::default();
+        assert!(settings.trusted_proxies.is_empty());
+        assert_eq!(settings.client_ip_header, "X-Real-IP");
+        settings.validate().unwrap();
+
+        let text = toml::to_string(&Settings::default()).unwrap();
+        let without: String = text.split("[http_context]").next().unwrap().to_string();
+        let parsed: Settings = toml::from_str(&without).unwrap();
+        assert_eq!(parsed.http_context, HttpContextSettings::default());
+    }
+
+    #[test]
+    fn environment_overrides_the_proxies_and_header() {
+        let mut settings = HttpContextSettings::default();
+        settings.apply_env_overrides(
+            Some("127.0.0.1, 10.0.0.0/8,".into()),
+            Some("X-Client-IP".into()),
+        );
+        assert_eq!(settings.trusted_proxies, vec!["127.0.0.1", "10.0.0.0/8"]);
+        assert_eq!(settings.client_ip_header, "X-Client-IP");
+        settings.validate().unwrap();
+
+        settings.apply_env_overrides(Some(String::new()), None);
+        assert!(settings.trusted_proxies.is_empty());
+        assert_eq!(settings.client_ip_header, "X-Client-IP");
+
+        settings.trusted_proxies = vec!["proxy.local".into()];
+        assert!(settings.validate().is_err());
+        settings.trusted_proxies.clear();
+        settings.client_ip_header = "X-Forwarded-For".into();
+        assert!(settings.validate().is_err());
+    }
 }
 
 /// Proof of work for new accounts. Off by default. See docs/REQUEST_HARDENING.md.
@@ -883,6 +995,7 @@ impl Settings {
         self.recovery_settings
             .validate(&self.coordinator_settings)?;
         self.pow_settings.validate()?;
+        self.http_context.validate()?;
         self.keymeld_settings.validate(network)
     }
 }
@@ -1591,6 +1704,10 @@ pub fn get_settings() -> Result<Settings, anyhow::Error> {
     settings
         .coordinator_settings
         .apply_settle_only_env(env::var(SETTLE_ONLY_ENV).ok())?;
+    settings.http_context.apply_env_overrides(
+        env::var(TRUSTED_PROXIES_ENV).ok(),
+        env::var(CLIENT_IP_HEADER_ENV).ok(),
+    );
     Ok(settings)
 }
 
