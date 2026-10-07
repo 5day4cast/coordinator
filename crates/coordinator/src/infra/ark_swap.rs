@@ -7,6 +7,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::api::request_context::ParentRequestId;
+
 /// Where a swap is, as `ark-swapd` reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -212,6 +214,7 @@ impl EscrowSwaps for SwapClient {
             .http
             .post(format!("{}/v1/swaps", self.base_url))
             .bearer_auth(&self.token)
+            .parent_request_id()
             .json(&serde_json::json!({
                 "escrow_address": escrow_address,
                 "amount_sat": amount_sat,
@@ -227,6 +230,7 @@ impl EscrowSwaps for SwapClient {
             .http
             .get(format!("{}/v1/swaps/{id}", self.base_url))
             .bearer_auth(&self.token)
+            .parent_request_id()
             .send()
             .await?;
         Self::checked(response).await
@@ -243,6 +247,7 @@ impl EscrowSwaps for SwapClient {
             .http
             .post(format!("{}/v1/refunds", self.base_url))
             .bearer_auth(&self.token)
+            .parent_request_id()
             .json(&serde_json::json!({
                 "payment_hash": payment_hash,
                 "amount_sat": amount_sat,
@@ -259,6 +264,7 @@ impl EscrowSwaps for SwapClient {
             .http
             .get(format!("{}/v1/refunds/{id}", self.base_url))
             .bearer_auth(&self.token)
+            .parent_request_id()
             .send()
             .await?;
         Self::checked(response).await
@@ -269,6 +275,7 @@ impl EscrowSwaps for SwapClient {
             .http
             .post(format!("{}/v1/refunds/{id}/paid", self.base_url))
             .bearer_auth(&self.token)
+            .parent_request_id()
             .json(&serde_json::json!({ "preimage": hex::encode(preimage) }))
             .send()
             .await?;
@@ -280,6 +287,7 @@ impl EscrowSwaps for SwapClient {
             .http
             .get(format!("{}/v1/wallet", self.base_url))
             .bearer_auth(&self.token)
+            .parent_request_id()
             .send()
             .await?;
         Self::checked(response).await

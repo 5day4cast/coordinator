@@ -73,6 +73,39 @@ pub fn record_user(pubkey_hex: &str) {
     });
 }
 
+/// Tags a call to one of our own services (oracle, ark-swapd) with the current request id
+/// as `X-Parent-Request-Id`. Calls to LND and third-party hosts never carry it.
+pub trait ParentRequestId {
+    fn parent_request_id(self) -> Self;
+}
+
+impl ParentRequestId for reqwest::RequestBuilder {
+    fn parent_request_id(self) -> Self {
+        match current_rid() {
+            Some(rid) => self.header(PARENT_REQUEST_ID_HEADER, rid),
+            None => self,
+        }
+    }
+}
+
+/// [`ParentRequestId`] for every call of a `reqwest-middleware` client.
+pub struct ParentRequestIdMiddleware;
+
+#[async_trait::async_trait]
+impl reqwest_middleware::Middleware for ParentRequestIdMiddleware {
+    async fn handle(
+        &self,
+        mut req: reqwest::Request,
+        extensions: &mut axum::http::Extensions,
+        next: reqwest_middleware::Next<'_>,
+    ) -> reqwest_middleware::Result<reqwest::Response> {
+        if let Some(value) = current_rid().and_then(|rid| HeaderValue::from_str(&rid).ok()) {
+            req.headers_mut().insert(PARENT_REQUEST_ID_HEADER, value);
+        }
+        next.run(req, extensions).await
+    }
+}
+
 impl<S: Send + Sync> FromRequestParts<S> for RequestContext {
     type Rejection = StatusCode;
 
@@ -422,6 +455,32 @@ mod tests {
         // Outside a request nothing happens.
         record_user(&"ab".repeat(32));
         assert!(current().is_none());
+    }
+
+    #[test]
+    fn calls_inside_a_request_name_it_as_their_parent() {
+        let client = reqwest::Client::new();
+        let request = client
+            .get("http://oracle.invalid/")
+            .parent_request_id()
+            .build()
+            .unwrap();
+        assert!(request.headers().get(PARENT_REQUEST_ID_HEADER).is_none());
+
+        let mut ctx = context(&[]).context(PROXY.parse().unwrap(), &HeaderMap::new());
+        ctx.rid = "rid-12345678".into();
+        let request = REQUEST_CONTEXT.sync_scope(ctx, || {
+            client
+                .get("http://oracle.invalid/")
+                .parent_request_id()
+                .build()
+                .unwrap()
+        });
+        assert_eq!(
+            request.headers().get(PARENT_REQUEST_ID_HEADER).unwrap(),
+            "rid-12345678"
+        );
+        assert!(request.headers().get(REQUEST_ID_HEADER).is_none());
     }
 
     #[test]

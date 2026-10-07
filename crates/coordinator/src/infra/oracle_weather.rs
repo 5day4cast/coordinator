@@ -19,6 +19,7 @@ use std::{
     time::Duration,
 };
 
+use crate::api::request_context::ParentRequestId;
 use anyhow::Context;
 use log::warn;
 use serde::Deserialize;
@@ -172,7 +173,7 @@ impl OracleWeather {
 
     async fn get<T: serde::de::DeserializeOwned>(&self, path_and_query: &str) -> anyhow::Result<T> {
         let url = format!("{}{path_and_query}", self.base_url);
-        let response = self.http.get(&url).send().await?;
+        let response = self.http.get(&url).parent_request_id().send().await?;
         let status = response.status();
         if !status.is_success() {
             anyhow::bail!("{url} answered {status}");
@@ -202,7 +203,7 @@ impl OracleWeather {
             event_announcement: Option<serde_json::Value>,
         }
         let url = format!("{}/oracle/events/{event_id}", self.base_url);
-        let response = self.http.get(&url).send().await?;
+        let response = self.http.get(&url).parent_request_id().send().await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(EventReadings::default());
         }

@@ -3,6 +3,7 @@ use super::{
     admin_monitoring::{AdminMonitoring, CAPABILITIES_TTL, PAGE_TTL, PAGE_WAIT},
     refresh_cache::Cached,
 };
+use crate::api::request_context::ParentRequestId;
 use anyhow::{ensure, Context};
 use futures::{stream, StreamExt};
 use serde::Deserialize;
@@ -118,7 +119,12 @@ impl AdminMonitoring {
                 }
                 let requests: Vec<_> = queries
                     .into_iter()
-                    .map(|query| client.get(&service.query_url).query(&[("query", query)]))
+                    .map(|query| {
+                        client
+                            .get(&service.query_url)
+                            .query(&[("query", query)])
+                            .parent_request_id()
+                    })
                     .collect();
                 let snapshot: Snapshot = tokio::time::timeout(
                     Duration::from_secs(8),

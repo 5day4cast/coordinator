@@ -1812,13 +1812,31 @@ pub fn setup_logger(
 
     fern::Dispatch::new()
         .format(move |out, message, record| {
-            out.finish(format_args!(
-                "[{} {}] {}: {}",
-                OffsetDateTime::now_utc().format(&Iso8601::DEFAULT).unwrap(),
-                colors.color(record.level()),
-                record.target(),
-                message
-            ));
+            // Lines written while handling a request end with its id, except the
+            // lines that carry their own `rid=` field.
+            let rid = crate::api::request_context::REQUEST_CONTEXT
+                .try_with(|context| context.rid.clone())
+                .ok()
+                .filter(|_| {
+                    !crate::api::request_context::OWN_RID_TARGETS.contains(&record.target())
+                });
+            match rid {
+                Some(rid) => out.finish(format_args!(
+                    "[{} {}] {}: {} rid={}",
+                    OffsetDateTime::now_utc().format(&Iso8601::DEFAULT).unwrap(),
+                    colors.color(record.level()),
+                    record.target(),
+                    message,
+                    rid
+                )),
+                None => out.finish(format_args!(
+                    "[{} {}] {}: {}",
+                    OffsetDateTime::now_utc().format(&Iso8601::DEFAULT).unwrap(),
+                    colors.color(record.level()),
+                    record.target(),
+                    message
+                )),
+            }
         })
         .level(rust_log)
         .filter(move |metadata| {
