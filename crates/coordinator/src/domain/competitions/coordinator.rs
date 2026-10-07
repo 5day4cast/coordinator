@@ -1,3 +1,5 @@
+#[path = "anchor_bump.rs"]
+mod anchor_bump;
 #[path = "ark_coordinator.rs"]
 mod ark_coordinator;
 #[path = "automatic_coordinator.rs"]
@@ -268,6 +270,8 @@ pub struct Coordinator {
     /// The check an Arkade pool passes before its contract is built; off until
     /// `with_kickoff_check`.
     kickoff_check: crate::config::KickoffCheckSettings,
+    /// Fee-bumps of stuck anchored settlement transactions; off until `with_cpfp`.
+    anchor_bumps: anchor_bump::AnchorBumps,
     ark: Option<Arc<super::Arkade>>,
     /// Whether the Arkade server is failing batch steps, which pauses entries to Arkade
     /// competitions.
@@ -349,6 +353,7 @@ impl Coordinator {
                 enabled: false,
                 ..Default::default()
             },
+            anchor_bumps: anchor_bump::AnchorBumps::default(),
             ark: None,
             arkade_health: Arc::default(),
             wakes: super::CompetitionWakes::default(),
@@ -1333,6 +1338,7 @@ impl Coordinator {
             }
 
             CompetitionStatus::OutcomeBroadcasted(mut state) => {
+                self.bump_stuck_settlement_tx(state.competition()).await;
                 match self
                     .publish_delta_transactions(state.competition_mut())
                     .await
@@ -1358,6 +1364,7 @@ impl Coordinator {
             }
 
             CompetitionStatus::DeltaBroadcasted(mut state) => {
+                self.bump_stuck_settlement_tx(state.competition()).await;
                 match self
                     .publish_delta2_transactions(state.competition_mut())
                     .await

@@ -216,6 +216,25 @@ pub trait Bitcoin: Send + Sync {
     /// Release this packet's wallet inputs after a definite pre-publication failure.
     async fn release_psbt_inputs(&self, psbt: &Psbt) -> Result<(), anyhow::Error>;
     async fn get_spendable_utxo(&self, amount_sats: u64) -> Result<WalletUtxo, anyhow::Error>;
+    /// Lease a wallet output under `id` for `seconds`, so that neither the wallet's own coin
+    /// selection nor another lease takes it meanwhile. Fails when it is leased already, or when
+    /// this backend cannot lease outputs.
+    async fn lease_output(
+        &self,
+        _outpoint: OutPoint,
+        _id: [u8; 32],
+        _seconds: u64,
+    ) -> Result<(), anyhow::Error> {
+        Err(anyhow!("This Bitcoin client cannot lease wallet outputs"))
+    }
+    /// Release a lease taken with [`Bitcoin::lease_output`].
+    async fn release_output(
+        &self,
+        _outpoint: OutPoint,
+        _id: [u8; 32],
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
     async fn get_current_height(&self) -> Result<u32, anyhow::Error>;
     async fn get_confirmed_blockchain_time(&self, blocks: usize) -> Result<u64, anyhow::Error>;
     async fn get_estimated_fee_rates(&self) -> Result<HashMap<u16, f64>, anyhow::Error>;
@@ -506,6 +525,37 @@ impl LndWallet {
             )
             .await?;
         decode_psbt(&response["signed_psbt"])
+    }
+
+    /// `v2/wallet/utxos/lease`: refused when the output is leased under another id already.
+    async fn lease_output(
+        &self,
+        outpoint: OutPoint,
+        id: [u8; 32],
+        seconds: u64,
+    ) -> Result<(), anyhow::Error> {
+        self.post::<Value>(
+            "v2/wallet/utxos/lease",
+            json!({
+                "id": BASE64.encode(id),
+                "outpoint": { "txid_str": outpoint.txid.to_string(), "output_index": outpoint.vout },
+                "expiration_seconds": seconds.to_string(),
+            }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn release_output(&self, outpoint: OutPoint, id: [u8; 32]) -> Result<(), anyhow::Error> {
+        self.post::<Value>(
+            "v2/wallet/utxos/release",
+            json!({
+                "id": BASE64.encode(id),
+                "outpoint": { "txid_str": outpoint.txid.to_string(), "output_index": outpoint.vout },
+            }),
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn publish(&self, transaction: &Transaction, label: &str) -> Result<(), anyhow::Error> {
@@ -1116,8 +1166,13 @@ impl Bitcoin for BitcoinClient {
                     Err(electrum_client::Error::Protocol(_)) => return Ok(None),
                     Err(e) => return Err(e),
                 };
-                // Any output script's history lists this transaction with its height.
+                // Any output script's history lists this transaction with its height. The
+                // pay-to-anchor script is shared by every anchor on the network, so its history is
+                // never read.
                 for output in &tx.output {
+                    if dlctix::anchor::is_anchor_script(&output.script_pubkey) {
+                        continue;
+                    }
                     let history = client.script_get_history(&output.script_pubkey)?;
                     if let Some(entry) = history.iter().find(|entry| entry.tx_hash == txid) {
                         return Ok(Some(entry.height));
@@ -1213,9 +1268,23 @@ impl Bitcoin for BitcoinClient {
             .ok_or_else(|| anyhow!("No local fee estimate for {conf_target} blocks"))
     }
 
+    /// Settlement fee-bumps the contract transactions it broadcast with anchors when they are
+    /// stuck: see `domain/competitions/anchor_bump.rs`.
     async fn broadcast(&self, transaction: &Transaction) -> Result<(), anyhow::Error> {
-        //TODO: add child-pays-for-parent if fees are too low
         self.lnd.publish(transaction, "coordinator").await
+    }
+
+    async fn lease_output(
+        &self,
+        outpoint: OutPoint,
+        id: [u8; 32],
+        seconds: u64,
+    ) -> Result<(), anyhow::Error> {
+        self.lnd.lease_output(outpoint, id, seconds).await
+    }
+
+    async fn release_output(&self, outpoint: OutPoint, id: [u8; 32]) -> Result<(), anyhow::Error> {
+        self.lnd.release_output(outpoint, id).await
     }
 
     async fn list_utxos(&self) -> Vec<WalletUtxo> {
