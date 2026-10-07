@@ -366,12 +366,15 @@ mockall::mock! {
 /// LND's floor of 253 sat/kWU, in sat/vB as the client reads LND's estimates.
 const LND_FLOOR_SAT_PER_VB: f64 = 253.0 * 4.0 / 1_000.0;
 
+/// The height a transaction confirmed at, if it did.
+type ConfirmedAt = Arc<dyn Fn(&Txid) -> Option<u32> + Send + Sync>;
+
 /// How the fixture's chain answers.
 #[derive(Clone)]
 struct ChainSetup {
     tip: u32,
     /// The height each transaction confirmed at, if it did.
-    confirmed: Arc<dyn Fn(&Txid) -> Option<u32> + Send + Sync>,
+    confirmed: ConfirmedAt,
     /// Whether every broadcast is refused, as for a transaction spending a spent output.
     refuse_broadcasts: bool,
     /// What a lookup of a contract output answers.
