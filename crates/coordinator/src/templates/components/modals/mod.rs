@@ -495,7 +495,7 @@ mod tests {
     /// Trusted Types policy admits.
     #[test]
     fn sign_up_names_its_proof_of_work_worker() {
-        let html = auth_modals(RecoveryHelp::Off).into_string();
+        let html = auth_modals(RecoveryHelp::Off, None).into_string();
         assert!(POW_WORKER_JS.url.starts_with("/assets/pow-worker."));
         assert!(html.contains(&format!(
             r#"id="registerModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="registerModalTitle" tabindex="-1" data-pow-worker="{}""#,
