@@ -1680,8 +1680,8 @@ async fn a_split_output_already_swept_to_the_market_maker_counts_as_swept() {
     settlement.database.close().await.unwrap();
 }
 
-/// Once every winner is paid, the coordinator closes the whole outcome at once, long before any
-/// winner could broadcast the split, instead of waiting until the split is valid and racing them.
+/// Once every winner is paid, the coordinator closes the whole outcome at once, long before the
+/// split transaction becomes valid, instead of waiting until it is.
 #[tokio::test]
 async fn every_winner_paid_closes_the_outcome_at_once() {
     // The outcome confirmed 11 blocks ago, far less than delta (72).
@@ -1727,9 +1727,9 @@ async fn every_winner_paid_closes_the_outcome_at_once() {
     settlement.database.close().await.unwrap();
 }
 
-/// A winner broadcast the split transaction before the coordinator closed the outcome. The
-/// close could never confirm; the coordinator follows the split and closes each paid winner's
-/// own output instead, before they could also claim it on chain.
+/// A winner broadcast the split transaction before the coordinator closed the outcome. A close of
+/// the outcome could never confirm; the coordinator follows the split and closes each paid
+/// winner's own output instead, well before the winners' own claim path opens.
 #[tokio::test]
 async fn a_split_a_winner_broadcast_is_followed_instead_of_closing_the_outcome() {
     let mut settlement = settling_at(1_000, 900, Some(995)).await;

@@ -2795,11 +2795,9 @@ impl Coordinator {
             .filter(|(_, entry)| !winner_output_settled(entry))
             .collect();
 
-        // A winner may broadcast the split transaction themselves once the outcome is `delta`
-        // blocks deep, and then claim on chain `delta` blocks later. Once it is on chain the
-        // outcome output is spent, so a close of the whole outcome can never confirm: each
-        // winner's own output settles instead. Retrying that close used to block settlement for
-        // good while a winner already paid over Lightning could claim again on chain.
+        // Any winner may broadcast the split transaction once the outcome is `delta` blocks deep.
+        // Once it is on chain the outcome output is spent, so a close of the whole outcome can
+        // never confirm: each winner's own output settles instead.
         let split_on_chain = match signed_contract.unsigned_split_tx(&outcome) {
             Some(split) => self
                 .bitcoin
@@ -2824,8 +2822,7 @@ impl Coordinator {
         if !split_on_chain && competition.delta_broadcasted_at.is_none() {
             if paid_winners.len() == winners.len() {
                 // Every winner was paid and released their key: close the whole outcome to the
-                // market maker now, long before any winner could broadcast the split. Waiting
-                // until the split became valid, as before, raced the winners for the outcome.
+                // market maker now, long before the split transaction becomes valid.
                 if confirmation_depth(current_height, outcome_height) < UNIFIED_CLOSE_CONFIRMATIONS
                 {
                     info!(
@@ -3135,7 +3132,7 @@ impl Coordinator {
                     (true, _) => error!(
                         "Competition {competition_id}: the split output of entry {} (player \
                          {player_index}), whose winner was paid over Lightning, was spent by \
-                         {txid:?}, not by the coordinator; the winner may have been paid twice",
+                         {txid:?}, not by the coordinator; check it against the payout",
                         entry.id
                     ),
                     (false, Some(txid)) => {
