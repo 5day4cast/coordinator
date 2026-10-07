@@ -78,16 +78,20 @@ Preparation retries use the persisted claim ID.
 A paid claim retries escrow release without requesting another invoice or sending another payment.
 Invoice expiry does not invalidate recovery of an already successful payment.
 
-Before each new payment, the coordinator checks that the outcome output remains unspent and confirmed.
+Before each new payment, the coordinator checks the contract output that holds the winner's share: the outcome output while it is unspent, then the winner's own output of the split transaction.
+That output must be confirmed and unspent.
 It checks both the Electrum tip and a fresh, synchronized LND tip.
-The payment route's total CLTV limit must end before the player's earliest on-chain claim.
-The limit reserves twelve settlement blocks and one mempool block.
-The limit shrinks as the chain advances and cannot exceed 432 blocks.
+The payment route's total CLTV limit must end before the player's earliest on-chain claim: `delta` blocks after the split transaction confirms.
+While the outcome output is unspent, the split can confirm no sooner than the next block, nor before the outcome is `delta` blocks deep.
+The limit reserves twelve settlement blocks and one mempool block, and cannot exceed 432 blocks.
 An invoice whose final CLTV requirement does not fit is not sent.
+So payouts continue after the split, and after a coordinator restart, for as long as no winner can claim on chain yet.
 
-At the cutoff, the coordinator closes the Lightning payout window.
+A successful payment releases the winner's entry key.
+The coordinator then closes the winner's output to itself before the winner could claim it on chain: the whole outcome once every winner is paid, or the winner's own split output.
+Once the winners could claim within the margin, the coordinator closes the Lightning payout window.
 It rejects new claims and stops unsent outbox items after LND confirms that no payment exists.
-Pending payments and successful claims awaiting escrow release must reconcile before the coordinator broadcasts its fallback transaction.
+A winner still unpaid is owed: the coordinator sweeps their output only once an operator approves (see [owed winners](ops/owed-winners.md)).
 An HTTP timeout alone does not establish that a payment failed.
 
 The chain check and Lightning send are separate operations.

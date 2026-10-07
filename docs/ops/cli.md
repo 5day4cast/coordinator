@@ -69,6 +69,18 @@ coordinator admin payout-holds list --all --json
 coordinator admin payout-holds release <entry-id> --yes
 ```
 
+```sh
+# Winners owed because their Lightning payout window closed unpaid (see owed-winners.md).
+# --all includes those paid or who claimed on chain.
+coordinator admin owed-winners list
+coordinator admin owed-winners list --all --json
+# Let the coordinator sweep a winner's split output to its own key once its delay has passed.
+# The winner stays owed.
+coordinator admin owed-winners approve-sweep <entry-id> --yes
+# Record how the winner was paid; this also approves the sweep.
+coordinator admin owed-winners settle <entry-id> --note "<payment hash>" --yes
+```
+
 The commands use these operator-listener endpoints, which scripts may call directly with the same
 bearer token:
 
@@ -81,6 +93,9 @@ bearer token:
 | `POST` | `/api/v1/admin/refunds/write-off` | write off escrow refunds (JSON `ticket_id` or `competition_id`, `reason`, `force`) |
 | `GET` | `/api/v1/admin/payout-holds` | held Lightning payouts; `?all=true` includes released ones |
 | `POST` | `/api/v1/admin/payout-holds/{entry_id}/release` | release an entry's held payout |
+| `GET` | `/api/v1/admin/owed-winners` | winners owed after their Lightning window closed unpaid; `?all=true` includes resolved ones |
+| `POST` | `/api/v1/admin/owed-winners/{entry_id}/approve-sweep` | approve sweeping a winner's split output |
+| `POST` | `/api/v1/admin/owed-winners/{entry_id}/settle` | record a winner paid (JSON `note`); approves the sweep too |
 
 ## `synth`
 

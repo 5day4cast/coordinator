@@ -130,7 +130,8 @@ While it is on:
   else. Players see no operator detail.
 - Everything that settles money keeps running: kickoffs (with `"kickoff"`), attestation polling,
   outcome, expiry and split broadcasts, Lightning payouts and the payout window cutoff, hold invoice
-  cancellations, Arkade escrow refunds and recoveries, and market-maker reclaims.
+  cancellations, Arkade escrow refunds and recoveries, and the market-maker reclaims an operator
+  approved ([owed winners](owed-winners.md)).
 - With `"refund"`, a competition or pool that has no contract yet and that no Arkade batch has
   funded is cancelled at its next step, and the cleanup sweep refunds its entries. One whose
   contract is built carries on: its kickoff is already under way.
@@ -171,9 +172,9 @@ Check, in order:
    coordinator admin payout-holds release <entry-id>
    ```
 
-   Resolve holds well within the contract's reclaim window: a held winner who neither is paid
-   over Lightning nor claims on chain is reclaimed by the market maker once the split outputs
-   mature. The `coordinator_payout_holds` gauge counts the holds still open.
+   A held winner who is neither paid over Lightning in time nor claims on chain becomes an owed
+   winner: their output is swept only once an operator approves ([owed winners](owed-winners.md)).
+   The `coordinator_payout_holds` gauge counts the holds still open.
 3. `coordinator admin competitions list --state active`: every unfinished competition should move
    within a few sweeps. `coordinator admin competitions show <id>` lists the errors each one kept.
    Compare the funding, outcome and split transactions with a block explorer.
@@ -208,8 +209,9 @@ With their nsec and their records, the recovery tool ([RECOVERY.md](../RECOVERY.
   expired unattested, and then the split transaction;
 - claim a win on chain once the split transaction has the required confirmations.
 
-The market maker can reclaim a winner's split output a further delay after that, so a winner who
-was not paid over Lightning should claim before then.
+The market maker's reclaim path on a winner's split output opens a further delay after that. The
+coordinator uses it only for an owed winner, and only once an operator approves
+([owed winners](owed-winners.md)), so an unpaid winner can still claim later.
 
 ## 6. When Keymeld is unavailable
 
@@ -219,8 +221,8 @@ Still works:
 
 - Broadcasting the pre-signed outcome and expiry transactions of every signed contract, and the
   split transactions, which the coordinator signs with ticket preimages it already holds.
-- Market-maker reclaims of unpaid winners' split outputs, and reclaims of the coordinator's own
-  escrows: they need only the market-maker key.
+- Market-maker reclaims of owed winners' split outputs an operator approved, and reclaims of the
+  coordinator's own escrows: they need only the market-maker key.
 - Cancelling hold invoices, so single competitions paid by hold invoice are refunded.
 - Lightning payouts for entries without a payout escrow: the winner reveals the payout preimage and
   pastes an invoice, and the coordinator pays it.
@@ -239,6 +241,7 @@ Does not work until Keymeld is back:
 ## 7. Leaving settle-only mode
 
 Once every unfinished competition has settled or been refunded, every payout hold is resolved,
+every owed winner is paid (`coordinator_winners_owed` is 0),
 and the Litestream replica is healthy again, set `settle_only = false` (and unset
 `COORDINATOR_SETTLE_ONLY`) and restart. `GET /api/v1/health_check` then reports
 `"settle_only":false` and new competitions can be created.
