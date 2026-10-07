@@ -10,10 +10,10 @@ use reqwest::{Client, RequestBuilder};
 use std::{path::Path, sync::Arc};
 use zeroize::Zeroizing;
 
-/// HTTP client for the coordinator API
 /// Sent on every synthetic request, so the operator pages can tell synthetic traffic apart.
 pub const USER_AGENT: &str = concat!("5day4cast-synth/", env!("CARGO_PKG_VERSION"));
 
+/// HTTP client for the coordinator API
 #[derive(Clone)]
 pub struct CoordinatorClient {
     http: Client,
