@@ -278,6 +278,7 @@ impl Tracker {
                 payee_node,
                 ark_swap,
                 http: reqwest::Client::builder()
+                    .user_agent(crate::client::USER_AGENT)
                     .timeout(Duration::from_secs(10))
                     .build()?,
                 config,
