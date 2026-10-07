@@ -646,12 +646,10 @@ pub async fn publish_due(
                     warn!("Recovery relay {relay} is unreachable: {error:#}");
                 }
             }
-            Some(Ok(_)) => {
-                if health.down.remove(relay).is_some() {
-                    recovered.push(relay.clone());
-                }
+            Some(Ok(_)) if health.down.remove(relay).is_some() => {
+                recovered.push(relay.clone());
             }
-            None => {}
+            Some(Ok(_)) | None => {}
         }
     }
 
