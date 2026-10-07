@@ -1317,6 +1317,7 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let ready = |created: OffsetDateTime| {
             let mut competition = open_competition();
+            competition.created_at = created;
             competition.total_entries = 3;
             competition.total_paid_entries = 3;
             competition.escrow_funds_confirmed_at = Some(created);
