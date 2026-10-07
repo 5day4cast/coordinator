@@ -67,6 +67,8 @@ pub struct Settings {
     pub http_context: HttpContextSettings,
     #[serde(default)]
     pub telemetry: TelemetrySettings,
+    #[serde(default, rename = "feedback")]
+    pub feedback_settings: FeedbackSettings,
 }
 
 /// Environment variable that sets `http_context.trusted_proxies`, overriding the file.
@@ -1047,6 +1049,8 @@ impl Settings {
             .validate(&self.coordinator_settings)?;
         self.pow_settings.validate()?;
         self.http_context.validate()?;
+        self.feedback_settings.validate()?;
+        self.admin_settings.logs.validate()?;
         self.keymeld_settings.validate(network)
     }
 }
@@ -1152,6 +1156,9 @@ pub struct AdminSettings {
     /// Refused on mainnet and on non-loopback addresses.
     #[serde(default)]
     pub dangerous_allow_unauthenticated: bool,
+    /// Where the Visitors page reads visitor logs.
+    #[serde(default)]
+    pub logs: LogsSettings,
 }
 
 impl Default for AdminSettings {
@@ -1161,6 +1168,7 @@ impl Default for AdminSettings {
             listen_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 9991)),
             token_file: String::from("./creds/admin_token"),
             dangerous_allow_unauthenticated: false,
+            logs: LogsSettings::default(),
         }
     }
 }
@@ -1762,6 +1770,13 @@ pub fn get_settings() -> Result<Settings, anyhow::Error> {
         env::var(TRUSTED_PROXIES_ENV).ok(),
         env::var(CLIENT_IP_HEADER_ENV).ok(),
     );
+    settings
+        .feedback_settings
+        .apply_env(|name| env::var(name).ok())?;
+    settings
+        .admin_settings
+        .logs
+        .apply_env(|name| env::var(name).ok());
     Ok(settings)
 }
 
@@ -2133,5 +2148,269 @@ mod satchel_settings_tests {
                 "{url}"
             );
         }
+    }
+}
+
+/// The feedback form and its alerts. Off by default.
+///
+/// Each key can also be set by an environment variable, which wins: `COORDINATOR_FEEDBACK_`
+/// and the key in capitals, for example `COORDINATOR_FEEDBACK_NTFY_URL`. Without an ntfy URL
+/// messages are stored and shown on the operator's Feedback page, and no alert is sent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FeedbackSettings {
+    pub enabled: bool,
+    /// The ntfy server alerts are posted to, for example `https://ntfy.example.com`.
+    pub ntfy_url: Option<String>,
+    pub ntfy_topic: String,
+    /// File holding an ntfy access token allowed to publish to the topic.
+    pub ntfy_token_file: Option<String>,
+    /// Sent as ntfy's `Email` header, so the server emails a copy too.
+    pub notify_email: Option<String>,
+    /// The operator origin alerts link to, for example `https://admin.example.com:9443`.
+    pub admin_url: Option<String>,
+}
+
+pub const FEEDBACK_ENV_PREFIX: &str = "COORDINATOR_FEEDBACK_";
+
+impl Default for FeedbackSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ntfy_url: None,
+            ntfy_topic: String::from("feedback"),
+            ntfy_token_file: None,
+            notify_email: None,
+            admin_url: None,
+        }
+    }
+}
+
+impl FeedbackSettings {
+    /// Apply the `COORDINATOR_FEEDBACK_*` variables `var` finds. An empty value unsets an
+    /// optional key.
+    pub fn apply_env(&mut self, var: impl Fn(&str) -> Option<String>) -> Result<(), anyhow::Error> {
+        let var = |key: &str| var(&format!("{FEEDBACK_ENV_PREFIX}{key}"));
+        if let Some(enabled) = var("ENABLED") {
+            self.enabled = match enabled.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => true,
+                "0" | "false" | "no" | "off" | "" => false,
+                other => {
+                    return Err(anyhow!(
+                        "{FEEDBACK_ENV_PREFIX}ENABLED must be true or false, not {other:?}"
+                    ))
+                }
+            };
+        }
+        let optional = |value: String| Some(value.trim().to_owned()).filter(|v| !v.is_empty());
+        if let Some(value) = var("NTFY_URL") {
+            self.ntfy_url = optional(value);
+        }
+        if let Some(value) = var("NTFY_TOPIC").and_then(optional) {
+            self.ntfy_topic = value;
+        }
+        if let Some(value) = var("NTFY_TOKEN_FILE") {
+            self.ntfy_token_file = optional(value);
+        }
+        if let Some(value) = var("NOTIFY_EMAIL") {
+            self.notify_email = optional(value);
+        }
+        if let Some(value) = var("ADMIN_URL") {
+            self.admin_url = optional(value);
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), anyhow::Error> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.ntfy_topic.is_empty()
+            || self.ntfy_topic.len() > 64
+            || !self
+                .ntfy_topic
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(anyhow!(
+                "feedback.ntfy_topic must be 1-64 letters, digits, - or _"
+            ));
+        }
+        for (key, url) in [
+            ("feedback.ntfy_url", &self.ntfy_url),
+            ("feedback.admin_url", &self.admin_url),
+        ] {
+            if let Some(url) = url {
+                let parsed = reqwest::Url::parse(url).map_err(|e| anyhow!("{key}: {e}"))?;
+                if !matches!(parsed.scheme(), "http" | "https")
+                    || parsed.query().is_some()
+                    || parsed.fragment().is_some()
+                    || !parsed.username().is_empty()
+                {
+                    return Err(anyhow!(
+                        "{key} must be an http(s) URL without credentials, query or fragment"
+                    ));
+                }
+            }
+        }
+        if let Some(email) = &self.notify_email {
+            if email.len() > 254 || email.contains(char::is_whitespace) || !email.contains('@') {
+                return Err(anyhow!("feedback.notify_email is not an email address"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Where the operator's Visitors page reads visitor logs: a Grafana-shaped base URL whose
+/// `query_path` answers Loki's `query_range`. Unset, the page says logs are not configured.
+/// Environment variables win: `COORDINATOR_LOGS_URL`, `COORDINATOR_LOGS_QUERY_PATH` and
+/// `COORDINATOR_LOGS_EXPLORE_URL`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LogsSettings {
+    pub url: Option<String>,
+    pub query_path: String,
+    /// The operator's Grafana, for "Open in Explore" links.
+    pub explore_url: Option<String>,
+}
+
+pub const DEFAULT_LOGS_QUERY_PATH: &str =
+    "/api/datasources/proxy/uid/visitors/loki/api/v1/query_range";
+
+impl Default for LogsSettings {
+    fn default() -> Self {
+        Self {
+            url: None,
+            query_path: String::from(DEFAULT_LOGS_QUERY_PATH),
+            explore_url: None,
+        }
+    }
+}
+
+impl LogsSettings {
+    pub fn apply_env(&mut self, var: impl Fn(&str) -> Option<String>) {
+        let optional = |value: String| Some(value.trim().to_owned()).filter(|v| !v.is_empty());
+        if let Some(value) = var("COORDINATOR_LOGS_URL") {
+            self.url = optional(value);
+        }
+        if let Some(value) = var("COORDINATOR_LOGS_QUERY_PATH").and_then(optional) {
+            self.query_path = value;
+        }
+        if let Some(value) = var("COORDINATOR_LOGS_EXPLORE_URL") {
+            self.explore_url = optional(value);
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), anyhow::Error> {
+        if !self.query_path.starts_with('/')
+            || self.query_path.contains(['?', '#'])
+            || self.query_path.contains("..")
+        {
+            return Err(anyhow!(
+                "admin_settings.logs.query_path must be an absolute path without a query"
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod feedback_settings_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name| map.get(name).cloned()
+    }
+
+    #[test]
+    fn feedback_is_off_by_default_and_read_from_toml_and_the_environment() {
+        let defaults = FeedbackSettings::default();
+        assert!(!defaults.enabled);
+        assert_eq!(defaults.ntfy_topic, "feedback");
+        assert!(defaults.validate().is_ok());
+
+        let mut settings: FeedbackSettings =
+            toml::from_str("enabled = true\nntfy_url = \"https://ntfy.example.com\"\n").unwrap();
+        assert!(settings.enabled);
+        assert_eq!(settings.ntfy_topic, "feedback");
+        settings
+            .apply_env(env(&[
+                ("COORDINATOR_FEEDBACK_NTFY_TOPIC", "feedback-test"),
+                ("COORDINATOR_FEEDBACK_NTFY_URL", ""),
+                (
+                    "COORDINATOR_FEEDBACK_ADMIN_URL",
+                    "https://admin.example.com:9443",
+                ),
+                ("COORDINATOR_FEEDBACK_NOTIFY_EMAIL", "ops@example.com"),
+            ]))
+            .unwrap();
+        assert_eq!(settings.ntfy_topic, "feedback-test");
+        assert_eq!(settings.ntfy_url, None);
+        assert_eq!(
+            settings.admin_url.as_deref(),
+            Some("https://admin.example.com:9443")
+        );
+        assert!(settings.validate().is_ok());
+
+        settings
+            .apply_env(env(&[("COORDINATOR_FEEDBACK_ENABLED", "false")]))
+            .unwrap();
+        assert!(!settings.enabled);
+        assert!(settings
+            .apply_env(env(&[("COORDINATOR_FEEDBACK_ENABLED", "maybe")]))
+            .is_err());
+    }
+
+    #[test]
+    fn bad_feedback_settings_are_refused_when_enabled() {
+        for bad in [
+            FeedbackSettings {
+                ntfy_topic: "a/b".into(),
+                ..FeedbackSettings::default()
+            },
+            FeedbackSettings {
+                ntfy_url: Some("ftp://ntfy.example.com".into()),
+                ..FeedbackSettings::default()
+            },
+            FeedbackSettings {
+                admin_url: Some("https://user:pw@admin.example.com".into()),
+                ..FeedbackSettings::default()
+            },
+            FeedbackSettings {
+                notify_email: Some("not an email".into()),
+                ..FeedbackSettings::default()
+            },
+        ] {
+            assert!(bad.validate().is_ok(), "ignored while disabled");
+            let enabled = FeedbackSettings {
+                enabled: true,
+                ..bad
+            };
+            assert!(enabled.validate().is_err(), "{enabled:?}");
+        }
+    }
+
+    #[test]
+    fn logs_settings_default_to_the_visitors_datasource() {
+        let mut logs = LogsSettings::default();
+        assert_eq!(logs.url, None);
+        assert_eq!(logs.query_path, DEFAULT_LOGS_QUERY_PATH);
+        logs.apply_env(env(&[
+            ("COORDINATOR_LOGS_URL", "https://monitoring.example.com"),
+            (
+                "COORDINATOR_LOGS_EXPLORE_URL",
+                "https://grafana.example.com",
+            ),
+        ]));
+        assert_eq!(logs.url.as_deref(), Some("https://monitoring.example.com"));
+        assert!(logs.validate().is_ok());
+        logs.query_path = "/x?y=1".into();
+        assert!(logs.validate().is_err());
     }
 }

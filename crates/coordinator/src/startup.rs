@@ -362,6 +362,10 @@ pub struct AppState {
     pub http_context: Arc<HttpContext>,
     /// Per-session and global caps on browser telemetry events.
     pub telemetry_caps: Arc<crate::api::telemetry::TelemetryCaps>,
+    /// The feedback form's messages, proof of work and limits.
+    pub feedback: Arc<crate::domain::feedback::Feedback>,
+    /// Visitor logs for the operator's Visitors page.
+    pub visitor_logs: Arc<crate::infra::visitor_logs::VisitorLogs>,
 }
 
 async fn create_bitcoin_client(config: &Settings) -> Result<Arc<dyn Bitcoin>, anyhow::Error> {
@@ -923,6 +927,22 @@ pub async fn build_app(
         );
         threads.insert("recovery_records".to_string(), recovery_handle);
     }
+    // Feedback is kept in the users database; its alerts go out from one coordinator.
+    let feedback_store = crate::domain::feedback::FeedbackStore::new(users_db_clone.clone());
+    if config.feedback_settings.enabled {
+        match crate::infra::feedback_alerts::FeedbackAlerts::from_settings(
+            &config.feedback_settings,
+        ) {
+            Ok(Some(alerts)) => Arc::new(alerts).spawn(
+                feedback_store.clone(),
+                coordinator.worker_leases().clone(),
+                &tracker,
+                cancel_token.clone(),
+            ),
+            Ok(None) => info!("Feedback is on without alerts (no ntfy URL)"),
+            Err(error) => warn!("Feedback alerts are unavailable: {error:#}"),
+        }
+    }
     tracker.close();
 
     let wasm_version = crate::api::ui_files::package_version(&config.ui_settings.ui_dir);
@@ -966,6 +986,13 @@ pub async fn build_app(
         signup_pow: Arc::new(SignupPow::new(config.pow_settings)),
         http_context: Arc::new(HttpContext::from_settings(&config.http_context)?),
         telemetry_caps: Arc::default(),
+        feedback: Arc::new(crate::domain::feedback::Feedback::new(
+            config.feedback_settings.enabled,
+            feedback_store,
+        )),
+        visitor_logs: Arc::new(crate::infra::visitor_logs::VisitorLogs::from_settings(
+            &config.admin_settings.logs,
+        )),
     };
     Ok((
         app_state,
@@ -1180,6 +1207,22 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Result<Router, anyhow
         )
         .layer(DefaultBodyLimit::max(crate::api::telemetry::MAX_BODY_BYTES));
 
+    // The feedback form has its own limits (domain::feedback), so it never uses up a
+    // client's request limit either.
+    let feedback = Router::new()
+        .route(
+            "/feedback",
+            get(crate::api::routes::feedback_page_handler).post(crate::api::routes::post_feedback),
+        )
+        .route(
+            "/api/v1/feedback/challenge",
+            get(crate::api::routes::feedback_challenge),
+        )
+        .route("/api/v1/feedback", post(crate::api::routes::post_feedback))
+        .layer(DefaultBodyLimit::max(
+            crate::api::routes::FEEDBACK_MAX_BODY_BYTES,
+        ));
+
     // The wallet also fetches the assigned enclave's attestation from Keymeld. Pages look up
     // the player's Satchel address and post the Satchel sign-in form, when it is configured.
     let satchel = app_state.satchel_url.as_deref().unwrap_or_default();
@@ -1197,6 +1240,7 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Result<Router, anyhow
     Ok(Router::new()
         .merge(api_routes)
         .merge(telemetry)
+        .merge(feedback)
         .merge(static_files(&app_state))
         .layer(compression())
         .layer(Extension(replay))
@@ -1268,6 +1312,21 @@ pub fn admin_app(app_state: Arc<AppState>, access: Arc<AdminAccess>, network: Ne
         .route("/operations", get(crate::api::routes::operations_page))
         .route("/keymeld", get(crate::api::routes::keymeld_page))
         .route("/services", get(crate::api::routes::services_page))
+        .route("/feedback", get(crate::api::routes::admin_feedback_list))
+        .route(
+            "/feedback/unread",
+            get(crate::api::routes::admin_feedback_unread),
+        )
+        .route(
+            "/feedback/{id}",
+            get(crate::api::routes::admin_feedback_detail)
+                .post(crate::api::routes::admin_feedback_update),
+        )
+        .route("/visitors", get(crate::api::routes::visitors_page_handler))
+        .route(
+            "/visitors/results",
+            get(crate::api::routes::visitors_results_handler),
+        )
         .route("/funds", get(crate::api::routes::funds_page))
         .route("/funds/tickets/{id}", get(crate::api::routes::funds_ticket))
         .route("/funds/chain/{id}", get(crate::api::routes::funds_chain))
@@ -1557,6 +1616,7 @@ mod startup_tests {
         "/api/v1/admin/owed-winners/0190b7a4-0000-7000-8000-000000000000/approve-sweep";
     const OWED_WINNER_SETTLE_PATH: &str =
         "/api/v1/admin/owed-winners/0190b7a4-0000-7000-8000-000000000000/settle";
+    const FEEDBACK_PATH: &str = "/admin/feedback/0190b7a4-0000-7000-8000-000000000000";
 
     /// Every operator route, including the sign-in form, as (method, path).
     const OPERATOR_ROUTES: &[(&str, &str)] = &[
@@ -1604,6 +1664,12 @@ mod startup_tests {
         ("POST", "/admin/api/recovery/republish"),
         ("GET", "/api/v1/admin/recovery"),
         ("POST", "/api/v1/admin/recovery/republish"),
+        ("GET", "/admin/feedback"),
+        ("GET", "/admin/feedback/unread"),
+        ("GET", FEEDBACK_PATH),
+        ("POST", FEEDBACK_PATH),
+        ("GET", "/admin/visitors"),
+        ("GET", "/admin/visitors/results"),
     ];
 
     fn protected_routes() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
@@ -2164,7 +2230,8 @@ mod startup_tests {
                         || path == &COMPETITION_PATH
                         || path == &PAYOUT_HOLD_RELEASE_PATH
                         || path == &OWED_WINNER_APPROVE_PATH
-                        || path == &OWED_WINNER_SETTLE_PATH),
+                        || path == &OWED_WINNER_SETTLE_PATH
+                        || path == &FEEDBACK_PATH),
                 "{method} {path} with bearer returned {status}: {body}"
             );
         }
@@ -2430,6 +2497,257 @@ mod startup_tests {
             at as u64 * 8 + u64::from(hash[at].leading_zeros())
         });
         zeros >= difficulty
+    }
+
+    /// Form fields carrying a solved feedback proof of work.
+    async fn feedback_proof(public: &Router) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let (status, headers, body) = send(
+            public,
+            request("GET", "/api/v1/feedback/challenge", &[], ""),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(headers["cache-control"], "no-store");
+        let issued: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let challenge = issued["challenge"].as_str().unwrap();
+        let bytes = URL_SAFE_NO_PAD.decode(challenge).unwrap();
+        let difficulty = issued["difficulty"].as_u64().unwrap();
+        assert_eq!(
+            difficulty,
+            u64::from(crate::domain::feedback::FEEDBACK_POW_BITS)
+        );
+        let nonce = (0u64..)
+            .find(|nonce| solves_pow(&bytes, *nonce, difficulty))
+            .unwrap();
+        format!("pow_challenge={challenge}&pow_nonce={nonce}")
+    }
+
+    const SESSION: &str = "Xq3vT9mPa1Lw0Zb8Yc7Rkd";
+
+    fn feedback_post(path: &str, htmx: bool, body: &str) -> Request<Body> {
+        let mut headers = vec![
+            ("content-type", FORM),
+            ("x-session-id", SESSION),
+            ("user-agent", "test-agent/1.0"),
+        ];
+        if htmx {
+            headers.push(("hx-request", "true"));
+            headers.push((
+                "hx-current-url",
+                "http://127.0.0.1:9990/competitions?secret=1#x",
+            ));
+        }
+        request("POST", path, &headers, body)
+    }
+
+    #[tokio::test]
+    async fn feedback_is_off_by_default() {
+        let test = TestState::start().await;
+        let public = test.public();
+        for (method, path) in [
+            ("GET", "/api/v1/feedback/challenge"),
+            ("POST", "/api/v1/feedback"),
+            ("POST", "/feedback"),
+            ("GET", "/feedback"),
+        ] {
+            let (status, _, _) = send(
+                &public,
+                request(method, path, &[("content-type", FORM)], "message=hi"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}");
+        }
+        let (_, _, body) = send(&public, request("GET", "/", &[], "")).await;
+        assert!(!body.contains("data-feedback-open"));
+        test.stop().await;
+    }
+
+    #[tokio::test]
+    async fn feedback_is_stored_once_with_the_servers_context_and_limited() {
+        let test =
+            TestState::start_with(|settings| settings.feedback_settings.enabled = true).await;
+        let public = test.public();
+        let store = test.state.feedback.store.clone();
+
+        let (status, _, body) = send(&public, request("GET", "/", &[], "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("data-feedback-open"),
+            "the footer links to it"
+        );
+        let (status, _, body) = send(&public, request("GET", "/feedback", &[], "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#"action="/feedback""#));
+
+        let proof = feedback_proof(&public).await;
+        let (status, _, body) = send(
+            &public,
+            feedback_post(
+                "/api/v1/feedback",
+                true,
+                &format!(
+                    "message=Hello+there%0D%0Asecond%07&contact=me%40example.com&website=&{proof}"
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.contains("Your message reached the 5day4cast team."),
+            "{body}"
+        );
+        assert!(!body.contains("<!DOCTYPE"));
+        let stored = store.list(None, 50).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        let row = &stored[0];
+        assert_eq!(row.message, "Hello there\nsecond");
+        assert_eq!(row.contact.as_deref(), Some("me@example.com"));
+        assert_eq!(row.page.as_deref(), Some("/competitions"));
+        assert_eq!(row.sid.as_deref(), Some(SESSION));
+        assert!(row
+            .rid
+            .as_deref()
+            .is_some_and(crate::api::request_context::valid_request_id));
+        assert_eq!(row.ip.as_deref(), Some("0.0.0.0"));
+        assert_eq!(row.user_agent.as_deref(), Some("test-agent/1.0"));
+        assert_eq!(row.pubkey, None);
+        assert_eq!(row.notified_at, None);
+
+        // A spent proof is refused, and the form comes back with the text.
+        let (status, _, body) = send(
+            &public,
+            feedback_post(
+                "/api/v1/feedback",
+                true,
+                &format!("message=Another&{proof}"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("Press Send again"), "{body}");
+        assert!(body.contains(">Another</textarea>"), "{body}");
+
+        // A repeat and a filled hidden field are thanked and dropped.
+        for body in [
+            "message=Hello+there%0Asecond".to_owned(),
+            "message=Buy+now&website=https%3A%2F%2Fspam.example".to_owned(),
+        ] {
+            let proof = feedback_proof(&public).await;
+            let (status, _, answer) = send(
+                &public,
+                feedback_post("/api/v1/feedback", true, &format!("{body}&{proof}")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(answer.contains("reached the 5day4cast team"), "{answer}");
+        }
+        assert_eq!(store.list(None, 50).await.unwrap().len(), 1);
+
+        // Without JavaScript: no proof, a whole page back.
+        let (status, _, body) = send(
+            &public,
+            feedback_post("/feedback", false, "message=No+script+here&contact="),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("<!DOCTYPE") && body.contains("reached the 5day4cast team"));
+        assert_eq!(store.list(None, 50).await.unwrap().len(), 2);
+        let (status, _, body) =
+            send(&public, feedback_post("/feedback", false, "message=+%0A+")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("Write a message first."));
+
+        // A tab sends three an hour: the first, the repeat and the page's one were counted.
+        let proof = feedback_proof(&public).await;
+        let (_, _, body) = send(
+            &public,
+            feedback_post("/api/v1/feedback", true, &format!("message=Four&{proof}")),
+        )
+        .await;
+        assert!(body.contains("a lot of messages"), "{body}");
+        assert_eq!(store.list(None, 50).await.unwrap().len(), 2);
+
+        // The operator's pages list, open and update it.
+        let admin = test.admin(token_access(), Network::Regtest);
+        let bearer = [("authorization", BEARER)];
+        let (status, _, body) = send(
+            &admin,
+            request("GET", "/admin/feedback/unread", &bearer, ""),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(">2</span>"), "{body}");
+        let (status, _, body) = send(&admin, request("GET", "/admin/feedback", &bearer, "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("Hello there second") && body.contains("No script here"),
+            "{body}"
+        );
+        let detail = format!("/admin/feedback/{}", row.id);
+        let (status, _, body) = send(&admin, request("GET", &detail, &bearer, "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("Hello there\nsecond"), "{body}");
+        assert!(body.contains("/admin/visitors?sid=Xq3vT9mPa1Lw0Zb8Yc7Rkd"));
+        let (status, _, body) = send(
+            &admin,
+            request(
+                "POST",
+                &detail,
+                &[("authorization", BEARER), ("content-type", FORM)],
+                "status=done&note=Replied+by+email",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("Saved."));
+        let updated = store.get(row.id).await.unwrap().unwrap();
+        assert_eq!(
+            updated.status,
+            crate::domain::feedback::FeedbackStatus::Done
+        );
+        assert_eq!(updated.operator_note.as_deref(), Some("Replied by email"));
+        let (_, _, body) = send(
+            &admin,
+            request("GET", "/admin/feedback/unread", &bearer, ""),
+        )
+        .await;
+        assert!(body.contains(">1</span>"), "{body}");
+        test.stop().await;
+    }
+
+    #[tokio::test]
+    async fn the_visitors_page_says_when_logs_are_not_configured() {
+        let test = TestState::start().await;
+        let admin = test.admin(token_access(), Network::Regtest);
+        let bearer = [("authorization", BEARER)];
+        let (status, _, body) = send(
+            &admin,
+            request("GET", "/admin/visitors?ip=203.0.113.7", &bearer, ""),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("Visitor logs are not configured"), "{body}");
+        let (status, _, body) = send(
+            &admin,
+            request("GET", "/admin/visitors/results?rid=bad%22rid", &bearer, ""),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("That is not a request id."), "{body}");
+        let (_, _, body) = send(
+            &admin,
+            request("GET", "/admin/visitors/results?user=nobody", &bearer, ""),
+        )
+        .await;
+        assert!(body.contains("No account has that username."), "{body}");
+        let (_, _, body) = send(
+            &admin,
+            request("GET", "/admin/visitors/results?ip=203.0.113.7", &bearer, ""),
+        )
+        .await;
+        assert!(body.contains("Visitor logs are not configured."), "{body}");
+        test.stop().await;
     }
 
     /// A challenge from the public API, its bytes, and the first nonce solving it.

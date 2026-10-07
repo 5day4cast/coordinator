@@ -1,0 +1,22 @@
+/* The feedback form's honeypot: off screen, out of the tab order, hidden from screen readers. */
+.feedback-website {
+  position: absolute;
+  left: -10000px;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+}
+
+.feedback-form .label {
+  display: block;
+}
+
+.feedback-form .label .textarea,
+.feedback-form .label .input {
+  margin-top: 0.25rem;
+  font-weight: normal;
+}
+
+.feedback-page {
+  max-width: 40rem;
+}

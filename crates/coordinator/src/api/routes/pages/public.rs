@@ -68,13 +68,13 @@ const MAIN_CONTENT: &str = "main#main-content";
 
 /// Whether to answer with content only: htmx swaps it into the open page.
 /// History restores (Back) need the whole page.
-fn is_fragment(headers: &HeaderMap) -> bool {
+pub(super) fn is_fragment(headers: &HeaderMap) -> bool {
     headers.contains_key("HX-Request") && !headers.contains_key("HX-History-Restore-Request")
 }
 
 /// Who may keep a copy of a response.
 #[derive(Clone, Copy)]
-enum Caching {
+pub(super) enum Caching {
     /// Anyone's view of public data: revalidate before reuse.
     Public,
     /// One account's data: never store it.
@@ -82,7 +82,7 @@ enum Caching {
 }
 
 impl Caching {
-    fn header(self) -> HeaderValue {
+    pub(super) fn header(self) -> HeaderValue {
         HeaderValue::from_static(match self {
             Caching::Public => "no-cache",
             Caching::Private => "private, no-store",
@@ -112,7 +112,7 @@ fn failed(id: &str, url: &str, what: &str) -> Response {
 }
 
 /// Content for htmx, or the whole page for a direct visit.
-fn page(
+pub(super) fn page(
     headers: &HeaderMap,
     state: &AppState,
     title: &str,
@@ -148,6 +148,7 @@ fn page(
                 Some(_) => RecoveryHelp::FileAndRelays,
             },
             satchel_url: state.satchel_url.as_deref(),
+            feedback: state.feedback.enabled,
         };
         base(&config, content).into_string()
     };

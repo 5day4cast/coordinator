@@ -5,6 +5,12 @@ pub use funds::*;
 mod operations;
 pub use operations::*;
 mod admin;
+mod admin_feedback;
+pub use admin_feedback::*;
+mod feedback;
+pub use feedback::*;
+mod visitors;
+pub use visitors::*;
 #[cfg(test)]
 mod entries_tests;
 mod late_results;

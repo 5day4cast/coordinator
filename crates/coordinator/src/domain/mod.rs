@@ -1,4 +1,5 @@
 mod competitions;
+pub mod feedback;
 mod invoices;
 pub mod leaderboard;
 pub mod recovery;

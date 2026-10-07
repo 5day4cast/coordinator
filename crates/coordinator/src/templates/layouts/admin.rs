@@ -59,6 +59,12 @@ pub fn admin_base(config: &AdminPageConfig, content: Markup) -> Markup {
                     a href="/admin/wallet" aria-current=[config.title.starts_with("Node").then_some("page")] { "Node & wallets" }
                     a href="/admin/keymeld" aria-current=[config.title.starts_with("Keymeld").then_some("page")] { "Keymeld" }
                     a href="/admin/services" aria-current=[(config.title == "Services").then_some("page")] { "Services" }
+                    a href="/admin/visitors" aria-current=[(config.title == "Visitors").then_some("page")] { "Visitors" }
+                    // The unread count loads after the page, so no page waits for it.
+                    a href="/admin/feedback" aria-current=[(config.title == "Feedback").then_some("page")] {
+                        "Feedback"
+                        span hx-get="/admin/feedback/unread" hx-trigger="load" hx-swap="innerHTML" {}
+                    }
                     label.admin-appearance hidden { "Appearance"
                         select id="admin-theme" {
                             option value="light" { "Light" }

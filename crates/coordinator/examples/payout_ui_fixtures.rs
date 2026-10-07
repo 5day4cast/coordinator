@@ -68,6 +68,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         wasm_version: "offline-fixture",
         recovery: coordinator::templates::components::RecoveryHelp::FileAndRelays,
         satchel_url: None,
+        feedback: false,
     };
     for (name, rows, default_address) in [
         ("payouts", payouts.as_slice(), Some(address)),
