@@ -73,7 +73,6 @@ impl Coordinator {
                 .payout_window_is_closed(competition.id)
                 .await
                 .unwrap_or(true)
-                || competition.delta_broadcasted_at.is_some()
                 || competition.completed_at.is_some()
                 || competition.cancelled_at.is_some();
             let automatic_lightning_address = policy

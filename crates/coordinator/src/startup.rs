@@ -4,21 +4,22 @@ use crate::{
     },
     api::nip98_replay::Nip98ReplayGuard,
     api::routes::{
-        add_event_entry, admin_competition_fragment, admin_competition_map,
-        admin_create_competition_handler, admin_delete_competition_handler,
+        add_event_entry, admin_approve_owed_winner_sweep_handler, admin_competition_fragment,
+        admin_competition_map, admin_create_competition_handler, admin_delete_competition_handler,
         admin_fee_estimates_fragment, admin_page_handler, admin_send_bitcoin_handler,
-        admin_settle_test_invoice_handler, admin_wallet_address_fragment,
-        admin_wallet_balance_fragment, admin_wallet_fragment, admin_wallet_outputs_fragment,
-        change_password, claim_ticket_payout, competitions_fragment, create_competition,
-        create_queued_competition, entries_fragment, entry_detail_fragment,
+        admin_settle_owed_winner_handler, admin_settle_test_invoice_handler,
+        admin_wallet_address_fragment, admin_wallet_balance_fragment, admin_wallet_fragment,
+        admin_wallet_outputs_fragment, change_password, claim_ticket_payout, competitions_fragment,
+        create_competition, create_queued_competition, entries_fragment, entry_detail_fragment,
         entry_forecasts_fragment, entry_form_fragment, entry_paid_fragment, entry_payout_fragment,
         entry_unpaid_fragment, forgot_password_challenge, forgot_password_reset,
         get_aggregate_nonces, get_balance, get_competition, get_competitions,
         get_contract_parameters, get_entries, get_estimated_fee_rates, get_next_address,
         get_outputs, get_paid_tickets, get_ticket_refund, get_ticket_status, get_unpaid_tickets,
         health, leaderboard_fragment, leaderboard_rows_fragment, login, login_username, not_found,
-        operator_competition, operator_competitions, operator_delete_competition,
-        operator_payout_holds, operator_release_payout_hold, operator_write_off_refunds,
+        operator_approve_owed_winner_sweep, operator_competition, operator_competitions,
+        operator_delete_competition, operator_owed_winners, operator_payout_holds,
+        operator_release_payout_hold, operator_settle_owed_winner, operator_write_off_refunds,
         payouts_fragment, public_page_handler, register, register_ticket, register_username,
         request_competition_ticket, send_to_address, set_lightning_address,
         submit_final_signatures, submit_public_nonces, submit_ticket_payout,
@@ -445,7 +446,7 @@ pub async fn build_app(
     let http_client = Client::new();
     let reqwest_client = build_reqwest_client(http_client.clone());
     let ln = create_lightning_client(&config, reqwest_client.clone()).await?;
-    let oracle_client = create_oracle_client(&config, http_client.clone())?;
+    let oracle_client = create_oracle_client(&config, oracle_http_client()?)?;
     create_folder(&config.db_settings.data_folder.clone());
 
     let pool_config: DatabasePoolConfig = config.db_settings.clone().into();
@@ -1244,6 +1245,14 @@ pub fn admin_app(app_state: Arc<AppState>, access: Arc<AdminAccess>, network: Ne
         .route(
             "/api/competitions/delete",
             post(admin_delete_competition_handler),
+        )
+        .route(
+            "/api/owed-winners/approve-sweep",
+            post(admin_approve_owed_winner_sweep_handler),
+        )
+        .route(
+            "/api/owed-winners/settle",
+            post(admin_settle_owed_winner_handler),
         );
     if network != Network::Bitcoin {
         admin_htmx_routes = admin_htmx_routes.route(
@@ -1280,6 +1289,15 @@ pub fn admin_app(app_state: Arc<AppState>, access: Arc<AdminAccess>, network: Ne
         .route(
             "/api/v1/admin/payout-holds/{entry_id}/release",
             post(operator_release_payout_hold),
+        )
+        .route("/api/v1/admin/owed-winners", get(operator_owed_winners))
+        .route(
+            "/api/v1/admin/owed-winners/{entry_id}/approve-sweep",
+            post(operator_approve_owed_winner_sweep),
+        )
+        .route(
+            "/api/v1/admin/owed-winners/{entry_id}/settle",
+            post(operator_settle_owed_winner),
         )
         .route_layer(middleware::from_fn_with_state(
             access.clone(),
@@ -1403,6 +1421,28 @@ pub fn build_reqwest_client(client: Client) -> ClientWithMiddleware {
         .build()
 }
 
+/// The longest one request to the oracle may take, from connecting to the end of its body.
+/// Without a limit, a connection the oracle, or the network on the way to it, accepted and then
+/// never answered held a competition step, and one of the few step slots, indefinitely. A
+/// request that times out is retried within the bound of [`build_oracle_reqwest_client`].
+pub const ORACLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// The longest connecting to the oracle may take.
+pub const ORACLE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The HTTP client the coordinator reaches the oracle with: every request is bounded by
+/// [`ORACLE_CONNECT_TIMEOUT`] and [`ORACLE_REQUEST_TIMEOUT`].
+pub fn oracle_http_client() -> Result<Client, anyhow::Error> {
+    oracle_http_client_with(ORACLE_CONNECT_TIMEOUT, ORACLE_REQUEST_TIMEOUT)
+}
+
+fn oracle_http_client_with(connect: Duration, request: Duration) -> Result<Client, anyhow::Error> {
+    Client::builder()
+        .connect_timeout(connect)
+        .timeout(request)
+        .build()
+        .map_err(|error| anyhow!("Failed to build the oracle HTTP client: {error}"))
+}
+
 /// Build a reqwest client for the oracle with more forgiving retry policy.
 /// The oracle may be temporarily unavailable during blue/green deployments,
 /// so we retry for up to 10 minutes with exponential backoff (5s to 60s).
@@ -1471,6 +1511,10 @@ mod startup_tests {
         "/api/v1/admin/competitions/0190b7a4-0000-7000-8000-000000000000";
     const PAYOUT_HOLD_RELEASE_PATH: &str =
         "/api/v1/admin/payout-holds/0190b7a4-0000-7000-8000-000000000000/release";
+    const OWED_WINNER_APPROVE_PATH: &str =
+        "/api/v1/admin/owed-winners/0190b7a4-0000-7000-8000-000000000000/approve-sweep";
+    const OWED_WINNER_SETTLE_PATH: &str =
+        "/api/v1/admin/owed-winners/0190b7a4-0000-7000-8000-000000000000/settle";
 
     /// Every operator route, including the sign-in form, as (method, path).
     const OPERATOR_ROUTES: &[(&str, &str)] = &[
@@ -1510,6 +1554,11 @@ mod startup_tests {
         ("POST", "/api/v1/admin/refunds/write-off"),
         ("GET", "/api/v1/admin/payout-holds"),
         ("POST", PAYOUT_HOLD_RELEASE_PATH),
+        ("POST", "/admin/api/owed-winners/approve-sweep"),
+        ("POST", "/admin/api/owed-winners/settle"),
+        ("GET", "/api/v1/admin/owed-winners"),
+        ("POST", OWED_WINNER_APPROVE_PATH),
+        ("POST", OWED_WINNER_SETTLE_PATH),
     ];
 
     fn protected_routes() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
@@ -1937,7 +1986,9 @@ mod startup_tests {
                     && (status != StatusCode::NOT_FOUND
                         || path == &SETTLE_PATH
                         || path == &COMPETITION_PATH
-                        || path == &PAYOUT_HOLD_RELEASE_PATH),
+                        || path == &PAYOUT_HOLD_RELEASE_PATH
+                        || path == &OWED_WINNER_APPROVE_PATH
+                        || path == &OWED_WINNER_SETTLE_PATH),
                 "{method} {path} with bearer returned {status}: {body}"
             );
         }

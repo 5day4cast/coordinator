@@ -34,7 +34,7 @@ use crate::{
     infra::refresh_cache::Cached,
     startup::AppState,
     templates::{
-        components::menu_toggle,
+        components::{menu_toggle, RecoveryHelp},
         format::{short_npub, Explorers},
         fragments::{
             entries_paused_banner,
@@ -142,6 +142,11 @@ fn page(
             oracle_base: &state.oracle_url,
             network: &network,
             wasm_version: &state.wasm_version,
+            recovery: match state.recovery.as_deref() {
+                None => RecoveryHelp::Off,
+                Some(recovery) if recovery.relays().is_empty() => RecoveryHelp::File,
+                Some(_) => RecoveryHelp::FileAndRelays,
+            },
         };
         base(&config, content).into_string()
     };

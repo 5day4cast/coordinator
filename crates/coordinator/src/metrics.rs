@@ -412,6 +412,11 @@ pub struct Metrics {
     payout_jobs_failed: IntGauge,
     payout_jobs_retrying: IntGauge,
     payout_job_oldest_open_age: IntGauge,
+    /// Competitions waiting for funding to confirm whose last check could not read the chain.
+    funding_checks_failing: IntGauge,
+    winners_owed: IntGauge,
+    winners_owed_sat: IntGauge,
+    winner_sweeps_held: IntGauge,
     background_thread_up: IntGaugeVec,
 }
 
@@ -464,6 +469,22 @@ impl Metrics {
             payout_job_oldest_open_age: gauge(
                 "coordinator_payout_job_oldest_open_age_seconds",
                 "Age of the oldest open automatic payout job, 0 when none is open",
+            )?,
+            funding_checks_failing: gauge(
+                "coordinator_funding_checks_failing",
+                "Competitions waiting for their funding to confirm whose last check could not read the chain",
+            )?,
+            winners_owed: gauge(
+                "coordinator_winners_owed",
+                "Winners whose Lightning payout window closed unpaid and whom no operator has recorded paying",
+            )?,
+            winners_owed_sat: gauge(
+                "coordinator_winners_owed_sat",
+                "Sats owed to winners whose Lightning payout window closed unpaid",
+            )?,
+            winner_sweeps_held: gauge(
+                "coordinator_winner_sweeps_held",
+                "Owed winners whose split output waits for an operator to approve its sweep",
             )?,
             background_thread_up: gauge_vec(
                 "coordinator_background_thread_up",
@@ -606,9 +627,11 @@ impl Metrics {
                 for state in COMPETITION_STATES {
                     self.competitions.with_label_values(&[state]).set(0);
                 }
-                for (state, count) in counts {
+                for (state, count) in counts.states {
                     self.competitions.with_label_values(&[state]).set(count);
                 }
+                self.funding_checks_failing
+                    .set(counts.funding_checks_failing);
             }
             Err(error) => {
                 warn!("Cannot count competitions for metrics: {error}");
@@ -652,6 +675,17 @@ impl Metrics {
         self.payout_jobs_retrying.set(counts.payout_jobs_retrying);
         self.payout_job_oldest_open_age
             .set(counts.oldest_open_payout_job_age_secs);
+        match self.store.owed_winner_counts().await {
+            Ok(owed) => {
+                self.winners_owed.set(owed.owed);
+                self.winners_owed_sat.set(owed.owed_sats);
+                self.winner_sweeps_held.set(owed.sweeps_held);
+            }
+            Err(error) => {
+                warn!("Cannot count owed winners for metrics: {error}");
+                return;
+            }
+        }
         *last_refresh = Some(Instant::now());
     }
 }
@@ -731,6 +765,10 @@ mod tests {
             "coordinator_payout_jobs_failed",
             "coordinator_payout_jobs_retrying",
             "coordinator_payout_job_oldest_open_age_seconds",
+            "coordinator_funding_checks_failing",
+            "coordinator_winners_owed",
+            "coordinator_winners_owed_sat",
+            "coordinator_winner_sweeps_held",
             "coordinator_background_thread_up",
             "coordinator_payout_attempts_total",
             "coordinator_payout_send_failures_total",
@@ -763,6 +801,8 @@ mod tests {
             "coordinator_tickets{status=\"expired\"} 0",
             "coordinator_payouts{status=\"failed\"} 0",
             "coordinator_payout_job_oldest_open_age_seconds 0",
+            "coordinator_winners_owed 0",
+            "coordinator_funding_checks_failing 0",
             "coordinator_background_thread_up{thread=\"running_worker\"} 1",
             "coordinator_background_thread_up{thread=\"stopped_worker\"} 0",
             "coordinator_payout_attempts_total{result=\"failed\"}",

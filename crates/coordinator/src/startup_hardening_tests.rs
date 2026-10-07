@@ -132,3 +132,31 @@ origins = ["http://localhost:9990"]"#;
         .validate(&crate::config::UISettings::default())
         .is_err());
 }
+
+/// An oracle that accepts the connection and never answers no longer holds a competition step:
+/// each request to it ends at the client's timeout, which the retry middleware treats as
+/// transient.
+#[tokio::test]
+async fn an_oracle_that_never_answers_times_out() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let silent = tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            held.push(socket);
+        }
+    });
+    let client =
+        oracle_http_client_with(Duration::from_secs(1), Duration::from_millis(300)).unwrap();
+    let started = std::time::Instant::now();
+    let error = client
+        .get(format!("http://{address}/oracle/events/x"))
+        .send()
+        .await
+        .unwrap_err();
+    assert!(error.is_timeout(), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(oracle_http_client().is_ok());
+    silent.abort();
+}

@@ -2,7 +2,7 @@ use maud::{html, Markup, DOCTYPE};
 
 use crate::templates::{
     assets::{APP_JS, BULMA_CSS, HTMX_JS, LOGIN_WORKER_JS, STYLES_CSS, THEME_JS},
-    components::{auth_modals, navbar},
+    components::{auth_modals, navbar, RecoveryHelp},
 };
 
 /// htmx 4 settings for the public pages, stated in full so they hold whatever
@@ -30,6 +30,8 @@ pub struct PageConfig<'a> {
     pub network: &'a str,
     /// Hash of the WASM package on disk; versions its URLs so browsers can cache it.
     pub wasm_version: &'a str,
+    /// What the sign-up dialog says about the recovery key.
+    pub recovery: RecoveryHelp,
 }
 
 pub fn base(config: &PageConfig, content: Markup) -> Markup {
@@ -72,7 +74,7 @@ pub fn base(config: &PageConfig, content: Markup) -> Markup {
                     a href=(format!("mailto:{CONTACT_EMAIL}")) { (CONTACT_EMAIL) }
                 }
 
-                (auth_modals())
+                (auth_modals(config.recovery))
             }
         }
     }
@@ -89,6 +91,7 @@ mod tests {
             oracle_base: "https://4casttruth.win",
             network: "signet",
             wasm_version: "abc123",
+            recovery: RecoveryHelp::FileAndRelays,
         };
         base(&config, html! { p { "content" } }).into_string()
     }

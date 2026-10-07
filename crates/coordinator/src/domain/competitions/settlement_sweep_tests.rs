@@ -340,6 +340,11 @@ mockall::mock! {
             outpoint: OutPoint,
             output: TxOut,
         ) -> Result<PayoutOutputStatus, anyhow::Error>;
+        async fn spending_transaction(
+            &self,
+            outpoint: OutPoint,
+            output: TxOut,
+        ) -> Result<Option<Transaction>, anyhow::Error>;
         async fn broadcast(&self, transaction: &Transaction) -> Result<(), anyhow::Error>;
         async fn get_next_address(&self) -> Result<bitcoin::Address, anyhow::Error>;
         async fn get_public_key(&self) -> Result<BitcoinPublicKey, anyhow::Error>;
@@ -361,6 +366,40 @@ mockall::mock! {
 /// LND's floor of 253 sat/kWU, in sat/vB as the client reads LND's estimates.
 const LND_FLOOR_SAT_PER_VB: f64 = 253.0 * 4.0 / 1_000.0;
 
+/// The height a transaction confirmed at, if it did.
+type ConfirmedAt = Arc<dyn Fn(&Txid) -> Option<u32> + Send + Sync>;
+
+/// How the fixture's chain answers.
+#[derive(Clone)]
+struct ChainSetup {
+    tip: u32,
+    /// The height each transaction confirmed at, if it did.
+    confirmed: ConfirmedAt,
+    /// Whether every broadcast is refused, as for a transaction spending a spent output.
+    refuse_broadcasts: bool,
+    /// What a lookup of a contract output answers.
+    output_status: PayoutOutputStatus,
+    /// The transaction that spent a contract output, when one did.
+    spender: Option<Transaction>,
+}
+
+impl Default for ChainSetup {
+    /// The outcome and split transactions confirmed long ago, and every output is unspent.
+    fn default() -> Self {
+        Self {
+            tip: 1_000,
+            confirmed: Arc::new(|_: &Txid| Some(100)),
+            refuse_broadcasts: false,
+            output_status: PayoutOutputStatus {
+                confirmation_height: Some(100),
+                current_height: 1_000,
+                unspent: true,
+            },
+            spender: None,
+        }
+    }
+}
+
 /// A competition past its split outputs' reclaim delay whose three winners were never paid.
 struct UnpaidWinners {
     _directory: tempfile::TempDir,
@@ -368,6 +407,7 @@ struct UnpaidWinners {
     coordinator: Coordinator,
     competition: Competition,
     contract: SignedContract,
+    players: [Scalar; 3],
     broadcasts: Arc<Mutex<Vec<Transaction>>>,
     ln: MockLnClient,
 }
@@ -383,31 +423,59 @@ impl UnpaidWinners {
     }
 
     async fn with_contract(
+        contract: (SignedContract, Scalar, [Scalar; 3]),
+        funding_value: Amount,
+        fee_rates: HashMap<u16, f64>,
+    ) -> Self {
+        Self::with_chain(contract, funding_value, fee_rates, ChainSetup::default()).await
+    }
+
+    async fn with_chain(
         (contract, market_maker, players): (SignedContract, Scalar, [Scalar; 3]),
         funding_value: Amount,
         fee_rates: HashMap<u16, f64>,
+        setup: ChainSetup,
     ) -> Self {
         let broadcasts = Arc::new(Mutex::new(Vec::new()));
         let mut chain = MockChain::new();
         chain
             .expect_get_derived_private_key()
             .returning(move || Ok(market_maker));
-        chain.expect_get_current_height().returning(|| Ok(1_000));
+        let ChainSetup {
+            tip,
+            confirmed,
+            refuse_broadcasts,
+            output_status,
+            spender,
+        } = setup;
+        chain.expect_get_current_height().returning(move || Ok(tip));
         chain
             .expect_get_confirmed_blockchain_time()
             .returning(|_| Ok(1_790_000_001));
-        // The outcome and split transactions confirmed long ago.
         chain
             .expect_get_tx_confirmation_height()
-            .returning(|_| Ok(Some(100)));
+            .returning(move |txid| Ok(confirmed(txid)));
         chain
             .expect_get_estimated_fee_rates()
             .returning(move || Ok(fee_rates.clone()));
         let record = broadcasts.clone();
         chain.expect_broadcast().returning(move |transaction| {
             record.lock().unwrap().push(transaction.clone());
-            Ok(())
+            if refuse_broadcasts {
+                Err(anyhow!("bad-txns-inputs-missingorspent"))
+            } else {
+                Ok(())
+            }
         });
+        chain
+            .expect_get_raw_transaction()
+            .returning(|txid| Err(anyhow!("transaction {txid} not found")));
+        chain
+            .expect_payout_output_status()
+            .returning(move |_, _| Ok(output_status));
+        chain
+            .expect_spending_transaction()
+            .returning(move |_, _| Ok(spender.clone()));
 
         let directory = tempfile::tempdir().unwrap();
         let database = DBConnection::new(
@@ -521,8 +589,57 @@ impl UnpaidWinners {
             coordinator,
             competition,
             contract,
+            players,
             broadcasts,
             ln,
+        }
+    }
+
+    /// Record that the winner with entry key `key` was paid over Lightning and released the key.
+    async fn pay(&self, key: Scalar) -> Uuid {
+        let pubkey = hex::encode(key.base_point_mul().serialize());
+        let entry = self
+            .entries()
+            .await
+            .into_iter()
+            .find(|entry| entry.ephemeral_pubkey == pubkey)
+            .expect("an entry with this key");
+        let (entry_id, secret) = (entry.id, hex::encode(key.serialize()));
+        let now = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        self.database
+            .execute_write(move |pool| async move {
+                sqlx::query(
+                    "INSERT INTO payouts (id, entry_id, payout_payment_request,
+                         payout_amount_sats, initiated_at, succeed_at)
+                     VALUES (?, ?, 'paid', 1, ?, ?)",
+                )
+                .bind(Uuid::now_v7().to_string())
+                .bind(entry_id.to_string())
+                .bind(now.clone())
+                .bind(now)
+                .execute(&pool)
+                .await?;
+                sqlx::query("UPDATE entries SET ephemeral_privatekey = ? WHERE id = ?")
+                    .bind(secret)
+                    .bind(entry_id.to_string())
+                    .execute(&pool)
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        entry_id
+    }
+
+    /// Approve the sweep of every owed winner's output.
+    async fn approve_every_sweep(&self) {
+        for owed in self.coordinator.owed_winners(false).await.unwrap() {
+            self.coordinator
+                .approve_owed_winner_sweep(owed.entry_id)
+                .await
+                .unwrap();
         }
     }
 
@@ -641,16 +758,55 @@ async fn split_reclaims_dust_at_any_fee_are_recorded_once_and_the_competition_co
     settlement.database.close().await.unwrap();
 }
 
-/// Split-reclaims are priced for confirmation within a day at LND's precision. The next-block
-/// estimate here would make every reclaim dust; the day's estimate, LND's floor, does not.
+/// Unpaid winners past their Lightning window are owed, and their outputs are held: nothing is
+/// swept until an operator approves. Approved split-reclaims are priced for confirmation within a
+/// day at LND's precision. The next-block estimate here would make every reclaim dust; the day's
+/// estimate, LND's floor, does not. The winners stay owed after the sweep.
 #[tokio::test]
-async fn split_reclaims_pay_the_economy_fee_rate() {
+async fn unpaid_winners_are_held_until_approved_and_then_swept_at_the_economy_fee_rate() {
     let settlement = UnpaidWinners::new(
         Amount::from_sat(10_000),
         HashMap::from([(1, 60.0), (ECONOMY_FEE_TARGET, LND_FLOOR_SAT_PER_VB)]),
     )
     .await;
 
+    let held = settlement
+        .coordinator
+        .process_status(CompetitionStatus::from(settlement.competition.clone()))
+        .await;
+    assert_eq!(held.state_name(), "delta_broadcasted");
+    assert!(
+        settlement.broadcasts().is_empty(),
+        "nothing is swept unapproved"
+    );
+    let owed = settlement.coordinator.owed_winners(false).await.unwrap();
+    assert_eq!(owed.len(), 3);
+    for winner in &owed {
+        assert!(winner.is_owed() && winner.sweep_approved_at.is_none());
+        assert_eq!(winner.sweepable_at_height, Some(100 + 144));
+        assert!(winner.output_status().starts_with("Held"));
+    }
+    let counts = settlement
+        .coordinator
+        .competition_store
+        .owed_winner_counts()
+        .await
+        .unwrap();
+    assert_eq!((counts.owed, counts.sweeps_held), (3, 3));
+    assert_eq!(
+        counts.owed_sats,
+        owed.iter()
+            .map(|winner| winner.amount_sats as i64)
+            .sum::<i64>()
+    );
+    // Settling again records nothing new.
+    settlement.coordinator.process_status(held).await;
+    assert_eq!(
+        settlement.coordinator.owed_winners(true).await.unwrap(),
+        owed
+    );
+
+    settlement.approve_every_sweep().await;
     let status = settlement
         .coordinator
         .process_status(CompetitionStatus::from(settlement.competition.clone()))
@@ -688,6 +844,46 @@ async fn split_reclaims_pay_the_economy_fee_rate() {
         assert!(entry.reclaimed_broadcasted_at.is_some());
         assert!(entry.sweep_uneconomic_at.is_none());
     }
+    let owed = settlement.coordinator.owed_winners(false).await.unwrap();
+    assert_eq!(owed.len(), 3, "a swept winner is still owed");
+    assert!(owed.iter().all(|winner| winner.swept_at.is_some()));
+    let counts = settlement
+        .coordinator
+        .competition_store
+        .owed_winner_counts()
+        .await
+        .unwrap();
+    assert_eq!((counts.owed, counts.sweeps_held), (3, 0));
+
+    // Recording each payment leaves nobody owed.
+    for winner in &owed {
+        let settled = settlement
+            .coordinator
+            .settle_owed_winner(winner.entry_id, "paid hash 00ff")
+            .await
+            .unwrap();
+        assert_eq!(settled.settled_note.as_deref(), Some("paid hash 00ff"));
+    }
+    assert!(settlement
+        .coordinator
+        .owed_winners(false)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(matches!(
+        settlement
+            .coordinator
+            .settle_owed_winner(owed[0].entry_id, " ")
+            .await,
+        Err(Error::BadRequest(_))
+    ));
+    assert!(matches!(
+        settlement
+            .coordinator
+            .approve_owed_winner_sweep(Uuid::now_v7())
+            .await,
+        Err(Error::NotFound(_))
+    ));
     settlement.database.close().await.unwrap();
 }
 
@@ -878,7 +1074,7 @@ async fn an_attestation_past_expiry_must_still_open_an_outcome() {
 }
 
 /// Settle-only mode stops no settlement: the unpaid winners' split outputs are reclaimed as
-/// usual and the competition completes.
+/// usual once approved, and the competition completes.
 #[tokio::test]
 async fn settle_only_mode_still_reclaims_unpaid_winners() {
     let mut settlement = UnpaidWinners::new(
@@ -890,6 +1086,12 @@ async fn settle_only_mode_still_reclaims_unpaid_winners() {
         enabled: true,
         unstarted: crate::config::SettleOnlyUnstarted::Refund,
     };
+    let held = settlement
+        .coordinator
+        .process_status(CompetitionStatus::from(settlement.competition.clone()))
+        .await;
+    assert_eq!(held.state_name(), "delta_broadcasted");
+    settlement.approve_every_sweep().await;
 
     let status = settlement
         .coordinator
@@ -1206,4 +1408,526 @@ async fn a_failed_payout_lnd_paid_is_marked_paid() {
         RestoreReconciliation::default()
     );
     settlement.database.close().await.unwrap();
+}
+
+/// The txid of the fixture's outcome transaction, as the competition records it.
+fn recorded_outcome_txid(settlement: &UnpaidWinners) -> Txid {
+    settlement
+        .competition
+        .outcome_transaction
+        .as_ref()
+        .unwrap()
+        .compute_txid()
+}
+
+/// The fixture's split transaction's txid.
+fn split_txid(contract: &SignedContract) -> Txid {
+    contract
+        .unsigned_split_tx(&Outcome::Attestation(0))
+        .unwrap()
+        .compute_txid()
+}
+
+/// A chain at `tip` where the recorded outcome transaction confirmed at `outcome` and the split
+/// transaction at `split`, if they did.
+async fn settling_at(tip: u32, outcome: u32, split: Option<u32>) -> UnpaidWinners {
+    let contract = signed_contract_funded(Amount::from_sat(100_000));
+    let split_id = split_txid(&contract.0);
+    let empty_outcome = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![],
+        output: vec![],
+    }
+    .compute_txid();
+    let setup = ChainSetup {
+        tip,
+        confirmed: Arc::new(move |txid: &Txid| {
+            if *txid == empty_outcome {
+                Some(outcome)
+            } else if *txid == split_id {
+                split
+            } else {
+                None
+            }
+        }),
+        ..ChainSetup::default()
+    };
+    let settlement = UnpaidWinners::with_chain(
+        contract,
+        Amount::from_sat(100_000),
+        HashMap::from([(1, 2.0), (ECONOMY_FEE_TARGET, 1.0)]),
+        setup,
+    )
+    .await;
+    assert_eq!(recorded_outcome_txid(&settlement), empty_outcome);
+    settlement
+}
+
+/// An unpaid winner may still be paid over Lightning until 13 blocks before they could claim on
+/// chain, `delta` blocks after the split confirmed: until then they are not owed, and nothing
+/// about their output is decided.
+#[tokio::test]
+async fn unpaid_winners_inside_their_lightning_window_are_not_owed_yet() {
+    // The split confirmed at 900; the window closes at 900 + 72 - 13 = 959.
+    let settlement = settling_at(950, 800, Some(900)).await;
+    let status = settlement
+        .coordinator
+        .process_status(CompetitionStatus::from(settlement.competition.clone()))
+        .await;
+    assert_eq!(status.state_name(), "delta_broadcasted");
+    assert!(settlement.broadcasts().is_empty());
+    assert!(settlement
+        .coordinator
+        .owed_winners(true)
+        .await
+        .unwrap()
+        .is_empty());
+    settlement.database.close().await.unwrap();
+
+    let settlement = settling_at(959, 800, Some(900)).await;
+    settlement
+        .coordinator
+        .process_status(CompetitionStatus::from(settlement.competition.clone()))
+        .await;
+    assert_eq!(
+        settlement
+            .coordinator
+            .owed_winners(false)
+            .await
+            .unwrap()
+            .len(),
+        3,
+        "at the window's close they are owed"
+    );
+    assert!(
+        settlement.broadcasts().is_empty(),
+        "the reclaim delay runs on"
+    );
+    settlement.database.close().await.unwrap();
+}
+
+/// A winner paid over Lightning has their split output closed to the market maker with the key
+/// the payout released, after the split, while the unpaid ones are held.
+#[tokio::test]
+async fn a_paid_winner_s_output_closes_after_the_split() {
+    let settlement = UnpaidWinners::new(
+        Amount::from_sat(100_000),
+        HashMap::from([(1, 2.0), (ECONOMY_FEE_TARGET, 1.0)]),
+    )
+    .await;
+    let paid = settlement.pay(settlement.players[0]).await;
+    let status = settlement
+        .coordinator
+        .process_status(CompetitionStatus::from(settlement.competition.clone()))
+        .await;
+    assert_eq!(status.state_name(), "delta_broadcasted");
+    let broadcasts = settlement.broadcasts();
+    assert_eq!(broadcasts.len(), 1);
+    let (close_input, _) = settlement
+        .contract
+        .split_close_tx_input_and_prevout(&WinCondition {
+            outcome: Outcome::Attestation(0),
+            player_index: 0,
+        })
+        .unwrap();
+    assert_eq!(
+        broadcasts[0].input[0].previous_output,
+        close_input.previous_output
+    );
+    let entries = settlement.entries().await;
+    let entry = entries.iter().find(|entry| entry.id == paid).unwrap();
+    assert!(entry.sellback_broadcasted_at.is_some());
+    let owed = settlement.coordinator.owed_winners(false).await.unwrap();
+    assert_eq!(owed.len(), 2);
+    assert!(owed.iter().all(|winner| winner.entry_id != paid));
+    settlement.database.close().await.unwrap();
+}
+
+/// A sweep of an output already spent can never confirm. Once the chain shows the output spent
+/// by the winner's own claim, the coordinator records it, the winner is no longer owed, and the
+/// competition completes instead of retrying the sweep forever.
+#[tokio::test]
+async fn a_split_output_the_winner_claimed_is_recorded_instead_of_swept_forever() {
+    let claim = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![],
+        output: vec![TxOut {
+            value: Amount::from_sat(33_000),
+            script_pubkey: ScriptBuf::new(),
+        }],
+    };
+    let setup = ChainSetup {
+        refuse_broadcasts: true,
+        output_status: PayoutOutputStatus {
+            confirmation_height: Some(100),
+            current_height: 1_000,
+            unspent: false,
+        },
+        spender: Some(claim.clone()),
+        ..ChainSetup::default()
+    };
+    let settlement = UnpaidWinners::with_chain(
+        signed_contract_funded(Amount::from_sat(100_000)),
+        Amount::from_sat(100_000),
+        HashMap::from([(1, 2.0), (ECONOMY_FEE_TARGET, 1.0)]),
+        setup,
+    )
+    .await;
+    let held = settlement
+        .coordinator
+        .process_status(CompetitionStatus::from(settlement.competition.clone()))
+        .await;
+    assert_eq!(held.state_name(), "delta_broadcasted");
+    settlement.approve_every_sweep().await;
+
+    let status = settlement
+        .coordinator
+        .process_status(CompetitionStatus::from(settlement.competition.clone()))
+        .await;
+    assert_eq!(status.state_name(), "completed");
+    assert_eq!(
+        settlement.broadcasts().len(),
+        3,
+        "each sweep was tried once"
+    );
+    for entry in settlement.entries().await {
+        assert!(entry.split_output_spent_at.is_some());
+        assert!(entry.reclaimed_broadcasted_at.is_none());
+    }
+    assert!(settlement
+        .coordinator
+        .owed_winners(false)
+        .await
+        .unwrap()
+        .is_empty());
+    let resolved = settlement.coordinator.owed_winners(true).await.unwrap();
+    assert_eq!(resolved.len(), 3);
+    for winner in resolved {
+        assert_eq!(
+            winner.claim_txid,
+            Some(claim.compute_txid().to_string()),
+            "the winner's claim is kept"
+        );
+        assert!(winner.output_status().starts_with("Claimed on chain"));
+        assert!(matches!(
+            settlement
+                .coordinator
+                .approve_owed_winner_sweep(winner.entry_id)
+                .await,
+            Err(Error::BadRequest(_))
+        ));
+    }
+    settlement.database.close().await.unwrap();
+}
+
+/// A sweep refused because the coordinator's own sweep of the output, whose record was lost,
+/// already confirmed is recorded as that sweep.
+#[tokio::test]
+async fn a_split_output_already_swept_to_the_market_maker_counts_as_swept() {
+    let (contract, market_maker, players) = signed_contract_funded(Amount::from_sat(100_000));
+    let ours = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![],
+        output: vec![TxOut {
+            value: Amount::from_sat(33_000),
+            script_pubkey: p2tr_script_pubkey(contract.params().market_maker.pubkey),
+        }],
+    };
+    let setup = ChainSetup {
+        refuse_broadcasts: true,
+        output_status: PayoutOutputStatus {
+            confirmation_height: Some(100),
+            current_height: 1_000,
+            unspent: false,
+        },
+        spender: Some(ours),
+        ..ChainSetup::default()
+    };
+    let settlement = UnpaidWinners::with_chain(
+        (contract, market_maker, players),
+        Amount::from_sat(100_000),
+        HashMap::from([(1, 2.0), (ECONOMY_FEE_TARGET, 1.0)]),
+        setup,
+    )
+    .await;
+    settlement
+        .coordinator
+        .process_status(CompetitionStatus::from(settlement.competition.clone()))
+        .await;
+    settlement.approve_every_sweep().await;
+    let status = settlement
+        .coordinator
+        .process_status(CompetitionStatus::from(settlement.competition.clone()))
+        .await;
+    assert_eq!(status.state_name(), "completed");
+    for entry in settlement.entries().await {
+        assert!(entry.reclaimed_broadcasted_at.is_some());
+        assert!(entry.split_output_spent_at.is_none());
+    }
+    assert_eq!(
+        settlement
+            .coordinator
+            .owed_winners(false)
+            .await
+            .unwrap()
+            .len(),
+        3,
+        "the winners were swept, not paid"
+    );
+    settlement.database.close().await.unwrap();
+}
+
+/// Once every winner is paid, the coordinator closes the whole outcome at once, long before the
+/// split transaction becomes valid, instead of waiting until it is.
+#[tokio::test]
+async fn every_winner_paid_closes_the_outcome_at_once() {
+    // The outcome confirmed 11 blocks ago, far less than delta (72).
+    let mut settlement = settling_at(1_000, 990, None).await;
+    settlement.competition.delta_broadcasted_at = None;
+    for key in settlement.players {
+        settlement.pay(key).await;
+    }
+    let status = settlement
+        .coordinator
+        .process_status(CompetitionStatus::from(settlement.competition.clone()))
+        .await;
+    assert_eq!(status.state_name(), "delta_broadcasted");
+    let broadcasts = settlement.broadcasts();
+    assert_eq!(broadcasts.len(), 1);
+    let (close_input, _) = settlement
+        .contract
+        .outcome_close_tx_input_and_prevout(&Outcome::Attestation(0))
+        .unwrap();
+    assert_eq!(
+        broadcasts[0].input[0].previous_output,
+        close_input.previous_output
+    );
+    for entry in settlement.entries().await {
+        assert!(entry.sellback_broadcasted_at.is_some());
+    }
+    let completed = settlement.coordinator.process_status(status).await;
+    assert_eq!(completed.state_name(), "completed");
+    settlement.database.close().await.unwrap();
+
+    // With fewer confirmations than a shallow reorganization could undo, it waits.
+    let mut settlement = settling_at(1_000, 997, None).await;
+    settlement.competition.delta_broadcasted_at = None;
+    for key in settlement.players {
+        settlement.pay(key).await;
+    }
+    let status = settlement
+        .coordinator
+        .process_status(CompetitionStatus::from(settlement.competition.clone()))
+        .await;
+    assert_eq!(status.state_name(), "outcome_broadcasted");
+    assert!(settlement.broadcasts().is_empty());
+    settlement.database.close().await.unwrap();
+}
+
+/// A winner broadcast the split transaction before the coordinator closed the outcome. A close of
+/// the outcome could never confirm; the coordinator follows the split and closes each paid
+/// winner's own output instead, well before the winners' own claim path opens.
+#[tokio::test]
+async fn a_split_a_winner_broadcast_is_followed_instead_of_closing_the_outcome() {
+    let mut settlement = settling_at(1_000, 900, Some(995)).await;
+    settlement.competition.delta_broadcasted_at = None;
+    for key in settlement.players {
+        settlement.pay(key).await;
+    }
+    let status = settlement
+        .coordinator
+        .process_status(CompetitionStatus::from(settlement.competition.clone()))
+        .await;
+    assert_eq!(status.state_name(), "delta_broadcasted");
+    let broadcasts = settlement.broadcasts();
+    assert_eq!(broadcasts.len(), 3, "one split-close per paid winner");
+    for player_index in 0..3 {
+        let (input, _) = settlement
+            .contract
+            .split_close_tx_input_and_prevout(&WinCondition {
+                outcome: Outcome::Attestation(0),
+                player_index,
+            })
+            .unwrap();
+        assert!(broadcasts
+            .iter()
+            .any(|tx| tx.input[0].previous_output == input.previous_output));
+    }
+    for entry in settlement.entries().await {
+        assert!(entry.sellback_broadcasted_at.is_some());
+    }
+    settlement.database.close().await.unwrap();
+}
+
+/// A window an earlier release closed at its fixed cutoff opens again while no winner can claim
+/// on chain yet.
+#[tokio::test]
+async fn a_closed_payout_window_reopens_while_the_outcome_is_unspent() {
+    let mut settlement = settling_at(1_000, 990, None).await;
+    settlement.competition.delta_broadcasted_at = None;
+    let store = &settlement.coordinator.competition_store;
+    let id = settlement.competition.id;
+    store.enable_automatic_payouts(id).await.unwrap();
+    store.close_payout_window(id).await.unwrap();
+    assert!(store.payout_window_is_closed(id).await.unwrap());
+
+    let status = settlement
+        .coordinator
+        .process_status(CompetitionStatus::from(settlement.competition.clone()))
+        .await;
+    assert_eq!(status.state_name(), "outcome_broadcasted");
+    assert!(!store.payout_window_is_closed(id).await.unwrap());
+    assert!(store.payout_window_is_open(id).await.unwrap());
+    assert!(
+        !store.reopen_payout_window(id).await.unwrap(),
+        "already open"
+    );
+    settlement.database.close().await.unwrap();
+}
+
+/// A chain where the contract's expiry transaction confirmed at `expiry_height`, the tip is at
+/// 1,000, nothing else confirmed, and every broadcast is refused as spending a spent output.
+async fn expired_under_us(expiry_height: u32) -> UnpaidWinners {
+    let contract = signed_contract_expiring(Amount::from_sat(30_000), Some(1_790_000_000));
+    let expiry_txid = contract.0.expiry_tx().unwrap().compute_txid();
+    let setup = ChainSetup {
+        confirmed: Arc::new(move |txid: &Txid| (*txid == expiry_txid).then_some(expiry_height)),
+        refuse_broadcasts: true,
+        ..ChainSetup::default()
+    };
+    let mut settlement = UnpaidWinners::with_chain(
+        contract,
+        Amount::from_sat(30_000),
+        HashMap::from([(1, 2.0), (ECONOMY_FEE_TARGET, 1.0)]),
+        setup,
+    )
+    .await;
+    settlement.competition.delta_broadcasted_at = None;
+    settlement
+}
+
+/// Anyone may broadcast the expiry transaction once the contract expired. When it confirmed
+/// while the coordinator held an attestation, the outcome transaction can never confirm: the
+/// competition settles on the expiry outcome instead of retrying the outcome forever.
+#[tokio::test]
+async fn an_expiry_transaction_confirmed_in_place_of_the_outcome_settles_the_expiry() {
+    let mut settlement = expired_under_us(990).await;
+    settlement.competition.outcome_transaction = None;
+    settlement.competition.outcome_broadcasted_at = None;
+    let status = CompetitionStatus::from(settlement.competition.clone());
+    assert_eq!(status.state_name(), "attested");
+    let next = settlement.coordinator.process_status(status).await;
+    assert_eq!(next.state_name(), "outcome_broadcasted");
+    let settling = next.into_competition();
+    assert!(settling.settled_by_expiry());
+    assert_eq!(settling.get_current_outcome().unwrap(), Outcome::Expiry);
+    assert!(settling.errors.is_empty());
+    settlement.database.close().await.unwrap();
+
+    // The outcome transaction was recorded as broadcast, and never confirmed.
+    let mut settlement = expired_under_us(990).await;
+    let attested = settlement
+        .contract
+        .signed_outcome_tx(0, Scalar::from_slice(&[10; 32]).unwrap())
+        .unwrap();
+    settlement.competition.outcome_transaction = Some(attested);
+    let next = settlement
+        .coordinator
+        .process_status(CompetitionStatus::from(settlement.competition.clone()))
+        .await;
+    assert_eq!(next.state_name(), "outcome_broadcasted");
+    assert_eq!(
+        next.into_competition().get_current_outcome().unwrap(),
+        Outcome::Expiry
+    );
+    settlement.database.close().await.unwrap();
+
+    // A shallow confirmation could still be undone: the outcome is retried meanwhile.
+    let mut settlement = expired_under_us(998).await;
+    settlement.competition.outcome_transaction = None;
+    settlement.competition.outcome_broadcasted_at = None;
+    let next = settlement
+        .coordinator
+        .process_status(CompetitionStatus::from(settlement.competition.clone()))
+        .await;
+    assert_eq!(next.state_name(), "attested");
+    assert!(!next.into_competition().errors.is_empty());
+    settlement.database.close().await.unwrap();
+}
+
+/// What a payout must be is what the outcome the contract settles on owes the entry. Once a
+/// competition settles on its expiry outcome, a payout prepared for the attested one no longer
+/// matches, and is not sent.
+#[test]
+fn an_entry_is_owed_what_the_settled_outcome_pays() {
+    let now = OffsetDateTime::now_utc();
+    let attestation = Scalar::from_slice(&[10; 32]).unwrap();
+    let players = [1u8, 3, 5].map(|key| Scalar::from_slice(&[key; 32]).unwrap());
+    let event = EventLockingConditions {
+        locking_points: vec![attestation.base_point_mul().into()],
+        expiry: Some(1_790_000_000),
+    };
+    let mut competition = Competition::new(&CreateEvent {
+        id: Uuid::now_v7(),
+        signing_date: now - time::Duration::hours(5),
+        start_observation_date: now - time::Duration::hours(7),
+        end_observation_date: now - time::Duration::hours(6),
+        locations: vec!["KDEN".into()],
+        number_of_values_per_entry: 3,
+        number_of_places_win: 1,
+        total_allowed_entries: 3,
+        entry_fee: 10_000,
+        coordinator_fee: crate::domain::CoordinatorFee::whole_percent(0),
+        total_competition_pool: 30_000,
+        relative_locktime_block_delta: Some(72),
+        unlisted: false,
+        scoring_rules: None,
+        scoring_fields: None,
+        max_entries_per_player: 1,
+        contract_options: None,
+    });
+    competition.contract_parameters = Some(ContractParameters {
+        market_maker: MarketMaker {
+            pubkey: Scalar::from_slice(&[7; 32]).unwrap().base_point_mul(),
+        },
+        players: players
+            .iter()
+            .enumerate()
+            .map(|(index, key)| Player {
+                pubkey: key.base_point_mul(),
+                ticket_hash: dlctix::hashlock::sha256(&[index as u8 + 10; 32]),
+                payout_hash: dlctix::hashlock::sha256(&[index as u8 + 20; 32]),
+            })
+            .collect(),
+        event: event.clone(),
+        outcome_payouts: BTreeMap::from([
+            (Outcome::Attestation(0), PayoutWeights::from([(0, 1)])),
+            (
+                Outcome::Expiry,
+                PayoutWeights::from([(0, 1), (1, 1), (2, 1)]),
+            ),
+        ]),
+        fee_rate: FeeRate::from_sat_per_vb_u32(1),
+        funding_value: Amount::from_sat(30_000),
+        relative_locktime_block_delta: 72,
+        anchor: None,
+        outcome_bound_splits: false,
+    });
+    competition.event_announcement = Some(event);
+    let key = |index: usize| hex::encode(players[index].base_point_mul().serialize());
+    assert_eq!(competition.owed_to_entry(&key(0)), None, "no outcome yet");
+
+    competition.attestation = Some(attestation.into());
+    assert_eq!(competition.owed_to_entry(&key(0)), Some(30_000));
+    assert_eq!(competition.owed_to_entry(&key(1)), Some(0));
+    assert_eq!(competition.owed_to_entry("not a key"), None);
+
+    // Settled on the expiry outcome: the expiry transaction is the outcome transaction.
+    competition.attestation = None;
+    competition.expiry_broadcasted_at = Some(now);
+    assert_eq!(competition.owed_to_entry(&key(0)), Some(10_000));
+    assert_eq!(competition.owed_to_entry(&key(1)), Some(10_000));
 }

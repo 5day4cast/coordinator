@@ -191,6 +191,9 @@ impl CompetitionStatus {
     pub fn next_check(&self, now: OffsetDateTime, idle: std::time::Duration) -> OffsetDateTime {
         match self {
             Self::AwaitingAttestation(state) => state.next_check(now, idle),
+            Self::FundingBroadcasted(state) => {
+                funding_check_retry(now, idle, state.competition().failed_funding_checks())
+            }
             _ => now + idle,
         }
     }
@@ -262,6 +265,22 @@ impl fmt::Display for CompetitionStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.state_name())
     }
+}
+
+/// The longest a competition whose funding checks keep failing waits before the next.
+pub const MAX_FUNDING_CHECK_BACKOFF: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// When to check a competition's funding again after `failures` checks in a row could not read
+/// the chain: `idle` doubled for each, up to [`MAX_FUNDING_CHECK_BACKOFF`].
+pub fn funding_check_retry(
+    now: OffsetDateTime,
+    idle: std::time::Duration,
+    failures: usize,
+) -> OffsetDateTime {
+    let doublings = u32::try_from(failures.min(8)).unwrap_or(8);
+    now + idle
+        .saturating_mul(1 << doublings)
+        .min(MAX_FUNDING_CHECK_BACKOFF.max(idle))
 }
 
 /// Trait for states that hold competition data and can be converted back.

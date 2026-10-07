@@ -15,9 +15,16 @@ coordinator, with the coordinator stopped until step 4.
 | `competitions.db`, `users.db` | `db_settings.data_folder` | Litestream, to object storage |
 | Market-maker key | `coordinator_settings.private_key_file` and `bitcoin_settings.seed_path` (by default both `./creds/coordinator_private_key.pem`) | A separate, offline copy of the creds directory |
 | LND macaroon and TLS certificate | `ln_settings.macaroon_file_path`, `ln_settings.tls_cert_path` | The creds backup, or new ones from LND |
+| Recovery key, when recovery records are on | `recovery.key_file` (by default `./creds/coordinator_recovery_key.pem`) | The creds backup |
 | Operator token | `admin_settings.token_file` | The creds backup, or a new one |
 | ark-swapd token | `ark_settings.swap_token_file` | The creds backup, or a new one from ark-swapd |
 | `Settings.toml` | The deployment's configuration | The deployment repository |
+
+The recovery key cannot be replaced either. Players find their recovery records by its public
+key, and the recovery tool and page are built with it. The coordinator creates a new key when the
+file is missing, without an error: every record published before then is orphaned, and players
+holding the old key's records cannot be told apart from new ones. Restore it before the first start,
+with the market-maker key.
 
 The market-maker key is the one secret that cannot be replaced. It signs every contract the
 coordinator is in, reclaims unpaid winners' outputs and the coordinator's escrows, and the
@@ -77,6 +84,16 @@ up, or says what still works when one is not.
    Do this **before the first start**. The coordinator creates a new key when the file is
    missing. A restored database then refuses it, since its stored public key differs, and the
    coordinator does not start. If that happens, delete the generated file and restore the backup.
+
+   When recovery records are on, restore the recovery key the same way, before the first start:
+
+   ```sh
+   install -m 600 /backup/creds/coordinator_recovery_key.pem /path/to/creds/coordinator_recovery_key.pem
+   ```
+
+   Nothing refuses a new recovery key: the coordinator starts and publishes under it, and the
+   records published under the old key are orphaned. Check that
+   `GET /api/v1/recovery/info` reports the same `coordinator_pubkey` as before the loss.
 2. Put back, or issue again, the LND macaroon and TLS certificate, the operator token and the
    ark-swapd token. These can be replaced; the market-maker key cannot.
 3. Check the key matches the database before going further:
@@ -113,7 +130,8 @@ While it is on:
   else. Players see no operator detail.
 - Everything that settles money keeps running: kickoffs (with `"kickoff"`), attestation polling,
   outcome, expiry and split broadcasts, Lightning payouts and the payout window cutoff, hold invoice
-  cancellations, Arkade escrow refunds and recoveries, and market-maker reclaims.
+  cancellations, Arkade escrow refunds and recoveries, and the market-maker reclaims an operator
+  approved ([owed winners](owed-winners.md)).
 - With `"refund"`, a competition or pool that has no contract yet and that no Arkade batch has
   funded is cancelled at its next step, and the cleanup sweep refunds its entries. One whose
   contract is built carries on: its kickoff is already under way.
@@ -154,9 +172,9 @@ Check, in order:
    coordinator admin payout-holds release <entry-id>
    ```
 
-   Resolve holds well within the contract's reclaim window: a held winner who neither is paid
-   over Lightning nor claims on chain is reclaimed by the market maker once the split outputs
-   mature. The `coordinator_payout_holds` gauge counts the holds still open.
+   A held winner who is neither paid over Lightning in time nor claims on chain becomes an owed
+   winner: their output is swept only once an operator approves ([owed winners](owed-winners.md)).
+   The `coordinator_payout_holds` gauge counts the holds still open.
 3. `coordinator admin competitions list --state active`: every unfinished competition should move
    within a few sweeps. `coordinator admin competitions show <id>` lists the errors each one kept.
    Compare the funding, outcome and split transactions with a block explorer.
@@ -177,17 +195,23 @@ What the reconciliation cannot repair, and how to handle it:
 
 ## 5. What players can do meanwhile
 
-Players do not need the coordinator to get their money back. With their nsec, or the recovery
-file from their account page, the recovery tool ([RECOVERY.md](../RECOVERY.md)) can:
+Only if recovery records were on before the disaster can players get their money back without
+the coordinator: the records, published to the relays or saved as the recovery file from their
+account page, hold what the player's nsec alone does not. Entries made while recovery was off
+have no records, and their players depend on this restore.
 
-- refund an Arkade escrow that never kicked off, with the player's key alone once its refund
-  locktime has passed;
+With their nsec and their records, the recovery tool ([RECOVERY.md](../RECOVERY.md)) can:
+
+- refund an Arkade escrow that never kicked off, once its refund locktime has passed: through its
+  refund leaf, which the player's key and the Arkade server sign together, or, without the server,
+  through its unilateral refund leaf once the escrow is unrolled on chain and its delay has passed;
 - broadcast a contract's outcome transaction, or its expiry transaction once the contract has
   expired unattested, and then the split transaction;
 - claim a win on chain once the split transaction has the required confirmations.
 
-The market maker can reclaim a winner's split output a further delay after that, so a winner who
-was not paid over Lightning should claim before then.
+The market maker's reclaim path on a winner's split output opens a further delay after that. The
+coordinator uses it only for an owed winner, and only once an operator approves
+([owed winners](owed-winners.md)), so an unpaid winner can still claim later.
 
 ## 6. When Keymeld is unavailable
 
@@ -197,8 +221,8 @@ Still works:
 
 - Broadcasting the pre-signed outcome and expiry transactions of every signed contract, and the
   split transactions, which the coordinator signs with ticket preimages it already holds.
-- Market-maker reclaims of unpaid winners' split outputs, and reclaims of the coordinator's own
-  escrows: they need only the market-maker key.
+- Market-maker reclaims of owed winners' split outputs an operator approved, and reclaims of the
+  coordinator's own escrows: they need only the market-maker key.
 - Cancelling hold invoices, so single competitions paid by hold invoice are refunded.
 - Lightning payouts for entries without a payout escrow: the winner reveals the payout preimage and
   pastes an invoice, and the coordinator pays it.
@@ -217,6 +241,7 @@ Does not work until Keymeld is back:
 ## 7. Leaving settle-only mode
 
 Once every unfinished competition has settled or been refunded, every payout hold is resolved,
+every owed winner is paid (`coordinator_winners_owed` is 0),
 and the Litestream replica is healthy again, set `settle_only = false` (and unset
 `COORDINATOR_SETTLE_ONLY`) and restart. `GET /api/v1/health_check` then reports
 `"settle_only":false` and new competitions can be created.

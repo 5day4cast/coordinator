@@ -12,6 +12,8 @@ mod escrow_watch;
 mod kickoff_check;
 #[path = "network_fee.rs"]
 mod network_fee;
+#[path = "owed_winners.rs"]
+mod owed_winners;
 #[path = "queued_coordinator.rs"]
 mod queued_coordinator;
 #[path = "queued_kickoff.rs"]
@@ -29,6 +31,7 @@ pub use network_fee::{
     network_fee_sats, NetworkFeeQuote, TicketPrice, ARKADE_UNAVAILABLE, ENTRIES_PAUSED,
     FEE_ESTIMATE_UNAVAILABLE,
 };
+pub use owed_winners::{OwedWinner, OwedWinnerCounts, MAX_SETTLED_NOTE_CHARS};
 pub use restore_reconcile::{PayoutHold, Reconciled, RestoreReconciliation};
 pub use settle_only::{SettleOnly, SETTLE_ONLY_PAUSED};
 
@@ -88,7 +91,7 @@ use dlctix::{
     musig2::{AggNonce, PartialSignature, PubNonce},
     secp::{Point, Scalar},
     ContractParameters, ContractSignatures, NonceSharingRound, Outcome, PayoutWeights, Player,
-    PlayerIndex, SigMap, SigningSession, TicketedDLC, WinCondition,
+    PlayerIndex, SigMap, SignedContract, SigningSession, TicketedDLC, WinCondition,
 };
 use futures::TryFutureExt;
 use itertools::Itertools;
@@ -101,7 +104,7 @@ use rand_chacha::ChaCha20Rng;
 use serde::Serialize;
 use std::sync::Arc;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     str::FromStr,
 };
 use time::OffsetDateTime;
@@ -115,6 +118,53 @@ fn confirmation_depth(tip: u32, inclusion_height: u32) -> u32 {
 
 /// Settlement errors kept on a competition; older ones are dropped.
 const KEPT_SETTLEMENT_ERRORS: usize = 5;
+
+/// Confirmations the outcome transaction needs before the coordinator closes the whole outcome
+/// to itself, once every winner was paid over Lightning: enough that a shallow reorganization
+/// does not undo the outcome under the close, and far fewer than the `delta` blocks before any
+/// winner could broadcast the split.
+const UNIFIED_CLOSE_CONFIRMATIONS: u32 = 6;
+
+/// Confirmations the expiry transaction needs, when it confirmed in place of the outcome
+/// transaction, before the competition settles on the expiry outcome instead: enough that a
+/// shallow reorganization does not bring the outcome transaction back.
+const EXPIRY_SWITCH_CONFIRMATIONS: u32 = 6;
+
+/// Each winner of `winners` with their entry, in player order. A winner without an entry is
+/// left out.
+fn winner_entries<'e>(
+    params: &ContractParameters,
+    winners: &PayoutWeights,
+    entries: &'e [UserEntry],
+) -> Vec<(PlayerIndex, &'e UserEntry)> {
+    winners
+        .keys()
+        .filter_map(|&player_index| {
+            let player = params.players.get(player_index)?;
+            entries
+                .iter()
+                .find(|entry| {
+                    Point::from_hex(&entry.ephemeral_pubkey).is_ok_and(|key| key == player.pubkey)
+                })
+                .map(|entry| (player_index, entry))
+        })
+        .collect()
+}
+
+/// Whether the winner's Lightning payout succeeded and released their entry key, so the
+/// coordinator can close their output. A payout still in flight does not count.
+fn paid_and_released(entry: &UserEntry, paid_out: &HashSet<Uuid>) -> bool {
+    paid_out.contains(&entry.id) && entry.ephemeral_privatekey.is_some()
+}
+
+/// Whether the winner's output needs nothing more: closed after their payout, swept, left on
+/// chain as dust, or spent by a transaction the coordinator has no record of making.
+fn winner_output_settled(entry: &UserEntry) -> bool {
+    entry.sellback_broadcasted_at.is_some()
+        || entry.reclaimed_broadcasted_at.is_some()
+        || entry.sweep_uneconomic_at.is_some()
+        || entry.split_output_spent_at.is_some()
+}
 
 /// Keep a competition whose contract holds the pot on-chain in its state after an error, so
 /// the next step tries again.
@@ -132,6 +182,47 @@ fn retry_settlement(status: CompetitionStatus, error: CompetitionError) -> Compe
         .saturating_sub(KEPT_SETTLEMENT_ERRORS);
     competition.errors.drain(..dropped);
     CompetitionStatus::from(competition)
+}
+
+/// What a failed oracle step leaves its competition in: creating its oracle event, or sending
+/// the oracle its entries.
+///
+/// Until `deadline` the competition stays where it is, keeping the latest errors, and its next
+/// step tries again, as a pool waits for its oracle event. After it, the competition fails and
+/// every entry is refunded. A single competition used to fail at the first oracle error, so an
+/// oracle unreachable for a minute refunded a full competition.
+fn oracle_step_failed(
+    status: CompetitionStatus,
+    error: CompetitionError,
+    deadline: OffsetDateTime,
+    now: OffsetDateTime,
+) -> CompetitionStatus {
+    let competition_id = status.competition_id();
+    if now < deadline {
+        warn!(
+            "Competition {competition_id} oracle step failed, and is tried again until \
+             {deadline}: {error}"
+        );
+        return retry_settlement(status, error);
+    }
+    error!(
+        "Competition {competition_id} oracle step failed, and it fails: its deadline, {deadline}, \
+         has passed: {error}"
+    );
+    status.fail(error)
+}
+
+/// Until when a competition's oracle steps are tried again: a pool's setup deadline
+/// (`POOL_SETUP_DEADLINE`) after the competition became ready for them.
+fn oracle_step_deadline(competition: &Competition) -> OffsetDateTime {
+    [
+        competition.escrow_funds_confirmed_at,
+        competition.event_created_at,
+    ]
+    .into_iter()
+    .flatten()
+    .fold(competition.created_at, |latest, at| latest.max(at))
+        + queued_kickoff::POOL_SETUP_DEADLINE
 }
 
 /// What a failed Arkade kickoff leaves its competition in.
@@ -905,12 +996,13 @@ impl Coordinator {
                         }
                     }
                     Err(e) => {
-                        error!(
-                            "Competition {} failed to create oracle event: {}",
-                            competition_id, e
-                        );
-                        CompetitionStatus::EscrowConfirmed(state)
-                            .fail(CompetitionError::FailedCreateEvent(e.to_string()))
+                        let deadline = oracle_step_deadline(state.competition());
+                        oracle_step_failed(
+                            CompetitionStatus::EscrowConfirmed(state),
+                            CompetitionError::FailedCreateEvent(format!("{e:#}")),
+                            deadline,
+                            OffsetDateTime::now_utc(),
+                        )
                     }
                 }
             }
@@ -919,12 +1011,13 @@ impl Coordinator {
                 match self.submit_entries_to_oracle(state.competition_mut()).await {
                     Ok(_) => state.entries_submitted(),
                     Err(e) => {
-                        error!(
-                            "Competition {} failed to submit entries: {}",
-                            competition_id, e
-                        );
-                        CompetitionStatus::EventCreated(state)
-                            .fail(CompetitionError::FailedSubmitEntries(e.to_string()))
+                        let deadline = oracle_step_deadline(state.competition());
+                        oracle_step_failed(
+                            CompetitionStatus::EventCreated(state),
+                            CompetitionError::FailedSubmitEntries(format!("{e:#}")),
+                            deadline,
+                            OffsetDateTime::now_utc(),
+                        )
                     }
                 }
             }
@@ -1224,21 +1317,21 @@ impl Coordinator {
                             CompetitionStatus::FundingBroadcasted(state)
                         }
                     }
+                    // A chain read that fails while the funding confirms is an outage of the chain
+                    // backends, not a fault of the competition, and its funding may already have
+                    // spent the escrows: an Arkade batch's always has. So it is tried again,
+                    // backing off (`CompetitionStatus::next_check`), as after confirmation, and
+                    // never fails the competition. Six failures in a row used to fail it for good,
+                    // and nothing resumed it while the pot sat in the contract.
                     Err(e) => {
-                        error!(
-                            "Competition {} funding confirmation failed: {}",
-                            competition_id, e
+                        warn!(
+                            "Competition {competition_id} cannot check its funding confirmation, \
+                             and tries again: {e:#}"
                         );
-                        state
-                            .competition_mut()
-                            .errors
-                            .push(CompetitionError::FailedFundingConfirmation(e.to_string()));
-                        if state.competition().should_abort() {
-                            CompetitionStatus::FundingBroadcasted(state)
-                                .fail(CompetitionError::FailedFundingConfirmation(e.to_string()))
-                        } else {
-                            CompetitionStatus::FundingBroadcasted(state)
-                        }
+                        retry_settlement(
+                            CompetitionStatus::FundingBroadcasted(state),
+                            CompetitionError::FailedFundingConfirmation(format!("{e:#}")),
+                        )
                     }
                 }
             }
@@ -2519,7 +2612,12 @@ impl Coordinator {
         debug!("Transaction ID: {}", outcome_tx.compute_txid());
         competition.outcome_transaction = Some(outcome_tx.clone());
         if competition.outcome_broadcasted_at.is_none() {
-            self.broadcast_or_known(&outcome_tx).await?;
+            if let Err(error) = self.broadcast_or_known(&outcome_tx).await {
+                if self.settle_on_confirmed_expiry(competition).await? {
+                    return Ok(competition);
+                }
+                return Err(error);
+            }
             info!(
                 "Competition {} outcome tx broadcast: txid={}",
                 competition.id,
@@ -2570,6 +2668,66 @@ impl Coordinator {
         Ok(competition)
     }
 
+    /// Settle on the expiry outcome when the contract's expiry transaction confirmed in place of
+    /// the outcome transaction the coordinator broadcast, or tried to. Anyone may broadcast the
+    /// expiry transaction once the contract has expired, and both spend the funding output, so
+    /// the outcome transaction can never confirm: retrying it used to stall the settlement for
+    /// good. Payouts prepared for the attested outcome are never sent, since they no longer match
+    /// what the expiry outcome owes (`payout_watcher::send_eligibility`). Returns whether the
+    /// competition now settles on the expiry outcome.
+    async fn settle_on_confirmed_expiry(
+        &self,
+        competition: &mut Competition,
+    ) -> Result<bool, anyhow::Error> {
+        if competition.settled_by_expiry() {
+            return Ok(false);
+        }
+        let Some(expiry_tx) = competition
+            .signed_contract
+            .as_ref()
+            .and_then(|contract| contract.expiry_tx())
+        else {
+            return Ok(false);
+        };
+        let expiry_txid = expiry_tx.compute_txid();
+        let Some(height) = self
+            .bitcoin
+            .get_tx_confirmation_height(&expiry_txid)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let tip = self.bitcoin.get_current_height().await?;
+        if confirmation_depth(tip, height) < EXPIRY_SWITCH_CONFIRMATIONS {
+            info!(
+                "Competition {}: its expiry transaction {expiry_txid} confirmed in place of its \
+                 outcome transaction; it settles on the expiry outcome at {} confirmations",
+                competition.id, EXPIRY_SWITCH_CONFIRMATIONS
+            );
+            return Ok(false);
+        }
+        warn!(
+            "Competition {}: its expiry transaction {expiry_txid} confirmed in place of its outcome \
+             transaction, so it settles on the expiry outcome: every player is owed an equal share",
+            competition.id
+        );
+        let now = OffsetDateTime::now_utc();
+        competition.expiry_broadcasted_at = Some(now);
+        competition.outcome_transaction = Some(expiry_tx);
+        competition.outcome_broadcasted_at = Some(now);
+        competition.errors.clear();
+        Ok(true)
+    }
+
+    /// Settle the contract once its outcome transaction confirmed: close it to the market maker
+    /// when every winner was paid over Lightning, or else broadcast the split transaction, which
+    /// gives each winner an output of their own.
+    ///
+    /// Lightning payouts are not cut off here. Each payout's deadline follows the winners'
+    /// earliest on-chain claim (`payout_watcher::classify_output`), which is at least `delta`
+    /// blocks after the split confirms, so payouts go on while the outcome output is unspent and
+    /// after the split. A window an earlier release closed at its fixed cutoff, or one that passed
+    /// while the coordinator was down, opens again.
     pub async fn publish_delta_transactions<'a>(
         &self,
         competition: &'a mut Competition,
@@ -2599,6 +2757,9 @@ impl Coordinator {
             .get_tx_confirmation_height(&outcome_transaction.compute_txid())
             .await?
         else {
+            if self.settle_on_confirmed_expiry(competition).await? {
+                return Ok(competition);
+            }
             info!(
                 "Outcome transaction not confirmed yet for competition {}",
                 competition.id
@@ -2610,414 +2771,391 @@ impl Coordinator {
             .checked_sub(outcome_height)
             .ok_or_else(|| anyhow!("LND chain tip is behind the outcome confirmation height"))?;
         let required_delta = signed_contract.params().relative_locktime_block_delta as u32;
-        // A participant can spend independently at the first delta. Close new
-        // Lightning sends early enough to leave the bounded HTLC settlement
-        // margin, while continuing to reconcile already submitted payments.
-        let payment_deadline = crate::infra::lightning::payout_htlc_expiry_height(
-            outcome_height,
-            signed_contract.params().relative_locktime_block_delta,
-        );
-        if payment_deadline.is_err() || current_height >= payment_deadline? {
-            self.competition_store
-                .close_payout_window(competition.id)
-                .await?;
-        }
+        self.reopen_payout_window(competition.id).await?;
 
-        if blocks_since_outcome < required_delta {
-            info!(
-                "Not enough blocks since outcome tx for competition {}. Need {} more blocks",
-                competition.id,
-                required_delta - blocks_since_outcome
-            );
-            return Ok(competition);
-        };
-
-        self.competition_store
-            .close_payout_window(competition.id)
-            .await?;
-        if self
-            .competition_store
-            .has_unsettled_payout_jobs(competition.id)
-            .await?
-        {
-            return Ok(competition);
-        }
-
-        // Get outcome and winner information
         let outcome = competition.get_current_outcome()?;
         let winners = signed_contract
             .params()
             .outcome_payouts
             .get(&outcome)
             .ok_or_else(|| anyhow!("No payout mapping found for outcome"))?;
-
         let entries = self
             .competition_store
             .get_competition_entries(competition.id, vec![EntryStatus::Paid])
             .await?;
-
-        // Get fee rate for transactions
-        let fee_rates = self.bitcoin.get_estimated_fee_rates().await?;
-        let fee_rate = fee_rate_for_target(&fee_rates, 1)?;
-
-        // Check if we can do a unified close
-        let paid_winners: Vec<(PlayerIndex, &UserEntry)> = winners
+        let paid_out = self
+            .competition_store
+            .paid_out_entries(competition.id)
+            .await?;
+        let winner_entries = winner_entries(signed_contract.params(), winners, &entries);
+        let paid_winners: Vec<(PlayerIndex, &UserEntry)> = winner_entries
             .iter()
-            .filter_map(|(&player_index, _)| {
-                entries
-                    .iter()
-                    .find(|entry| {
-                        let Ok(pubkey) = Point::from_hex(&entry.ephemeral_pubkey) else {
-                            return false;
-                        };
-                        if let Some(player) = signed_contract.params().players.get(player_index) {
-                            player.pubkey == pubkey
-                        } else {
-                            false
-                        }
-                    })
-                    .map(move |entry| (player_index, entry))
-            })
-            .filter(|(_, entry)| {
-                entry.paid_out_at.is_some()
-                    && entry.ephemeral_privatekey.is_some()
-                    && entry.sellback_broadcasted_at.is_none()
-            })
+            .copied()
+            .filter(|(_, entry)| paid_and_released(entry, &paid_out))
+            .filter(|(_, entry)| !winner_output_settled(entry))
             .collect();
 
+        // Any winner may broadcast the split transaction once the outcome is `delta` blocks deep.
+        // Once it is on chain the outcome output is spent, so a close of the whole outcome can
+        // never confirm: each winner's own output settles instead.
+        let split_on_chain = match signed_contract.unsigned_split_tx(&outcome) {
+            Some(split) => self
+                .bitcoin
+                .get_tx_confirmation_height(&split.compute_txid())
+                .await?
+                .is_some(),
+            None => false,
+        };
+
         info!(
-            "Competition {} delta check: outcome={:?}, winners={}, paid_winners={}, entries={}",
+            "Competition {} delta check: outcome={:?}, winners={}, paid_winners={}, entries={}, \
+             blocks_since_outcome={}, split_on_chain={}",
             competition.id,
             outcome,
             winners.len(),
             paid_winners.len(),
-            entries.len()
+            entries.len(),
+            blocks_since_outcome,
+            split_on_chain
         );
-        for (player_index, entry) in &paid_winners {
-            info!(
-                "Competition {} paid_winner: player_index={}, entry_id={}, paid_out_at={:?}, ephemeral_privatekey={}, sellback_broadcasted_at={:?}",
-                competition.id,
-                player_index,
-                entry.id,
-                entry.paid_out_at,
-                entry.ephemeral_privatekey.is_some(),
-                entry.sellback_broadcasted_at
-            );
-        }
 
-        if paid_winners.len() != winners.len() {
-            info!(
-                "Competition {} not all winners paid: paid_winners={}, winners={}, blocks_since_outcome={}, required_2x_delta={}",
-                competition.id,
-                paid_winners.len(),
-                winners.len(),
-                blocks_since_outcome,
-                2 * required_delta
-            );
-            // Log which winners are missing
-            for &player_index in winners.keys() {
-                let found_entry = entries.iter().find(|entry| {
-                    let Ok(pubkey) = Point::from_hex(&entry.ephemeral_pubkey) else {
-                        return false;
-                    };
-                    signed_contract
-                        .params()
-                        .players
-                        .get(player_index)
-                        .map(|player| player.pubkey == pubkey)
-                        .unwrap_or(false)
-                });
-                if let Some(entry) = found_entry {
-                    let is_paid_winner = paid_winners.iter().any(|(idx, _)| *idx == player_index);
+        if !split_on_chain && competition.delta_broadcasted_at.is_none() {
+            if paid_winners.len() == winners.len() {
+                // Every winner was paid and released their key: close the whole outcome to the
+                // market maker now, long before the split transaction becomes valid.
+                if confirmation_depth(current_height, outcome_height) < UNIFIED_CLOSE_CONFIRMATIONS
+                {
                     info!(
-                        "Competition {} winner player_index={}: entry_id={}, paid_out_at={:?}, ephemeral_privatekey={}, sellback_broadcasted_at={:?}, in_paid_winners={}",
-                        competition.id,
-                        player_index,
-                        entry.id,
-                        entry.paid_out_at,
-                        entry.ephemeral_privatekey.is_some(),
-                        entry.sellback_broadcasted_at,
-                        is_paid_winner
+                        "Competition {} closes its outcome once the outcome transaction has {} \
+                         confirmations",
+                        competition.id, UNIFIED_CLOSE_CONFIRMATIONS
                     );
-                } else {
-                    info!(
-                        "Competition {} winner player_index={}: NO MATCHING ENTRY FOUND",
-                        competition.id, player_index
-                    );
+                    return Ok(competition);
                 }
-            }
-            // Technically we are good to broadcast the first delta transaction
-            // once blocks_since_outcome < required_delta, we add this wait to
-            // give users more time to be paid out via lightning
-            if blocks_since_outcome < (2 * required_delta) {
-                info!(
-                    "Not enough blocks since outcome tx. Need {} more blocks",
-                    (2 * required_delta) - blocks_since_outcome
-                );
-                return Ok(competition);
-            }
-        }
-
-        if paid_winners.len() == winners.len() {
-            info!(
-                "Competition {} taking UNIFIED CLOSE path: all {} winners paid",
-                competition.id,
-                paid_winners.len()
-            );
-            // All winners have paid out and none have had sellback broadcast - do unified close
-            let (close_tx_input, close_tx_prevout) =
-                signed_contract.outcome_close_tx_input_and_prevout(&outcome)?;
-
-            // The whole pot: too small to sweep only if the contract itself is dust-sized.
-            let (mut close_tx, input_index) = simple_sweep_tx(
-                signed_contract.params().market_maker.pubkey,
-                close_tx_input.clone(),
-                signed_contract.close_tx_input_weight(),
-                close_tx_prevout.value,
-                fee_rate,
-            )
-            .map_err(|uneconomic| anyhow!("Cannot build the unified close: {uneconomic}"))?;
-
-            let winner_seckeys: BTreeMap<Point, Scalar> = paid_winners
-                .iter()
-                .filter_map(|(_, entry)| {
-                    let seckey = Scalar::from_hex(entry.ephemeral_privatekey.as_ref()?).ok()?;
-                    let pubkey = Point::from_hex(&entry.ephemeral_pubkey).ok()?;
-                    Some((pubkey, seckey))
-                })
-                .collect();
-
-            info!(
-                "Competition {} unified close: winner_seckeys_count={}, close_tx_prevout_value={}",
-                competition.id,
-                winner_seckeys.len(),
-                close_tx_prevout.value
-            );
-
-            signed_contract.sign_outcome_close_tx_input(
-                &outcome,
-                &mut close_tx,
-                input_index,
-                &Prevouts::All(&[close_tx_prevout]),
-                self.private_key,
-                &winner_seckeys,
-            )?;
-
-            if competition.delta_broadcasted_at.is_none() {
-                info!(
-                    "Competition {} broadcasting unified close tx",
-                    competition.id
-                );
+                let fee_rates = self.bitcoin.get_estimated_fee_rates().await?;
+                let fee_rate = fee_rate_for_target(&fee_rates, 1)?;
+                let (close_tx_input, close_tx_prevout) =
+                    signed_contract.outcome_close_tx_input_and_prevout(&outcome)?;
+                // The whole pot: too small to sweep only if the contract itself is dust-sized.
+                let (mut close_tx, input_index) = simple_sweep_tx(
+                    signed_contract.params().market_maker.pubkey,
+                    close_tx_input.clone(),
+                    signed_contract.close_tx_input_weight(),
+                    close_tx_prevout.value,
+                    fee_rate,
+                )
+                .map_err(|uneconomic| anyhow!("Cannot build the unified close: {uneconomic}"))?;
+                let winner_seckeys: BTreeMap<Point, Scalar> = paid_winners
+                    .iter()
+                    .filter_map(|(_, entry)| {
+                        let seckey = Scalar::from_hex(entry.ephemeral_privatekey.as_ref()?).ok()?;
+                        let pubkey = Point::from_hex(&entry.ephemeral_pubkey).ok()?;
+                        Some((pubkey, seckey))
+                    })
+                    .collect();
+                signed_contract.sign_outcome_close_tx_input(
+                    &outcome,
+                    &mut close_tx,
+                    input_index,
+                    &Prevouts::All(&[close_tx_prevout]),
+                    self.private_key,
+                    &winner_seckeys,
+                )?;
                 self.broadcast_or_known(&close_tx).await?;
                 info!(
                     "Competition {} unified close tx broadcast: txid={}",
                     competition.id,
                     close_tx.compute_txid()
                 );
-                competition.delta_broadcasted_at = Some(OffsetDateTime::now_utc());
-            } else {
-                info!(
-                    "Competition {} unified close already broadcast, skipping",
-                    competition.id
-                );
-            }
-
-            // Mark all entries as closed
-            let now = OffsetDateTime::now_utc();
-            for (_, entry) in paid_winners {
-                self.competition_store
-                    .mark_entry_sellback_broadcast(entry.id, now)
-                    .await?;
-            }
-        } else {
-            info!(
-                "Competition {} taking SPLIT TX path: paid_winners={}, winners={}",
-                competition.id,
-                paid_winners.len(),
-                winners.len()
-            );
-            // Not all winners have been paid via lightning.
-            // We need the split TX so each winner has their own output to
-            // claim from (on-chain via split-win, or off-chain via lightning
-            // leading to split-close/split-sellback). Delta2 will later do
-            // split-reclaim for any winners still unpaid after 2*delta blocks.
-
-            // Broadcast the split TX if not already done.
-            // Use a paid winner's ticket preimage when available - easier to
-            // reason about which preimage was used. Fall back to any winner's
-            // preimage if no one has been paid yet.
-            if competition.delta_broadcasted_at.is_none() {
-                let (split_player_index, split_entry) = if !paid_winners.is_empty() {
-                    info!(
-                        "Competition {} using paid winner for split TX preimage",
-                        competition.id
-                    );
-                    let &(idx, entry) = &paid_winners[0];
-                    (idx, entry)
-                } else {
-                    info!(
-                        "Competition {} no paid winners, finding any winner entry for split TX preimage",
-                        competition.id
-                    );
-                    // No paid winners yet - find any winner's entry for the preimage
-                    winners
-                        .keys()
-                        .find_map(|&player_index| {
-                            entries
-                                .iter()
-                                .find(|entry| {
-                                    let Ok(pubkey) = Point::from_hex(&entry.ephemeral_pubkey)
-                                    else {
-                                        return false;
-                                    };
-                                    signed_contract
-                                        .params()
-                                        .players
-                                        .get(player_index)
-                                        .map(|player| player.pubkey == pubkey)
-                                        .unwrap_or(false)
-                                })
-                                .map(|entry| (player_index, entry))
-                        })
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "Competition {} has no winner entries to build split TX",
-                                competition.id
-                            )
-                        })?
-                };
-
-                info!(
-                    "Competition {} building split TX: split_player_index={}, split_entry_id={}, ticket_id={}",
-                    competition.id,
-                    split_player_index,
-                    split_entry.id,
-                    split_entry.ticket_id
-                );
-
-                let ticket = self
-                    .competition_store
-                    .get_ticket(split_entry.ticket_id)
-                    .await
-                    .map_err(|e| anyhow!("Failed to get ticket for split TX: {}", e))?;
-
-                let ticket_preimage = self
-                    .competition_store
-                    .ticket_preimage(&ticket)
-                    .map_err(|e| anyhow!("Failed to read ticket preimage: {}", e))?;
-
-                let win_cond = WinCondition {
-                    outcome,
-                    player_index: split_player_index,
-                };
-
-                info!(
-                    "Competition {} signing split TX: outcome={:?}, player_index={}",
-                    competition.id, win_cond.outcome, win_cond.player_index
-                );
-
-                let split_tx = signed_contract
-                    .signed_split_tx(&win_cond, ticket_preimage)
-                    .map_err(|e| anyhow!("Failed to build signed split TX: {}", e))?;
-
-                self.broadcast_or_known(&split_tx).await?;
-                info!(
-                    "Competition {} split tx broadcast: txid={}",
-                    competition.id,
-                    split_tx.compute_txid()
-                );
-                competition.delta_broadcasted_at = Some(OffsetDateTime::now_utc());
-            } else {
-                info!(
-                    "Competition {} split TX already broadcast, processing individual closes",
-                    competition.id
-                );
-            }
-
-            // Handle individual cooperative closes for paid winners
-            for (player_index, entry) in paid_winners {
-                // Skip if already processed
-                if entry.sellback_broadcasted_at.is_some() || entry.sweep_uneconomic_at.is_some() {
-                    info!(
-                        "Competition {} skipping already-closed entry {} for player {}",
-                        competition.id, entry.id, player_index
-                    );
-                    continue;
-                }
-
-                info!(
-                    "Competition {} broadcasting split-close for player {}, entry {}",
-                    competition.id, player_index, entry.id
-                );
-
-                let win_condition = WinCondition {
-                    outcome,
-                    player_index,
-                };
-
-                let (close_tx_input, close_tx_prevout) =
-                    signed_contract.split_close_tx_input_and_prevout(&win_condition)?;
-
-                let (mut close_tx, input_index) = match simple_sweep_tx(
-                    signed_contract.params().market_maker.pubkey,
-                    close_tx_input.clone(),
-                    signed_contract.close_tx_input_weight(),
-                    close_tx_prevout.value,
-                    fee_rate,
-                ) {
-                    Ok(sweep) => sweep,
-                    Err(uneconomic) if uneconomic.permanent => {
-                        self.leave_uneconomic_output(
-                            competition.id,
-                            entry,
-                            player_index,
-                            "split-close",
-                            uneconomic,
-                        )
+                let now = OffsetDateTime::now_utc();
+                competition.delta_broadcasted_at = Some(now);
+                for (_, entry) in &paid_winners {
+                    self.competition_store
+                        .mark_entry_sellback_broadcast(entry.id, now)
                         .await?;
-                        continue;
-                    }
-                    // Settlement retries this step, as after a failed broadcast; the split TX
-                    // is already out, so the retry only repeats the closes still owed.
-                    Err(uneconomic) => {
-                        return Err(anyhow!(
-                            "Split-close of entry {} (player {}) waits for lower fees: {}",
-                            entry.id,
-                            player_index,
-                            uneconomic
-                        ))
-                    }
-                };
-
-                let winner_seckey = Scalar::from_hex(entry.ephemeral_privatekey.as_ref().unwrap())
-                    .map_err(|e| anyhow!("Invalid winner secret key: {}", e))?;
-
-                signed_contract.sign_split_close_tx_input(
-                    &win_condition,
-                    &mut close_tx,
-                    input_index,
-                    &Prevouts::All(&[close_tx_prevout]),
-                    self.private_key,
-                    winner_seckey,
-                )?;
-
-                self.broadcast_or_known(&close_tx).await?;
-                info!(
-                    "Competition {} split-close tx broadcast for player {}: txid={}",
-                    competition.id,
-                    player_index,
-                    close_tx.compute_txid()
-                );
-
-                // Mark entry as closed
-                self.competition_store
-                    .mark_entry_sellback_broadcast(entry.id, OffsetDateTime::now_utc())
-                    .await?;
+                }
+                competition.errors = vec![];
+                return Ok(competition);
             }
+            // Some winner is unpaid. The split is valid after `delta` blocks; waiting until
+            // twice that gives Lightning more time to pay them first, and payouts go on after
+            // the split too.
+            if blocks_since_outcome < (2 * required_delta) {
+                info!(
+                    "Competition {} not all winners paid; it splits in {} blocks, and Lightning \
+                     payouts continue meanwhile",
+                    competition.id,
+                    (2 * required_delta) - blocks_since_outcome
+                );
+                return Ok(competition);
+            }
+        }
+
+        if competition.delta_broadcasted_at.is_none() {
+            if !split_on_chain {
+                self.broadcast_split(
+                    competition.id,
+                    signed_contract,
+                    outcome,
+                    &winner_entries,
+                    &paid_winners,
+                )
+                .await?;
+            } else {
+                info!(
+                    "Competition {}'s split transaction is already on chain; its winners' \
+                     outputs settle one by one",
+                    competition.id
+                );
+            }
+            competition.delta_broadcasted_at = Some(OffsetDateTime::now_utc());
+        }
+
+        // Close the outputs of winners already paid at once: from the split's confirmation they
+        // have `delta` blocks before they could claim them on chain as well.
+        if !paid_winners.is_empty() {
+            let fee_rates = self.bitcoin.get_estimated_fee_rates().await?;
+            let fee_rate = fee_rate_for_target(&fee_rates, 1)?;
+            self.close_paid_split_outputs(
+                competition.id,
+                signed_contract,
+                outcome,
+                &paid_winners,
+                fee_rate,
+            )
+            .await?;
         }
         competition.errors = vec![];
 
         Ok(competition)
+    }
+
+    /// Broadcast the outcome's split transaction, signed with a winner's ticket preimage: a paid
+    /// winner's when there is one, else any winner's. The transaction is the same whichever
+    /// preimage signs it, so broadcasting it again is safe.
+    async fn broadcast_split(
+        &self,
+        competition_id: Uuid,
+        contract: &SignedContract,
+        outcome: Outcome,
+        winner_entries: &[(PlayerIndex, &UserEntry)],
+        paid_winners: &[(PlayerIndex, &UserEntry)],
+    ) -> Result<(), anyhow::Error> {
+        let &(player_index, entry) = paid_winners
+            .first()
+            .or_else(|| winner_entries.first())
+            .ok_or_else(|| {
+                anyhow!("Competition {competition_id} has no winner entries to build split TX")
+            })?;
+        let ticket = self
+            .competition_store
+            .get_ticket(entry.ticket_id)
+            .await
+            .map_err(|e| anyhow!("Failed to get ticket for split TX: {}", e))?;
+        let ticket_preimage = self
+            .competition_store
+            .ticket_preimage(&ticket)
+            .map_err(|e| anyhow!("Failed to read ticket preimage: {}", e))?;
+        let win_cond = WinCondition {
+            outcome,
+            player_index,
+        };
+        let split_tx = contract
+            .signed_split_tx(&win_cond, ticket_preimage)
+            .map_err(|e| anyhow!("Failed to build signed split TX: {}", e))?;
+        self.broadcast_or_known(&split_tx).await?;
+        info!(
+            "Competition {} split tx broadcast with the ticket of entry {} (player {}): txid={}",
+            competition_id,
+            entry.id,
+            player_index,
+            split_tx.compute_txid()
+        );
+        Ok(())
+    }
+
+    /// Close each paid winner's split output to the market maker, with the entry key their
+    /// payout released. Returns whether any close waits for lower fees.
+    async fn close_paid_split_outputs(
+        &self,
+        competition_id: Uuid,
+        contract: &SignedContract,
+        outcome: Outcome,
+        paid_winners: &[(PlayerIndex, &UserEntry)],
+        fee_rate: FeeRate,
+    ) -> Result<bool, anyhow::Error> {
+        let mut waiting_for_fees = false;
+        for &(player_index, entry) in paid_winners {
+            if winner_output_settled(entry) {
+                continue;
+            }
+            let win_condition = WinCondition {
+                outcome,
+                player_index,
+            };
+            let (close_tx_input, close_tx_prevout) =
+                contract.split_close_tx_input_and_prevout(&win_condition)?;
+            let (mut close_tx, input_index) = match simple_sweep_tx(
+                contract.params().market_maker.pubkey,
+                close_tx_input.clone(),
+                contract.close_tx_input_weight(),
+                close_tx_prevout.value,
+                fee_rate,
+            ) {
+                Ok(sweep) => sweep,
+                Err(uneconomic) if uneconomic.permanent => {
+                    self.leave_uneconomic_output(
+                        competition_id,
+                        entry,
+                        player_index,
+                        "split-close",
+                        uneconomic,
+                    )
+                    .await?;
+                    continue;
+                }
+                // Settlement tries again at a later step.
+                Err(uneconomic) => {
+                    info!(
+                        "Competition {competition_id} leaves the split-close of entry {} (player \
+                         {player_index}) for later: {uneconomic}",
+                        entry.id
+                    );
+                    waiting_for_fees = true;
+                    continue;
+                }
+            };
+            let winner_seckey = Scalar::from_hex(
+                entry
+                    .ephemeral_privatekey
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("Entry {} has no released entry key", entry.id))?,
+            )
+            .map_err(|e| anyhow!("Invalid winner secret key: {}", e))?;
+            contract.sign_split_close_tx_input(
+                &win_condition,
+                &mut close_tx,
+                input_index,
+                &Prevouts::All(&[close_tx_prevout]),
+                self.private_key,
+                winner_seckey,
+            )?;
+            if let Err(error) = self.broadcast_or_known(&close_tx).await {
+                if self
+                    .resolve_spent_split_output(
+                        competition_id,
+                        contract,
+                        entry,
+                        player_index,
+                        &close_tx_input,
+                        close_tx_prevout,
+                        true,
+                    )
+                    .await?
+                {
+                    continue;
+                }
+                return Err(error);
+            }
+            info!(
+                "Competition {} split-close tx broadcast for player {}: txid={}",
+                competition_id,
+                player_index,
+                close_tx.compute_txid()
+            );
+            self.competition_store
+                .mark_entry_sellback_broadcast(entry.id, OffsetDateTime::now_utc())
+                .await?;
+        }
+        Ok(waiting_for_fees)
+    }
+
+    /// After a sweep of a winner's split output failed, look whether the output is spent
+    /// already. If it is, record it and return true, so settlement moves on instead of retrying
+    /// a sweep that can never confirm. A spend that pays the market maker is the coordinator's
+    /// own sweep whose record was lost; any other is the winner's own claim.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the output, its contract and entry, and whether the winner was paid"
+    )]
+    async fn resolve_spent_split_output(
+        &self,
+        competition_id: Uuid,
+        contract: &SignedContract,
+        entry: &UserEntry,
+        player_index: PlayerIndex,
+        input: &TxIn,
+        prevout: &TxOut,
+        paid: bool,
+    ) -> Result<bool, anyhow::Error> {
+        let status = self
+            .bitcoin
+            .payout_output_status(input.previous_output, prevout.clone())
+            .await?;
+        // An output not in a block yet, or still unspent, is not settled: the sweep failed for
+        // another reason and is tried again.
+        if status.unspent || status.confirmation_height.is_none() {
+            return Ok(false);
+        }
+        let spender = self
+            .bitcoin
+            .spending_transaction(input.previous_output, prevout.clone())
+            .await
+            .ok()
+            .flatten();
+        let ours = p2tr_script_pubkey(contract.params().market_maker.pubkey);
+        let now = OffsetDateTime::now_utc();
+        match spender {
+            Some(spender) if spender.output.iter().any(|out| out.script_pubkey == ours) => {
+                info!(
+                    "Competition {competition_id}: the split output of entry {} (player \
+                     {player_index}) was already swept to the market maker in {}",
+                    entry.id,
+                    spender.compute_txid()
+                );
+                if paid {
+                    self.competition_store
+                        .mark_entry_sellback_broadcast(entry.id, now)
+                        .await?;
+                } else {
+                    self.competition_store
+                        .mark_entry_reclaim_broadcast(entry.id, now)
+                        .await?;
+                }
+            }
+            spender => {
+                let txid = spender.as_ref().map(Transaction::compute_txid);
+                self.competition_store
+                    .mark_entry_split_output_spent(entry.id, now)
+                    .await?;
+                match (paid, txid) {
+                    (true, _) => error!(
+                        "Competition {competition_id}: the split output of entry {} (player \
+                         {player_index}), whose winner was paid over Lightning, was spent by \
+                         {txid:?}, not by the coordinator; check it against the payout",
+                        entry.id
+                    ),
+                    (false, Some(txid)) => {
+                        self.competition_store
+                            .mark_owed_winner_claimed(entry.id, txid.to_string())
+                            .await?;
+                        warn!(
+                            "Competition {competition_id}: the winner of entry {} (player \
+                             {player_index}) claimed their split output on chain in {txid}; they \
+                             are no longer owed",
+                            entry.id
+                        );
+                    }
+                    (false, None) => warn!(
+                        "Competition {competition_id}: the split output of entry {} (player \
+                         {player_index}) was spent by a transaction that could not be read; an \
+                         operator checks whether the winner is still owed",
+                        entry.id
+                    ),
+                }
+            }
+        }
+        Ok(true)
     }
 
     /// Leave a winner's split output on chain because sweeping it would leave less than the dust
@@ -3047,6 +3185,16 @@ impl Coordinator {
         Ok(())
     }
 
+    /// Settle every winner's split output once the split transaction is out.
+    ///
+    /// - A winner paid over Lightning has their output closed to the market maker with the key
+    ///   the payout released.
+    /// - An unpaid winner may still be paid over Lightning until 13 blocks before they could claim
+    ///   their output on chain (`delta` blocks after the split confirms). Their output waits.
+    /// - After that they are **owed** (`owed_winners.rs`). Their output is swept to the market
+    ///   maker only once an operator approves, and the reclaim delay has passed. Until then it
+    ///   stays where it is, still claimable by the winner. The competition completes when every
+    ///   output is settled.
     pub async fn publish_delta2_transactions<'a>(
         &self,
         competition: &'a mut Competition,
@@ -3073,182 +3221,297 @@ impl Coordinator {
         };
 
         let current_height = self.bitcoin.get_current_height().await?;
-        let Some(outcome_height) = self
+        if self
             .bitcoin
             .get_tx_confirmation_height(&outcome_transaction.compute_txid())
             .await?
-        else {
+            .is_none()
+        {
             info!(
                 "Outcome transaction not confirmed yet for competition {}",
                 competition.id
             );
             return Ok(competition);
-        };
-
-        let blocks_since_outcome = current_height
-            .checked_sub(outcome_height)
-            .ok_or_else(|| anyhow!("LND chain tip is behind the outcome confirmation height"))?;
-        let required_delta = signed_contract.params().relative_locktime_block_delta as u32;
-
-        if blocks_since_outcome < (2 * required_delta) {
-            info!(
-                "Not enough blocks since outcome tx. Need {} more blocks",
-                (2 * required_delta) - blocks_since_outcome
-            );
-            return Ok(competition);
         }
 
-        // Get outcome and winner information
         let outcome = competition.get_current_outcome()?;
-        let winners = signed_contract
-            .params()
+        let params = signed_contract.params();
+        let winners = params
             .outcome_payouts
             .get(&outcome)
             .ok_or_else(|| anyhow!("No payout mapping found for outcome"))?;
-
         let entries = self
             .competition_store
             .get_competition_entries(competition.id, vec![EntryStatus::Paid])
             .await?;
-
-        // A split-reclaim has no deadline once its delay has passed: the reclaim path does not
-        // expire, and the winner the output belongs to is the only other party who can take it.
-        // So pay for confirmation within about a day, not the next block.
-        let fee_rates = self.bitcoin.get_estimated_fee_rates().await?;
-        let fee_rate = economy_fee_rate(&fee_rates)?;
-
-        // The split TX was broadcast during delta, so each winner has their
-        // own output. Use split-reclaim for unpaid winners who haven't been
-        // closed or reclaimed yet, once the split TX's reclaim delay has passed.
-        let mut split_confirmation = None;
-        // A reclaim fees make dust for now keeps the competition open for a later attempt.
-        let mut waiting_for_fees = false;
-        for &player_index in winners.keys() {
-            if let Some(entry) = entries.iter().find(|entry| {
-                let Ok(pubkey) = Point::from_hex(&entry.ephemeral_pubkey) else {
-                    return false;
-                };
-                if let Some(player) = signed_contract.params().players.get(player_index) {
-                    player.pubkey == pubkey
-                } else {
-                    false
-                }
-            }) {
-                // Skip if already processed, left as uneconomic, paid out, or already closed
-                // via delta
-                if entry.reclaimed_broadcasted_at.is_some()
-                    || entry.sweep_uneconomic_at.is_some()
-                    || entry.paid_out_at.is_some()
-                    || entry.sellback_broadcasted_at.is_some()
+        let paid_out = self
+            .competition_store
+            .paid_out_entries(competition.id)
+            .await?;
+        let pending: Vec<(PlayerIndex, &UserEntry)> = winner_entries(params, winners, &entries)
+            .into_iter()
+            .filter(|(_, entry)| !winner_output_settled(entry))
+            .collect();
+        if !pending.is_empty() {
+            // Every winner's output is in the one split transaction.
+            let split_txid = signed_contract
+                .unsigned_split_tx(&outcome)
+                .ok_or_else(|| anyhow!("No split transaction for the outcome"))?
+                .compute_txid();
+            let Some(split_height) = self.bitcoin.get_tx_confirmation_height(&split_txid).await?
+            else {
+                // No winner can claim before the split confirms. One dropped from the mempool
+                // would never confirm, and sending it again is safe.
+                if let Err(error) = self
+                    .broadcast_split(competition.id, signed_contract, outcome, &pending, &[])
+                    .await
                 {
-                    continue;
+                    warn!(
+                        "Competition {} cannot broadcast its split again: {error:#}",
+                        competition.id
+                    );
                 }
-
-                let win_condition = WinCondition {
-                    outcome,
-                    player_index,
-                };
-
-                let (reclaim_tx_input, reclaim_tx_prevout) =
-                    signed_contract.split_reclaim_tx_input_and_prevout(&win_condition)?;
-
-                // Every winner's output is in the one split TX.
-                let split_txid = reclaim_tx_input.previous_output.txid;
-                if split_confirmation.is_none() {
-                    split_confirmation =
-                        Some(self.bitcoin.get_tx_confirmation_height(&split_txid).await?);
-                }
-                match reclaim_readiness(
-                    split_confirmation.flatten(),
-                    current_height,
-                    u32::from(signed_contract.params().reclaim_block_delay()),
-                ) {
-                    ReclaimReadiness::Ready => {}
-                    ReclaimReadiness::SplitUnconfirmed => {
-                        info!(
-                            "Competition {} split tx {} is not confirmed yet; reclaiming later",
-                            competition.id, split_txid
-                        );
-                        return Ok(competition);
-                    }
-                    ReclaimReadiness::Wait { blocks } => {
-                        info!(
-                            "Competition {} can reclaim unpaid split outputs in {} more blocks",
-                            competition.id, blocks
-                        );
-                        return Ok(competition);
-                    }
-                }
-
-                let (mut reclaim_tx, input_index) = match simple_sweep_tx(
-                    signed_contract.params().market_maker.pubkey,
-                    reclaim_tx_input.clone(),
-                    signed_contract.split_reclaim_tx_input_weight(),
-                    reclaim_tx_prevout.value,
-                    fee_rate,
-                ) {
-                    Ok(sweep) => sweep,
-                    Err(uneconomic) if uneconomic.permanent => {
-                        self.leave_uneconomic_output(
-                            competition.id,
-                            entry,
-                            player_index,
-                            "split-reclaim",
-                            uneconomic,
-                        )
-                        .await?;
-                        continue;
-                    }
-                    Err(uneconomic) => {
-                        info!(
-                            "Competition {} leaves the split-reclaim of entry {} (player {}) \
-                             for later: {}",
-                            competition.id, entry.id, player_index, uneconomic
-                        );
-                        waiting_for_fees = true;
-                        continue;
-                    }
-                };
-
-                signed_contract.sign_split_reclaim_tx_input(
-                    &win_condition,
-                    &mut reclaim_tx,
-                    input_index,
-                    &Prevouts::All(&[reclaim_tx_prevout]),
-                    self.private_key,
-                )?;
-
-                self.broadcast_or_known(&reclaim_tx).await?;
                 info!(
-                    "Competition {} split-reclaim tx broadcast for player {}: txid={}",
-                    competition.id,
-                    player_index,
-                    reclaim_tx.compute_txid()
+                    "Competition {} split tx {split_txid} is not confirmed yet; its winners' \
+                     outputs wait",
+                    competition.id
                 );
-
-                self.competition_store
-                    .mark_entry_reclaim_broadcast(entry.id, OffsetDateTime::now_utc())
-                    .await?;
-                // The winner was never paid over Lightning, and with the entry key held in
-                // escrow cannot claim on-chain either, so the coordinator now holds their share.
-                warn!(
-                    "Competition {} reclaimed the split output of unpaid winner entry {} \
-                     (player {}, {} sats before fees); the winner is still owed their payout",
+                return Ok(competition);
+            };
+            if self
+                .settle_split_outputs(
                     competition.id,
-                    entry.id,
-                    player_index,
-                    reclaim_tx_prevout.value.to_sat()
-                );
+                    signed_contract,
+                    outcome,
+                    &pending,
+                    &paid_out,
+                    split_height,
+                    current_height,
+                )
+                .await?
+            {
+                return Ok(competition);
             }
-        }
-
-        if waiting_for_fees {
-            return Ok(competition);
         }
         competition.completed_at = Some(OffsetDateTime::now_utc());
         competition.errors = vec![];
 
         Ok(competition)
+    }
+
+    /// Settle the winners' split outputs once the split confirmed at `split_height`: see
+    /// [`Self::publish_delta2_transactions`]. Returns whether any output is left for later.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the outputs, their contract and the chain heights that decide them"
+    )]
+    async fn settle_split_outputs(
+        &self,
+        competition_id: Uuid,
+        contract: &SignedContract,
+        outcome: Outcome,
+        pending: &[(PlayerIndex, &UserEntry)],
+        paid_out: &HashSet<Uuid>,
+        split_height: u32,
+        current_height: u32,
+    ) -> Result<bool, anyhow::Error> {
+        let (paid, unpaid): (Vec<_>, Vec<_>) = pending
+            .iter()
+            .copied()
+            .partition(|(_, entry)| paid_and_released(entry, paid_out));
+        let mut waiting = false;
+        if !paid.is_empty() {
+            let fee_rates = self.bitcoin.get_estimated_fee_rates().await?;
+            let fee_rate = fee_rate_for_target(&fee_rates, 1)?;
+            waiting |= self
+                .close_paid_split_outputs(competition_id, contract, outcome, &paid, fee_rate)
+                .await?;
+        }
+        if unpaid.is_empty() {
+            return Ok(waiting);
+        }
+
+        let params = contract.params();
+        // Lightning may pay a winner until 13 blocks before they could claim on chain.
+        let lightning_open = crate::infra::lightning::payout_htlc_expiry_height(
+            split_height,
+            params.relative_locktime_block_delta,
+        )
+        .is_ok_and(|deadline| current_height < deadline);
+        if lightning_open {
+            self.reopen_payout_window(competition_id).await?;
+            info!(
+                "Competition {competition_id}: {} unpaid winners may still be paid over Lightning",
+                unpaid.len()
+            );
+            return Ok(true);
+        }
+        if self
+            .competition_store
+            .payout_window_is_open(competition_id)
+            .await?
+        {
+            self.competition_store
+                .close_payout_window(competition_id)
+                .await?;
+        }
+
+        let sweepable_at = split_height.saturating_add(u32::from(params.reclaim_block_delay()));
+        let mut economy: Option<FeeRate> = None;
+        for (player_index, entry) in unpaid {
+            if entry.paid_out_at.is_some() {
+                // A Lightning payout is under way, or paid and waiting for its key release.
+                waiting = true;
+                continue;
+            }
+            let entry_pubkey = Point::from_hex(&entry.ephemeral_pubkey)
+                .map_err(|e| anyhow!("Invalid entry key of entry {}: {e}", entry.id))?;
+            let owed = winner_payout_sats(params, &outcome, &entry_pubkey)
+                .map_err(|e| anyhow!("Entry {}: {e}", entry.id))?;
+            if self
+                .competition_store
+                .record_owed_winner(entry.id, competition_id, owed, sweepable_at)
+                .await?
+            {
+                warn!(
+                    "Competition {competition_id}: the winner of entry {} (player {player_index}) \
+                     is owed {owed} sats; their Lightning payout window closed unpaid. Their \
+                     split output is swept to the coordinator only once an operator approves \
+                     (coordinator admin owed-winners)",
+                    entry.id
+                );
+            }
+            match reclaim_readiness(
+                Some(split_height),
+                current_height,
+                u32::from(params.reclaim_block_delay()),
+            ) {
+                ReclaimReadiness::Ready => {}
+                ReclaimReadiness::SplitUnconfirmed | ReclaimReadiness::Wait { .. } => {
+                    waiting = true;
+                    continue;
+                }
+            }
+            let win_condition = WinCondition {
+                outcome,
+                player_index,
+            };
+            let (reclaim_tx_input, reclaim_tx_prevout) =
+                contract.split_reclaim_tx_input_and_prevout(&win_condition)?;
+            // A split-reclaim has no deadline once its delay has passed: pay for confirmation
+            // within about a day, not the next block.
+            let fee_rate = match economy {
+                Some(rate) => rate,
+                None => {
+                    let rate = economy_fee_rate(&self.bitcoin.get_estimated_fee_rates().await?)?;
+                    economy = Some(rate);
+                    rate
+                }
+            };
+            let (mut reclaim_tx, input_index) = match simple_sweep_tx(
+                params.market_maker.pubkey,
+                reclaim_tx_input.clone(),
+                contract.split_reclaim_tx_input_weight(),
+                reclaim_tx_prevout.value,
+                fee_rate,
+            ) {
+                Ok(sweep) => sweep,
+                Err(uneconomic) if uneconomic.permanent => {
+                    self.leave_uneconomic_output(
+                        competition_id,
+                        entry,
+                        player_index,
+                        "split-reclaim",
+                        uneconomic,
+                    )
+                    .await?;
+                    continue;
+                }
+                Err(uneconomic) => {
+                    info!(
+                        "Competition {competition_id} leaves the split-reclaim of entry {} \
+                         (player {player_index}) for later: {uneconomic}",
+                        entry.id
+                    );
+                    waiting = true;
+                    continue;
+                }
+            };
+            let approved = self
+                .competition_store
+                .owed_winner(entry.id)
+                .await?
+                .is_some_and(|owed| owed.sweep_approved_at.is_some());
+            if !approved {
+                if self
+                    .reported
+                    .is_new("held sweep", entry.id, "awaiting approval")
+                {
+                    warn!(
+                        "Competition {competition_id}: the split output of owed winner entry {} \
+                         (player {player_index}) can be swept, and waits for an operator's \
+                         approval",
+                        entry.id
+                    );
+                }
+                waiting = true;
+                continue;
+            }
+            contract.sign_split_reclaim_tx_input(
+                &win_condition,
+                &mut reclaim_tx,
+                input_index,
+                &Prevouts::All(&[reclaim_tx_prevout]),
+                self.private_key,
+            )?;
+            if let Err(error) = self.broadcast_or_known(&reclaim_tx).await {
+                if self
+                    .resolve_spent_split_output(
+                        competition_id,
+                        contract,
+                        entry,
+                        player_index,
+                        &reclaim_tx_input,
+                        reclaim_tx_prevout,
+                        false,
+                    )
+                    .await?
+                {
+                    continue;
+                }
+                return Err(error);
+            }
+            self.competition_store
+                .mark_entry_reclaim_broadcast(entry.id, OffsetDateTime::now_utc())
+                .await?;
+            warn!(
+                "Competition {} swept the split output of owed winner entry {} (player {}, {} \
+                 sats before fees) to the coordinator, as an operator approved: txid={}; the \
+                 winner is still owed until an operator records paying them",
+                competition_id,
+                entry.id,
+                player_index,
+                reclaim_tx_prevout.value.to_sat(),
+                reclaim_tx.compute_txid()
+            );
+        }
+        Ok(waiting)
+    }
+
+    /// Open the competition's Lightning payout window again if it was closed. Each payout is
+    /// still checked against the winners' earliest on-chain claim before it is sent.
+    async fn reopen_payout_window(&self, competition_id: Uuid) -> Result<(), anyhow::Error> {
+        if self
+            .competition_store
+            .reopen_payout_window(competition_id)
+            .await?
+        {
+            info!(
+                "Competition {competition_id}: Lightning payouts are open again, since no winner \
+                 can claim on chain yet"
+            );
+        }
+        Ok(())
     }
 
     //Nonces from every entry into competition
