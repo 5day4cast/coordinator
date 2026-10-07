@@ -118,7 +118,7 @@ async function offerSatchelAddress(line) {
   if (!address || !line.isConnected || satchelSigner() !== signer) return;
   const field = document.getElementById("payoutLightningAddress");
   if (field && field.value.trim().toLowerCase() === address.toLowerCase()) {
-    line.hidden = true;
+    line.classList.add("is-hidden");
     return;
   }
   const use = document.createElement("button");

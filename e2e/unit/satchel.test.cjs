@@ -161,8 +161,15 @@ const ALICE = { ok: true, status: 200,
 
 // The Payouts page's line under the Lightning Address field, and the field.
 function payoutsLine(stored = "") {
+  const classes = new Set();
   return {
-    satchelAddress: { dataset: {}, isConnected: true, replaceChildren(...children) { this.children = children; } },
+    satchelAddress: {
+      dataset: {},
+      isConnected: true,
+      classes,
+      classList: { add: (name) => classes.add(name) },
+      replaceChildren(...children) { this.children = children; },
+    },
     payoutLightningAddress: { value: stored, focus() { this.focused = true; } },
   };
 }
@@ -200,7 +207,7 @@ test("a player without a Satchel wallet, or without a key, keeps the line that g
   await offerSatchelAddress(without.satchelAddress);
   assert.equal(fetched.length, 1);
   assert.equal(without.satchelAddress.children, undefined);
-  assert.ok(!without.satchelAddress.hidden);
+  assert.ok(!without.satchelAddress.classes.has("is-hidden"));
 
   const signedOut = payoutsLine();
   const nobody = page({ elements: signedOut });
@@ -213,6 +220,6 @@ test("the line hides when the account already uses its Satchel address", async (
   const elements = payoutsLine("Alice@wallet.example.org ");
   const { offerSatchelAddress } = page({ signer: signer(), elements, answer: ALICE });
   await offerSatchelAddress(elements.satchelAddress);
-  assert.ok(elements.satchelAddress.hidden);
+  assert.ok(elements.satchelAddress.classes.has("is-hidden"));
   assert.equal(elements.satchelAddress.children, undefined);
 });
