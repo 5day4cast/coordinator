@@ -22,6 +22,12 @@ fn server_rejects_invalid_runtime_environment_before_starting() {
         let mut child = Command::new(env!("CARGO_BIN_EXE_coordinator"))
             .args(["--config", config.to_str().unwrap()])
             .env_clear()
+            // Cargo and CI may supply the paths to the linked SQLite library.
+            .envs(
+                ["LD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH"]
+                    .into_iter()
+                    .filter_map(|key| std::env::var_os(key).map(|value| (key, value))),
+            )
             .env(name, "invalid-test-value")
             .current_dir(dir.path())
             .stdout(Stdio::null())
