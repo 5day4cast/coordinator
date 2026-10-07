@@ -3,16 +3,13 @@
 //! its messages unnotified, so the next tick tries again, until they are a day old.
 //!
 //! Email goes through ntfy too: with `notify_email` set, each push carries ntfy's `Email`
-//! header. A server without email refuses that header; the push is sent again without it,
-//! and later pushes leave it off.
+//! header. A server without email refuses that header, and so does one whose email allowance
+//! is used up; the push is sent again without it, and email stays off for [`EMAIL_PAUSE`].
 
 use std::{
     io::Read,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::Duration,
+    sync::{Arc, Mutex, PoisonError},
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, ensure, Context};
@@ -33,6 +30,9 @@ use crate::{
 pub const PUSH_EVERY: Duration = Duration::from_secs(120);
 /// How often unnotified messages are looked for.
 const TICK: Duration = Duration::from_secs(15);
+/// How long email stays off after ntfy refuses it: long enough for its hourly email
+/// allowance to refill, short enough that email set up later is picked up without a restart.
+pub const EMAIL_PAUSE: Duration = Duration::from_secs(3600);
 /// Messages older than this are not pushed any more.
 const GIVE_UP_AFTER_SECS: i64 = DUPLICATE_WINDOW_SECS;
 /// Characters of a message a push carries.
@@ -72,8 +72,8 @@ pub struct FeedbackAlerts {
     token: Option<Zeroizing<String>>,
     email: Option<String>,
     admin_url: Option<String>,
-    /// The server refused the `Email` header once; it is left off from then on.
-    email_refused: AtomicBool,
+    /// Until when the `Email` header is left off, after the server refused it.
+    email_paused_until: Mutex<Option<Instant>>,
 }
 
 impl FeedbackAlerts {
@@ -107,25 +107,35 @@ impl FeedbackAlerts {
             token,
             email: settings.notify_email.clone(),
             admin_url: settings.admin_url.clone(),
-            email_refused: AtomicBool::new(false),
+            email_paused_until: Mutex::new(None),
         }))
     }
 
-    /// Send one push, with the `Email` header unless the server refused it before.
+    /// Send one push, with the `Email` header unless the server refused it recently.
     pub async fn send(&self, push: &Push) -> anyhow::Result<()> {
-        let email = self
-            .email
-            .as_deref()
-            .filter(|_| !self.email_refused.load(Ordering::Relaxed));
+        let email = self.email.as_deref().filter(|_| !self.email_paused());
         match self.post(push, email).await {
             Err(Refusal::Email) => {
-                if !self.email_refused.swap(true, Ordering::Relaxed) {
-                    warn!("ntfy refused the Email header (is email set up on the server?); alerts go without it");
-                }
+                self.pause_email();
+                warn!("ntfy refused the Email header (email not set up on the server, or its email allowance used up); alerts go without email for the next hour");
                 self.post(push, None).await.map_err(Refusal::into_error)
             }
             result => result.map_err(Refusal::into_error),
         }
+    }
+
+    fn email_paused(&self) -> bool {
+        self.email_paused_until
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    fn pause_email(&self) {
+        *self
+            .email_paused_until
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Instant::now() + EMAIL_PAUSE);
     }
 
     async fn post(&self, push: &Push, email: Option<&str>) -> Result<(), Refusal> {
@@ -217,7 +227,7 @@ impl FeedbackAlerts {
 }
 
 enum Refusal {
-    /// The server does not send email.
+    /// The server does not send email, or not now.
     Email,
     Other(anyhow::Error),
 }
@@ -232,8 +242,13 @@ impl Refusal {
 }
 
 /// Whether ntfy refused a push for its `Email` header: 400 with an error code 400xx, as ntfy
-/// answers when email is not set up.
+/// answers when email is not set up, or 429, as it answers once a sender's email allowance is
+/// used up. A 429 for too many requests is taken the same way; the push without email then
+/// fails too and is retried on a later tick.
 fn email_refused(status: u16, body: &[u8]) -> bool {
+    if status == 429 {
+        return true;
+    }
     if status != 400 {
         return false;
     }
@@ -302,10 +317,14 @@ mod tests {
     }
 
     #[test]
-    fn only_a_400xx_refusal_means_email_is_not_set_up() {
+    fn a_400xx_or_429_answer_refuses_email() {
         assert!(email_refused(
             400,
             br#"{"code":40001,"http":400,"error":"e-mail notifications are not enabled"}"#
+        ));
+        assert!(email_refused(
+            429,
+            br#"{"code":42902,"http":429,"error":"limit reached: too many emails"}"#
         ));
         assert!(!email_refused(400, br#"{"code":40401}"#));
         assert!(!email_refused(403, br#"{"code":40301}"#));
@@ -396,12 +415,15 @@ mod tests {
             assert!(seen[0].0.contains_key("email"));
             assert!(!seen[1].0.contains_key("email"));
         }
-        assert!(alerts.email_refused.load(Ordering::Relaxed));
-        // Later pushes go without it at once.
+        assert!(alerts.email_paused());
+        // Later pushes go without it at once, until the pause ends.
         alerts.send(&push).await.unwrap();
         let seen = stub.seen.lock().unwrap();
         assert_eq!(seen.len(), 3);
         assert!(!seen[2].0.contains_key("email"));
+        drop(seen);
+        *alerts.email_paused_until.lock().unwrap() = Some(Instant::now());
+        assert!(!alerts.email_paused());
     }
 
     #[test]
