@@ -42,7 +42,7 @@ test.describe("Basic UI", () => {
     await page.goto("/");
 
     await expect(page.locator(".navbar-brand strong")).toContainText(
-      "Fantasy Weather",
+      "5day4cast",
     );
 
     await expect(page.locator("#competitions-page")).toBeVisible();
