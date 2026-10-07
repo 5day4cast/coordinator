@@ -56,6 +56,9 @@ pub struct ChainView {
     pub tip_height: Option<u32>,
     /// The best block's median time past: what a timestamp locktime is checked against.
     pub median_time_past: Option<u64>,
+    /// Seconds between blocks lately, if the caller measured them: for saying about when a
+    /// height is reached. Mutinynet makes a block about every 30 seconds, mainnet every 600.
+    pub block_interval: Option<u32>,
     txs: BTreeMap<Txid, Option<TxStatus>>,
     outspends: BTreeMap<OutPoint, Outspend>,
     missing: RefCell<BTreeSet<Query>>,
@@ -73,6 +76,11 @@ impl ChainView {
     pub fn set_tip(&mut self, tip_height: u32, median_time_past: u64) {
         self.tip_height = Some(tip_height);
         self.median_time_past = Some(median_time_past);
+    }
+
+    /// The seconds between blocks lately; zero leaves it unknown.
+    pub fn set_block_interval(&mut self, seconds: u32) {
+        self.block_interval = (seconds > 0).then_some(seconds);
     }
 
     pub fn insert_tx(&mut self, txid: Txid, status: Option<TxStatus>) {
@@ -125,5 +133,88 @@ impl ChainView {
     pub fn matured(&self, height: u32, blocks: u16) -> bool {
         self.tip_height
             .is_some_and(|tip| tip + 1 >= height.saturating_add(u32::from(blocks)))
+    }
+
+    /// How many blocks are still to be mined before a transaction can go into block `height`:
+    /// 0 once the next block can take it. `None` until the tip is known.
+    pub fn blocks_until(&self, height: u32) -> Option<u32> {
+        self.tip_height
+            .map(|tip| height.saturating_sub(tip.saturating_add(1)))
+    }
+
+    /// About how long `blocks` take to mine, if the block interval is known.
+    pub fn time_for(&self, blocks: u32) -> Option<u64> {
+        self.block_interval
+            .map(|interval| u64::from(blocks) * u64::from(interval))
+    }
+
+    /// When block `height` opens, in words: `block 1073 (in 72 blocks, about 36 min)`.
+    pub fn describe_height(&self, height: u32) -> String {
+        match self.blocks_until(height) {
+            Some(0) => format!("block {height}, which the next block reaches"),
+            Some(blocks) => match self.time_for(blocks) {
+                Some(seconds) => format!(
+                    "block {height} (in {blocks} blocks, about {})",
+                    duration(seconds)
+                ),
+                None => format!("block {height} (in {blocks} blocks)"),
+            },
+            None => format!("block {height}"),
+        }
+    }
+}
+
+/// `seconds` in words, rounded: `less than a minute`, `36 min`, `5 h 20 min`, `3 d 4 h`.
+pub fn duration(seconds: u64) -> String {
+    if seconds < 60 {
+        return "less than a minute".into();
+    }
+    let minutes = (seconds + 30) / 60;
+    if minutes < 60 {
+        return format!("{minutes} min");
+    }
+    if minutes < 48 * 60 {
+        return format!("{} h {} min", minutes / 60, minutes % 60);
+    }
+    let hours = (seconds + 1_800) / 3_600;
+    format!("{} d {} h", hours / 24, hours % 24)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn says_when_a_height_opens() {
+        let mut chain = ChainView::default();
+        assert_eq!(chain.blocks_until(110), None);
+        assert_eq!(chain.describe_height(110), "block 110");
+        chain.set_tip(100, 0);
+        // The next block is 101, so a transaction for block 110 waits for 9 more.
+        assert_eq!(chain.blocks_until(110), Some(9));
+        assert_eq!(chain.blocks_until(101), Some(0));
+        assert_eq!(chain.blocks_until(50), Some(0));
+        assert_eq!(chain.describe_height(110), "block 110 (in 9 blocks)");
+        chain.set_block_interval(30);
+        assert_eq!(
+            chain.describe_height(110),
+            "block 110 (in 9 blocks, about 5 min)"
+        );
+        assert_eq!(
+            chain.describe_height(101),
+            "block 101, which the next block reaches"
+        );
+        chain.set_block_interval(0);
+        assert_eq!(chain.block_interval, None);
+    }
+
+    #[test]
+    fn rounds_durations() {
+        assert_eq!(duration(0), "less than a minute");
+        assert_eq!(duration(59), "less than a minute");
+        assert_eq!(duration(89), "1 min");
+        assert_eq!(duration(36 * 60), "36 min");
+        assert_eq!(duration(5 * 3_600 + 20 * 60), "5 h 20 min");
+        assert_eq!(duration(3 * 86_400 + 4 * 3_600), "3 d 4 h");
     }
 }

@@ -68,7 +68,13 @@ def metadata(root, version, source):
         "source_commit": source,
         "source_sha256": {
             name: digest(root / name)
-            for name in ("Cargo.lock", "flake.lock", "crates/coordinator-wasm/keymeld-trusted-pcrs.json")
+            for name in (
+                "Cargo.lock",
+                "flake.lock",
+                "crates/coordinator-wasm/keymeld-trusted-pcrs.json",
+                # The coordinator recovery keys and relays the recovery CLI and page compile in.
+                "crates/coordinator-recover/recovery-defaults.json",
+            )
         },
     }
 

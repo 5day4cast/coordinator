@@ -12,13 +12,15 @@
 //!   ([`Session::claim`]). It does no I/O: the caller fetches what it asks for, so the CLI and
 //!   the browser page share it.
 //! - [`spec`]: the published record formats.
-//! - [`fees`]: which transactions can be fee bumped, and the hook for anchor CPFP.
+//! - [`fees`]: which transactions can be fee bumped, and the CPFP child that bumps them.
+//! - [`defaults`]: the coordinator recovery keys and relays compiled into this build.
 //!
 //! The `native` feature adds the CLI's I/O: relays, Esplora, the oracle and Arkade.
 
 pub mod attestation;
 pub mod chain;
 pub mod contract;
+pub mod defaults;
 pub mod escrow;
 pub mod fees;
 mod identity;
@@ -32,7 +34,7 @@ pub mod native;
 
 pub use identity::Identity;
 pub use keys::{EntryKey, WalletSeed};
-pub use session::{network as parse_network, ClaimPlan, ClaimTx, Session};
+pub use session::{network as parse_network, ClaimPlan, ClaimTx, Deadline, Session};
 
 use uuid::Uuid;
 
@@ -48,7 +50,10 @@ pub enum Error {
     Record(String),
     #[error("No wallet backup was found for this nsec")]
     NoWallet,
-    #[error("No coordinator recovery pubkey: pass --coordinator-pubkey or the recovery file")]
+    #[error(
+        "No coordinator recovery pubkey: this build has none for the network; pass \
+         --coordinator-pubkey or the recovery file"
+    )]
     NoCoordinator,
     #[error(
         "Entry {0} was not created by this wallet: its recorded key differs from the one the seed derives"

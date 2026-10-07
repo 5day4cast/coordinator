@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use bitcoin::absolute::LockTime;
 use bitcoin::{Amount, FeeRate, Network, ScriptBuf, Transaction};
 use dlctix::hashlock::Preimage;
 use dlctix::secp::MaybeScalar;
@@ -62,8 +63,23 @@ pub struct ClaimPlan {
     pub txs: Vec<ClaimTx>,
     /// Steps already on chain.
     pub done: Vec<String>,
+    /// Steps in the mempool and not yet confirmed: the outcome, expiry or split transaction a
+    /// child can still pay for, if it has an anchor.
+    pub unconfirmed: Vec<ClaimTx>,
     /// Why the claim stops where it does, if it is not finished.
     pub waiting: Option<String>,
+    /// By when the next step must confirm, if something else can take the money after that.
+    pub deadline: Option<Deadline>,
+}
+
+/// When a step must have confirmed by, and what happens after.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Deadline {
+    /// Confirm before this block.
+    pub height: Option<u32>,
+    /// Confirm before this time, unix seconds.
+    pub time: Option<u64>,
+    pub reason: String,
 }
 
 impl Session {
@@ -87,6 +103,12 @@ impl Session {
 
     pub fn network(&self) -> Network {
         self.network
+    }
+
+    /// Change the network, before [`Session::load`]: entry keys are derived for it, and records
+    /// for another network are refused.
+    pub fn set_network(&mut self, network: Network) {
+        self.network = network;
     }
 
     pub fn identity(&self) -> &Identity {
@@ -138,6 +160,48 @@ impl Session {
         relays.sort();
         relays.dedup();
         relays
+    }
+
+    /// The networks this player's wallet and entry records name, under the current coordinator
+    /// key, from the relays' events and the recovery files: what the network is when nobody
+    /// said. Records that do not decrypt are skipped; [`Session::load`] reports them.
+    pub fn recorded_networks(&self) -> Vec<Network> {
+        let Ok(coordinator) = self.coordinator() else {
+            return Vec::new();
+        };
+        let blind = self.identity.blind_tag(&coordinator);
+        let prefix = spec::entry_d_prefix(&blind);
+        let wallet_d = spec::wallet_d(&blind);
+        let ciphertexts = spec::newest_by_d(&self.events, &coordinator)
+            .into_iter()
+            .filter(|(d, event)| {
+                spec::tag(event, "b") == Some(blind.as_str())
+                    && (*d == wallet_d || d.starts_with(&prefix))
+            })
+            .map(|(_, event)| event.content)
+            .chain(
+                self.kits
+                    .iter()
+                    .flat_map(|kit| kit.wallet.iter().chain(&kit.entries).cloned()),
+            );
+        let mut networks = Vec::new();
+        for ciphertext in ciphertexts {
+            let Ok(plaintext) = self
+                .identity
+                .decrypt(&coordinator, &ciphertext, "player record")
+            else {
+                continue;
+            };
+            let named = serde_json::from_str::<Value>(&plaintext)
+                .ok()
+                .and_then(|record| record.get("network")?.as_str().map(network));
+            if let Some(Ok(found)) = named {
+                if !networks.contains(&found) {
+                    networks.push(found);
+                }
+            }
+        }
+        networks
     }
 
     /// The relay filter for this player's wallet and entry records.
@@ -426,6 +490,7 @@ impl Session {
                     self.attestation(entry.competition_id),
                     self.ticket_preimage(entry, None).is_ok(),
                     &self.chain,
+                    now,
                 );
                 return report;
             }
@@ -480,6 +545,10 @@ impl Session {
 
     /// The transactions that move `entry_id`'s contract money forward now, skipping what is
     /// already on chain. `destination` and `fee_rate` are for the final claim to the player.
+    ///
+    /// A step is planned only once nodes take it: the split spends the outcome output with a
+    /// relative locktime of `delta` blocks, and the win the split output with the same, so each
+    /// waits until its parent has `delta` confirmations, and `waiting` says from which block.
     pub fn claim(
         &self,
         entry_id: Uuid,
@@ -506,39 +575,66 @@ impl Session {
             entry_id,
             txs: Vec::new(),
             done: Vec::new(),
+            unconfirmed: Vec::new(),
             waiting: None,
+            deadline: None,
         };
+        let delta = contract.delta();
+        let reclaim = u32::from(delta) * 2;
         let preimage = self.ticket_preimage(entry, ticket_preimage);
-        let split = |plan: &mut ClaimPlan, outcome: Outcome, parent: &Transaction| -> Result<()> {
-            match &preimage {
-                Ok(preimage) => {
-                    let tx = contract.split_tx(outcome, *preimage)?;
-                    let fee = fee_paid(&tx, &[parent.output[0].value]);
-                    plan.txs.push(ClaimTx {
-                        label: "split",
-                        bump: bump_status(&tx, fee),
-                        tx,
-                    });
-                    plan.waiting = Some(format!(
-                        "the claim to your address opens {} blocks after the split confirms",
-                        contract.delta()
-                    ));
-                }
-                Err(e) => plan.waiting = Some(e.to_string()),
-            }
-            Ok(())
+        let presigned = |label: &'static str, tx: Transaction| ClaimTx {
+            label,
+            bump: bump_status(&tx, contract.signed().presigned_tx_fee(&tx)),
+            tx,
         };
-        let unsigned_outcome = |outcome: Outcome| -> Result<Transaction> {
-            contract
-                .signed()
-                .dlc()
-                .unsigned_outcome_txs()
-                .get(&outcome)
-                .cloned()
-                .ok_or_else(|| Error::Contract {
-                    entry: entry_id,
-                    reason: format!("no {outcome} outcome transaction"),
-                })
+        // When the split opens, given the outcome (or expiry) transaction's height once it has
+        // one.
+        let split_opens = |label: &str, outcome_height: Option<u32>| {
+            let opens = match outcome_height {
+                Some(height) => format!(
+                    "the split opens at {}",
+                    self.chain.describe_height(height + u32::from(delta))
+                ),
+                None => {
+                    format!("the split opens {delta} blocks after the {label} transaction confirms")
+                }
+            };
+            match &preimage {
+                Ok(_) => format!("{opens}; run claim again then"),
+                Err(e) => format!("{opens}; {e}"),
+            }
+        };
+        // Until it confirms, an attested outcome transaction competes with the expiry
+        // transaction, which anyone can broadcast once the event expires.
+        let expiry_deadline = |outcome: Outcome| -> Option<Deadline> {
+            if outcome == Outcome::Expiry {
+                return None;
+            }
+            let reason = "the expiry transaction, which pays every player an equal share, becomes \
+                          valid then and can take the outcome transaction's place"
+                .to_owned();
+            match contract.expiry()? {
+                LockTime::Blocks(height) => Some(Deadline {
+                    height: Some(height.to_consensus_u32()),
+                    time: None,
+                    reason,
+                }),
+                LockTime::Seconds(time) => Some(Deadline {
+                    height: None,
+                    time: Some(u64::from(time.to_consensus_u32())),
+                    reason,
+                }),
+            }
+        };
+        let claim_after_split =
+            || format!("the claim to your address opens {delta} blocks after the split confirms");
+        let reclaim_deadline = |what: &str, height: u32| Deadline {
+            height: Some(height + reclaim),
+            time: None,
+            reason: format!(
+                "the market maker can reclaim {what} from block {}, 2·delta after it confirmed",
+                height + reclaim
+            ),
         };
         match inspect::stage(contract, &self.chain) {
             Stage::Pending => {
@@ -570,13 +666,9 @@ impl Session {
                     plan.waiting = Some(format!("the {outcome} outcome pays this player nothing"));
                     return Ok(plan);
                 }
-                let fee = fee_paid(&tx, &[contract.funding_value()]);
-                plan.txs.push(ClaimTx {
-                    label,
-                    bump: bump_status(&tx, fee),
-                    tx: tx.clone(),
-                });
-                split(&mut plan, outcome, &tx)?;
+                plan.txs.push(presigned(label, tx));
+                plan.deadline = expiry_deadline(outcome);
+                plan.waiting = Some(split_opens(label, None));
             }
             Stage::FundingSpentElsewhere { by } => {
                 plan.waiting = Some(format!(
@@ -586,9 +678,50 @@ impl Session {
             Stage::NotPaid { outcome } => {
                 plan.waiting = Some(format!("the {outcome} outcome pays this player nothing"))
             }
-            Stage::OutcomeUnspent { outcome, txid, .. } => {
-                plan.done.push(format!("outcome transaction {txid}"));
-                split(&mut plan, outcome, &unsigned_outcome(outcome)?)?;
+            Stage::OutcomeUnspent {
+                outcome,
+                txid,
+                height,
+            } => {
+                let label = if outcome == Outcome::Expiry {
+                    "expiry"
+                } else {
+                    "outcome"
+                };
+                match height {
+                    Some(height) => {
+                        plan.done.push(format!(
+                            "{label} transaction {txid}, confirmed in block {height}"
+                        ));
+                        plan.deadline = Some(reclaim_deadline("the outcome output", height));
+                    }
+                    None => {
+                        plan.done
+                            .push(format!("{label} transaction {txid}, not confirmed yet"));
+                        // Rebuilt from the contract, so a child can still pay for it.
+                        let signed = match outcome {
+                            Outcome::Expiry => contract.expiry_tx().ok(),
+                            Outcome::Attestation(_) => self
+                                .attestation(entry.competition_id)
+                                .and_then(|attestation| contract.outcome_tx(attestation).ok()),
+                        };
+                        if let Some(tx) = signed.filter(|tx| tx.compute_txid() == txid) {
+                            plan.unconfirmed.push(presigned(label, tx));
+                        }
+                        plan.deadline = expiry_deadline(outcome);
+                    }
+                }
+                match (height, &preimage) {
+                    (Some(height), Ok(preimage)) if self.chain.matured(height, delta) => {
+                        plan.txs
+                            .push(presigned("split", contract.split_tx(outcome, *preimage)?));
+                        plan.waiting = Some(claim_after_split());
+                    }
+                    (Some(height), Err(e)) if self.chain.matured(height, delta) => {
+                        plan.waiting = Some(e.to_string())
+                    }
+                    _ => plan.waiting = Some(split_opens(label, height)),
+                }
             }
             Stage::OutcomeSpentElsewhere { txid, by } => {
                 plan.done.push(format!("outcome transaction {txid}"));
@@ -600,7 +733,20 @@ impl Session {
                 outcome, height, ..
             } => {
                 plan.done.push("outcome and split transactions".into());
-                let delta = contract.delta();
+                match height {
+                    Some(height) => {
+                        plan.deadline = Some(reclaim_deadline("this player's split output", height))
+                    }
+                    // In the mempool: rebuilt with this player's preimage, so a child can still
+                    // pay for it (any winner's preimage gives the same txid).
+                    None => {
+                        if let Ok(preimage) = &preimage {
+                            if let Ok(tx) = contract.split_tx(outcome, *preimage) {
+                                plan.unconfirmed.push(presigned("split", tx));
+                            }
+                        }
+                    }
+                }
                 match height {
                     Some(height) if self.chain.matured(height, delta) => {
                         let destination = destination.ok_or_else(|| {
@@ -623,15 +769,11 @@ impl Session {
                     }
                     Some(height) => {
                         plan.waiting = Some(format!(
-                            "the claim to your address opens at block {}",
-                            height + u32::from(delta)
+                            "the claim to your address opens at {}",
+                            self.chain.describe_height(height + u32::from(delta))
                         ))
                     }
-                    None => {
-                        plan.waiting = Some(format!(
-                        "the claim to your address opens {delta} blocks after the split confirms"
-                    ))
-                    }
+                    None => plan.waiting = Some(claim_after_split()),
                 }
             }
             Stage::SplitSpent { outpoint, by, .. } => {

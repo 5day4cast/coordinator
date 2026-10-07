@@ -26,6 +26,7 @@ class ReleaseTests(unittest.TestCase):
         self.put("Cargo.lock", '[[package]]\nname = "coordinator"\nversion = "2.0.0"\n')
         self.put("flake.lock", "{}")
         self.put("crates/coordinator-wasm/keymeld-trusted-pcrs.json", "{}")
+        self.put("crates/coordinator-recover/recovery-defaults.json", '{"coordinator_pubkeys": {}, "relays": []}')
         for chart in ("coordinator", "synth"):
             self.put(f"deploy/helm/{chart}/Chart.yaml", 'version: 2.0.0\nappVersion: "2.0.0"\n')
         self.put("docs/releases/v2.0.0.md", "Release migration instructions.")
@@ -82,6 +83,18 @@ class ReleaseTests(unittest.TestCase):
         (self.root / "crates/coordinator-wasm/keymeld-trusted-pcrs.json").unlink()
         with self.assertRaises(FileNotFoundError):
             self.wasm()
+
+    def test_recovery_defaults_are_recorded_and_required(self):
+        self.put("target/x86_64-unknown-linux-gnu/release/coordinator-recover", "binary fixture").chmod(0o755)
+        destination = release.package_recover(self.root, VERSION, SOURCE, TARGET, self.root / "recover")
+        with tarfile.open(destination) as archive:
+            prefix = f"coordinator-recover-{VERSION}-{TARGET}/"
+            manifest = json.load(archive.extractfile(prefix + "RELEASE.json"))
+        name = "crates/coordinator-recover/recovery-defaults.json"
+        self.assertEqual(manifest["source_sha256"][name], release.digest(self.root / name))
+        (self.root / name).unlink()
+        with self.assertRaises(FileNotFoundError):
+            release.package_recover(self.root, VERSION, SOURCE, TARGET, self.root / "recover2")
 
     def test_dry_run_allows_an_untagged_source(self):
         with patch("release.subprocess.check_output", return_value=SOURCE + "\n") as git:

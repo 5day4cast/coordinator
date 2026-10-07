@@ -69,6 +69,48 @@ pub struct Opens {
     pub at_height: Option<u32>,
     /// Unix seconds.
     pub at_time: Option<u64>,
+    /// Blocks still to be mined before `at_height` opens, once the tip is known.
+    pub blocks_left: Option<u32>,
+    /// About when `at_height` opens, unix seconds, once the block interval is known.
+    pub eta: Option<u64>,
+}
+
+impl Opens {
+    /// Opens with block `height`.
+    fn at_height(action: Action, height: u32, chain: &ChainView, now: u64) -> Self {
+        let blocks_left = chain.blocks_until(height);
+        Self {
+            action,
+            at_height: Some(height),
+            at_time: None,
+            blocks_left,
+            eta: blocks_left
+                .and_then(|blocks| chain.time_for(blocks))
+                .map(|seconds| now + seconds),
+        }
+    }
+
+    /// Opens once the chain's median time passes `time`.
+    fn at_time(action: Action, time: u64) -> Self {
+        Self {
+            action,
+            at_height: None,
+            at_time: Some(time),
+            blocks_left: None,
+            eta: None,
+        }
+    }
+
+    /// Opens some blocks after a transaction that has not confirmed yet does.
+    fn after_confirmation(action: Action) -> Self {
+        Self {
+            action,
+            at_height: None,
+            at_time: None,
+            blocks_left: None,
+            eta: None,
+        }
+    }
 }
 
 /// Where an entry's money is now.
@@ -229,7 +271,18 @@ impl fmt::Display for EntryReport {
         if let Some(next) = &self.next {
             write!(f, "  Next: {}", next.action)?;
             match (next.at_height, next.at_time) {
-                (Some(height), _) => writeln!(f, " from block {height}")?,
+                (Some(height), _) => match (next.blocks_left, next.eta) {
+                    (Some(0), _) => writeln!(f, " from block {height}, the next block")?,
+                    (Some(blocks), Some(eta)) => writeln!(
+                        f,
+                        " from block {height} (in {blocks} blocks, around {})",
+                        utc(eta)
+                    )?,
+                    (Some(blocks), None) => {
+                        writeln!(f, " from block {height} (in {blocks} blocks)")?
+                    }
+                    (None, _) => writeln!(f, " from block {height}")?,
+                },
                 (None, Some(time)) => writeln!(f, " from {} (unix {time})", utc(time))?,
                 (None, None) => writeln!(f, " once the previous step confirms")?,
             }
@@ -394,13 +447,14 @@ pub(crate) fn expired(expiry: LockTime, chain: &ChainView) -> bool {
     }
 }
 
-/// Report on an entry with a verified contract.
+/// Report on an entry with a verified contract. `now` is unix seconds, for estimates.
 pub(crate) fn contract_report(
     report: &mut EntryReport,
     contract: &EntryContract,
     attestation: Option<MaybeScalar>,
     has_preimage: bool,
     chain: &ChainView,
+    now: u64,
 ) {
     let delta = contract.delta();
     let reclaim = u32::from(delta) * 2;
@@ -457,9 +511,18 @@ pub(crate) fn contract_report(
             };
             let attested = attestation.and_then(|a| contract.attested_outcome(a));
             let expiry = contract.expiry();
+            // The split spends the outcome output with a `delta` relative locktime: it opens
+            // `delta` blocks after the outcome or expiry transaction confirms.
+            let split_after = |report: &mut EntryReport, what: &str| {
+                report.next = Some(Opens::after_confirmation(Action::BroadcastSplit));
+                report.notes.push(format!(
+                    "the split opens {delta} blocks after the {what} transaction confirms"
+                ));
+            };
             match (attested, expiry) {
                 (Some(outcome), _) if contract.win_condition(outcome).is_some() => {
-                    report.now = vec![Action::BroadcastOutcome, Action::BroadcastSplit];
+                    report.now = vec![Action::BroadcastOutcome];
+                    split_after(report, "outcome");
                     needs_preimage(report);
                 }
                 (Some(outcome), _) => {
@@ -469,22 +532,23 @@ pub(crate) fn contract_report(
                 }
                 (None, Some(expiry)) if expired(expiry, chain) => {
                     if contract.win_condition(Outcome::Expiry).is_some() {
-                        report.now = vec![Action::BroadcastExpiry, Action::BroadcastSplit];
+                        report.now = vec![Action::BroadcastExpiry];
+                        split_after(report, "expiry");
                         needs_preimage(report);
                     }
                 }
                 (None, Some(expiry)) => {
                     report.next = Some(match expiry {
-                        LockTime::Blocks(height) => Opens {
-                            action: Action::BroadcastExpiry,
-                            at_height: Some(height.to_consensus_u32() + 1),
-                            at_time: None,
-                        },
-                        LockTime::Seconds(time) => Opens {
-                            action: Action::BroadcastExpiry,
-                            at_height: None,
-                            at_time: Some(u64::from(time.to_consensus_u32()) + 1),
-                        },
+                        LockTime::Blocks(height) => Opens::at_height(
+                            Action::BroadcastExpiry,
+                            height.to_consensus_u32() + 1,
+                            chain,
+                            now,
+                        ),
+                        LockTime::Seconds(time) => Opens::at_time(
+                            Action::BroadcastExpiry,
+                            u64::from(time.to_consensus_u32()) + 1,
+                        ),
                     });
                     report.notes.push(
                         "the outcome transaction can be broadcast as soon as the oracle attests"
@@ -516,7 +580,26 @@ pub(crate) fn contract_report(
                 outcome: outcome.to_string(),
                 confirmed_height: height,
             };
-            report.now = vec![Action::BroadcastSplit];
+            match height {
+                Some(height) if chain.matured(height, delta) => {
+                    report.now = vec![Action::BroadcastSplit]
+                }
+                Some(height) => {
+                    report.next = Some(Opens::at_height(
+                        Action::BroadcastSplit,
+                        height + u32::from(delta),
+                        chain,
+                        now,
+                    ))
+                }
+                None => {
+                    report.next = Some(Opens::after_confirmation(Action::BroadcastSplit));
+                    report.notes.push(format!(
+                        "the outcome transaction is not confirmed yet; the split opens {delta} \
+                         blocks after it confirms"
+                    ));
+                }
+            }
             needs_preimage(report);
             if let Some(height) = height {
                 report.warnings.push(deadline("the outcome output", height));
@@ -544,18 +627,15 @@ pub(crate) fn contract_report(
                     report.now = vec![Action::ClaimWin];
                 }
                 Some(height) => {
-                    report.next = Some(Opens {
-                        action: Action::ClaimWin,
-                        at_height: Some(height + u32::from(delta)),
-                        at_time: None,
-                    })
+                    report.next = Some(Opens::at_height(
+                        Action::ClaimWin,
+                        height + u32::from(delta),
+                        chain,
+                        now,
+                    ))
                 }
                 None => {
-                    report.next = Some(Opens {
-                        action: Action::ClaimWin,
-                        at_height: None,
-                        at_time: None,
-                    });
+                    report.next = Some(Opens::after_confirmation(Action::ClaimWin));
                     report.notes.push(format!(
                         "the claim opens {delta} blocks after the split transaction confirms"
                     ));
@@ -635,11 +715,7 @@ pub(crate) fn escrow_report(
     if open {
         report.now = vec![refund];
     } else {
-        report.next = Some(Opens {
-            action: refund,
-            at_height: None,
-            at_time: Some(refund_at),
-        });
+        report.next = Some(Opens::at_time(refund, refund_at));
     }
 }
 

@@ -11,9 +11,10 @@
 //!
 //! What is missing: an on-chain destination for a live VTXO (offboarding spends it in a batch,
 //! which needs a forfeit signed through the refund leaf; refund to an Ark address and offboard
-//! from any Arkade wallet instead), and the CPFP child each unrolled virtual transaction needs,
-//! since they pay no fee themselves (see [`crate::fees::AnchorBumper`]). Unrolling also needs
-//! arkd's indexer for the virtual transactions: the records do not carry them.
+//! from any Arkade wallet instead). Each unrolled virtual transaction pays no fee, so it goes out
+//! with a CPFP child paid from the player's fee coin ([`crate::fees::FeeCoin`]), or the player
+//! builds the child in their own wallet. Unrolling also needs arkd's indexer for the virtual
+//! transactions: the records do not carry them.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,7 +28,7 @@ use ark_core::{build_unilateral_exit_tree_txids, ArkAddress};
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::key::{Keypair, Secp256k1};
 use bitcoin::secp256k1::{schnorr, Message};
-use bitcoin::{psbt, FeeRate, Psbt, ScriptBuf, Transaction, Txid, XOnlyPublicKey};
+use bitcoin::{psbt, Amount, FeeRate, Psbt, ScriptBuf, Transaction, Txid, XOnlyPublicKey};
 use coordinator_ark::{
     recover_escrow_into, ArkServer, ArkTransport, EscrowInput, KeypairSigner, KickoffConfig,
 };
@@ -335,25 +336,29 @@ pub async fn unroll(
                 BumpStatus::Anchor {
                     outpoint,
                     value_sat,
+                    ..
                 } => {
                     lines.push(format!(
                         "Next: {txid}, which pays no fee and needs a child spending its anchor {outpoint} ({value_sat} sat)"
                     ));
                     lines.push(format!("Transaction: {}", serialize_hex(&tx)));
                     match bumper {
-                        Some(bumper) if !dry_run => {
-                            let anchor_output = &tx.output[outpoint.vout as usize];
-                            let child = bumper.bump(&tx, outpoint, anchor_output, fee_rate)?;
-                            lines.push(format!(
-                                "Child: {} (broadcast both together as a package)",
-                                serialize_hex(&child)
-                            ));
+                        Some(bumper) => {
+                            let child = bumper.bump(&tx, Amount::ZERO, fee_rate)?;
+                            lines.push(format!("Child: {}", serialize_hex(&child)));
+                            if !dry_run {
+                                esplora.broadcast_package(&tx, &child).await?;
+                                lines.push(format!(
+                                    "Broadcast {txid} with child {}",
+                                    child.compute_txid()
+                                ));
+                            }
                         }
-                        _ => lines.push(
-                            "No CPFP wallet is built in yet. Spend the anchor in a child that pays \
-                             for both from your own wallet, then submit the two as a package \
-                             (bitcoin-cli submitpackage '[\"<transaction>\",\"<child>\"]'). Run \
-                             unroll again after each confirms."
+                        None => lines.push(
+                            "Pass --fee-utxo and --fee-key to pay for it, or spend the anchor in a \
+                             child that pays for both from your own wallet and submit the two as a \
+                             package (bitcoin-cli submitpackage '[\"<transaction>\",\"<child>\"]'). \
+                             Run unroll again after each confirms."
                                 .into(),
                         ),
                     }
