@@ -8,8 +8,7 @@
 use maud::{html, Markup};
 use time::OffsetDateTime;
 
-use crate::domain::leaderboard::{Phase, PickProgress, PickState, Rule};
-use crate::infra::oracle::ValueOptions;
+use crate::domain::leaderboard::{Phase, PickProgress, PickState};
 use crate::templates::{
     components::{tip_end, tip_start},
     format::{self, city_name, MetricText},
@@ -74,14 +73,6 @@ pub(crate) fn state_badge(state: PickState) -> Markup {
         @if let Some((class, text, title)) = badge(state) {
             span class=(class) tabindex="0" data-tip=(title) { (text) }
         }
-    }
-}
-
-fn pick_label(pick: &ValueOptions) -> &'static str {
-    match pick {
-        ValueOptions::Over => "Over",
-        ValueOptions::Par => "Par",
-        ValueOptions::Under => "Under",
     }
 }
 
@@ -214,13 +205,14 @@ fn detail(
                 @let station_picks: Vec<&PickView> = picks.iter().filter(|view| view.pick.station_id == *station).collect();
                 section class="picks-station" {
                     @let name = station_picks.first().and_then(|view| view.station_name.as_deref());
-                    // The city leads; the station's own name is its tooltip, and its code
-                    // stays small beside it. Without the oracle's stations, the code alone.
+                    // Airport details stay in the tooltip. Without the station's name,
+                    // show its code rather than guessing a city.
                     h3 class="picks-station-name" title=[name.map(|name| format!("Weather station: {name} ({station})"))] {
                         @if let Some(name) = name {
-                            (city_name(name)) " "
+                            (city_name(name))
+                        } @else {
+                            (station)
                         }
-                        span class="station-code" { (station) }
                     }
                     @for view in station_picks {
                         @if live { (live_pick_row(view.pick)) } @else { (pick_row(view.pick, phase != Phase::Expired)) }
@@ -264,34 +256,14 @@ fn coverage(picks: &[PickView]) -> Option<(u32, u32)> {
         .min()
 }
 
-/// What the pick needs the reading to be: `< 69.4°F`, `69.4–72.0°F`, `> 72.0°F`; with a fixed
-/// Par, the forecast itself: `< 69°F`, `69°F`, `> 69°F`.
-fn pick_target(pick: &PickProgress) -> Option<String> {
-    let forecast = pick.forecast?;
-    let metric = pick.metric;
-    Some(match (pick.rule, &pick.pick) {
-        (Some(Rule::Line { lower, .. }), ValueOptions::Under) => {
-            format!("< {}", metric.bound(forecast + lower))
-        }
-        (Some(Rule::Line { lower, upper }), ValueOptions::Par) => {
-            metric.range(forecast + lower, forecast + upper)
-        }
-        (Some(Rule::Line { upper, .. }), ValueOptions::Over) => {
-            format!("> {}", metric.bound(forecast + upper))
-        }
-        (_, ValueOptions::Under) => format!("< {}", metric.value(forecast)),
-        (_, ValueOptions::Par) => metric.value(forecast),
-        (_, ValueOptions::Over) => format!("> {}", metric.value(forecast)),
-    })
-}
-
-/// `High · Under < 69.4°F`: the reading, the pick and what it needs.
+/// The reading and the selected threshold or inclusive range.
 fn pick_cells(pick: &PickProgress) -> Markup {
     html! {
-        span class="pick-metric" { (pick.metric.short()) }
+        span class="pick-metric" { (pick.metric.label()) }
         span class="pick-choice" {
-            (pick_label(&pick.pick))
-            @if let Some(target) = pick_target(pick) { " " span class="pick-target" { (target) } }
+            span class="pick-target" {
+                (format::pick_target(pick.metric, pick.forecast, pick.rule, &pick.pick))
+            }
         }
         span class="pick-reading" {
             @if let Some(observed) = pick.observed { (pick.metric.value(observed)) }
@@ -346,7 +318,8 @@ fn live_pick_row(pick: &PickProgress) -> Markup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::leaderboard::{progress::points, Metric};
+    use crate::domain::leaderboard::{progress::points, Metric, Rule};
+    use crate::infra::oracle::ValueOptions;
     use time::macros::datetime;
 
     const NOW: OffsetDateTime = datetime!(2026-09-24 12:52 UTC);
@@ -410,9 +383,11 @@ mod tests {
             NOW,
         )
         .into_string();
-        // The city leads, with the station's full name on hover and its code beside it.
-        assert!(html.contains(r#"title="Weather station: New York/JFK International, NY (KJFK)">New York, NY <span class="station-code">KJFK</span>"#));
-        assert!(html.contains(r#"Under <span class="pick-target">&lt; 69°F</span>"#));
+        // Saved picks show the city; airport details stay in the tooltip.
+        assert!(html.contains(
+            r#"title="Weather station: New York/JFK International, NY (KJFK)">New York, NY</h3>"#
+        ));
+        assert!(html.contains(r#"<span class="pick-target">&lt; 69°F</span>"#));
         assert!(html.contains(r#"<span class="pick-reading">55°F</span>"#));
         assert!(html.contains("&gt; 18 knots"));
         assert!(html.contains("✓ +10"));
@@ -563,7 +538,7 @@ mod tests {
         )];
         let own = own_picks_detail("e", &views(&picks), NOW).into_string();
         assert!(own.contains("Your picks"));
-        assert!(own.contains(r#"Over <span class="pick-target">&gt; 69°F</span>"#));
+        assert!(own.contains(r#"<span class="pick-target">&gt; 69°F</span>"#));
         assert!(
             !own.contains("No readings"),
             "nothing is due before the window"
@@ -610,7 +585,7 @@ mod tests {
         let html = picks_detail("e1", &views(&picks), Phase::Live, updated, NOW).into_string();
         // One line per pick: the metric, the pick and what it needs, the reading so far.
         assert!(html.contains(
-            r#"<span class="pick-metric">High</span><span class="pick-choice">Over <span class="pick-target">&gt; 69°F</span></span><span class="pick-reading">71°F</span>"#
+            r#"<span class="pick-metric">Highest temperature</span><span class="pick-choice"><span class="pick-target">&gt; 69°F</span></span><span class="pick-reading">71°F</span>"#
         ), "{html}");
         assert!(html.contains(r#"<span class="pick-reading">14 knots</span>"#));
         assert!(!html.contains("Forecast") && !html.contains("lately"));

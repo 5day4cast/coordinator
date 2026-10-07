@@ -27,7 +27,7 @@ pub fn navbar(satchel: Option<&str>) -> Markup {
                 div class="navbar-brand" {
                     div class="navbar-item navbar-brand-text" {
                         a href="/" {
-                            strong class="is-size-5" { "Fantasy Weather" }
+                            strong class="is-size-5" { "5day4cast" }
                         }
                         span class="is-size-7 brand-note" {
                             "Powered by "

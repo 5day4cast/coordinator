@@ -50,6 +50,7 @@ function setupPage() {
   document.addEventListener("htmx:after:process", (event) => {
     localizeTimes(event.target);
     markOwnRows(event.target);
+    showKeymeldTrust();
   });
 
   // A tip or a disclosure inside a clickable row opens without opening the row.

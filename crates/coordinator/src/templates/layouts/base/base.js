@@ -5,6 +5,7 @@ function initApp() {
   setupModalCloseHandlers();
   setupThemeToggle();
   setupPage();
+  setupCompetitions();
   setupEntryForm();
   setupPayoutModal();
   setupSatchel();

@@ -299,6 +299,7 @@
     grid-template-areas:
       "status action"
       "window window"
+      "personal personal"
       "facts facts";
     gap: 0.45rem 0.75rem;
     padding: 0.9rem 0.85rem;
@@ -331,5 +332,53 @@
     font-size: 0.85rem;
     line-height: 1.6;
     color: var(--competition-muted);
+  }
+}
+
+.competition-sort {
+  color: inherit;
+  font: inherit;
+  text-transform: inherit;
+  letter-spacing: inherit;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  padding: 0.3rem 0;
+  cursor: pointer;
+}
+
+.competition-sort:hover,
+.competition-sort:focus-visible {
+  color: var(--bulma-link-text);
+}
+
+@media screen and (max-width: 1023px) {
+  .competition-header.is-sortable {
+    display: flex;
+    justify-content: space-between;
+    gap: 0.5rem;
+  }
+
+  .competition-header.is-sortable > span {
+    display: none;
+  }
+
+  .competition-sort {
+    min-height: 44px;
+  }
+}
+
+.player-entries {
+  display: block;
+}
+
+@media screen and (max-width: 1023px) {
+  .competition-row .cell-entries:has(.player-entries) {
+    display: block;
+    grid-area: personal;
+  }
+
+  .cell-entries .entry-count {
+    display: none;
   }
 }
