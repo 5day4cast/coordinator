@@ -179,6 +179,26 @@ settled_retention_days = 7
 
 A relay added later gets the existing records with `coordinator admin recovery republish`.
 
+### Satchel test wallet
+
+Off by default. On a test network, ordinary wallets cannot pay the entry
+invoices. Set `ui_settings.satchel_url` to the origin of a
+[Satchel](https://wallet.5day4cast.com) wallet and players get **Pay with
+Satchel** beside **Pay with Zeus** in the payment dialog, **Open Satchel** in
+their account menu, and their Satchel Lightning Address under the address field
+on the Payouts page. With the player's key in the page, these links sign them
+in to Satchel with a signed Nostr handoff, and a player without a wallet there
+is offered one. The pages' Content-Security-Policy allows that origin for form
+posts and connections only when it is set.
+
+```toml
+[ui_settings]
+# An https:// origin alone: no path, query or credentials. Refused on mainnet.
+satchel_url = "https://wallet.5day4cast.com"
+```
+
+For Helm, set `config.ui.satchelUrl`.
+
 ### Operator access
 
 Operator routes are served only by the admin listener and require the token in

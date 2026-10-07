@@ -13,6 +13,8 @@ mod leaderboard_tests;
 mod oracle_view;
 mod public;
 mod recover;
+#[cfg(test)]
+mod satchel_tests;
 
 pub use admin::*;
 pub use public::*;

@@ -601,8 +601,13 @@ function payingPlayer({ ticket = () => ({ ok: true, json: async () => ({ ticket_
   payment_request: "lnbc53000n1ticket", ...price(), keymeld_session_id: "session",
   keymeld_registration: { user_id: "ticket", session_id: "session", payout_policy: "policy" } }) }),
   entry = () => ({ ok: true, json: async () => ({ id: "entry" }) }), sessionStorage,
-  unpaid = null, listed = [], timers = null, paid = null } = {}) {
+  unpaid = null, listed = [], timers = null, paid = null, satchel = null } = {}) {
   const { elements, document } = entryPage();
+  // The Satchel wallet this site offers beside Zeus, when it names one.
+  if (satchel) {
+    document.body.dataset.satchelUrl = satchel;
+    elements.walletLinkSatchel = element();
+  }
   // The notice the form shows for the signed-in player's unpaid ticket, when they hold one.
   if (unpaid) elements.entryUnpaid = element({ dataset: { ticketId: unpaid } });
   // The notice for a ticket they paid for and never entered.
@@ -733,6 +738,16 @@ test("closing the payment dialog gives Pay back; Pay reopens the same invoice, a
   assert.equal(elements.submitEntry.textContent, "Entered");
   assert.ok(!elements.successMessage.classList.contains("hidden"));
   assert.equal(tickets().length, 1);
+});
+
+test("a site that offers Satchel links the invoice to it beside Zeus", async () => {
+  const { elements, modal, pay } = payingPlayer({ satchel: "https://wallet.example.org" });
+  await pay();
+  assert.ok(modal.classList.contains("is-active"));
+  assert.equal(elements.walletLinkZeus.href, "zeusln:lightning:lnbc53000n1ticket");
+  // shared/satchel.js signs the player in there and then opens this page.
+  assert.equal(elements.walletLinkSatchel.dataset.satchelNext, "/launch/lightning/lnbc53000n1ticket");
+  assert.equal(elements.walletLinkSatchel.href, "https://wallet.example.org/launch/lightning/lnbc53000n1ticket");
 });
 
 function closeDialog(modal) {
