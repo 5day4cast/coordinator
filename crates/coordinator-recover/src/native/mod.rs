@@ -8,34 +8,68 @@ mod ws;
 use std::time::Duration;
 
 use bitcoin::Network;
+use nostr::PublicKey;
 use serde_json::Value;
 
 use crate::attestation;
 use crate::Session;
 use esplora::Esplora;
 
-/// The coordinator's recovery key on each network, for a player with only their nsec. A key is
-/// listed here once the coordinator has published it (`GET /api/v1/recovery/info`); until then,
-/// pass `--coordinator-pubkey` or the recovery file, which names it.
-const COORDINATOR_PUBKEYS: &[(Network, &str)] = &[];
-
-pub fn default_coordinator_pubkey(network: Network) -> Option<&'static str> {
-    COORDINATOR_PUBKEYS
-        .iter()
-        .find(|(known, _)| *known == network)
-        .map(|(_, pubkey)| *pubkey)
+/// Find who published this player's records: try each candidate coordinator recovery key, with
+/// the network it is for when that is known, until one has a wallet or entry record of theirs on
+/// `relays` or in the recovery file. The session keeps that key and the network: the
+/// candidate's, else the one the records name. With no records anywhere it keeps the first
+/// candidate, and [`load`] says no wallet backup was found. Failures of single relays are
+/// returned as warnings.
+pub async fn find_player(
+    session: &mut Session,
+    relays: &[String],
+    candidates: &[(PublicKey, Option<Network>)],
+) -> Result<Vec<String>, String> {
+    let mut warnings = Vec::new();
+    let mut fetched: Vec<PublicKey> = Vec::new();
+    for (coordinator, network) in candidates {
+        session.set_coordinator(*coordinator);
+        if !relays.is_empty() && !fetched.contains(coordinator) {
+            let filter = session.player_filter().map_err(|e| e.to_string())?;
+            let (events, failed) = relays::fetch(relays, &[filter]).await;
+            warnings.extend(failed);
+            session.add_events(events);
+            fetched.push(*coordinator);
+        }
+        let recorded = session.recorded_networks();
+        match (network, recorded.as_slice()) {
+            (Some(network), recorded) if recorded.contains(network) => {
+                session.set_network(*network);
+                return Ok(warnings);
+            }
+            (None, [network]) => {
+                session.set_network(*network);
+                return Ok(warnings);
+            }
+            (None, [_, _, ..]) => {
+                let names: Vec<String> = recorded.iter().map(ToString::to_string).collect();
+                return Err(format!(
+                    "this nsec has records on {}: pass --network to choose one",
+                    names.join(" and ")
+                ));
+            }
+            _ => {}
+        }
+    }
+    if let Some((coordinator, network)) = candidates.first() {
+        session.set_coordinator(*coordinator);
+        if let Some(network) = network {
+            session.set_network(*network);
+        }
+    }
+    Ok(warnings)
 }
 
-/// Fetch this player's records from `relays` and decrypt them, then the contracts of their
-/// competitions. Failures of single relays are returned as warnings.
+/// Decrypt this player's records, found with [`find_player`], then fetch and read the contracts
+/// of their competitions. Failures of single relays are returned as warnings.
 pub async fn load(session: &mut Session, relays: &[String]) -> Result<Vec<String>, String> {
     let mut warnings = Vec::new();
-    if !relays.is_empty() {
-        let filter = session.player_filter().map_err(|e| e.to_string())?;
-        let (events, failed) = relays::fetch(relays, &[filter]).await;
-        warnings.extend(failed);
-        session.add_events(events);
-    }
     session.load().map_err(|e| e.to_string())?;
     if let Some(filter) = session.competition_filter().filter(|_| !relays.is_empty()) {
         let (events, failed) = relays::fetch(relays, &[filter]).await;
@@ -101,6 +135,12 @@ pub async fn settle_chain<T>(
 ) -> Result<T, String> {
     let (tip, median_time_past) = esplora.tip().await?;
     session.chain.set_tip(tip, median_time_past);
+    // Only for saying about when a block comes: a failure leaves the estimates out.
+    if session.chain.block_interval.is_none() {
+        if let Ok(seconds) = esplora.block_interval(tip, median_time_past, 144).await {
+            session.chain.set_block_interval(seconds);
+        }
+    }
     // Each round follows the money one transaction further; four reach a claimed win.
     for _ in 0..8 {
         let result = run(session);

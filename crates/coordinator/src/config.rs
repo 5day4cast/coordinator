@@ -56,6 +56,8 @@ pub struct Settings {
     #[serde(default)]
     pub network_fee_settings: NetworkFeeSettings,
     #[serde(default)]
+    pub cpfp_settings: CpfpSettings,
+    #[serde(default)]
     pub kickoff_check_settings: KickoffCheckSettings,
     #[serde(default, rename = "recovery")]
     pub recovery_settings: RecoverySettings,
@@ -256,6 +258,99 @@ impl NetworkFeeSettings {
             && self.pause_above_entry_bps > 0
             && u128::from(network_fee_sats) * 10_000
                 > u128::from(entry_fee_sats) * u128::from(self.pause_above_entry_bps)
+    }
+}
+
+/// Fee-bumping the coordinator's own settlement transactions through their pay-to-anchor
+/// outputs: the outcome, expiry and split transactions of contracts built since dlctix 0.2.
+/// Contracts without anchors are left as they are. See docs/RECOVERY.md, "Fee bumping".
+///
+/// A transaction the coordinator broadcast that has waited `after_secs` without confirming, and
+/// pays less than the local estimate for `conf_target` blocks, gets a child that spends its
+/// anchor and one confirmed coin of the LND wallet, so the two pay the estimate. Near a deadline
+/// the target is `urgent_conf_target`: an attested outcome transaction within
+/// `urgent_within_secs` of the contract's expiry, after which the pre-signed expiry transaction
+/// is valid and could take its place. A transaction is bumped again only once the estimate is a
+/// quarter above its last child's rate, and no child pays more than `max_fee_percent` of what
+/// its parent spends; past that the child pays what the budget allows.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CpfpSettings {
+    pub enabled: bool,
+    pub after_secs: u64,
+    pub conf_target: u16,
+    pub urgent_conf_target: u16,
+    pub urgent_within_secs: u64,
+    pub max_fee_percent: u64,
+}
+
+impl Default for CpfpSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            after_secs: 1_800,
+            conf_target: 6,
+            urgent_conf_target: 1,
+            urgent_within_secs: 6 * 3_600,
+            max_fee_percent: 10,
+        }
+    }
+}
+
+impl CpfpSettings {
+    pub fn validate(&self) -> Result<(), anyhow::Error> {
+        if self.conf_target == 0 || self.urgent_conf_target == 0 {
+            return Err(anyhow!(
+                "cpfp_settings confirmation targets must be at least one block"
+            ));
+        }
+        if self.urgent_conf_target > self.conf_target {
+            return Err(anyhow!(
+                "cpfp_settings.urgent_conf_target must not exceed conf_target"
+            ));
+        }
+        if !(1..=100).contains(&self.max_fee_percent) {
+            return Err(anyhow!(
+                "cpfp_settings.max_fee_percent must be between 1 and 100"
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cpfp_settings_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_bump_and_settings_are_checked() {
+        let defaults = CpfpSettings::default();
+        assert!(defaults.enabled);
+        defaults.validate().unwrap();
+        let parsed: CpfpSettings = toml::from_str("enabled = false\nconf_target = 3").unwrap();
+        assert!(!parsed.enabled);
+        assert_eq!(parsed.conf_target, 3);
+        assert_eq!(parsed.max_fee_percent, defaults.max_fee_percent);
+        for invalid in [
+            CpfpSettings {
+                conf_target: 0,
+                ..CpfpSettings::default()
+            },
+            CpfpSettings {
+                urgent_conf_target: 12,
+                ..CpfpSettings::default()
+            },
+            CpfpSettings {
+                max_fee_percent: 0,
+                ..CpfpSettings::default()
+            },
+            CpfpSettings {
+                max_fee_percent: 101,
+                ..CpfpSettings::default()
+            },
+        ] {
+            assert!(invalid.validate().is_err(), "{invalid:?}");
+        }
     }
 }
 

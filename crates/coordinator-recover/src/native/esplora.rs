@@ -26,6 +26,22 @@ pub struct Esplora {
     base: String,
 }
 
+/// Fee estimates in sat/vB by confirmation target, as Esplora's `/fee-estimates` gives them.
+#[derive(Debug, Clone, Default)]
+pub struct FeeEstimates(std::collections::BTreeMap<u16, f64>);
+
+impl FeeEstimates {
+    /// The estimate for the longest target within `blocks`, at least 1 sat/vB.
+    pub fn within(&self, blocks: u16) -> FeeRate {
+        let rate = self
+            .0
+            .range(..=blocks)
+            .next_back()
+            .map_or(1.0, |(_, rate)| rate.max(1.0));
+        FeeRate::from_sat_per_kwu((rate * 250.0).ceil() as u64)
+    }
+}
+
 #[derive(Deserialize)]
 struct StatusJson {
     confirmed: bool,
@@ -175,18 +191,83 @@ impl Esplora {
         Txid::from_str(body.trim()).map_err(|e| format!("broadcast answer {body}: {e}"))
     }
 
-    /// The fee rate Esplora estimates for confirmation within `blocks`, at least 1 sat/vB.
-    pub async fn fee_rate(&self, blocks: u16) -> Result<FeeRate, String> {
+    /// Broadcast `parent` with its CPFP `child` as a package (`POST /txs/package`), so a parent
+    /// below the mempool minimum still relays. On an Esplora without the package endpoint they go
+    /// one after the other, which works when the parent pays the relay minimum on its own, as
+    /// anchored contract transactions do. A parent the chain already has is not sent again.
+    pub async fn broadcast_package(
+        &self,
+        parent: &Transaction,
+        child: &Transaction,
+    ) -> Result<(), String> {
+        let url = format!("{}/txs/package", self.base);
+        let response = self
+            .client
+            .post(&url)
+            .json(&[serialize_hex(parent), serialize_hex(child)])
+            .send()
+            .await
+            .map_err(|e| format!("{url}: {e}"))?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if status.is_success() {
+            // Bitcoin Core's submitpackage answer: "success", or why the package was refused.
+            let message = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|answer| answer["package_msg"].as_str().map(str::to_owned));
+            return match message.as_deref() {
+                None | Some("success") => Ok(()),
+                Some(message) => Err(format!(
+                    "package of {} and {} refused: {message}",
+                    parent.compute_txid(),
+                    child.compute_txid()
+                )),
+            };
+        }
+        if !matches!(
+            status,
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+        ) {
+            return Err(format!(
+                "package of {} and {} refused: {body}",
+                parent.compute_txid(),
+                child.compute_txid()
+            ));
+        }
+        if self.tx_status(parent.compute_txid()).await?.is_none() {
+            self.broadcast(parent).await?;
+        }
+        self.broadcast(child).await.map(|_| ())
+    }
+
+    /// Esplora's fee estimates, sat/vB by confirmation target in blocks.
+    pub async fn fee_estimates(&self) -> Result<FeeEstimates, String> {
         let estimates: std::collections::HashMap<String, f64> =
             self.get_json("/fee-estimates").await?.unwrap_or_default();
-        // The estimate for the longest target within `blocks`.
-        let rate = estimates
-            .iter()
-            .filter_map(|(target, rate)| Some((target.parse::<u16>().ok()?, *rate)))
-            .filter(|(target, _)| *target <= blocks)
-            .max_by_key(|(target, _)| *target)
-            .map_or(1.0, |(_, rate)| rate.max(1.0));
-        Ok(FeeRate::from_sat_per_kwu((rate * 250.0).ceil() as u64))
+        Ok(FeeEstimates(
+            estimates
+                .into_iter()
+                .filter_map(|(target, rate)| Some((target.parse::<u16>().ok()?, rate)))
+                .collect(),
+        ))
+    }
+
+    /// The fee rate Esplora estimates for confirmation within `blocks`, at least 1 sat/vB.
+    pub async fn fee_rate(&self, blocks: u16) -> Result<FeeRate, String> {
+        Ok(self.fee_estimates().await?.within(blocks))
+    }
+
+    /// The average seconds between the last `blocks` blocks, by their median times past: about
+    /// 600 on mainnet, 30 on Mutinynet.
+    pub async fn block_interval(&self, tip: u32, tip_mtp: u64, blocks: u32) -> Result<u32, String> {
+        let start = tip.saturating_sub(blocks);
+        let count = tip - start;
+        if count == 0 {
+            return Ok(0);
+        }
+        let earlier = self.median_time_at(start).await?;
+        let seconds = tip_mtp.saturating_sub(earlier) / u64::from(count);
+        u32::try_from(seconds).map_err(|e| format!("block interval: {e}"))
     }
 
     /// Answer every lookup `chain` is missing, until a round asks for nothing new.
@@ -204,5 +285,24 @@ impl Esplora {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn takes_the_estimate_for_the_longest_target_within() {
+        let estimates = FeeEstimates([(1, 20.0), (6, 5.5), (144, 0.5)].into_iter().collect());
+        assert_eq!(estimates.within(1), FeeRate::from_sat_per_kwu(5_000));
+        assert_eq!(estimates.within(6), FeeRate::from_sat_per_kwu(1_375));
+        assert_eq!(estimates.within(100), FeeRate::from_sat_per_kwu(1_375));
+        // Never below 1 sat/vB, and 1 sat/vB with no estimates at all.
+        assert_eq!(estimates.within(1_000), FeeRate::from_sat_per_kwu(250));
+        assert_eq!(
+            FeeEstimates::default().within(6),
+            FeeRate::from_sat_per_kwu(250)
+        );
     }
 }

@@ -7,7 +7,7 @@
 
 use bitcoin::{Address, FeeRate, Network};
 use coordinator_recover::chain::Answer;
-use coordinator_recover::{attestation, parse_network, spec::Kit, Identity, Session};
+use coordinator_recover::{attestation, defaults, parse_network, spec::Kit, Identity, Session};
 use serde_json::{json, Value};
 use std::str::FromStr;
 use uuid::Uuid;
@@ -31,6 +31,19 @@ impl RecoveryCore {
 
     pub fn network(&self) -> Network {
         self.session.network()
+    }
+
+    /// This build's coordinator recovery key for the session's network and its default relays:
+    /// `{coordinator_pubkey, relays}`, the key null when the build has none.
+    pub fn defaults(&self) -> String {
+        let defaults = defaults::built_in();
+        json!({
+            "coordinator_pubkey": defaults
+                .coordinator(self.network())
+                .map(|key| key.to_hex()),
+            "relays": defaults.relays,
+        })
+        .to_string()
     }
 
     pub fn set_coordinator(&mut self, pubkey: &str) -> Result<(), String> {
@@ -112,6 +125,11 @@ impl RecoveryCore {
         self.session.chain.set_tip(height, median_time_past);
     }
 
+    /// The seconds between blocks lately, for saying about when a step opens.
+    pub fn set_block_interval(&mut self, seconds: u32) {
+        self.session.chain.set_block_interval(seconds);
+    }
+
     /// Add answers to chain lookups, a JSON array of `{"tx": …}` / `{"outspend": …}`.
     pub fn add_chain(&mut self, json: &str) -> Result<(), String> {
         let answers: Vec<Answer> = serde_json::from_str(json).map_err(|e| e.to_string())?;
@@ -173,20 +191,26 @@ impl RecoveryCore {
             return Ok(json!({"plan": null, "missing": missing}).to_string());
         }
         let plan = plan.map_err(|e| e.to_string())?;
-        let steps: Vec<Value> = plan
-            .txs
-            .iter()
-            .map(|step| {
-                json!({
-                    "label": step.label,
-                    "txid": step.tx.compute_txid(),
-                    "hex": bitcoin::consensus::encode::serialize_hex(&step.tx),
-                    "bump": step.bump.describe(),
+        let steps = |txs: &[coordinator_recover::ClaimTx]| -> Vec<Value> {
+            txs.iter()
+                .map(|step| {
+                    json!({
+                        "label": step.label,
+                        "txid": step.tx.compute_txid(),
+                        "hex": bitcoin::consensus::encode::serialize_hex(&step.tx),
+                        "bump": step.bump.describe(),
+                    })
                 })
-            })
-            .collect();
+                .collect()
+        };
         Ok(json!({
-            "plan": {"steps": steps, "done": plan.done, "waiting": plan.waiting},
+            "plan": {
+                "steps": steps(&plan.txs),
+                "unconfirmed": steps(&plan.unconfirmed),
+                "done": plan.done,
+                "waiting": plan.waiting,
+                "deadline": plan.deadline,
+            },
             "missing": [],
         })
         .to_string())
@@ -278,6 +302,16 @@ mod wasm {
             self.0.set_tip(height, median_time_past as u64);
         }
 
+        #[wasm_bindgen(js_name = setBlockInterval)]
+        pub fn set_block_interval(&mut self, seconds: u32) {
+            self.0.set_block_interval(seconds);
+        }
+
+        /// This build's coordinator recovery key and relays, as JSON.
+        pub fn defaults(&self) -> String {
+            self.0.defaults()
+        }
+
         #[wasm_bindgen(js_name = addChain)]
         pub fn add_chain(&mut self, json: &str) -> Result<(), JsValue> {
             self.0.add_chain(json).map_err(error)
@@ -325,5 +359,16 @@ mod tests {
         assert_eq!(inspected["missing"], json!([]));
         assert!(RecoveryCore::new("nsec1bad", "signet").is_err());
         assert!(RecoveryCore::new(&"01".repeat(32), "litecoin").is_err());
+    }
+
+    #[test]
+    fn offers_the_built_in_relays() {
+        let core = RecoveryCore::new(&"01".repeat(32), "signet").unwrap();
+        let defaults: Value = serde_json::from_str(&core.defaults()).unwrap();
+        assert_eq!(
+            defaults["relays"],
+            json!(coordinator_recover::defaults::built_in().relays)
+        );
+        assert!(!defaults["relays"].as_array().unwrap().is_empty());
     }
 }

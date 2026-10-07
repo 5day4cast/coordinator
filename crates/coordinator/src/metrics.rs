@@ -104,6 +104,43 @@ pub static PAYOUT_SEND_FAILURES: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("valid metric")
 });
 
+/// Fee-bumps of the coordinator's own stuck settlement transactions through their anchors, by
+/// the transaction (`outcome`, `expiry`, `split`) and the result: `broadcast`; `capped`
+/// (broadcast at the rate `cpfp_settings.max_fee_percent` allows); `over_budget` (that rate is
+/// no better than the transaction's own); `no_coin` (no confirmed wallet coin covers the child);
+/// `parent_rejected` (the transaction itself is not in the mempool and was refused again, for
+/// example below the mempool minimum, which needs package relay); `failed`.
+pub static CPFP_BUMPS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "coordinator_cpfp_bumps_total",
+            "Fee-bumps of stuck settlement transactions through their anchors, by transaction and result",
+        ),
+        &["tx", "result"],
+    )
+    .expect("valid metric")
+});
+
+/// Every name [`CPFP_BUMPS`] uses, so each series reads 0 from the start.
+pub const CPFP_TXS: [&str; 3] = ["outcome", "expiry", "split"];
+pub const CPFP_RESULTS: [&str; 6] = [
+    "broadcast",
+    "capped",
+    "over_budget",
+    "no_coin",
+    "parent_rejected",
+    "failed",
+];
+
+/// Sats the coordinator's CPFP children paid in fees, child by child as each was broadcast.
+pub static CPFP_FEES_SAT: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "coordinator_cpfp_fees_sat_total",
+        "Sats paid in fees by the coordinator's CPFP children of settlement transactions",
+    )
+    .expect("valid metric")
+});
+
 /// Competition steps that returned an error; the runner retries them with backoff.
 pub static COMPETITION_STEP_FAILURES: LazyLock<IntCounter> = LazyLock::new(|| {
     IntCounter::new(
@@ -482,6 +519,13 @@ impl Metrics {
             .registry
             .register(Box::new(ESCROW_SUBSCRIPTION_ESCROWS.clone()))?;
         metrics.registry.register(Box::new(ESCROW_EVENTS.clone()))?;
+        metrics.registry.register(Box::new(CPFP_BUMPS.clone()))?;
+        metrics.registry.register(Box::new(CPFP_FEES_SAT.clone()))?;
+        for tx in CPFP_TXS {
+            for result in CPFP_RESULTS {
+                CPFP_BUMPS.with_label_values(&[tx, result]);
+            }
+        }
         metrics
             .registry
             .register(Box::new(ENTRY_FORM_UNAVAILABLE.clone()))?;

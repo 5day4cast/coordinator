@@ -8,12 +8,6 @@ const RECOVER_DEFAULTS = {
   bitcoin: { esplora: "https://mempool.space/api" },
   signet: { esplora: "https://mutinynet.com/api" },
 };
-const RECOVER_RELAYS = [
-  "wss://relay.damus.io",
-  "wss://nos.lol",
-  "wss://relay.primal.net",
-  "wss://relay.nostr.band",
-];
 
 function recoverElement(id) {
   return document.getElementById(id);
@@ -156,12 +150,18 @@ async function recoverStart(event) {
     // The module holds the key now; the page keeps no copy.
     nsecField.value = "";
 
+    // The coordinator's recovery key and relays this release was built with, used when the
+    // form and the recovery file name none.
+    const builtIn = JSON.parse(tool.defaults());
     let relays = recoverLines(recoverElement("recover-relays").value);
     const coordinator = recoverElement("recover-coordinator").value.trim();
     if (coordinator) tool.setCoordinator(coordinator);
     const kitFile = recoverElement("recover-kit").files[0];
     if (kitFile) relays = relays.concat(JSON.parse(tool.addKit(await kitFile.text())));
-    if (relays.length === 0) relays = RECOVER_RELAYS;
+    if (!coordinator && !kitFile && builtIn.coordinator_pubkey) {
+      tool.setCoordinator(builtIn.coordinator_pubkey);
+    }
+    if (relays.length === 0) relays = builtIn.relays;
     relays = [...new Set(relays)];
 
     recoverStatus(`Reading your records from ${relays.length} relays…`);
@@ -189,6 +189,17 @@ async function recoverStart(event) {
     const hash = (await (await recoverEsplora(esplora, "/blocks/tip/hash")).text()).trim();
     const tip = await (await recoverEsplora(esplora, `/block/${hash}`)).json();
     tool.setTip(tip.height, tip.mediantime);
+    try {
+      // About how long blocks take here, for saying when the next step opens.
+      const back = Math.min(144, tip.height);
+      if (back > 0) {
+        const earlierHash = (await (await recoverEsplora(esplora, `/block-height/${tip.height - back}`)).text()).trim();
+        const earlier = await (await recoverEsplora(esplora, `/block/${earlierHash}`)).json();
+        tool.setBlockInterval(Math.max(0, Math.round((tip.mediantime - earlier.mediantime) / back)));
+      }
+    } catch (_) {
+      // Only the estimates are lost.
+    }
     const inspected = await recoverSettle(tool, esplora, () =>
       JSON.parse(tool.inspect(Date.now() / 1000)),
     );
@@ -268,6 +279,13 @@ function recoverEntry(tool, esplora, text, report) {
       const plan = claimed.plan;
       steps = plan.steps;
       const lines = plan.done.map((done) => `Already on chain: ${done}`);
+      if (plan.deadline) lines.push(`Deadline: ${plan.deadline.reason}`);
+      for (const step of plan.unconfirmed) {
+        lines.push(
+          `${step.label} ${step.txid} is in the mempool: ${step.bump}. ` +
+            "The recovery CLI can pay for it with a child (--fee-utxo).",
+        );
+      }
       for (const step of steps) {
         lines.push(`${step.label} ${step.txid}: ${step.bump}`, step.hex);
       }

@@ -102,7 +102,9 @@
             || (builtins.match ".*\\.css$" path != null)
             || (builtins.match ".*\\.svg$" path != null)
             # Keymeld enclave measurements compiled into the browser WASM.
-            || (builtins.match ".*/keymeld-trusted-pcrs\\.json$" path != null);
+            || (builtins.match ".*/keymeld-trusted-pcrs\\.json$" path != null)
+            # Coordinator recovery keys and relays compiled into the recovery tools.
+            || (builtins.match ".*/recovery-defaults\\.json$" path != null);
         };
 
         # Build workspace dependencies once (for caching)

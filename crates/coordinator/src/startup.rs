@@ -563,6 +563,7 @@ pub async fn build_app(
     .with_arkade_outage_secs(config.ark_settings.arkade_outage_secs)
     .with_network_fee(config.network_fee_settings.clone())?
     .with_kickoff_check(config.kickoff_check_settings.clone())?
+    .with_cpfp(config.cpfp_settings.clone())?
     .with_settle_only(
         config.coordinator_settings.settle_only,
         config.coordinator_settings.settle_only_unstarted,
