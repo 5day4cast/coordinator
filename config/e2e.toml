@@ -65,6 +65,14 @@ payout_watch_interval = 2
 mock_enabled = true  # Use MockLnClient instead of real LND
 mock_auto_accept_secs = 2  # Auto-accept invoices after 2 seconds
 
+[http_context]
+# Playwright talks to the listener directly; no proxy vouches for anyone.
+trusted_proxies = []
+client_ip_header = "X-Real-IP"
+
+[telemetry]
+enabled = true  # Exercise the beacon and POST /api/v1/telemetry
+
 [admin_settings]
 listen_addr = "127.0.0.1:9991"
 token_file = "./config/e2e_admin_token"  # Test-only token; Playwright's global setup sends it

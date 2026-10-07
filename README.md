@@ -145,6 +145,8 @@ token_file = "./creds/admin_token"
 ```
 
 Public request limits and NIP-98 origin configuration are described in [Request controls](docs/REQUEST_HARDENING.md).
+Request ids, trusted proxies (`[http_context]`) and browser telemetry (`[telemetry]`, off by
+default) are described in [Request ids and telemetry](docs/REQUEST_CONTEXT.md).
 
 ### Metrics
 

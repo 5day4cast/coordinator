@@ -133,7 +133,8 @@ impl HttpContext {
             trusted_proxies: settings
                 .trusted_proxies
                 .iter()
-                .map(|cidr| Cidr::parse(cidr))
+                .map(String::as_str)
+                .map(Cidr::parse)
                 .collect::<Result<_, _>>()?,
             client_ip_header: HeaderName::try_from(settings.client_ip_header.trim())?,
         })

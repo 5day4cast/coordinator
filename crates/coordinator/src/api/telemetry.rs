@@ -194,10 +194,13 @@ fn ui_event_line(sid: &str, page_rid: &str, ip: &str, event: &Event) -> Option<S
         "js_error" => {
             push(&mut line, "msg", event.msg.as_deref().map(Into::into));
             let src = event.src.as_deref().map(|src| {
-                let src = path_only(src);
-                src.rsplit('/').next().unwrap_or_default().to_owned().into()
+                path_only(src)
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
             });
-            push(&mut line, "src", src);
+            push(&mut line, "src", src.map(Into::into));
             number(&mut line, "line", event.line);
         }
         "mark" => push(&mut line, "name", event.name.as_deref().map(Into::into)),
@@ -341,7 +344,7 @@ mod tests {
             "LNURL1DP68GURN8GHJ7",
             "xprv9s21ZrQH143K",
             "tprv8ZgxMBicQKsP",
-            &"ab".repeat(20),
+            "abababababababababababababababababababab",
             "write to someone@example.com please",
             "a.b@mail.example.org",
         ] {
