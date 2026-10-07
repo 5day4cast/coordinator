@@ -133,11 +133,12 @@ impl Coordinator {
                 .funding_outpoint
                 .ok_or_else(|| Error::BadRequest("Missing funding outpoint".into()))?,
         };
+        // The split transaction does not close the window: winners may be paid until they could
+        // claim on chain (`payout_watcher::classify_output`).
         let window_closed = self
             .competition_store
             .payout_window_is_closed(competition_id)
             .await?
-            || competition.delta_broadcasted_at.is_some()
             || competition.completed_at.is_some()
             || competition.cancelled_at.is_some();
         let status = self
@@ -188,10 +189,7 @@ impl Coordinator {
             .competition_store
             .get_competition(competition_id)
             .await?;
-        if competition.delta_broadcasted_at.is_some()
-            || competition.completed_at.is_some()
-            || competition.cancelled_at.is_some()
-        {
+        if competition.completed_at.is_some() || competition.cancelled_at.is_some() {
             return Err(Error::BadRequest(
                 "On-chain settlement has already started".into(),
             ));
@@ -648,7 +646,6 @@ impl Coordinator {
             || (competition.attestation.is_none() && !competition.settled_by_expiry())
             || competition.signed_contract.is_none()
             || competition.funding_confirmed_at.is_none()
-            || competition.delta_broadcasted_at.is_some()
             || competition.cancelled_at.is_some()
             || competition.completed_at.is_some()
             || competition.failed_at.is_some()
@@ -800,9 +797,14 @@ impl Coordinator {
                 .await?;
             return Ok(());
         }
-        if competition.delta_broadcasted_at.is_some()
-            || competition.completed_at.is_some()
+        // The split transaction does not stop preparation: a winner may be paid until they could
+        // claim on chain, which the payout watcher checks before it sends.
+        if competition.completed_at.is_some()
             || competition.cancelled_at.is_some()
+            || self
+                .competition_store
+                .payout_window_is_closed(competition.id)
+                .await?
         {
             return Err(anyhow!(
                 "Competition has entered on-chain settlement; payout preparation is stopped"

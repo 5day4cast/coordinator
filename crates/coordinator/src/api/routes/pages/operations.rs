@@ -1,4 +1,5 @@
-//! Operator work queue and transaction evidence. All routes here are read-only.
+//! Operator work queue and transaction evidence. All routes here are read-only; the actions on
+//! owed winners they show post to the admin API (`admin.rs`).
 use std::sync::Arc;
 
 use axum::{
@@ -273,10 +274,11 @@ pub async fn operations_page(
     Query(filter): Query<QueueFilter>,
     headers: HeaderMap,
 ) -> Html<String> {
-    let (competitions, refunds, monitoring) = tokio::join!(
+    let (competitions, refunds, monitoring, owed) = tokio::join!(
         state.coordinator.list_competitions(),
         state.coordinator.refund_progress(None),
-        state.admin_monitoring.read()
+        state.admin_monitoring.read(),
+        state.coordinator.owed_winners(false)
     );
     let content = match (competitions, refunds) {
         (Ok(mut competitions), Ok(refunds)) => {
@@ -315,6 +317,10 @@ pub async fn operations_page(
                     p.eyebrow { "Operator desk" } h1 { "Competition operations" }
                     p { "Follow the next step, inspect the money, and distinguish expected waiting from a competition that needs review." }
                     (state.admin_monitoring.render(&monitoring))
+                    @match &owed {
+                        Ok(owed) => (crate::templates::admin::owed_winners::owed_winners_notice(owed)),
+                        Err(_) => p.notice { "Owed winners could not be loaded." },
+                    }
                     nav.discovery-filters aria-label="Competition views" {
                         @for show in QueueShow::VIEWS {
                             @let count = competitions.iter().filter(|c| show.includes(c, refunds.get(&c.id), now, payout_progress.as_ref().ok().and_then(|p| p.get(&c.id)))).count();
@@ -406,10 +412,11 @@ pub async fn operation_detail(
     headers: HeaderMap,
 ) -> Html<String> {
     let ids = [id];
-    let (competition, refunds, written_off) = tokio::join!(
+    let (competition, refunds, written_off, owed) = tokio::join!(
         state.coordinator.get_competition(id),
         state.coordinator.refund_status(&ids),
-        state.coordinator.refund_write_offs(Some(id))
+        state.coordinator.refund_write_offs(Some(id)),
+        state.coordinator.competition_owed_winners(id)
     );
     let content = match (competition, refunds, written_off) {
         (Ok(c), Ok(refunds), Ok(written_off)) => {
@@ -454,6 +461,10 @@ pub async fn operation_detail(
                     h2 { "Customer funds" }
                     p { a href=(format!("/admin/funds?competition={id}")) { "Trace Lightning payments → Arkade escrows → DLC funding → Lightning payouts" } }
                     p.note { "Includes individual tickets, every recorded payout attempt, refunds, write-offs and live service checks." }
+                    @match &owed {
+                        Ok(owed) => (crate::templates::admin::owed_winners::owed_winners_section(owed)),
+                        Err(_) => p.notice { "Owed winners could not be loaded." },
+                    }
                     div id="chain-evidence" {}
                     (funding) (outcome)
                     section {

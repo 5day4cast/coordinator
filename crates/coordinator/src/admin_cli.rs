@@ -1,5 +1,5 @@
-//! `coordinator admin`: drive competitions, and write off escrow refunds that can never finish,
-//! from a terminal or a script, through the operator listener and its bearer token. A client
+//! `coordinator admin`: drive competitions, write off escrow refunds that can never finish,
+//! release held payouts and settle owed winners, from a terminal or a script, through the operator listener and its bearer token. A client
 //! only; everything it does, the operator listener's HTTP API does.
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -15,8 +15,11 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
-    api::routes::{OperatorCompetition, WriteOffRequest},
-    domain::{CoordinatorFee, CreateEvent, CreateQueuedCompetition, PayoutHold, WriteOffReport},
+    api::routes::{OperatorCompetition, SettleOwedWinnerRequest, WriteOffRequest},
+    domain::{
+        CoordinatorFee, CreateEvent, CreateQueuedCompetition, OwedWinner, PayoutHold,
+        WriteOffReport,
+    },
     infra::oracle::ScoringRules,
 };
 
@@ -61,6 +64,40 @@ pub enum AdminCommand {
     PayoutHolds {
         #[command(subcommand)]
         action: PayoutHoldCommand,
+    },
+    /// Winners owed because their Lightning payout window closed unpaid. The coordinator sweeps
+    /// a winner's split output to its own key only once approved here, and the winner stays owed
+    /// until their payment is recorded here.
+    OwedWinners {
+        #[command(subcommand)]
+        action: OwedWinnerCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OwedWinnerCommand {
+    /// List the winners still owed; with --all, those paid or who claimed on chain too.
+    List {
+        #[arg(long)]
+        all: bool,
+    },
+    /// Approve sweeping a winner's split output to the coordinator's key once its reclaim delay
+    /// has passed. The winner stays owed: pay them, then record it with `settle`.
+    ApproveSweep {
+        entry_id: Uuid,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Record that a winner was paid, saying how (such as the payment hash). This also approves
+    /// the sweep of their output.
+    Settle {
+        entry_id: Uuid,
+        #[arg(long)]
+        note: String,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -464,6 +501,48 @@ impl AdminClient {
         Ok(())
     }
 
+    /// The owed winners; with `all`, those resolved too.
+    pub async fn owed_winners(&self, all: bool) -> Result<Vec<OwedWinner>> {
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                &format!("/api/v1/admin/owed-winners?all={all}"),
+            )
+            .send()
+            .await
+            .context("reach the operator listener")?;
+        Ok(checked(response).await?.json().await?)
+    }
+
+    /// Approve sweeping an owed winner's output.
+    pub async fn approve_owed_winner_sweep(&self, entry_id: Uuid) -> Result<OwedWinner> {
+        let response = self
+            .request(
+                reqwest::Method::POST,
+                &format!("/api/v1/admin/owed-winners/{entry_id}/approve-sweep"),
+            )
+            .send()
+            .await
+            .context("reach the operator listener")?;
+        Ok(checked(response).await?.json().await?)
+    }
+
+    /// Record that an owed winner was paid.
+    pub async fn settle_owed_winner(&self, entry_id: Uuid, note: &str) -> Result<OwedWinner> {
+        let response = self
+            .request(
+                reqwest::Method::POST,
+                &format!("/api/v1/admin/owed-winners/{entry_id}/settle"),
+            )
+            .json(&SettleOwedWinnerRequest {
+                note: note.to_owned(),
+            })
+            .send()
+            .await
+            .context("reach the operator listener")?;
+        Ok(checked(response).await?.json().await?)
+    }
+
     pub async fn delete(&self, id: Uuid) -> Result<()> {
         let response = self
             .request(
@@ -646,8 +725,81 @@ pub async fn run(args: AdminArgs) -> Result<()> {
                 }
             }
         },
+        AdminCommand::OwedWinners { action } => match action {
+            OwedWinnerCommand::List { all } => {
+                let owed = client.owed_winners(all).await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&owed)?);
+                } else {
+                    print!("{}", owed_winners_text(&owed));
+                }
+            }
+            OwedWinnerCommand::ApproveSweep { entry_id, yes } => {
+                confirm(
+                    &format!(
+                        "Sweep the split output of owed winner entry {entry_id} to the \
+                         coordinator's key once its delay has passed; the winner stays owed"
+                    ),
+                    yes,
+                )?;
+                let owed = client.approve_owed_winner_sweep(entry_id).await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&owed)?);
+                } else {
+                    print!("{}", owed_winners_text(&[owed]));
+                }
+            }
+            OwedWinnerCommand::Settle {
+                entry_id,
+                note,
+                yes,
+            } => {
+                confirm(
+                    &format!(
+                        "Record that owed winner entry {entry_id} was paid ({note}), which also \
+                         approves sweeping their output"
+                    ),
+                    yes,
+                )?;
+                let owed = client.settle_owed_winner(entry_id, &note).await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&owed)?);
+                } else {
+                    print!("{}", owed_winners_text(&[owed]));
+                }
+            }
+        },
     }
     Ok(())
+}
+
+/// The owed winners, one line each.
+pub fn owed_winners_text(owed: &[OwedWinner]) -> String {
+    let mut out = String::new();
+    if owed.is_empty() {
+        out.push_str("No winner is owed\n");
+    }
+    for winner in owed {
+        let payment = match (&winner.settled_at, &winner.claimed_on_chain_at) {
+            (Some(at), _) => format!(
+                "paid, recorded {at}: {}",
+                winner.settled_note.as_deref().unwrap_or("-")
+            ),
+            (None, Some(_)) => "claimed on chain".to_string(),
+            (None, None) => "still owed".to_string(),
+        };
+        let _ = writeln!(
+            out,
+            "Entry {} (competition {}): {} sats, owed since {}; {}; {}",
+            winner.entry_id,
+            winner.competition_id,
+            winner.amount_sats,
+            winner.owed_since,
+            winner.output_status(),
+            payment
+        );
+    }
+    out
 }
 
 /// The held payouts, one line each.
@@ -1173,5 +1325,66 @@ mod tests {
         assert!(!state_matches(&active, "cancelled"));
         assert!(state_matches(&[], "failed"));
         assert!(state_matches(&["failed".to_string()], "failed"));
+    }
+
+    #[test]
+    fn owed_winner_commands_parse_and_list_each_winner() {
+        let entry = "0190b7a4-0000-7000-8000-000000000000";
+        match parse(&[
+            "owed-winners",
+            "settle",
+            entry,
+            "--note",
+            "paid abc",
+            "--yes",
+        ])
+        .command
+        {
+            AdminCommand::OwedWinners {
+                action:
+                    OwedWinnerCommand::Settle {
+                        entry_id,
+                        note,
+                        yes,
+                    },
+            } => {
+                assert_eq!(entry_id.to_string(), entry);
+                assert_eq!(note, "paid abc");
+                assert!(yes);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            parse(&["owed-winners", "approve-sweep", entry]).command,
+            AdminCommand::OwedWinners {
+                action: OwedWinnerCommand::ApproveSweep { yes: false, .. }
+            }
+        ));
+        assert!(matches!(
+            parse(&["owed-winners", "list", "--all"]).command,
+            AdminCommand::OwedWinners {
+                action: OwedWinnerCommand::List { all: true }
+            }
+        ));
+
+        assert_eq!(owed_winners_text(&[]), "No winner is owed\n");
+        let owed = OwedWinner {
+            entry_id: entry.parse().unwrap(),
+            competition_id: Uuid::now_v7(),
+            amount_sats: 9_000,
+            owed_since: "2026-10-06T23:00:00Z".into(),
+            sweepable_at_height: Some(500),
+            sweep_approved_at: None,
+            swept_at: None,
+            claimed_on_chain_at: None,
+            claim_txid: None,
+            settled_at: None,
+            settled_note: None,
+        };
+        let text = owed_winners_text(std::slice::from_ref(&owed));
+        assert!(text.contains(&format!("Entry {entry}")), "{text}");
+        assert!(text.contains("9000 sats"), "{text}");
+        assert!(text.contains("still owed"), "{text}");
+        assert!(text.contains("from block 500"), "{text}");
     }
 }

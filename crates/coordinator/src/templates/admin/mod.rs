@@ -7,3 +7,4 @@ pub use wallet::wallet_page;
 pub mod transactions;
 
 pub mod funds;
+pub mod owed_winners;

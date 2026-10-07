@@ -811,6 +811,7 @@ impl CompetitionStore {
                 sellback_broadcasted_at,
                 reclaimed_broadcasted_at,
                 sweep_uneconomic_at,
+                split_output_spent_at,
                 latest_payouts.latest_payout_time as paid_out_at,
                 latest_payouts.payout_payment_request as payout_ln_invoice
             FROM entries
@@ -892,6 +893,7 @@ impl CompetitionStore {
               sellback_broadcasted_at,
               reclaimed_broadcasted_at,
               sweep_uneconomic_at,
+              split_output_spent_at,
               latest_payouts.latest_payout_time as paid_out_at,
               latest_payouts.payout_payment_request as payout_ln_invoice
           FROM entries
@@ -2939,6 +2941,7 @@ impl CompetitionStore {
               sellback_broadcasted_at,
               reclaimed_broadcasted_at,
               sweep_uneconomic_at,
+              split_output_spent_at,
               latest_payouts.latest_payout_time as paid_out_at,
               latest_payouts.payout_payment_request as payout_ln_invoice
           FROM entries

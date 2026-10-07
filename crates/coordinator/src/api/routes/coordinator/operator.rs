@@ -1,7 +1,8 @@
 //! Competition views for the operator listener's scripts and command line
 //! (`coordinator admin`): what state each competition is in, how far it has settled, the errors
 //! it kept, and how far its escrow refunds have got; writing off escrow refunds that can never
-//! finish; and the Lightning payouts held after a restore.
+//! finish; the Lightning payouts held after a restore; and the winners owed because their
+//! Lightning payout window closed unpaid.
 
 use axum::{
     body::Bytes,
@@ -18,7 +19,7 @@ use uuid::Uuid;
 use crate::{
     api::routes::ApiError,
     domain::{
-        Competition, CompetitionError, CompetitionKind, CreateEvent, Error, PayoutHold,
+        Competition, CompetitionError, CompetitionKind, CreateEvent, Error, OwedWinner, PayoutHold,
         QueueSummary, RefundProgress, RefundWriteOff, WriteOffReport, WriteOffTarget,
     },
     startup::AppState,
@@ -250,6 +251,58 @@ pub async fn operator_release_payout_hold(
     }
     Ok(Json(
         serde_json::json!({ "entry_id": entry_id, "released": released }),
+    ))
+}
+
+/// Winners owed because their Lightning payout window closed unpaid, as
+/// `coordinator admin owed-winners list` shows them: those still owed, or every one with
+/// `?all=true`.
+pub async fn operator_owed_winners(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<OwedWinnersQuery>,
+) -> Result<Json<Vec<OwedWinner>>, ApiError> {
+    Ok(Json(state.coordinator.owed_winners(query.all).await?))
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct OwedWinnersQuery {
+    #[serde(default)]
+    pub all: bool,
+}
+
+/// Approve sweeping an owed winner's split output to the coordinator's key
+/// (`coordinator admin owed-winners approve-sweep`). The winner stays owed.
+pub async fn operator_approve_owed_winner_sweep(
+    State(state): State<Arc<AppState>>,
+    Path(entry_id): Path<Uuid>,
+) -> Result<Json<OwedWinner>, ApiError> {
+    Ok(Json(
+        state
+            .coordinator
+            .approve_owed_winner_sweep(entry_id)
+            .await?,
+    ))
+}
+
+/// How an operator paid an owed winner.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettleOwedWinnerRequest {
+    /// Kept with the record, such as the Lightning payment hash.
+    pub note: String,
+}
+
+/// Record that an operator paid an owed winner (`coordinator admin owed-winners settle`), which
+/// also approves sweeping their output.
+pub async fn operator_settle_owed_winner(
+    State(state): State<Arc<AppState>>,
+    Path(entry_id): Path<Uuid>,
+    Json(request): Json<SettleOwedWinnerRequest>,
+) -> Result<Json<OwedWinner>, ApiError> {
+    Ok(Json(
+        state
+            .coordinator
+            .settle_owed_winner(entry_id, &request.note)
+            .await?,
     ))
 }
 

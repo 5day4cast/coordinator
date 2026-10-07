@@ -564,6 +564,67 @@ pub async fn admin_delete_competition_handler(
     }
 }
 
+/// Form data naming an owed winner, with how they were paid when recording it.
+#[derive(Debug, Deserialize)]
+pub struct OwedWinnerForm {
+    pub entry_id: String,
+    #[serde(default)]
+    pub note: String,
+}
+
+fn owed_winner_entry(form: &OwedWinnerForm) -> Result<Uuid, Html<String>> {
+    Uuid::parse_str(form.entry_id.trim()).map_err(|e| {
+        Html(
+            crate::templates::admin::owed_winners::owed_winner_error(&format!(
+                "Invalid entry ID: {e}"
+            ))
+            .into_string(),
+        )
+    })
+}
+
+/// Approve sweeping an owed winner's output, from the competition's operator page.
+pub async fn admin_approve_owed_winner_sweep_handler(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<OwedWinnerForm>,
+) -> Html<String> {
+    use crate::templates::admin::owed_winners::{owed_winner_error, owed_winner_result};
+    let entry_id = match owed_winner_entry(&form) {
+        Ok(entry_id) => entry_id,
+        Err(error) => return error,
+    };
+    Html(
+        match state.coordinator.approve_owed_winner_sweep(entry_id).await {
+            Ok(owed) => owed_winner_result("Sweep approved.", &owed),
+            Err(e) => owed_winner_error(&e.to_string()),
+        }
+        .into_string(),
+    )
+}
+
+/// Record that an owed winner was paid, from the competition's operator page.
+pub async fn admin_settle_owed_winner_handler(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<OwedWinnerForm>,
+) -> Html<String> {
+    use crate::templates::admin::owed_winners::{owed_winner_error, owed_winner_result};
+    let entry_id = match owed_winner_entry(&form) {
+        Ok(entry_id) => entry_id,
+        Err(error) => return error,
+    };
+    Html(
+        match state
+            .coordinator
+            .settle_owed_winner(entry_id, &form.note)
+            .await
+        {
+            Ok(owed) => owed_winner_result("Payment recorded; the sweep is approved.", &owed),
+            Err(e) => owed_winner_error(&e.to_string()),
+        }
+        .into_string(),
+    )
+}
+
 /// Test-only: Settle a ticket's HODL invoice without real Lightning payment.
 /// Used by the synthetic testing tool. Marks the ticket as both paid and settled.
 /// The admin router never registers this route on mainnet.

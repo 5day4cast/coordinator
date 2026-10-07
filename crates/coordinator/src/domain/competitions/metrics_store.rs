@@ -199,7 +199,10 @@ mod tests {
         .unwrap();
         let store = CompetitionStore::new(database.clone());
 
-        assert_eq!(store.competition_state_counts().await.unwrap(), vec![]);
+        assert_eq!(
+            store.competition_state_counts().await.unwrap(),
+            CompetitionCounts::default()
+        );
         assert_eq!(store.store_counts().await.unwrap(), StoreCounts::default());
 
         let event = competition();
@@ -321,7 +324,7 @@ mod tests {
 
         // Five entries without a full field: the competition still collects entries.
         assert_eq!(
-            store.competition_state_counts().await.unwrap(),
+            store.competition_state_counts().await.unwrap().states,
             vec![("collecting_entries", 1)]
         );
         let mut counts = store.store_counts().await.unwrap();

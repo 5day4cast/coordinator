@@ -510,12 +510,13 @@ async fn send_eligibility(
         .await?
         .ok_or_else(|| anyhow::anyhow!("Payout entry no longer exists"))?;
     let competition = store.get_competition(entry.event_id).await?;
-    if competition.delta_broadcasted_at.is_some()
-        || competition.completed_at.is_some()
+    if competition.completed_at.is_some()
         || competition.failed_at.is_some()
         || competition.cancelled_at.is_some()
         || entry.sellback_broadcasted_at.is_some()
         || entry.reclaimed_broadcasted_at.is_some()
+        || entry.sweep_uneconomic_at.is_some()
+        || entry.split_output_spent_at.is_some()
     {
         return Ok(SendEligibility::Closed(
             "Competition has entered on-chain resolution".into(),
@@ -546,11 +547,48 @@ async fn send_eligibility(
         ),
     )
     .await??;
+    // Once the outcome output is spent, by the split transaction, the winner's own output of it
+    // decides how long they may still be paid.
+    let split = match winner_split_output(&competition, &entry) {
+        Some((outpoint, output)) if !status.unspent && status.confirmation_height.is_some() => {
+            Some(
+                tokio::time::timeout(
+                    Duration::from_secs(20),
+                    chain.payout_output_status(outpoint, output),
+                )
+                .await??,
+            )
+        }
+        _ => None,
+    };
     Ok(classify_output(
         status,
+        split,
         params.relative_locktime_block_delta,
         invoice.min_final_cltv_expiry_delta(),
     ))
+}
+
+/// The entry's output of the split transaction, when it won the competition's outcome.
+fn winner_split_output(
+    competition: &crate::domain::Competition,
+    entry: &crate::domain::UserEntry,
+) -> Option<(bitcoin::OutPoint, bitcoin::TxOut)> {
+    let contract = competition.signed_contract.as_ref()?;
+    let outcome = competition.get_current_outcome().ok()?;
+    let entry_key = entry.ephemeral_pubkey.parse::<dlctix::secp::Point>().ok()?;
+    let player_index = contract
+        .params()
+        .players
+        .iter()
+        .position(|player| player.pubkey == entry_key)?;
+    let (input, output) = contract
+        .split_reclaim_tx_input_and_prevout(&dlctix::WinCondition {
+            outcome,
+            player_index,
+        })
+        .ok()?;
+    Some((input.previous_output, output.clone()))
 }
 
 /// The contract output of an outcome or expiry transaction: its first output. Contracts built
@@ -574,25 +612,63 @@ enum SendEligibility {
     Deferred(String),
     Closed(String),
 }
-fn classify_output(status: PayoutOutputStatus, delta: u16, final_cltv: u64) -> SendEligibility {
-    let Some(confirmation_height) = status.confirmation_height else {
+/// Whether a payout may be sent now, and the latest block its HTLC may expire at.
+///
+/// A winner paid over Lightning releases their entry key, and the coordinator closes their
+/// output with it. That must happen before the winner could also claim the output on chain:
+/// `delta` blocks after the split transaction confirms (the win path's relative locktime). So a
+/// payout's HTLC must expire 13 blocks before the earliest block such a claim could confirm in:
+///
+/// - while the outcome output is unspent, the split can confirm no sooner than the next block,
+///   nor before the outcome is `delta` blocks deep;
+/// - once the split spent it, `split` is the winner's own output of it, which counts from the
+///   block the split confirmed in.
+///
+/// Payouts therefore go on after a restart past the old fixed cutoff (outcome + `delta` - 13),
+/// for as long as no winner can claim on chain yet.
+fn classify_output(
+    outcome: PayoutOutputStatus,
+    split: Option<PayoutOutputStatus>,
+    delta: u16,
+    final_cltv: u64,
+) -> SendEligibility {
+    let Some(outcome_height) = outcome.confirmation_height else {
         return SendEligibility::Deferred("Outcome is not confirmed".into());
     };
-    if confirmation_height > status.current_height {
+    if outcome_height > outcome.current_height {
         return SendEligibility::Deferred("Chain observations disagree".into());
     }
-    if !status.unspent {
-        return SendEligibility::Closed("DLC outcome output has already been spent".into());
-    }
-    let expiry = match payout_htlc_expiry_height(confirmation_height, delta) {
+    let (split_height, current_height) = if outcome.unspent {
+        let earliest_split = outcome_height
+            .saturating_add(u32::from(delta))
+            .max(outcome.current_height.saturating_add(1));
+        (earliest_split, outcome.current_height)
+    } else {
+        let Some(split) = split else {
+            return SendEligibility::Closed("DLC outcome output has already been spent".into());
+        };
+        let Some(split_height) = split.confirmation_height else {
+            return SendEligibility::Deferred("The split transaction is not confirmed".into());
+        };
+        if split_height > split.current_height {
+            return SendEligibility::Deferred("Chain observations disagree".into());
+        }
+        if !split.unspent {
+            return SendEligibility::Closed(
+                "The winner's split output has already been spent".into(),
+            );
+        }
+        (split_height, split.current_height)
+    };
+    let expiry = match payout_htlc_expiry_height(split_height, delta) {
         Ok(value) => value,
         Err(error) => return SendEligibility::Closed(error.to_string()),
     };
     let deadline = PaymentDeadline {
         max_htlc_expiry_height: expiry,
-        minimum_chain_height: status.current_height,
+        minimum_chain_height: current_height,
     };
-    match payout_cltv_limit(deadline, status.current_height, final_cltv) {
+    match payout_cltv_limit(deadline, current_height, final_cltv) {
         Ok(_) => SendEligibility::Ready(deadline),
         Err(error) => SendEligibility::Closed(error.to_string()),
     }
@@ -623,23 +699,70 @@ mod tests {
     };
     use uuid::Uuid;
 
+    /// A payout may start until 13 blocks before the winner could claim their output on chain:
+    /// `delta` blocks after the split confirms. While the outcome output is unspent the split can
+    /// confirm no sooner than the next block, so payouts go on past the old fixed cutoff
+    /// (outcome + `delta` - 13), as after a restart; once the split spent it, the winner's own
+    /// output decides.
     #[test]
-    fn new_payments_require_confirmed_unspent_outcome_and_enough_cltv() {
+    fn payouts_may_start_until_13_blocks_before_the_winner_could_claim_on_chain() {
         let confirmed = PayoutOutputStatus {
             confirmation_height: Some(100),
             current_height: 103,
             unspent: true,
         };
+        let ready_until = |outcome, split| match classify_output(outcome, split, 72, 40) {
+            SendEligibility::Ready(deadline) => Some(deadline.max_htlc_expiry_height),
+            _ => None,
+        };
+        // The split confirms no sooner than outcome + delta, the winner's claim delta later.
+        assert_eq!(ready_until(confirmed, None), Some(100 + 72 + 72 - 13));
+        // Past the old cutoff at block 159 the split could confirm in the next block at best.
+        let restarted = PayoutOutputStatus {
+            current_height: 200,
+            ..confirmed
+        };
+        assert_eq!(ready_until(restarted, None), Some(201 + 72 - 13));
+
+        for waiting in [
+            PayoutOutputStatus {
+                confirmation_height: None,
+                ..confirmed
+            },
+            PayoutOutputStatus {
+                current_height: 99,
+                ..confirmed
+            },
+        ] {
+            assert!(matches!(
+                classify_output(waiting, None, 72, 40),
+                SendEligibility::Deferred(_)
+            ));
+        }
+
+        // The split spent the outcome output: the winner's output of it counts from its block.
+        let spent = PayoutOutputStatus {
+            unspent: false,
+            current_height: 260,
+            ..confirmed
+        };
         assert!(matches!(
-            classify_output(confirmed, 72, 40),
-            SendEligibility::Ready(_)
+            classify_output(spent, None, 72, 40),
+            SendEligibility::Closed(_)
         ));
+        let split = PayoutOutputStatus {
+            confirmation_height: Some(250),
+            current_height: 260,
+            unspent: true,
+        };
+        assert_eq!(ready_until(spent, Some(split)), Some(250 + 72 - 13));
         assert!(matches!(
             classify_output(
-                PayoutOutputStatus {
+                spent,
+                Some(PayoutOutputStatus {
                     confirmation_height: None,
-                    ..confirmed
-                },
+                    ..split
+                }),
                 72,
                 40
             ),
@@ -647,39 +770,34 @@ mod tests {
         ));
         assert!(matches!(
             classify_output(
-                PayoutOutputStatus {
-                    current_height: 99,
-                    ..confirmed
-                },
-                72,
-                40
-            ),
-            SendEligibility::Deferred(_)
-        ));
-        assert!(matches!(
-            classify_output(
-                PayoutOutputStatus {
+                spent,
+                Some(PayoutOutputStatus {
                     unspent: false,
-                    ..confirmed
-                },
+                    ..split
+                }),
                 72,
                 40
             ),
             SendEligibility::Closed(_)
         ));
+        // Too few blocks left for the invoice's final CLTV.
         assert!(matches!(
             classify_output(
                 PayoutOutputStatus {
-                    current_height: 117,
-                    ..confirmed
+                    current_height: 270,
+                    ..spent
                 },
+                Some(PayoutOutputStatus {
+                    current_height: 270,
+                    ..split
+                }),
                 72,
                 40
             ),
             SendEligibility::Closed(_)
         ));
         assert!(matches!(
-            classify_output(confirmed, 1, 18),
+            classify_output(confirmed, None, 1, 18),
             SendEligibility::Closed(_)
         ));
     }

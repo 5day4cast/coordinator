@@ -225,6 +225,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         oracle_base: "",
         network: "signet",
         wasm_version: "offline-fixture",
+        recovery: coordinator::templates::components::RecoveryHelp::FileAndRelays,
     };
     for (name, content) in pages {
         let page = without_scripts(&base(&config, content).into_string());

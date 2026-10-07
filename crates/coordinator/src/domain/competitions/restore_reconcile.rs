@@ -215,10 +215,9 @@ impl Coordinator {
     async fn unpaid_entries(&self) -> Result<Vec<UnpaidEntry>, anyhow::Error> {
         let mut unpaid = Vec::new();
         for competition in self.competition_store.get_competitions(false).await? {
-            if competition.kind == CompetitionKind::Queued
-                || competition.delta_broadcasted_at.is_some()
-                || competition.completed_at.is_some()
-            {
+            // Payouts go on after the split transaction, so a contract is unsettled until it
+            // completes.
+            if competition.kind == CompetitionKind::Queued || competition.completed_at.is_some() {
                 continue;
             }
             let Some(contract) = competition.signed_contract.as_ref() else {
@@ -302,7 +301,7 @@ impl CompetitionStore {
              JOIN entries e ON e.id = p.entry_id
              JOIN competitions c ON c.id = e.event_id
              WHERE p.failed_at IS NOT NULL AND p.succeed_at IS NULL
-               AND c.completed_at IS NULL AND c.delta_broadcasted_at IS NULL",
+               AND c.completed_at IS NULL",
         )
         .fetch_all(self.db_connection.read())
         .await?;
