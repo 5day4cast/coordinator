@@ -101,13 +101,14 @@ impl PayoutWatcher {
 
     async fn send_eligibility(
         &self,
-        entry_id: uuid::Uuid,
+        payout: &EntryPayout,
         invoice: &Bolt11Invoice,
     ) -> Result<SendEligibility, anyhow::Error> {
         send_eligibility(
             &self.competition_store,
             self.bitcoin.as_ref(),
-            entry_id,
+            payout.entry_id,
+            payout.payout_amount_sats,
             invoice,
         )
         .await
@@ -200,7 +201,7 @@ impl PayoutWatcher {
         if self.held(payout).await? {
             return Ok(());
         }
-        let deadline = match self.send_eligibility(payout.entry_id, &invoice).await {
+        let deadline = match self.send_eligibility(payout, &invoice).await {
             Ok(SendEligibility::Ready(deadline)) => deadline,
             Ok(SendEligibility::Closed(closed)) => {
                 store
@@ -358,7 +359,7 @@ impl PayoutWatcher {
                             .await?;
                         continue;
                     }
-                    let deadline = match self.send_eligibility(payout.entry_id, &invoice).await {
+                    let deadline = match self.send_eligibility(&payout, &invoice).await {
                         Ok(SendEligibility::Ready(deadline)) => deadline,
                         Ok(SendEligibility::Closed(reason)) => {
                             // NotFound was established above; accepted/in-flight payments never enter this branch.
@@ -490,7 +491,15 @@ async fn failed_send_fields(
 ) -> String {
     let invoice = payout.payout_payment_request.parse::<Bolt11Invoice>().ok();
     let deadline = match &invoice {
-        Some(invoice) => match send_eligibility(store, bitcoin, payout.entry_id, invoice).await {
+        Some(invoice) => match send_eligibility(
+            store,
+            bitcoin,
+            payout.entry_id,
+            payout.payout_amount_sats,
+            invoice,
+        )
+        .await
+        {
             Ok(SendEligibility::Ready(deadline)) => Some(deadline),
             _ => None,
         },
@@ -503,6 +512,7 @@ async fn send_eligibility(
     store: &CompetitionStore,
     chain: &dyn Bitcoin,
     entry_id: uuid::Uuid,
+    amount_sats: u64,
     invoice: &Bolt11Invoice,
 ) -> Result<SendEligibility, anyhow::Error> {
     let entry = store
@@ -535,6 +545,17 @@ async fn send_eligibility(
                 .map(|signed| signed.params())
         })
         .ok_or_else(|| anyhow::anyhow!("Payout has no persisted contract parameters"))?;
+    // A payout pays what the outcome the contract settles on owes the entry. One prepared for
+    // another outcome, such as the attested one when the expiry transaction confirmed instead,
+    // is never sent.
+    if competition
+        .owed_to_entry(&entry.ephemeral_pubkey)
+        .is_some_and(|owed| owed != amount_sats)
+    {
+        return Ok(SendEligibility::Closed(
+            "The payout is not what the outcome the contract settles on owes this entry".into(),
+        ));
+    }
     let output = outcome_contract_output(outcome)?;
     let status = tokio::time::timeout(
         Duration::from_secs(20),
@@ -848,7 +869,7 @@ mod tests {
         let chain = crate::infra::bitcoin_mock::MockBitcoinClient::new(bitcoin::Network::Regtest);
         let invoice = fresh_invoice(7).parse::<Bolt11Invoice>().unwrap();
         assert!(matches!(
-            send_eligibility(&store, &chain, entry_id, &invoice)
+            send_eligibility(&store, &chain, entry_id, 10, &invoice)
                 .await
                 .unwrap(),
             SendEligibility::Ready(_)

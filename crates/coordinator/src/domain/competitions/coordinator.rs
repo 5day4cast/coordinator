@@ -125,6 +125,11 @@ const KEPT_SETTLEMENT_ERRORS: usize = 5;
 /// winner could broadcast the split.
 const UNIFIED_CLOSE_CONFIRMATIONS: u32 = 6;
 
+/// Confirmations the expiry transaction needs, when it confirmed in place of the outcome
+/// transaction, before the competition settles on the expiry outcome instead: enough that a
+/// shallow reorganization does not bring the outcome transaction back.
+const EXPIRY_SWITCH_CONFIRMATIONS: u32 = 6;
+
 /// Each winner of `winners` with their entry, in player order. A winner without an entry is
 /// left out.
 fn winner_entries<'e>(
@@ -2607,7 +2612,12 @@ impl Coordinator {
         debug!("Transaction ID: {}", outcome_tx.compute_txid());
         competition.outcome_transaction = Some(outcome_tx.clone());
         if competition.outcome_broadcasted_at.is_none() {
-            self.broadcast_or_known(&outcome_tx).await?;
+            if let Err(error) = self.broadcast_or_known(&outcome_tx).await {
+                if self.settle_on_confirmed_expiry(competition).await? {
+                    return Ok(competition);
+                }
+                return Err(error);
+            }
             info!(
                 "Competition {} outcome tx broadcast: txid={}",
                 competition.id,
@@ -2658,6 +2668,57 @@ impl Coordinator {
         Ok(competition)
     }
 
+    /// Settle on the expiry outcome when the contract's expiry transaction confirmed in place of
+    /// the outcome transaction the coordinator broadcast, or tried to. Anyone may broadcast the
+    /// expiry transaction once the contract has expired, and both spend the funding output, so
+    /// the outcome transaction can never confirm: retrying it used to stall the settlement for
+    /// good. Payouts prepared for the attested outcome are never sent, since they no longer match
+    /// what the expiry outcome owes (`payout_watcher::send_eligibility`). Returns whether the
+    /// competition now settles on the expiry outcome.
+    async fn settle_on_confirmed_expiry(
+        &self,
+        competition: &mut Competition,
+    ) -> Result<bool, anyhow::Error> {
+        if competition.settled_by_expiry() {
+            return Ok(false);
+        }
+        let Some(expiry_tx) = competition
+            .signed_contract
+            .as_ref()
+            .and_then(|contract| contract.expiry_tx())
+        else {
+            return Ok(false);
+        };
+        let expiry_txid = expiry_tx.compute_txid();
+        let Some(height) = self
+            .bitcoin
+            .get_tx_confirmation_height(&expiry_txid)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let tip = self.bitcoin.get_current_height().await?;
+        if confirmation_depth(tip, height) < EXPIRY_SWITCH_CONFIRMATIONS {
+            info!(
+                "Competition {}: its expiry transaction {expiry_txid} confirmed in place of its \
+                 outcome transaction; it settles on the expiry outcome at {} confirmations",
+                competition.id, EXPIRY_SWITCH_CONFIRMATIONS
+            );
+            return Ok(false);
+        }
+        warn!(
+            "Competition {}: its expiry transaction {expiry_txid} confirmed in place of its outcome \
+             transaction, so it settles on the expiry outcome: every player is owed an equal share",
+            competition.id
+        );
+        let now = OffsetDateTime::now_utc();
+        competition.expiry_broadcasted_at = Some(now);
+        competition.outcome_transaction = Some(expiry_tx);
+        competition.outcome_broadcasted_at = Some(now);
+        competition.errors.clear();
+        Ok(true)
+    }
+
     /// Settle the contract once its outcome transaction confirmed: close it to the market maker
     /// when every winner was paid over Lightning, or else broadcast the split transaction, which
     /// gives each winner an output of their own.
@@ -2696,6 +2757,9 @@ impl Coordinator {
             .get_tx_confirmation_height(&outcome_transaction.compute_txid())
             .await?
         else {
+            if self.settle_on_confirmed_expiry(competition).await? {
+                return Ok(competition);
+            }
             info!(
                 "Outcome transaction not confirmed yet for competition {}",
                 competition.id

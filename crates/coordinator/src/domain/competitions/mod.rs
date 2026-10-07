@@ -1475,6 +1475,18 @@ impl Competition {
         self.kind != CompetitionKind::Single || !self.event_submission.unlisted
     }
 
+    /// What the outcome the contract settles on owes the entry with `entry_pubkey` (hex): 0 for
+    /// an entry it pays nothing. None while the outcome or the entry's key is not known.
+    pub fn owed_to_entry(&self, entry_pubkey: &str) -> Option<u64> {
+        let params = self
+            .contract_parameters
+            .as_ref()
+            .or_else(|| self.signed_contract.as_ref().map(|signed| signed.params()))?;
+        let outcome = self.get_current_outcome().ok()?;
+        let key = entry_pubkey.parse::<dlctix::secp::Point>().ok()?;
+        Some(winner_payout_sats(params, &outcome, &key).unwrap_or(0))
+    }
+
     pub(crate) fn get_current_outcome(&self) -> Result<Outcome, anyhow::Error> {
         if self.settled_by_expiry() {
             return Ok(Outcome::Expiry);

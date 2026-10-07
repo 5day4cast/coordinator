@@ -1784,3 +1784,147 @@ async fn a_closed_payout_window_reopens_while_the_outcome_is_unspent() {
     );
     settlement.database.close().await.unwrap();
 }
+
+/// A chain where the contract's expiry transaction confirmed at `expiry_height`, the tip is at
+/// 1,000, nothing else confirmed, and every broadcast is refused as spending a spent output.
+async fn expired_under_us(expiry_height: u32) -> UnpaidWinners {
+    let contract = signed_contract_expiring(Amount::from_sat(30_000), Some(1_790_000_000));
+    let expiry_txid = contract.0.expiry_tx().unwrap().compute_txid();
+    let setup = ChainSetup {
+        confirmed: Arc::new(move |txid: &Txid| (*txid == expiry_txid).then_some(expiry_height)),
+        refuse_broadcasts: true,
+        ..ChainSetup::default()
+    };
+    let mut settlement = UnpaidWinners::with_chain(
+        contract,
+        Amount::from_sat(30_000),
+        HashMap::from([(1, 2.0), (ECONOMY_FEE_TARGET, 1.0)]),
+        setup,
+    )
+    .await;
+    settlement.competition.delta_broadcasted_at = None;
+    settlement
+}
+
+/// Anyone may broadcast the expiry transaction once the contract expired. When it confirmed
+/// while the coordinator held an attestation, the outcome transaction can never confirm: the
+/// competition settles on the expiry outcome instead of retrying the outcome forever.
+#[tokio::test]
+async fn an_expiry_transaction_confirmed_in_place_of_the_outcome_settles_the_expiry() {
+    let mut settlement = expired_under_us(990).await;
+    settlement.competition.outcome_transaction = None;
+    settlement.competition.outcome_broadcasted_at = None;
+    let status = CompetitionStatus::from(settlement.competition.clone());
+    assert_eq!(status.state_name(), "attested");
+    let next = settlement.coordinator.process_status(status).await;
+    assert_eq!(next.state_name(), "outcome_broadcasted");
+    let settling = next.into_competition();
+    assert!(settling.settled_by_expiry());
+    assert_eq!(settling.get_current_outcome().unwrap(), Outcome::Expiry);
+    assert!(settling.errors.is_empty());
+    settlement.database.close().await.unwrap();
+
+    // The outcome transaction was recorded as broadcast, and never confirmed.
+    let mut settlement = expired_under_us(990).await;
+    let attested = settlement
+        .contract
+        .signed_outcome_tx(0, Scalar::from_slice(&[10; 32]).unwrap())
+        .unwrap();
+    settlement.competition.outcome_transaction = Some(attested);
+    let next = settlement
+        .coordinator
+        .process_status(CompetitionStatus::from(settlement.competition.clone()))
+        .await;
+    assert_eq!(next.state_name(), "outcome_broadcasted");
+    assert_eq!(
+        next.into_competition().get_current_outcome().unwrap(),
+        Outcome::Expiry
+    );
+    settlement.database.close().await.unwrap();
+
+    // A shallow confirmation could still be undone: the outcome is retried meanwhile.
+    let mut settlement = expired_under_us(998).await;
+    settlement.competition.outcome_transaction = None;
+    settlement.competition.outcome_broadcasted_at = None;
+    let next = settlement
+        .coordinator
+        .process_status(CompetitionStatus::from(settlement.competition.clone()))
+        .await;
+    assert_eq!(next.state_name(), "attested");
+    assert!(!next.into_competition().errors.is_empty());
+    settlement.database.close().await.unwrap();
+}
+
+/// What a payout must be is what the outcome the contract settles on owes the entry. Once a
+/// competition settles on its expiry outcome, a payout prepared for the attested one no longer
+/// matches, and is not sent.
+#[test]
+fn an_entry_is_owed_what_the_settled_outcome_pays() {
+    let now = OffsetDateTime::now_utc();
+    let attestation = Scalar::from_slice(&[10; 32]).unwrap();
+    let players = [1u8, 3, 5].map(|key| Scalar::from_slice(&[key; 32]).unwrap());
+    let event = EventLockingConditions {
+        locking_points: vec![attestation.base_point_mul().into()],
+        expiry: Some(1_790_000_000),
+    };
+    let mut competition = Competition::new(&CreateEvent {
+        id: Uuid::now_v7(),
+        signing_date: now - time::Duration::hours(5),
+        start_observation_date: now - time::Duration::hours(7),
+        end_observation_date: now - time::Duration::hours(6),
+        locations: vec!["KDEN".into()],
+        number_of_values_per_entry: 3,
+        number_of_places_win: 1,
+        total_allowed_entries: 3,
+        entry_fee: 10_000,
+        coordinator_fee: crate::domain::CoordinatorFee::whole_percent(0),
+        total_competition_pool: 30_000,
+        relative_locktime_block_delta: Some(72),
+        unlisted: false,
+        scoring_rules: None,
+        scoring_fields: None,
+        max_entries_per_player: 1,
+        contract_options: None,
+    });
+    competition.contract_parameters = Some(ContractParameters {
+        market_maker: MarketMaker {
+            pubkey: Scalar::from_slice(&[7; 32]).unwrap().base_point_mul(),
+        },
+        players: players
+            .iter()
+            .enumerate()
+            .map(|(index, key)| Player {
+                pubkey: key.base_point_mul(),
+                ticket_hash: dlctix::hashlock::sha256(&[index as u8 + 10; 32]),
+                payout_hash: dlctix::hashlock::sha256(&[index as u8 + 20; 32]),
+            })
+            .collect(),
+        event: event.clone(),
+        outcome_payouts: BTreeMap::from([
+            (Outcome::Attestation(0), PayoutWeights::from([(0, 1)])),
+            (
+                Outcome::Expiry,
+                PayoutWeights::from([(0, 1), (1, 1), (2, 1)]),
+            ),
+        ]),
+        fee_rate: FeeRate::from_sat_per_vb_u32(1),
+        funding_value: Amount::from_sat(30_000),
+        relative_locktime_block_delta: 72,
+        anchor: None,
+        outcome_bound_splits: false,
+    });
+    competition.event_announcement = Some(event);
+    let key = |index: usize| hex::encode(players[index].base_point_mul().serialize());
+    assert_eq!(competition.owed_to_entry(&key(0)), None, "no outcome yet");
+
+    competition.attestation = Some(attestation.into());
+    assert_eq!(competition.owed_to_entry(&key(0)), Some(30_000));
+    assert_eq!(competition.owed_to_entry(&key(1)), Some(0));
+    assert_eq!(competition.owed_to_entry("not a key"), None);
+
+    // Settled on the expiry outcome: the expiry transaction is the outcome transaction.
+    competition.attestation = None;
+    competition.expiry_broadcasted_at = Some(now);
+    assert_eq!(competition.owed_to_entry(&key(0)), Some(10_000));
+    assert_eq!(competition.owed_to_entry(&key(1)), Some(10_000));
+}
