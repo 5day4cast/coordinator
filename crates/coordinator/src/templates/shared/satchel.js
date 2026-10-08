@@ -47,11 +47,11 @@ async function satchelName(signer) {
 }
 
 // A top-level form POST of the signed event to Satchel's handoff, into its tab.
-function postHandoff(origin, signedEvent, next) {
+function postHandoff(origin, signedEvent, next, target = SATCHEL_TAB) {
   const form = document.createElement("form");
   form.method = "post";
   form.action = `${origin}/auth/nostr/handoff`;
-  form.target = SATCHEL_TAB;
+  form.target = target;
   form.hidden = true;
   for (const [name, value] of [["event", signedEvent], ["next", next]]) {
     const input = document.createElement("input");
@@ -71,19 +71,43 @@ async function handOffToSatchel(event) {
   const origin = satchelOrigin();
   const signer = satchelSigner();
   const next = link?.dataset.satchelNext;
-  if (!link || !origin || !next || !signer) return;
+  if (!link || !origin || !next) return;
+  const signup = link.dataset.signupSatchel !== undefined;
+  const status = signup ? link.parentElement?.querySelector("[data-satchel-status]") : null;
+  if (!signer) {
+    if (signup) {
+      event.preventDefault();
+      if (status) status.textContent = "Your signup session ended. Start signup again to connect this wallet.";
+    }
+    return;
+  }
   event.preventDefault();
   // Opened now, inside the click, so no popup blocker stops it; the form fills it once signed.
   const tab = window.open("", SATCHEL_TAB);
+  if (status) status.textContent = "";
+  // A signup's new key has not been stored yet. Keep its tab alive when a
+  // browser blocks the wallet tab so the player can allow popups and retry.
+  if (signup && !tab) {
+    if (status) status.textContent = "Allow popups for this site, then select Set up Satchel again.";
+    return;
+  }
   try {
-    const name = await satchelName(signer);
+    const name = signup ? link.dataset.satchelName || null : await satchelName(signer);
     const signed = await signer.signHandoff(`${origin}/auth/nostr/handoff`, name);
-    postHandoff(origin, signed, next);
+    if (signup && tab.closed) throw new Error("The Satchel tab was closed");
+    // Popup blocking must not leave a dead button. Same-tab navigation still
+    // opens the checked invoice, and the entry can be resumed on return.
+    postHandoff(origin, signed, next, tab && !tab.closed ? SATCHEL_TAB : "_self");
   } catch (error) {
+    if (signup) {
+      if (tab && !tab.closed) tab.close();
+      if (status) status.textContent = "Could not connect your account to Satchel. Try again and approve the sign-in request.";
+      return;
+    }
     // The extension refused to sign, say: Satchel's own sign-in, then the same page.
     console.warn("Satchel sign-in failed; opening its sign-in page:", error);
-    if (tab) tab.location.href = link.href;
-    else window.open(link.href, "_blank", "noopener");
+    if (tab && !tab.closed) tab.location.href = link.href;
+    else window.location.href = link.href;
   }
 }
 
