@@ -523,8 +523,15 @@ async fn overlapping_runs_are_each_tracked_by_their_competition() {
     })
     .await
     .expect("overlapping runs finish together");
-    assert_eq!(a.unwrap().status, ScenarioStatus::Passed);
-    assert_eq!(b.unwrap().status, ScenarioStatus::Passed);
+    for result in [a.unwrap(), b.unwrap()] {
+        let failures: Vec<_> = result
+            .steps
+            .iter()
+            .filter(|step| step.status == StepStatus::Failed)
+            .map(|step| (&step.name, &step.error))
+            .collect();
+        assert_eq!(result.status, ScenarioStatus::Passed, "{failures:?}");
+    }
     let mut seen = seen.await.unwrap();
     seen.sort();
     let mut expected = competitions.to_vec();
