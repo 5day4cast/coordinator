@@ -101,6 +101,7 @@ struct RunParams {
     deadline_margin_secs: Option<u64>,
     queue_players: Option<usize>,
     max_pool_players: Option<usize>,
+    places: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -728,6 +729,9 @@ async fn trigger_run(
     if params.max_pool_players.is_some() {
         config.max_pool_players = params.max_pool_players;
     }
+    if params.places.is_some() {
+        config.places = params.places;
+    }
     for (target, value) in [
         (&mut config.entry_window_secs, params.entry_window_secs),
         (
@@ -1181,7 +1185,7 @@ mod tests {
             dashboard.observation_windows_secs = vec![duration];
             let response = router(dashboard.clone())
                 .oneshot(
-                    Request::post("/api/run?scenario=full_lifecycle")
+                    Request::post("/api/run?scenario=queued_one_pool&queue_players=20&max_pool_players=20&places=2")
                         .body(Body::empty())
                         .unwrap(),
                 )
@@ -1202,6 +1206,8 @@ mod tests {
             let saved: ScenarioConfig =
                 serde_json::from_str(run.config_json.as_deref().unwrap()).unwrap();
             assert_eq!(saved.observation_window_secs, duration);
+            assert_eq!(saved.places, Some(2));
+            assert_eq!(saved.max_pool_players, Some(20));
         }
     }
 

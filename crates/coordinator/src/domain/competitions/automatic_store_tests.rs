@@ -991,3 +991,54 @@ async fn a_refund_records_each_step_before_taking_it() {
     assert_eq!(stored.checkpoint_psbt.as_deref(), Some("70736274ff"));
     assert!(stored.updated_at >= refund.updated_at);
 }
+
+/// Discovery ignores historical contract blobs and still admits both oracle and expiry payouts.
+#[tokio::test]
+async fn payout_discovery_filters_before_decoding_contracts() {
+    let f = Fixture::new().await;
+    let mut expected = Vec::new();
+    for excluded in [
+        "eligible",
+        "expiry",
+        "unsettled",
+        "unsigned",
+        "unconfirmed",
+        "cancelled",
+        "completed",
+        "failed",
+        "closed",
+        "manual",
+        "queued",
+    ] {
+        let id = Uuid::now_v7();
+        if matches!(excluded, "eligible" | "expiry") {
+            expected.push(id);
+        }
+        f.database.execute_write(move |pool| async move {
+            // Intentionally not decodable as a signed contract: discovery must only read IDs.
+            sqlx::query("INSERT INTO competitions (id, created_at, event_submission, signed_contract,
+                attestation, expiry_broadcasted_at, funding_confirmed_at, cancelled_at, completed_at, failed_at, kind)
+                VALUES (?, datetime('now'), '{}', ?, ?, ?, ?, ?, ?, ?, ?)")
+                .bind(id.to_string())
+                .bind((excluded != "unsigned").then_some("unread-contract"))
+                .bind((!matches!(excluded, "expiry" | "unsettled")).then_some("unread-attestation"))
+                .bind((excluded == "expiry").then_some("2026-10-08 00:00:00"))
+                .bind((excluded != "unconfirmed").then_some("2026-10-08 00:00:00"))
+                .bind((excluded == "cancelled").then_some("2026-10-08 00:00:00"))
+                .bind((excluded == "completed").then_some("2026-10-08 00:00:00"))
+                .bind((excluded == "failed").then_some("2026-10-08 00:00:00"))
+                .bind(if excluded == "queued" { "queued" } else { "pool" })
+                .execute(&pool).await?;
+            if excluded != "manual" {
+                sqlx::query("INSERT INTO automatic_payout_competitions(event_id, payout_window_closed_at) VALUES (?, ?)")
+                    .bind(id.to_string()).bind((excluded == "closed").then_some(1_i64)).execute(&pool).await?;
+            }
+            Ok(())
+        }).await.unwrap();
+    }
+    assert_eq!(
+        f.store.automatic_payout_candidates().await.unwrap(),
+        expected
+    );
+    f.database.close().await.unwrap();
+}

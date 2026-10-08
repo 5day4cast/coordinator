@@ -51,6 +51,26 @@ fn invalid(message: impl Into<String>) -> DatabaseWriteError {
 }
 
 impl CompetitionStore {
+    /// Discover potential payouts without decoding every historical signed contract.
+    /// The domain rechecks eligibility after loading each selected competition.
+    pub async fn automatic_payout_candidates(&self) -> Result<Vec<Uuid>, sqlx::Error> {
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT c.id FROM competitions c
+             JOIN automatic_payout_competitions a ON a.event_id = c.id
+             WHERE c.kind != 'queued'
+               AND (c.attestation IS NOT NULL OR c.expiry_broadcasted_at IS NOT NULL)
+               AND c.signed_contract IS NOT NULL AND c.funding_confirmed_at IS NOT NULL
+               AND c.cancelled_at IS NULL AND c.completed_at IS NULL AND c.failed_at IS NULL
+               AND a.payout_window_closed_at IS NULL
+             ORDER BY c.id",
+        )
+        .fetch_all(self.db_connection.read())
+        .await?;
+        ids.into_iter()
+            .map(|id| Uuid::parse_str(&id).map_err(|error| sqlx::Error::Decode(Box::new(error))))
+            .collect()
+    }
+
     pub async fn payout_window_is_closed(&self, event_id: Uuid) -> Result<bool, sqlx::Error> {
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM automatic_payout_competitions WHERE event_id = ? AND payout_window_closed_at IS NOT NULL)")
             .bind(event_id.to_string()).fetch_one(self.db_connection.read()).await

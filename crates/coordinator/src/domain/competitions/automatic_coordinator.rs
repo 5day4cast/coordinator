@@ -617,7 +617,8 @@ impl Coordinator {
         self.competition_store
             .index_existing_payment_hashes()
             .await?;
-        for competition in self.competition_store.get_competitions(false).await? {
+        for id in self.competition_store.automatic_payout_candidates().await? {
+            let competition = self.competition_store.get_competition(id).await?;
             if let Err(error) = self.queue_automatic_competition(&competition).await {
                 warn!(
                     "Cannot discover payouts for competition {}: {}",
