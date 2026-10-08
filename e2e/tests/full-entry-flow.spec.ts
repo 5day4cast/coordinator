@@ -51,6 +51,24 @@ async function chooseRequiredPicks(page: Page): Promise<void> {
   await expect(form.locator("input[type=radio]:checked")).toHaveCount(required);
 }
 
+async function expectPaymentHelp(page: Page, messages: string[]): Promise<void> {
+  const link = page.getByRole("link", { name: "How your entry is held and paid", exact: true });
+  const href = await link.getAttribute("href");
+  expect(href).toMatch(/^\/help\?open=advanced&competition=[^#]+#advanced$/);
+  const popup = page.waitForEvent("popup");
+  await link.click();
+  const help = await popup;
+  try {
+    await expect(help).toHaveURL(new URL(href!, page.url()).href);
+    await expect(help.locator("#advanced > details")).toHaveAttribute("open", "");
+    for (const message of messages) {
+      await expect(help.locator("#advanced")).toContainText(message);
+    }
+  } finally {
+    await help.close();
+  }
+}
+
 test.describe("Full Entry Submission Flow", () => {
   test("complete entry flow: login → competition → picks → payment → submission", async ({
     page,
@@ -104,9 +122,7 @@ test.describe("Full Entry Submission Flow", () => {
     // Entering is the consent: no checkbox, one line about where money goes.
     await expect(page.locator("#entryPayoutDestination")).toContainText("submit a Lightning invoice");
     await expect(page.locator("#entryContainer input[type=checkbox]")).toHaveCount(0);
-    await expect(page.locator("#entryContainer details.entry-advanced")).toContainText(
-      "no payout escrow",
-    );
+    await expectPaymentHelp(page, ["no payout escrow"]);
     const ticketRequests: string[] = [];
     page.on("request", (request) => {
       if (request.method() === "POST" && /\/competitions\/[^/]+\/ticket$/.test(request.url())) {
@@ -200,10 +216,11 @@ test.describe("Full Entry Submission Flow", () => {
       .first().click();
     // Winnings go to the profile's address; the entry form asks nothing more.
     await expect(page.locator("#entryContainer input[type=checkbox]")).toHaveCount(0);
-    // The fee cap and the winners' shares, in the Advanced section.
-    const advanced = page.locator("#entryContainer details.entry-advanced");
-    await expect(advanced).toContainText("On-chain fees for the contract are capped at 100 sat/vB");
-    await expect(advanced).toContainText("Winner shares by rank: 70%, 30%");
+    // The linked help page opens this competition's payment terms.
+    await expectPaymentHelp(page, [
+      "On-chain fees for the contract are capped at 100 sat/vB",
+      "Winner shares by rank: 70%, 30%",
+    ]);
     // Beside the prize, how the two places share the pot; no fee breakdown.
     await expect(page.locator("#entryContainer .entry-facts")).toContainText("1st 70% · 2nd 30%");
     await chooseRequiredPicks(page);
