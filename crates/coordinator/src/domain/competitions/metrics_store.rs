@@ -43,7 +43,8 @@ impl CompetitionStore {
     /// Competitions by the state name their runner reports, and those whose funding checks fail.
     pub async fn competition_state_counts(&self) -> Result<CompetitionCounts, sqlx::Error> {
         let mut counts = CompetitionCounts::default();
-        for competition in self.get_competitions(false).await? {
+        // Counts need lifecycle fields and retained funding-check errors, not contracts.
+        for competition in self.list_operator_competitions().await? {
             let status = CompetitionStatus::from(competition);
             let state = status.state_name();
             if let CompetitionStatus::FundingBroadcasted(waiting) = &status {
@@ -357,6 +358,16 @@ mod tests {
                 payout_jobs_retrying: 1,
                 oldest_open_payout_job_age_secs: counts.oldest_open_payout_job_age_secs,
             }
+        );
+        // Finished competitions must not decode their historical contract blobs at scrape time.
+        database.execute_write(move |pool| async move {
+            sqlx::query("UPDATE competitions SET completed_at = '2026-10-08T00:00:00Z', signed_contract = 'not-json' WHERE id = ?")
+                .bind(event_id.to_string()).execute(&pool).await?;
+            Ok(())
+        }).await.unwrap();
+        assert_eq!(
+            store.competition_state_counts().await.unwrap().states,
+            vec![("completed", 1)]
         );
         database.close().await.unwrap();
     }

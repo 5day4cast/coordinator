@@ -363,7 +363,7 @@ impl Leaderboards {
 
     async fn refresh_open_competitions(&self) {
         self.weather.warm_stations();
-        let competitions = match self.coordinator.get_competitions().await {
+        let competitions = match self.coordinator.list_competitions().await {
             Ok(competitions) => competitions,
             Err(e) => {
                 debug!("Cannot list competitions to refresh their weather: {e}");

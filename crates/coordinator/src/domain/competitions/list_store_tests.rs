@@ -160,7 +160,18 @@ async fn the_list_reads_the_same_rows_order_and_pages_as_the_full_read() {
     let (params, event, attestation) = pot_return_contract();
     let mut contracted = competition(now - hours(4), false);
     contracted.contract_parameters = Some(params.clone());
-    rows.push((contracted, 1, 1));
+    rows.push((contracted.clone(), 1, 1));
+    // Contract state takes precedence over all earlier lifecycle timestamps.
+    for earlier in 0..3 {
+        let mut c = contracted.clone();
+        c.id = Uuid::now_v7();
+        match earlier {
+            0 => c.escrow_funds_confirmed_at = Some(now),
+            1 => c.event_created_at = Some(now),
+            _ => c.entries_submitted_at = Some(now),
+        }
+        rows.push((c, 1, 1));
+    }
     // The newest finished: its pot went back to every entry, which only its contract says.
     let mut returned = competition(now - hours(5), false);
     returned.event_announcement = Some(event);
@@ -181,6 +192,20 @@ async fn the_list_reads_the_same_rows_order_and_pages_as_the_full_read() {
     }
 
     let full = store.get_competitions(false).await.unwrap();
+    let mut expected_counts = std::collections::BTreeMap::new();
+    for competition in &full {
+        *expected_counts
+            .entry(states::CompetitionStatus::from(competition.clone()).state_name())
+            .or_insert(0_i64) += 1;
+    }
+    let counts = store.competition_state_counts().await.unwrap();
+    assert_eq!(
+        counts
+            .states
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        expected_counts
+    );
     let lean = store.list_competitions().await.unwrap();
     let ids = |competitions: &[Competition]| -> Vec<Uuid> {
         competitions

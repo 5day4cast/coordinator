@@ -1650,8 +1650,8 @@ impl CompetitionStore {
     /// of a row and which a list never shows. Those fields are `None`, so read anything derived
     /// from them (a pot return, an outcome) from [`Self::get_competition`].
     ///
-    /// Without its contract, a competition whose contract exists but that recorded nothing
-    /// else would read as just created; those few are read in full, so
+    /// Without its contract, a competition that has not reached signing can read as an
+    /// earlier state; those few are read in full, so
     /// [`Competition::get_state`] reads as it does for [`Self::get_competitions`].
     pub async fn list_competitions(&self) -> Result<Vec<Competition>, sqlx::Error> {
         self.list_summaries(false).await
@@ -1742,7 +1742,16 @@ impl CompetitionStore {
         for row in &rows {
             let competition = <Competition as sqlx::FromRow<_>>::from_row(row)?;
             let has_contract = sqlx::Row::try_get::<i64, _>(row, "has_contract")? != 0;
-            if has_contract && competition.get_state() == super::CompetitionState::Created {
+            if has_contract
+                && matches!(
+                    competition.get_state(),
+                    super::CompetitionState::Created
+                        | super::CompetitionState::EntriesCollected
+                        | super::CompetitionState::EscrowFundsConfirmed
+                        | super::CompetitionState::EventCreated
+                        | super::CompetitionState::EntriesSubmitted
+                )
+            {
                 competitions.push(self.get_competition(competition.id).await?);
             } else {
                 competitions.push(competition);

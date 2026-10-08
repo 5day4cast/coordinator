@@ -31,7 +31,10 @@ impl Coordinator {
         let entries = self
             .get_entries(pubkey.to_owned(), SearchBy { event_ids: None })
             .await?;
-        let competitions = self.get_competitions().await?;
+        let mut ids: Vec<_> = entries.iter().map(|entry| entry.event_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let competitions = self.get_competitions_page(&ids).await?;
         let store = &self.competition_store;
 
         let mut payouts = Vec::new();
