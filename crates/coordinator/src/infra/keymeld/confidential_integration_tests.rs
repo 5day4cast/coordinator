@@ -708,7 +708,12 @@ impl PoolHarness {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let app = Router::new()
-            .route("/api/v1/confidential", post(pool_relay))
+            .route(
+                "/api/v1/confidential",
+                post(pool_relay).layer(axum::extract::DefaultBodyLimit::max(
+                    keymeld_core::confidential::MAX_WIRE_BYTES,
+                )),
+            )
             .route("/api/v1/enclaves/{id}/public-key", get(pool_public_key))
             .route("/api/v1/enclaves", get(pool_enclaves))
             .with_state(relay.clone())
@@ -2241,9 +2246,20 @@ fn assert_recovered_swap(
 
 /// Real encrypted transport, three enclave operators, all contract and forfeit
 /// signatures verified. The scripted Arkade server does not spend real funds.
+///
+/// Run with `cargo test -p coordinator --lib --release --features e2e-testing
+/// twenty_player_two_place_arkade_kickoff_benchmark -- --ignored --nocapture`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "20-player, two-place kickoff timing; run optimized"]
 async fn twenty_player_two_place_arkade_kickoff_benchmark() {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .filter_level(log::LevelFilter::Off)
+        .filter_module(
+            "coordinator::infra::keymeld::confidential_service",
+            log::LevelFilter::Info,
+        )
+        .try_init();
     let mut params = pool_parameters(20);
     params
         .outcome_payouts
