@@ -61,6 +61,7 @@ pub fn admin_base(config: &AdminPageConfig, content: Markup) -> Markup {
                     a href="/admin/services" aria-current=[(config.title == "Services").then_some("page")] { "Services" }
                     a href="/admin/visitors" aria-current=[(config.title == "Visitors").then_some("page")] { "Visitors" }
                     // The unread count loads after the page, so no page waits for it.
+                    a href="/admin/mainnet-signups" aria-current=[(config.title == "Mainnet signups").then_some("page")] { "Mainnet signups" }
                     a href="/admin/feedback" aria-current=[(config.title == "Feedback").then_some("page")] {
                         "Feedback"
                         span hx-get="/admin/feedback/unread" hx-trigger="load" hx-swap="innerHTML" {}

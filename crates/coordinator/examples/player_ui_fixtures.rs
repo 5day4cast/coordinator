@@ -228,6 +228,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         recovery: coordinator::templates::components::RecoveryHelp::FileAndRelays,
         satchel_url: None,
         feedback: false,
+        mainnet_signup: true,
     };
     for (name, content) in pages {
         let page = without_scripts(&base(&config, content).into_string());

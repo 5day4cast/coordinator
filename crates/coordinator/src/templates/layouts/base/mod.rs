@@ -6,6 +6,7 @@ use crate::templates::{
     components::{
         auth_modals,
         feedback::{feedback_link, feedback_modal},
+        mainnet_signup::{mainnet_signup_link, mainnet_signup_modal},
         navbar, RecoveryHelp,
     },
 };
@@ -42,6 +43,7 @@ pub struct PageConfig<'a> {
     pub satchel_url: Option<&'a str>,
     /// The footer links to the feedback form, when it is on.
     pub feedback: bool,
+    pub mainnet_signup: bool,
 }
 
 pub fn base(config: &PageConfig, content: Markup) -> Markup {
@@ -93,12 +95,14 @@ pub fn base(config: &PageConfig, content: Markup) -> Markup {
                         " · "
                         (feedback_link())
                     }
+                    @if config.mainnet_signup { " · " (mainnet_signup_link()) }
                 }
 
                 (auth_modals(config.recovery, config.satchel_url))
                 @if config.feedback {
                     (feedback_modal())
                 }
+                @if config.mainnet_signup { (mainnet_signup_modal()) }
             }
         }
     }
@@ -122,6 +126,7 @@ mod tests {
             recovery: RecoveryHelp::FileAndRelays,
             satchel_url,
             feedback: false,
+            mainnet_signup: true,
         };
         base(&config, html! { p { "content" } }).into_string()
     }
@@ -183,6 +188,7 @@ mod tests {
             recovery: RecoveryHelp::FileAndRelays,
             satchel_url: None,
             feedback: true,
+            mainnet_signup: true,
         };
         let html = base(&config, html! { p { "content" } }).into_string();
         let footer = &html[html.find(r#"<footer class="site-footer">"#).unwrap()..];

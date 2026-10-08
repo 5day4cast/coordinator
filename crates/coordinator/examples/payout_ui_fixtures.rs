@@ -69,6 +69,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         recovery: coordinator::templates::components::RecoveryHelp::FileAndRelays,
         satchel_url: None,
         feedback: false,
+        mainnet_signup: true,
     };
     for (name, rows, default_address) in [
         ("payouts", payouts.as_slice(), Some(address)),

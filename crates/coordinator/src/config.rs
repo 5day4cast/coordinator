@@ -69,6 +69,8 @@ pub struct Settings {
     pub telemetry: TelemetrySettings,
     #[serde(default, rename = "feedback")]
     pub feedback_settings: FeedbackSettings,
+    #[serde(default, rename = "mainnet_signup")]
+    pub mainnet_signup_settings: MainnetSignupSettings,
 }
 
 /// Environment variable that sets `http_context.trusted_proxies`, overriding the file.
@@ -2155,6 +2157,19 @@ mod satchel_settings_tests {
                 "{url}"
             );
         }
+    }
+}
+
+/// Collect launch notification emails. Disable this form after the mainnet launch.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MainnetSignupSettings {
+    pub enabled: bool,
+}
+
+impl Default for MainnetSignupSettings {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
