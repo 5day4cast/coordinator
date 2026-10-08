@@ -504,6 +504,20 @@ impl Coordinator {
         &self,
         competition: &mut Competition,
     ) -> Result<(), anyhow::Error> {
+        self.competition_store
+            .with_arkade_kickoff(self.ark_kickoff_admitted(competition))
+            .await?
+            .unwrap_or_else(|| {
+                Err(anyhow!(
+                    "Waiting for another pool's Arkade kickoff to finish"
+                ))
+            })
+    }
+
+    async fn ark_kickoff_admitted(
+        &self,
+        competition: &mut Competition,
+    ) -> Result<(), anyhow::Error> {
         use coordinator_ark::{
             fund_pool, DlcKickoff, EscrowInput, KeypairSigner, KickoffConfig, PoolFunding,
         };

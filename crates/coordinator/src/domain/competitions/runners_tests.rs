@@ -387,6 +387,58 @@ fn event() -> CreateEvent {
 }
 
 #[tokio::test]
+async fn arkade_kickoff_capacity_is_shared_and_released_after_success_or_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let blue = Arc::new(CompetitionStore::new(open(&directory).await));
+    let green = CompetitionStore::new(open(&directory).await);
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let first_store = blue.clone();
+    let first = tokio::spawn(async move {
+        first_store
+            .with_arkade_kickoff(async {
+                started.send(()).unwrap();
+                released.await.unwrap();
+                11
+            })
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(10), ready)
+        .await
+        .unwrap()
+        .unwrap();
+    let calls = AtomicUsize::new(0);
+    for store in [&*blue, &green] {
+        assert!(store
+            .with_arkade_kickoff(async {
+                calls.fetch_add(1, Ordering::SeqCst);
+            })
+            .await
+            .unwrap()
+            .is_none());
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a busy caller started its batch work"
+    );
+    release.send(()).unwrap();
+    assert_eq!(first.await.unwrap(), Some(11));
+    assert_eq!(
+        green
+            .with_arkade_kickoff(async { Err::<(), _>("signer failed") })
+            .await
+            .unwrap(),
+        Some(Err("signer failed"))
+    );
+    assert_eq!(
+        blue.with_arkade_kickoff(async { 12 }).await.unwrap(),
+        Some(12)
+    );
+}
+
+#[tokio::test]
 async fn a_coordinator_that_lost_the_lease_cannot_save_the_competition() {
     let directory = tempfile::tempdir().unwrap();
     let blue = CompetitionStore::new(open(&directory).await);

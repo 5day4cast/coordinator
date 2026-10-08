@@ -1378,9 +1378,10 @@ async fn an_enclave_failing_its_share_fails_the_kickoff_step() {
     pool.harness.stop().await;
 }
 
-/// Outside a batch the journal is durable, and the contract's permits still go one at a time.
+/// Outside a batch, permits remain sequential and each concurrent signing round
+/// checkpoints all of its requests. A completed retry reloads the saved results.
 #[tokio::test]
-async fn durable_contract_signing_sends_one_request_at_a_time() {
+async fn durable_contract_signing_checkpoints_concurrent_rounds_and_replays_them() {
     let pool = PoolHarness::start_with(
         pool_parameters(6),
         Consent {
@@ -1423,7 +1424,20 @@ async fn durable_contract_signing_sends_one_request_at_a_time() {
         hooks.signed_contract().unwrap().all_signatures(),
     )
     .unwrap();
-    assert_eq!(pool.relay.load.lock().unwrap().most, 1);
+    {
+        let load = pool.relay.load.lock().unwrap();
+        assert!(load.most > 1 && load.most <= 3);
+        assert_eq!(load.most_on_one, 1);
+    }
+    let original = hooks.signed_contract().unwrap().all_signatures().clone();
+    pool.relay.reset_load_peaks();
+    coordinator_ark::KickoffHooks::before_forfeits(&hooks, funding, &commitment)
+        .await
+        .unwrap();
+    assert_eq!(hooks.signed_contract().unwrap().all_signatures(), &original);
+    // Keygen liveness probes may still contact enclaves. The completed nonce
+    // and partial rounds must come from the durable journal on this retry.
+    assert!(pool.relay.load.lock().unwrap().most <= 1);
     pool.stop().await;
 }
 
