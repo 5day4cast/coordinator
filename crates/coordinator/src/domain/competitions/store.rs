@@ -1772,6 +1772,8 @@ impl CompetitionStore {
         competition_id: Uuid,
         include_signed_contract: bool,
     ) -> Result<Competition, sqlx::Error> {
+        // Every nonaggregate field belongs to this primary-key row (including the one
+        // payout_stats row). Do not duplicate contract blobs in the GROUP BY sort key.
         let query_str = r#"
             WITH payout_stats AS (
                         SELECT
@@ -1830,44 +1832,7 @@ impl CompetitionStore {
             LEFT JOIN entries ON entries.event_id = competitions.id
             LEFT JOIN tickets ON entries.ticket_id = tickets.id
             WHERE competitions.id = ?
-            GROUP BY
-                competitions.id,
-                created_at,
-                event_submission,
-                event_announcement,
-                outcome_transaction,
-                competitions.funding_psbt_base64,
-                funding_outpoint,
-                funding_transaction,
-                contract_parameters,
-                competitions.public_nonces,
-                aggregated_nonces,
-                competitions.partial_signatures,
-                signed_contract,
-                attestation,
-                cancelled_at,
-                contracted_at,
-                competitions.signed_at,
-                escrow_funds_confirmed_at,
-                event_created_at,
-                entries_submitted_at,
-                funding_broadcasted_at,
-                funding_confirmed_at,
-                funding_settled_at,
-                awaiting_attestation_at,
-                invoices_settled_at,
-                expiry_broadcasted_at,
-                outcome_broadcasted_at,
-                delta_broadcasted_at,
-                completed_at,
-                failed_at,
-                keymeld_keygen_completed_at,
-                errors,
-                competitions.kind,
-                competitions.parent_id,
-                competitions.pool_index,
-                competitions.pools_formed_at,
-                competitions.pools_finished_at"#;
+            GROUP BY competitions.id"#;
 
         let competition = sqlx::query_as::<_, Competition>(query_str)
             .bind(competition_id.to_string())
