@@ -7,6 +7,8 @@ pub use operations::*;
 mod admin;
 mod admin_feedback;
 pub use admin_feedback::*;
+mod mainnet_signup;
+pub use mainnet_signup::*;
 mod feedback;
 pub use feedback::*;
 mod visitors;

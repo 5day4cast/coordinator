@@ -196,6 +196,23 @@ impl CompetitionView {
         }
     }
 
+    /// Compact capacity for the competition list; the full wording labels it accessibly.
+    pub fn entries_compact(&self) -> String {
+        match &self.queue {
+            Queue::Queued(queue) => match queue.seats() {
+                Some(seats) if self.phase == Phase::Upcoming && queue.pools.is_empty() => {
+                    format!(
+                        "{}/{seats}",
+                        seats.saturating_sub(queue.taken(self.total_entries))
+                    )
+                }
+                Some(seats) => format!("{}/{seats}", self.entry_count(queue)),
+                None => self.entries(),
+            },
+            _ => format!("{}/{}", self.total_entries, self.total_allowed_entries),
+        }
+    }
+
     /// Whether anyone took part. For one that didn't run, every paid entry fee counts, as its
     /// refunds count them, even one whose entry never arrived.
     pub fn entered(&self) -> u64 {
@@ -1117,7 +1134,13 @@ fn featured_card(competition: &CompetitionView, now: OffsetDateTime) -> Markup {
                         @if let Some(rule) = competition.prize_rule() { span class="cell-note prize-note" { (rule) } }
                     }
                 }
-                div { dt { "Entries" } dd { (competition.entries()) } }
+                div {
+                    dt { "Entries" }
+                    dd title=(competition.entries()) {
+                        span aria-hidden="true" { (competition.entries_compact()) }
+                        span class="is-sr-only" { (competition.entries()) }
+                    }
+                }
             }
             a class=(if competition.can_enter { "button is-primary is-fullwidth" } else { "button is-fullwidth" })
               href=(competition.url()) hx-get=(competition.url())
@@ -1255,7 +1278,10 @@ pub fn competition_row(competition: &CompetitionView, now: OffsetDateTime) -> Ma
                 @if let Some(rule) = competition.prize_rule() { span class="cell-note prize-note" { (rule) } }
             }
             span class="cell-entries" data-label="Entries" {
-                span class="entry-count" { (competition.entries()) }
+                span class="entry-count" title=(competition.entries()) {
+                    span aria-hidden="true" { (competition.entries_compact()) }
+                    span class="is-sr-only" { (competition.entries()) }
+                }
                 @if competition.phase == Phase::Upcoming {
                     span class="cell-note player-entries" data-player-entries=(competition.id)
                       data-entry-limit=(competition.max_entries_per_player) {
@@ -1889,7 +1915,7 @@ pub(crate) mod tests {
         let queue = queued("q", 40);
         let row = competition_row(&queue, NOW).into_string();
         assert!(
-            row.contains(r#"class="entry-count">40 entered</span>"#),
+            row.contains(r#"title="40 entered"><span aria-hidden="true">40 entered</span>"#),
             "{row}"
         );
         assert!(row.contains("pools of up to 25"));
@@ -2021,7 +2047,7 @@ pub(crate) mod tests {
         };
         let row = competition_row(&pool(OTHER_POOL, 1, Phase::Live), NOW).into_string();
         assert!(row.contains(r#"<span class="cell-note">Pool 2</span>"#));
-        assert!(row.contains(r#"class="entry-count">1 of 3</span>"#));
+        assert!(row.contains(r#"title="1 of 3"><span aria-hidden="true">1/3</span>"#));
 
         // The list shows the queue once, with its least advanced pool, and not its pools.
         let all = [
@@ -2207,6 +2233,7 @@ pub(crate) mod tests {
     fn a_one_pool_queue_shows_its_seats_and_how_its_prizes_split() {
         let open = twenty_seats(3);
         assert_eq!(open.entries(), "20 seats · 17 left");
+        assert_eq!(twenty_seats(13).entries_compact(), "7/20");
         assert_eq!(open.prize_split().as_deref(), Some("1st 70% · 2nd 30%"));
         assert_eq!(
             open.prize_rule().as_deref(),
@@ -2216,7 +2243,7 @@ pub(crate) mod tests {
         assert_eq!(open.win(), "15,000 sats");
         let row = competition_row(&open, NOW).into_string();
         assert!(
-            row.contains(r#"class="entry-count">20 seats · 17 left</span>"#),
+            row.contains(r#"title="20 seats · 17 left"><span aria-hidden="true">17/20</span>"#),
             "{row}"
         );
         assert!(row.contains("1st 70% · 2nd 30%"));
@@ -2269,6 +2296,7 @@ pub(crate) mod tests {
         // 19 paid and the last seat held for an unpaid invoice: full, never "1 left".
         let last_held = with_held(19, 20);
         assert_eq!(last_held.entries(), "20 seats · 0 left");
+        assert_eq!(last_held.entries_compact(), "0/20");
         assert!(last_held.is_full() && !last_held.can_enter);
         let badge = phase_badge(&last_held).into_string();
         assert!(badge.contains(">Full</span>"), "{badge}");

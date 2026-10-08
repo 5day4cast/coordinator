@@ -1,6 +1,7 @@
 pub mod dashboard;
 pub mod discovery;
 pub mod feedback;
+pub mod mainnet_signup;
 pub mod visitors;
 pub mod wallet;
 pub mod weather_map;
