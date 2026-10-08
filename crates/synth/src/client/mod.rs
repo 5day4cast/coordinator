@@ -188,6 +188,48 @@ mod tests {
     use axum::{http::HeaderMap, routing::get, Json, Router};
 
     #[tokio::test]
+    async fn competition_polling_requests_evidence_without_the_unused_signed_graph() {
+        use axum::extract::Query;
+        use std::collections::HashMap;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let router = Router::new().route(
+            "/api/v1/competitions/{id}",
+            get(|Query(query): Query<HashMap<String, String>>| async move {
+                assert_eq!(
+                    query.get("include_signed_contract").map(String::as_str),
+                    Some("false")
+                );
+                Json(serde_json::json!({
+                    "id": uuid::Uuid::nil(),
+                    "created_at": "2026-10-08T00:00:00Z",
+                    "event_submission": {},
+                    "state": "awaiting_attestation",
+                    "signed_at": "2026-10-08T01:00:00Z",
+                    "funding_outpoint": "funding-evidence:0",
+                    "contract_parameters": { "funding_value": 100000 },
+                    "signed_contract": null
+                }))
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let observed = CoordinatorClient::new(&url, None)
+            .get_competition(&uuid::Uuid::nil())
+            .await
+            .unwrap();
+        assert_eq!(observed.inferred_status(), "awaiting_attestation");
+        assert_eq!(
+            observed.funding_outpoint.as_deref(),
+            Some("funding-evidence:0")
+        );
+        assert_eq!(
+            observed.contract_parameters.unwrap()["funding_value"],
+            100000
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn list_pages_keep_filters_and_authentication_on_each_page() {
         use axum::{extract::Query, response::IntoResponse};
         use std::collections::HashMap;

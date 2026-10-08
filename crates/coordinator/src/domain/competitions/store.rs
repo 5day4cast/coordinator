@@ -1761,6 +1761,17 @@ impl CompetitionStore {
     }
 
     pub async fn get_competition(&self, competition_id: Uuid) -> Result<Competition, sqlx::Error> {
+        self.get_competition_detail(competition_id, true).await
+    }
+
+    /// Read a competition for a client that may not need its signed transaction graph.
+    /// The opt-out happens in SQL, before `SignedContract` decoding rebuilds that graph.
+    /// Terms, lifecycle state, funding, outcomes and payout evidence remain available.
+    pub async fn get_competition_detail(
+        &self,
+        competition_id: Uuid,
+        include_signed_contract: bool,
+    ) -> Result<Competition, sqlx::Error> {
         let query_str = r#"
             WITH payout_stats AS (
                         SELECT
@@ -1789,7 +1800,7 @@ impl CompetitionStore {
                 competitions.public_nonces as public_nonces,
                 aggregated_nonces,
                 competitions.partial_signatures as partial_signatures,
-                signed_contract,
+                CASE WHEN ? THEN signed_contract ELSE NULL END AS signed_contract,
                 attestation,
                 cancelled_at as cancelled_at,
                 contracted_at as contracted_at,
@@ -1860,6 +1871,7 @@ impl CompetitionStore {
 
         let competition = sqlx::query_as::<_, Competition>(query_str)
             .bind(competition_id.to_string())
+            .bind(include_signed_contract)
             .bind(competition_id.to_string())
             .fetch_one(self.db_connection.read())
             .await?;

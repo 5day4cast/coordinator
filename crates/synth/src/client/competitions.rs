@@ -636,9 +636,14 @@ impl CoordinatorClient {
             .context("Failed to parse the operator's competitions")
     }
 
-    /// Get a specific competition by ID
+    /// Get a competition's lifecycle and settlement evidence. Synth never consumes the signed
+    /// contract graph, so polling must not make the coordinator rebuild it on every request.
     pub async fn get_competition(&self, id: &Uuid) -> Result<CompetitionResponse> {
-        let url = format!("{}/api/v1/competitions/{}", self.base_url(), id);
+        let url = format!(
+            "{}/api/v1/competitions/{}?include_signed_contract=false",
+            self.base_url(),
+            id
+        );
         let resp = super::retry_transport(3, || async {
             anyhow::Ok(self.http().get(&url).send().await?)
         })

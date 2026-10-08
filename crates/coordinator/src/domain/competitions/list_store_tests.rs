@@ -276,6 +276,79 @@ async fn the_list_reads_the_same_rows_order_and_pages_as_the_full_read() {
 }
 
 #[tokio::test]
+async fn an_observer_read_preserves_settlement_evidence_without_decoding_the_signed_graph() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = DBConnection::new(
+        directory.path().to_str().unwrap(),
+        "competitions",
+        DatabasePoolConfig::default(),
+        DatabaseType::Competitions,
+    )
+    .await
+    .unwrap();
+    let store = CompetitionStore::new(database.clone());
+    let now = OffsetDateTime::now_utc();
+    let (params, event, attestation) = pot_return_contract();
+    let mut c = competition(now - Duration::DAY, false);
+    c.contract_parameters = Some(params);
+    c.event_announcement = Some(event);
+    c.signed_at = Some(now);
+    c.funding_confirmed_at = Some(now);
+    c.awaiting_attestation_at = Some(now);
+    c.attestation = Some(attestation);
+    let tx = bitcoin::Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![],
+        output: vec![bitcoin::TxOut {
+            value: Amount::from_sat(3_000),
+            script_pubkey: bitcoin::ScriptBuf::new(),
+        }],
+    };
+    c.funding_outpoint = Some(bitcoin::OutPoint {
+        txid: tx.compute_txid(),
+        vout: 0,
+    });
+    c.funding_transaction = Some(tx.clone());
+    c.outcome_transaction = Some(tx);
+    c.errors.push(CompetitionError::InvalidStateTransition(
+        "retained evidence".into(),
+    ));
+    store
+        .add_competition_with_tickets(c.clone(), vec![])
+        .await
+        .unwrap();
+    store.update_competitions(vec![c.clone()]).await.unwrap();
+    enter(&database, c.id, 3, 3).await;
+    let expected = serde_json::to_value(store.get_competition(c.id).await.unwrap()).unwrap();
+
+    let id = c.id;
+    database
+        .execute_write(move |pool| async move {
+            sqlx::query("UPDATE competitions SET signed_contract = ? WHERE id = ?")
+                .bind(b"a graph that must not be decoded".to_vec())
+                .bind(id.to_string())
+                .execute(&pool)
+                .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let observed = store.get_competition_detail(c.id, false).await.unwrap();
+    assert_eq!(serde_json::to_value(observed).unwrap(), expected);
+    assert!(
+        store.get_competition(c.id).await.is_err(),
+        "full reads still decode the graph"
+    );
+    assert!(matches!(
+        store.get_competition_detail(Uuid::now_v7(), false).await,
+        Err(sqlx::Error::RowNotFound)
+    ));
+    database.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn operator_summaries_keep_signing_errors_without_loading_contracts() {
     let directory = tempfile::tempdir().unwrap();
     let database = DBConnection::new(

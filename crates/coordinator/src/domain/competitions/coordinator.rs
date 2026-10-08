@@ -4192,9 +4192,18 @@ impl Coordinator {
     }
 
     pub async fn get_competition(&self, competition_id: Uuid) -> Result<Competition, Error> {
+        self.get_competition_detail(competition_id, true).await
+    }
+
+    /// A detailed public read, optionally omitting the signed contract's transaction graph.
+    pub async fn get_competition_detail(
+        &self,
+        competition_id: Uuid,
+        include_signed_contract: bool,
+    ) -> Result<Competition, Error> {
         let mut competition = self
             .competition_store
-            .get_competition(competition_id)
+            .get_competition_detail(competition_id, include_signed_contract)
             .map_err(|e| {
                 error!(
                     "failed to get competition: competition_id {} {:?}",
