@@ -206,6 +206,10 @@ mod tests {
                     "event_submission": {},
                     "state": "awaiting_attestation",
                     "signed_at": "2026-10-08T01:00:00Z",
+                    "funding_broadcasted_at": "2026-10-08T01:00:00Z",
+                    "funding_confirmed_at": "2026-10-08T01:01:00Z",
+                    "funding_settled_at": "2026-10-08T01:01:00Z",
+                    "awaiting_attestation_at": "2026-10-08T01:01:00Z",
                     "funding_outpoint": "funding-evidence:0",
                     "contract_parameters": { "funding_value": 100000 },
                     "signed_contract": null
