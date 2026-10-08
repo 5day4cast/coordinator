@@ -42,25 +42,30 @@ struct Oracle {
 type Shared = Arc<StdMutex<Oracle>>;
 
 fn json(station: &StationInfo) -> serde_json::Value {
-    serde_json::json!({
-        "station_id": station.station_id,
-        "station_name": station.station_name,
-        "state": station.state,
-        "iata_id": station.iata_id.clone().unwrap_or_default(),
-        "latitude": station.latitude,
-        "longitude": station.longitude,
-        "clean_days": 30,
-        "days_checked": 30,
-        "last_report": "2026-10-01T00:00:00Z",
-        "forecast_through": "2026-10-08T00:00:00Z",
-    })
+    serde_json::to_value(station).unwrap()
 }
 
-async fn eligible(State(oracle): State<Shared>) -> Response {
+async fn eligible(
+    State(oracle): State<Shared>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
     let mut oracle = oracle.lock().unwrap();
     oracle.eligible_calls += 1;
     match &oracle.eligible {
-        Some(stations) => Json(stations.iter().map(json).collect::<Vec<_>>()).into_response(),
+        Some(stations) => Json(
+            stations
+                .iter()
+                .map(|station| {
+                    let mut value = json(station);
+                    if station.coverage.is_some() {
+                        value["recent_window_hours"] =
+                            query["window_hours"].parse::<u32>().unwrap().into();
+                    }
+                    value
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -123,7 +128,28 @@ async fn eligible_forecasts(
         .iter()
         .all(|key| query.contains_key(*key)));
     oracle.discovery_calls += 1;
-    let stations: Vec<_> = oracle.eligible.iter().flatten().map(json).collect();
+    let start = OffsetDateTime::parse(
+        &query["start"],
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    let end = OffsetDateTime::parse(
+        &query["end"],
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    let stations: Vec<_> = oracle
+        .eligible
+        .iter()
+        .flatten()
+        .map(|station| {
+            let mut value = json(station);
+            if station.coverage.is_some() {
+                value["recent_window_hours"] = (end - start).whole_hours().min(24).into();
+            }
+            value
+        })
+        .collect();
     let forecasts: Vec<_> = oracle.forecasts.iter().map(forecast_json).collect();
     Json(serde_json::json!({ "stations": stations, "forecasts": forecasts })).into_response()
 }
@@ -502,4 +528,51 @@ async fn eligible_cache_keeps_each_history_window_separate() {
     assert!(f.picker.eligible(30, 24).await.is_err());
     assert_eq!(f.picker.eligible(3, 24).await.unwrap().len(), 1);
     assert_eq!(f.oracle.lock().unwrap().eligible_calls, 2);
+}
+
+#[tokio::test]
+async fn both_discovery_paths_reject_missing_stale_or_incomplete_coverage() {
+    for discovery in [false, true] {
+        let (mut stations, forecasts) = weather();
+        stations[0].coverage.as_mut().unwrap().clean_days = 2;
+        stations[1].coverage.as_mut().unwrap().last_report -= time::Duration::hours(2);
+        stations[2].coverage.as_mut().unwrap().coverage_checked_at -= time::Duration::minutes(21);
+        stations[3].coverage = None;
+        stations[4].coverage.as_mut().unwrap().coverage_checked_at += time::Duration::HOUR;
+        let f = fixture(Oracle {
+            eligible: Some(stations),
+            forecasts,
+            discovery,
+            ..Default::default()
+        })
+        .await;
+        let mut lane = lane("");
+        lane.stations_per_run = Some(1);
+        let mut config = run(&lane);
+        config.observation_start = Some(OffsetDateTime::now_utc() + time::Duration::HOUR);
+        let picked = f
+            .picker
+            .choose(&lane, &ScenarioConfig::default(), &mut config)
+            .await
+            .unwrap();
+        assert_eq!(picked.stations(), ["KSEA"]);
+        assert!(picked.explanation.contains("coverage 3/3 clean days"));
+        assert_eq!(
+            f.oracle.lock().unwrap().discovery_calls,
+            usize::from(discovery)
+        );
+    }
+}
+
+#[tokio::test]
+async fn local_cache_cannot_extend_expired_coverage_evidence() {
+    let f = fixture(Oracle::default()).await;
+    let mut stale = station("KDEN", "DEN", DENVER);
+    stale.coverage.as_mut().unwrap().coverage_checked_at -= time::Duration::minutes(21);
+    f.picker
+        .eligible
+        .lock()
+        .await
+        .insert((3, 24), (Instant::now(), vec![stale]));
+    assert!(f.picker.eligible(3, 24).await.is_err());
 }

@@ -53,7 +53,40 @@ pub fn discovery_window_fits(
         && length.subsec_nanoseconds() == 0
 }
 
-/// A station, as the oracle lists it. The eligible list says more; only this is used.
+/// The observation evidence behind an eligible station. Missing evidence cannot authorize a pick.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Coverage {
+    pub clean_days: u32,
+    pub days_checked: u32,
+    #[serde(with = "time::serde::rfc3339")]
+    pub last_report: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub forecast_through: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub coverage_checked_at: OffsetDateTime,
+    pub recent_window_hours: u32,
+    pub max_report_gap_seconds: u64,
+}
+impl Coverage {
+    pub fn current(&self, days: u32, hours: u64, now: OffsetDateTime) -> bool {
+        self.days_checked == days
+            && days > 0
+            && self.clean_days <= days
+            && self.clean_days >= days - days / 10
+            && u64::from(self.recent_window_hours) == hours
+            && self.coverage_checked_at <= now
+            && now - self.coverage_checked_at < time::Duration::minutes(20)
+            && self.last_report <= now
+            && now - self.last_report < time::Duration::minutes(90)
+            && self.forecast_through >= now + time::Duration::hours(hours as i64)
+    }
+    /// A station with no missed-report allowance used has more coverage margin.
+    pub fn missed_report(&self) -> bool {
+        self.max_report_gap_seconds > 90 * 60
+    }
+}
+
+/// A station, including the oracle's coverage evidence when listed as eligible.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StationInfo {
     pub station_id: String,
@@ -68,6 +101,8 @@ pub struct StationInfo {
     pub latitude: Option<f64>,
     #[serde(default)]
     pub longitude: Option<f64>,
+    #[serde(flatten)]
+    pub coverage: Option<Coverage>,
 }
 
 impl StationInfo {
@@ -80,6 +115,7 @@ impl StationInfo {
             iata_id: None,
             latitude: None,
             longitude: None,
+            coverage: None,
         }
     }
 

@@ -12,7 +12,7 @@
 
     # Match the SDK and verifier to the Keymeld pin in Cargo.toml (Keymeld v0.9.1).
     keymeld = {
-      url = "github:tee8z/keymeld/30e84199ea091ca0947e0d90c5e601df06052da0";
+      url = "github:tee8z/keymeld/8131f490a0a423e83b612b422eca3f75baef4c09";
     };
   };
 

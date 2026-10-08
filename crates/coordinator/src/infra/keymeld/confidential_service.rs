@@ -1487,6 +1487,7 @@ impl KeymeldService {
         players: Vec<UserId>,
         ark_funding: Option<coordinator_escrow::ark::ArkFunding>,
     ) -> Result<DlcSignatureResults, KeymeldError> {
+        let started = std::time::Instant::now();
         let _guard = self.lock_session(&session.session_id).await;
         let (mut state, checkpoint) = self.checkpoint(session).await?;
         let subsets = outcome_subsets_for_payouts(
@@ -1582,7 +1583,11 @@ impl KeymeldService {
             // their own copy of it, side by side. Signing needs only what was journaled before
             // them, the route and the batch prepared above, so the copies are not merged back:
             // their permit commands are dropped with the journal when the batch ends.
+            let setup = started.elapsed();
+            let round_started = std::time::Instant::now();
             prepare_signing_round(driver, &plan).await?;
+            let prepare = round_started.elapsed();
+            let permits_started = std::time::Instant::now();
             let permits = state
                 .policies
                 .iter()
@@ -1618,10 +1623,18 @@ impl KeymeldService {
                 Ok(vec![(); permits.len()])
             })
             .await?;
+            let permit_time = permits_started.elapsed();
+            let sign_started = std::time::Instant::now();
             let driver = self
                 .connect(session, state, credentials, &mut journal, saver)
                 .await?;
-            finish_signing_batch(driver, plan, self.settings.signing_session_expiry_secs).await?
+            let signatures =
+                finish_signing_batch(driver, plan, self.settings.signing_session_expiry_secs)
+                    .await?;
+            log::info!("Arkade DLC signing {} participants, {} messages: setup {:.3}s, prepare {:.3}s, permits {:.3}s, MuSig {:.3}s, total {:.3}s",
+                state.policies.len(), plan.batch.items.len(), setup.as_secs_f64(), prepare.as_secs_f64(),
+                permit_time.as_secs_f64(), sign_started.elapsed().as_secs_f64(), started.elapsed().as_secs_f64());
+            signatures
         };
         if durable {
             state.roster = Some(roster);

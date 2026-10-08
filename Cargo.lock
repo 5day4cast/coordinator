@@ -1566,7 +1566,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator"
-version = "2.26.5"
+version = "2.26.6"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1641,7 +1641,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-ark"
-version = "2.26.5"
+version = "2.26.6"
 dependencies = [
  "anyhow",
  "ark-core",
@@ -1669,7 +1669,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-ark-escrow"
-version = "2.26.5"
+version = "2.26.6"
 dependencies = [
  "bitcoin",
  "hex",
@@ -1680,7 +1680,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-ark-swap"
-version = "2.26.5"
+version = "2.26.6"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1712,7 +1712,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-core"
-version = "2.26.5"
+version = "2.26.6"
 dependencies = [
  "axum",
  "coordinator-escrow",
@@ -1728,7 +1728,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-escrow"
-version = "2.26.5"
+version = "2.26.6"
 dependencies = [
  "anyhow",
  "coordinator-ark-escrow",
@@ -1749,7 +1749,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-escrow-verifier"
-version = "2.26.5"
+version = "2.26.6"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1782,7 +1782,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-lnurl-relay"
-version = "2.26.5"
+version = "2.26.6"
 dependencies = [
  "anyhow",
  "coordinator-escrow",
@@ -1794,7 +1794,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-payout-witness"
-version = "2.26.5"
+version = "2.26.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -1810,7 +1810,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-recover"
-version = "2.26.5"
+version = "2.26.6"
 dependencies = [
  "ark-core",
  "base64 0.22.1",
@@ -1839,7 +1839,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-synth"
-version = "2.26.5"
+version = "2.26.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -1885,7 +1885,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-verifier-enclave"
-version = "2.26.5"
+version = "2.26.6"
 dependencies = [
  "anyhow",
  "coordinator-escrow-verifier",
@@ -1896,7 +1896,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-wasm"
-version = "2.26.5"
+version = "2.26.6"
 dependencies = [
  "base64 0.22.1",
  "bitcoin",
@@ -2100,7 +2100,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d045de693cb712d0b22c6a64be5b953f67b3ce00ab5ad3dd5d8b441886ab8e1a"
 dependencies = [
  "quote",
- "syn 2.0.114",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -3600,8 +3600,8 @@ dependencies = [
 
 [[package]]
 name = "keymeld-core"
-version = "0.9.1"
-source = "git+https://github.com/tee8z/keymeld?rev=30e84199ea091ca0947e0d90c5e601df06052da0#30e84199ea091ca0947e0d90c5e601df06052da0"
+version = "0.10.1"
+source = "git+https://github.com/tee8z/keymeld?rev=8131f490a0a423e83b612b422eca3f75baef4c09#8131f490a0a423e83b612b422eca3f75baef4c09"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3640,8 +3640,8 @@ dependencies = [
 
 [[package]]
 name = "keymeld-enclave"
-version = "0.9.1"
-source = "git+https://github.com/tee8z/keymeld?rev=30e84199ea091ca0947e0d90c5e601df06052da0#30e84199ea091ca0947e0d90c5e601df06052da0"
+version = "0.10.1"
+source = "git+https://github.com/tee8z/keymeld?rev=8131f490a0a423e83b612b422eca3f75baef4c09#8131f490a0a423e83b612b422eca3f75baef4c09"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3678,8 +3678,8 @@ dependencies = [
 
 [[package]]
 name = "keymeld-sdk"
-version = "0.9.1"
-source = "git+https://github.com/tee8z/keymeld?rev=30e84199ea091ca0947e0d90c5e601df06052da0#30e84199ea091ca0947e0d90c5e601df06052da0"
+version = "0.10.1"
+source = "git+https://github.com/tee8z/keymeld?rev=8131f490a0a423e83b612b422eca3f75baef4c09#8131f490a0a423e83b612b422eca3f75baef4c09"
 dependencies = [
  "dlctix",
  "flate2",
@@ -7821,7 +7821,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

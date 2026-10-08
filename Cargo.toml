@@ -23,7 +23,7 @@ default-members = [
 resolver = "2"
 
 [workspace.package]
-version = "2.26.5"
+version = "2.26.6"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/5day4cast/coordinator"
@@ -52,8 +52,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # keymeld-sdk and the coordinator must resolve dlctix from the same source.
 # Pinned to Keymeld 0.9.1 for dlctix 0.2.
 # Every crate that names Keymeld pins the same rev.
-keymeld-sdk = { git = "https://github.com/tee8z/keymeld", rev = "30e84199ea091ca0947e0d90c5e601df06052da0", default-features = false, features = ["escrow", "dlctix"] }
-keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "30e84199ea091ca0947e0d90c5e601df06052da0", default-features = false, features = ["escrow"] }
+keymeld-sdk = { git = "https://github.com/tee8z/keymeld", rev = "8131f490a0a423e83b612b422eca3f75baef4c09", default-features = false, features = ["escrow", "dlctix"] }
+keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "8131f490a0a423e83b612b422eca3f75baef4c09", default-features = false, features = ["escrow"] }
 
 # Bitcoin
 bitcoin = { version = "0.32", features = ["serde", "base64", "rand-std"] }

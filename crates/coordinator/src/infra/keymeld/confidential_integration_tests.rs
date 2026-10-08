@@ -1128,7 +1128,9 @@ impl Watched {
             .down
             .filter(|(during, _)| *during == step)
             .map(|(_, enclave)| enclave);
+        let started = std::time::Instant::now();
         let result = run.await;
+        println!("  {step}: {:.3}s", started.elapsed().as_secs_f64());
         *self.relay.down.lock().unwrap() = None;
         let load = self.relay.load.lock().unwrap();
         self.seen
@@ -1189,6 +1191,11 @@ struct ArkadePool {
 
 impl ArkadePool {
     async fn start(count: usize, enclaves: usize) -> Self {
+        Self::start_with(pool_parameters(count), enclaves).await
+    }
+
+    async fn start_with(params: ContractParameters, enclaves: usize) -> Self {
+        let count = params.players.len();
         use coordinator_ark::testing::{keypair, mock_info, xonly};
         use coordinator_ark::{escrow_terms, server_rules, EscrowInput, PoolFunding};
 
@@ -1208,7 +1215,7 @@ impl ArkadePool {
             })
             .collect();
         let harness = PoolHarness::start_with(
-            pool_parameters(count),
+            params,
             Consent {
                 escrows: Some(&escrows),
                 enclaves,
@@ -2230,4 +2237,52 @@ fn assert_recovered_swap(
         .unwrap();
     assert_eq!(&paid.script, expected_script);
     assert_eq!(paid.amount, expected_amount);
+}
+
+/// Real encrypted transport, three enclave operators, all contract and forfeit
+/// signatures verified. The scripted Arkade server does not spend real funds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "20-player, two-place kickoff timing; run optimized"]
+async fn twenty_player_two_place_arkade_kickoff_benchmark() {
+    let mut params = pool_parameters(20);
+    params
+        .outcome_payouts
+        .retain(|outcome, _| *outcome == Outcome::Expiry);
+    params.event.locking_points.clear();
+    params.outcome_bound_splits = true;
+    for winner in 0..20 {
+        for runner_up in 0..20 {
+            if winner == runner_up {
+                continue;
+            }
+            let index = params.event.locking_points.len();
+            let mut secret = [0u8; 32];
+            secret[28..].copy_from_slice(&(index as u32 + 1).to_be_bytes());
+            params
+                .event
+                .locking_points
+                .push(Scalar::from_slice(&secret).unwrap().base_point_mul().into());
+            params.outcome_payouts.insert(
+                Outcome::Attestation(index),
+                BTreeMap::from([(winner, 70), (runner_up, 30)]),
+            );
+        }
+    }
+    let pool = ArkadePool::start_with(params, 3).await;
+    let signer = Watched::new(pool.keymeld.clone(), pool.harness.relay.clone(), None);
+    for batch_nonce in 0..2 {
+        let started = std::time::Instant::now();
+        let (kickoff, forfeits) = pool.kick_off(&signer, batch_nonce).await;
+        let kickoff = kickoff.unwrap();
+        let duration = started.elapsed();
+        assert_eq!(forfeits.len(), 20);
+        let signed = pool.keymeld.signed_contract().unwrap();
+        assert_eq!(signed.dlc().funding_outpoint(), kickoff.funding);
+        assert!(signed.expiry_tx().is_some());
+        println!(
+            "20 players / 2 places / 3 enclaves, attempt {batch_nonce}: full mock kickoff {:.3}s",
+            duration.as_secs_f64()
+        );
+    }
+    pool.harness.stop().await;
 }

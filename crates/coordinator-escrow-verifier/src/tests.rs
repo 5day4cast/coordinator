@@ -1011,7 +1011,7 @@ async fn a_compact_scope_expands_to_the_full_scope_with_the_same_decisions() {
         expand_signing_scope(
             &f.manifest,
             &restored,
-            &f.contract,
+            &payout::signing_requirements(&f.contract).unwrap(),
             &ContractItem::compact(&scope)
         )
         .unwrap(),
@@ -2532,4 +2532,93 @@ async fn missing_durable_witness_refuses_preparation_execution_and_restoration()
         )
         .await
         .is_err());
+}
+
+#[test]
+fn signing_derivations_are_shared_only_for_the_exact_funded_contract() {
+    let cache = crate::signing_requirements::SigningRequirements::default();
+    let mut contract = fixture(false).contract;
+    let first = cache.get(&contract).unwrap();
+    assert_eq!(*first, payout::signing_requirements(&contract).unwrap());
+    assert!(Arc::ptr_eq(&first, &cache.get(&contract).unwrap()));
+    contract.funding_outpoint.vout = 1;
+    let moved = cache.get(&contract).unwrap();
+    assert!(!Arc::ptr_eq(&first, &moved));
+    assert_ne!(
+        *first, *moved,
+        "the actual funding outpoint changes the messages"
+    );
+    contract.contract_parameters.players[0].ticket_hash = payout::sha256(&[99; 32]);
+    let changed = cache.get(&contract).unwrap();
+    assert_ne!(*changed, *moved);
+    for vout in 2..7 {
+        contract.funding_outpoint.vout = vout;
+        cache.get(&contract).unwrap();
+    }
+    assert!(
+        !Arc::ptr_eq(&first, &cache.get(&fixture(false).contract).unwrap()),
+        "old contracts are evicted from the bounded cache"
+    );
+    contract.contract_parameters.players.clear();
+    assert!(cache.get(&contract).is_err());
+    assert!(
+        cache.get(&contract).is_err(),
+        "a failed derivation is never cached as success"
+    );
+}
+
+/// Measures the public derivation work for one enclave's seven participants,
+/// each expanded, validated and executed. No signing authorization is skipped.
+#[test]
+#[ignore = "20-player, two-place performance measurement"]
+fn twenty_player_signing_derivation_benchmark() {
+    let mut contract = fixture(false).contract;
+    let params = &mut contract.contract_parameters;
+    params.players = (0..20)
+        .map(|i| Player {
+            pubkey: Scalar::from_slice(&[20 + i; 32]).unwrap().base_point_mul(),
+            ticket_hash: payout::sha256(&[50 + i; 32]),
+            payout_hash: payout::sha256(&[80 + i; 32]),
+        })
+        .collect();
+    params.outcome_payouts.clear();
+    params.event.locking_points.clear();
+    for winner in 0..20 {
+        for runner_up in 0..20 {
+            if winner == runner_up {
+                continue;
+            }
+            let index = params.event.locking_points.len();
+            let mut secret = [0u8; 32];
+            secret[28..].copy_from_slice(&(index as u32 + 1).to_be_bytes());
+            params
+                .event
+                .locking_points
+                .push(Scalar::from_slice(&secret).unwrap().base_point_mul().into());
+            params.outcome_payouts.insert(
+                Outcome::Attestation(index),
+                BTreeMap::from([(winner, 2), (runner_up, 1)]),
+            );
+        }
+    }
+    params
+        .outcome_payouts
+        .insert(Outcome::Expiry, (0..20).map(|i| (i, 1)).collect());
+    params.funding_value = Amount::from_sat(100_000);
+    params.outcome_bound_splits = true;
+    let started = std::time::Instant::now();
+    let expected = payout::signing_requirements(&contract).unwrap();
+    let one = started.elapsed();
+    let started = std::time::Instant::now();
+    for _ in 0..21 {
+        std::hint::black_box(payout::signing_requirements(&contract).unwrap());
+    }
+    let before = started.elapsed();
+    let cache = crate::signing_requirements::SigningRequirements::default();
+    let started = std::time::Instant::now();
+    for _ in 0..21 {
+        assert_eq!(*cache.get(&contract).unwrap(), expected);
+    }
+    eprintln!("20 players / 2 places: {} requirements, one derivation {:?}, 21 uncached {:?}, 21 cached {:?}",
+        expected.len(), one, before, started.elapsed());
 }
