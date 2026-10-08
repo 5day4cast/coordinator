@@ -299,7 +299,7 @@ async fn an_observer_read_preserves_settlement_evidence_without_decoding_the_sig
     let tx = bitcoin::Transaction {
         version: bitcoin::transaction::Version::TWO,
         lock_time: bitcoin::absolute::LockTime::ZERO,
-        input: vec![],
+        input: vec![bitcoin::TxIn::default()],
         output: vec![bitcoin::TxOut {
             value: Amount::from_sat(3_000),
             script_pubkey: bitcoin::ScriptBuf::new(),
