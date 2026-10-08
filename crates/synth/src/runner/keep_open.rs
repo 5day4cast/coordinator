@@ -112,8 +112,7 @@ struct Blocked {
     recorded: bool,
 }
 
-/// The latest keep-open check, shared with the dashboard. None before the first, or without a
-/// keep-open lane.
+/// The latest visitor check, shared with the dashboard. None before the first successful check.
 pub type SharedOpenStatus = Arc<Mutex<Option<OpenStatus>>>;
 
 /// Starts requested by keep-open and the last run started by its lane.
@@ -160,9 +159,11 @@ impl LaneStart {
     }
 }
 
-/// Decides, check by check, when the keep-open lane's next run starts early.
+/// Checks visitors' entry forms, optionally starting the keep-open lane early.
+/// Without a scheduling configuration, this only observes existing competitions.
+#[derive(Default)]
 pub struct KeepOpen {
-    config: KeepOpenConfig,
+    config: Option<KeepOpenConfig>,
     /// What a ticket of the lane's runs costs before fees, to tell if fees pause entries.
     entry_fee: u64,
     last_start: Option<tokio::time::Instant>,
@@ -181,7 +182,7 @@ pub struct KeepOpen {
 impl KeepOpen {
     pub fn new(config: KeepOpenConfig, entry_fee: u64, lane_start: Arc<LaneStart>) -> Self {
         Self {
-            config,
+            config: Some(config),
             entry_fee,
             last_start: None,
             lane_start,
@@ -194,12 +195,11 @@ impl KeepOpen {
     }
 
     fn min_left(&self) -> Duration {
-        Duration::minutes(self.config.min_minutes_left as i64)
-    }
-
-    /// How long the last open competition must still count as open for the next run to wait.
-    fn start_ahead(&self) -> Duration {
-        Duration::minutes(self.config.start_ahead_minutes as i64)
+        Duration::minutes(
+            self.config
+                .as_ref()
+                .map_or(0, |config| config.min_minutes_left) as i64,
+        )
     }
 
     /// Check once: what is open, and whether to start a run now.
@@ -210,14 +210,28 @@ impl KeepOpen {
         let now = OffsetDateTime::now_utc();
         let listed = client.list_open_competitions().await?;
         let open = open_competitions(&listed, now, self.min_left());
-        // Those with long enough left that the next run need not start yet.
-        let lasting = open_competitions(&listed, now, self.min_left() + self.start_ahead());
         self.open_now = open_to_visitors(&listed, now, self.min_left())
             .into_iter()
             .map(|(competition, _)| (competition.id, competition.stations()))
             .collect();
         crate::server::metrics::record_open(open.competitions, open.minutes_left);
-        let grace = std::time::Duration::from_secs(self.config.min_minutes_left * 60);
+        let Some(config) = self.config.as_ref() else {
+            return Ok((
+                OpenStatus {
+                    open,
+                    starting: false,
+                    forms: self.forms,
+                },
+                false,
+            ));
+        };
+        // Those with long enough left that the next run need not start yet.
+        let lasting = open_competitions(
+            &listed,
+            now,
+            self.min_left() + Duration::minutes(config.start_ahead_minutes as i64),
+        );
+        let grace = std::time::Duration::from_secs(config.min_minutes_left * 60);
         // A start that created no competition is not one to wait for.
         if self.lane_start.take_failed() {
             self.last_start = None;
@@ -258,13 +272,13 @@ impl KeepOpen {
         if open.competitions == 0 {
             info!(
                 "No competition is open for visitors; lane {} starts its next run now",
-                self.config.lane
+                config.lane
             );
         } else {
             info!(
                 "The last competition open for visitors stops counting in under {} minutes; lane \
                  {} starts its next run now",
-                self.config.start_ahead_minutes, self.config.lane
+                config.start_ahead_minutes, config.lane
             );
         }
         Ok((
@@ -348,7 +362,9 @@ impl KeepOpen {
     /// for the dashboard.
     pub async fn run(mut self, client: CoordinatorClient, db: SynthDb, status: SharedOpenStatus) {
         let mut checks = tokio::time::interval(std::time::Duration::from_secs(
-            self.config.check_interval_secs,
+            self.config
+                .as_ref()
+                .map_or(60, |config| config.check_interval_secs),
         ));
         checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let publish = |open: OpenStatus| {
@@ -368,6 +384,7 @@ impl KeepOpen {
                         let forms = self.check_forms(&client, &db).await;
                         publish(OpenStatus { forms, ..open });
                     }
+                    crate::server::metrics::record_visitor_check();
                 }
                 Err(e) => {
                     warn!("Cannot check for a competition open for visitors: {e:#}");
@@ -503,6 +520,82 @@ mod tests {
             check_interval_secs: 60,
             start_ahead_minutes,
         }
+    }
+
+    /// Manual-only Synth still checks public forms, including competitions near closing.
+    /// With no competition open, it never asks for fees or requests a lane start.
+    #[tokio::test]
+    async fn observation_without_a_keep_open_lane_checks_forms_without_starting_runs() {
+        use axum::{http::StatusCode, routing::get, Json, Router};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let listed = Arc::new(AtomicBool::new(true));
+        let form_requests = Arc::new(AtomicUsize::new(0));
+        let unexpected = Arc::new(AtomicUsize::new(0));
+        let id = Uuid::now_v7();
+        let list_state = listed.clone();
+        let forms_state = form_requests.clone();
+        let unexpected_state = unexpected.clone();
+        let app = Router::new()
+            .route("/api/v1/competitions", get(move || {
+                let listed = list_state.clone();
+                async move {
+                    Json(if listed.load(Ordering::SeqCst) {
+                        serde_json::json!([{
+                            "id": id, "created_at": "2026-10-01T00:00:00Z", "kind": "queued",
+                            "event_submission": {
+                                "start_observation_date": closing(OffsetDateTime::now_utc() + Duration::minutes(5)),
+                                "locations": ["KSTS"],
+                            },
+                            "pool_rules": {"min_players": 2, "max_players": 25},
+                            "entries": 3, "max_entries": 100, "total_entries": 3,
+                        }])
+                    } else { serde_json::json!([]) })
+                }
+            }))
+            .route("/competitions/{id}/entry-forecasts", get(move || {
+                let requests = forms_state.clone();
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    "<div id=\"entryForecasts\"><fieldset data-station=\"KSTS\"><div class=\"pick-row\"><strong class=\"pick-forecast\">98</strong><input type=\"radio\" name=\"KSTS_temp_high\" value=\"over\"></div></fieldset></div>"
+                }
+            }))
+            .fallback(move || {
+                let unexpected = unexpected_state.clone();
+                async move {
+                    unexpected.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            CoordinatorClient::new(&format!("http://{}", listener.local_addr().unwrap()), None);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let directory = tempfile::tempdir().unwrap();
+        let db = SynthDb::new(directory.path().join("synth.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let mut observer = KeepOpen::default();
+        let (status, start) = observer.check(&client).await.unwrap();
+        assert_eq!(status.open.competitions, 1);
+        assert!(!start && !status.starting);
+        assert_eq!(
+            observer.check_forms(&client, &db).await,
+            Some(Forms {
+                checked: 1,
+                enterable: 1,
+                missing_forecasts: 0,
+            })
+        );
+        assert_eq!(form_requests.load(Ordering::SeqCst), 1);
+        listed.store(false, Ordering::SeqCst);
+        let (status, start) = observer.check(&client).await.unwrap();
+        assert_eq!(status.open.competitions, 0);
+        assert!(!start && !status.starting);
+        assert_eq!(observer.check_forms(&client, &db).await, None);
+        assert!(db.list_runs(10).await.unwrap().is_empty());
+        assert_eq!(unexpected.load(Ordering::SeqCst), 0);
+        server.abort();
     }
 
     /// The next run starts while the last open competition still counts as open, so there is no

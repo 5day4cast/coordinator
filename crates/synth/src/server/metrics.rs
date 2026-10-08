@@ -48,6 +48,11 @@ lazy_static::lazy_static! {
         "Listed competitions taking entries, not full, whose entries close far enough ahead"
     ).unwrap();
 
+    pub static ref VISITOR_LAST_CHECK: prometheus::Gauge = register_gauge!(
+        "synth_visitor_last_check_timestamp_seconds",
+        "Unix timestamp of the last completed visitor check, including checks with no open competitions"
+    ).unwrap();
+
     pub static ref OPEN_COMPETITION_MINUTES_LEFT: prometheus::Gauge = register_gauge!(
         "synth_open_competition_minutes_left",
         "Minutes until entries close for the open competition with the most time left (0 when none)"
@@ -139,6 +144,7 @@ fn initialize() {
     lazy_static::initialize(&LIFECYCLE_HEALTHY);
     lazy_static::initialize(&LAST_SUCCESS);
     lazy_static::initialize(&OPEN_COMPETITIONS);
+    lazy_static::initialize(&VISITOR_LAST_CHECK);
     lazy_static::initialize(&OPEN_COMPETITION_MINUTES_LEFT);
     lazy_static::initialize(&ENTRY_FORM_MISSING_FORECASTS);
     // Set by the keep-open check once it has loaded a form.
@@ -277,6 +283,11 @@ pub fn record_scenario(
 pub fn record_open(open: usize, minutes_left: i64) {
     OPEN_COMPETITIONS.set(open as f64);
     OPEN_COMPETITION_MINUTES_LEFT.set(minutes_left.max(0) as f64);
+}
+
+/// Record a completed listing and any entry form checks due on this pass.
+pub fn record_visitor_check() {
+    VISITOR_LAST_CHECK.set(time::OffsetDateTime::now_utc().unix_timestamp() as f64);
 }
 
 /// Record a run started early to keep a competition open.
