@@ -28,6 +28,21 @@ use coordinator_escrow::{
 };
 
 impl Coordinator {
+    /// Pools, including ones formed before the locktime was copied into their event, use
+    /// the queue's immutable consent. Existing contracts keep their stored parameters.
+    pub(super) async fn contract_locktime(
+        &self,
+        competition: &Competition,
+    ) -> Result<u16, anyhow::Error> {
+        if let Some((settings, _)) = self.pool_of(competition).await? {
+            return Ok(settings.terms.relative_locktime_block_delta);
+        }
+        Ok(competition
+            .event_submission
+            .relative_locktime_block_delta
+            .unwrap_or(self.relative_locktime_block_delta as u16))
+    }
+
     /// Create a queued competition: its reference oracle event, which freezes the lines players
     /// pick against, and the terms every player consents to. No Keymeld session and no tickets
     /// exist until players ask for them.

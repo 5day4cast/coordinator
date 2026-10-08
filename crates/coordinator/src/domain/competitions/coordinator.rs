@@ -1755,10 +1755,7 @@ impl Coordinator {
                     // An Arkade competition's is the rate its kickoff check passed at.
                     fee_rate: self.checked_contract_fee_rate(competition).await?,
                     funding_value: Amount::from_sat(contract_amount_sats as u64),
-                    relative_locktime_block_delta: competition
-                        .event_submission
-                        .relative_locktime_block_delta
-                        .unwrap_or(self.relative_locktime_block_delta as u16),
+                    relative_locktime_block_delta: self.contract_locktime(competition).await?,
                     anchor: None,
                     outcome_bound_splits: false,
                 };
