@@ -708,7 +708,12 @@ impl PoolHarness {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let app = Router::new()
-            .route("/api/v1/confidential", post(pool_relay))
+            .route(
+                "/api/v1/confidential",
+                post(pool_relay).layer(axum::extract::DefaultBodyLimit::max(
+                    keymeld_core::confidential::MAX_WIRE_BYTES,
+                )),
+            )
             .route("/api/v1/enclaves/{id}/public-key", get(pool_public_key))
             .route("/api/v1/enclaves", get(pool_enclaves))
             .with_state(relay.clone())
@@ -1128,7 +1133,9 @@ impl Watched {
             .down
             .filter(|(during, _)| *during == step)
             .map(|(_, enclave)| enclave);
+        let started = std::time::Instant::now();
         let result = run.await;
+        println!("  {step}: {:.3}s", started.elapsed().as_secs_f64());
         *self.relay.down.lock().unwrap() = None;
         let load = self.relay.load.lock().unwrap();
         self.seen
@@ -1189,6 +1196,11 @@ struct ArkadePool {
 
 impl ArkadePool {
     async fn start(count: usize, enclaves: usize) -> Self {
+        Self::start_with(pool_parameters(count), enclaves).await
+    }
+
+    async fn start_with(params: ContractParameters, enclaves: usize) -> Self {
+        let count = params.players.len();
         use coordinator_ark::testing::{keypair, mock_info, xonly};
         use coordinator_ark::{escrow_terms, server_rules, EscrowInput, PoolFunding};
 
@@ -1208,7 +1220,7 @@ impl ArkadePool {
             })
             .collect();
         let harness = PoolHarness::start_with(
-            pool_parameters(count),
+            params,
             Consent {
                 escrows: Some(&escrows),
                 enclaves,
@@ -1366,9 +1378,10 @@ async fn an_enclave_failing_its_share_fails_the_kickoff_step() {
     pool.harness.stop().await;
 }
 
-/// Outside a batch the journal is durable, and the contract's permits still go one at a time.
+/// Outside a batch, permits remain sequential and each concurrent signing round
+/// checkpoints all of its requests. A completed retry reloads the saved results.
 #[tokio::test]
-async fn durable_contract_signing_sends_one_request_at_a_time() {
+async fn durable_contract_signing_checkpoints_concurrent_rounds_and_replays_them() {
     let pool = PoolHarness::start_with(
         pool_parameters(6),
         Consent {
@@ -1411,7 +1424,20 @@ async fn durable_contract_signing_sends_one_request_at_a_time() {
         hooks.signed_contract().unwrap().all_signatures(),
     )
     .unwrap();
-    assert_eq!(pool.relay.load.lock().unwrap().most, 1);
+    {
+        let load = pool.relay.load.lock().unwrap();
+        assert!(load.most > 1 && load.most <= 3);
+        assert_eq!(load.most_on_one, 1);
+    }
+    let original = hooks.signed_contract().unwrap().all_signatures().clone();
+    pool.relay.reset_load_peaks();
+    coordinator_ark::KickoffHooks::before_forfeits(&hooks, funding, &commitment)
+        .await
+        .unwrap();
+    assert_eq!(hooks.signed_contract().unwrap().all_signatures(), &original);
+    // Keygen liveness probes may still contact enclaves. The completed nonce
+    // and partial rounds must come from the durable journal on this retry.
+    assert!(pool.relay.load.lock().unwrap().most <= 1);
     pool.stop().await;
 }
 
@@ -2230,4 +2256,63 @@ fn assert_recovered_swap(
         .unwrap();
     assert_eq!(&paid.script, expected_script);
     assert_eq!(paid.amount, expected_amount);
+}
+
+/// Real encrypted transport, three enclave operators, all contract and forfeit
+/// signatures verified. The scripted Arkade server does not spend real funds.
+///
+/// Run with `cargo test -p coordinator --lib --release --features e2e-testing
+/// twenty_player_two_place_arkade_kickoff_benchmark -- --ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "20-player, two-place kickoff timing; run optimized"]
+async fn twenty_player_two_place_arkade_kickoff_benchmark() {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .filter_level(log::LevelFilter::Off)
+        .filter_module(
+            "coordinator::infra::keymeld::confidential_service",
+            log::LevelFilter::Info,
+        )
+        .try_init();
+    let mut params = pool_parameters(20);
+    params
+        .outcome_payouts
+        .retain(|outcome, _| *outcome == Outcome::Expiry);
+    params.event.locking_points.clear();
+    params.outcome_bound_splits = true;
+    for winner in 0..20 {
+        for runner_up in 0..20 {
+            if winner == runner_up {
+                continue;
+            }
+            let index = params.event.locking_points.len();
+            let mut secret = [0u8; 32];
+            secret[28..].copy_from_slice(&(index as u32 + 1).to_be_bytes());
+            params
+                .event
+                .locking_points
+                .push(Scalar::from_slice(&secret).unwrap().base_point_mul().into());
+            params.outcome_payouts.insert(
+                Outcome::Attestation(index),
+                BTreeMap::from([(winner, 70), (runner_up, 30)]),
+            );
+        }
+    }
+    let pool = ArkadePool::start_with(params, 3).await;
+    let signer = Watched::new(pool.keymeld.clone(), pool.harness.relay.clone(), None);
+    for batch_nonce in 0..2 {
+        let started = std::time::Instant::now();
+        let (kickoff, forfeits) = pool.kick_off(&signer, batch_nonce).await;
+        let kickoff = kickoff.unwrap();
+        let duration = started.elapsed();
+        assert_eq!(forfeits.len(), 20);
+        let signed = pool.keymeld.signed_contract().unwrap();
+        assert_eq!(signed.dlc().funding_outpoint(), kickoff.funding);
+        assert!(signed.expiry_tx().is_some());
+        println!(
+            "20 players / 2 places / 3 enclaves, attempt {batch_nonce}: full mock kickoff {:.3}s",
+            duration.as_secs_f64()
+        );
+    }
+    pool.harness.stop().await;
 }

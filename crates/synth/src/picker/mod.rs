@@ -256,7 +256,7 @@ impl Picker {
         // One request for the stations and their forecasts where the oracle offers it, rather
         // than one per batch of stations: lanes starting together sent the oracle more than it
         // takes at once.
-        let (source, all, forecasts) = match self
+        let (source, mut all, forecasts) = match self
             .oracle
             .eligible_forecasts(settings.eligible_days, start, end)
             .await?
@@ -274,6 +274,13 @@ impl Picker {
                 (source, all, None)
             }
         };
+        let now = OffsetDateTime::now_utc();
+        all.retain(|station| {
+            station.coverage.as_ref().is_some_and(|coverage| {
+                coverage.current(settings.eligible_days, window_hours, now)
+                    && coverage.forecast_through >= end
+            })
+        });
         let (avoided, candidates): (Vec<StationInfo>, Vec<StationInfo>) = all
             .into_iter()
             .partition(|station| recent.contains(&station.station_id));
@@ -383,7 +390,7 @@ impl Picker {
         let mut cache = self.eligible.lock().await;
         if let Some((read, stations)) = cache.get(&(days, window_hours)) {
             if read.elapsed() < LIST_TTL {
-                return Ok(stations.clone());
+                return current_stations(stations.clone(), days, window_hours);
             }
         }
         // Never extend an expired success after an error, and never substitute a directory list.
@@ -399,8 +406,28 @@ impl Picker {
             "Oracle lists no eligible stations; no competition was created"
         );
         cache.insert((days, window_hours), (Instant::now(), stations.clone()));
-        Ok(stations)
+        current_stations(stations, days, window_hours)
     }
+}
+
+/// Recheck timestamps even when using a locally cached eligible list.
+fn current_stations(
+    mut stations: Vec<StationInfo>,
+    days: u32,
+    hours: u64,
+) -> anyhow::Result<Vec<StationInfo>> {
+    let now = OffsetDateTime::now_utc();
+    stations.retain(|station| {
+        station
+            .coverage
+            .as_ref()
+            .is_some_and(|coverage| coverage.current(days, hours, now))
+    });
+    anyhow::ensure!(
+        !stations.is_empty(),
+        "Oracle has no stations with current coverage evidence; no competition was created"
+    );
+    Ok(stations)
 }
 
 /// The eligible stations a lane draws from: all of them, or those of its own it lists.
@@ -429,9 +456,10 @@ pub(crate) mod fixtures {
     pub fn picker(db: crate::db::SynthDb) -> super::Picker {
         use axum::{routing::get, Json, Router};
         let app = Router::new()
-            .route("/stations/eligible", get(|| async {
+            .route("/stations/eligible", get(|axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+                let hours = query.get("window_hours").and_then(|h| h.parse().ok()).unwrap_or(24);
                 Json(["KDEN", "KJFK", "KORD", "KSEA", "KBOS", "KATL", "KLAX"].into_iter()
-                    .map(|id| serde_json::json!({"station_id":id,"latitude":40.0,"longitude":-100.0})).collect::<Vec<_>>())
+                    .map(|id| { let mut s = station(id, "", (40.0, -100.0)); s.coverage = Some(coverage(hours)); s }).collect::<Vec<_>>())
             }))
             .route("/stations/forecasts", get(|| async {
                 Json(["KDEN", "KJFK", "KORD", "KSEA", "KBOS", "KATL", "KLAX"].into_iter()
@@ -453,6 +481,20 @@ pub(crate) mod fixtures {
             iata_id: (!iata.is_empty()).then(|| iata.into()),
             latitude: Some(at.0),
             longitude: Some(at.1),
+            coverage: Some(coverage(24)),
+        }
+    }
+
+    pub fn coverage(hours: u32) -> super::oracle::Coverage {
+        let now = time::OffsetDateTime::now_utc();
+        super::oracle::Coverage {
+            clean_days: 3,
+            days_checked: 3,
+            last_report: now - time::Duration::minutes(10),
+            forecast_through: now + time::Duration::days(7),
+            coverage_checked_at: now,
+            recent_window_hours: hours,
+            max_report_gap_seconds: 3600,
         }
     }
 

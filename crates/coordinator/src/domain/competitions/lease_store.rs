@@ -46,6 +46,30 @@ fn expiry(ttl: Duration) -> i64 {
 }
 
 impl CompetitionStore {
+    /// Admit one Arkade kickoff across all coordinator processes. Pools share
+    /// enclave CPU, so competing kickoffs must wait before joining a timed batch.
+    /// Keep renewing until work completes, including when it returns an error;
+    /// never cancel financial side effects because another lease was observed.
+    pub async fn with_arkade_kickoff<F: Future>(
+        &self,
+        work: F,
+    ) -> Result<Option<F::Output>, anyhow::Error> {
+        const TTL: Duration = Duration::from_secs(300);
+        // A distinct holder per invocation also excludes competing pools in one
+        // process: acquire_lease otherwise permits the holder to renew itself.
+        let holder = uuid::Uuid::now_v7().to_string();
+        let Some(lease) = self.acquire_lease("arkade:kickoff", &holder, TTL).await? else {
+            return Ok(None);
+        };
+        let result = while_leased(self, &lease, TTL, work).await;
+        if let Err(error) = self.release_lease(&lease).await {
+            warn!("Cannot release Arkade kickoff capacity: {error}");
+        }
+        result
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("Arkade kickoff capacity lease was lost"))
+    }
+
     /// Take `resource` for `holder` until `ttl` from now, if nobody else holds it.
     ///
     /// The holder's own lease is extended with the same token. An expired or released lease

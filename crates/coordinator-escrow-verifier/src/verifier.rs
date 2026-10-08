@@ -43,6 +43,7 @@ pub struct CoordinatorVerifier {
     witness: Option<Arc<dyn crate::witness::ReservationWitness>>,
     /// Completed contracts already verified, so a kickoff's forfeits verify theirs once.
     contracts: payout::VerifiedContracts,
+    signing_requirements: crate::signing_requirements::SigningRequirements,
 }
 impl CoordinatorVerifier {
     /// Enables network preparation only in this statically registered verifier.
@@ -704,7 +705,7 @@ fn validate_signing_scope(
     manifest: &SignedSessionManifest,
     signed: &SignedEscrowPolicy,
     bound: &BoundContract,
-    contract: &ContractCommitment,
+    requirements: &crate::signing_requirements::Requirements,
     scope: &SigningScope,
 ) -> Result<(), VerificationError> {
     scope
@@ -720,7 +721,7 @@ fn validate_signing_scope(
     // never needs one message twice under the same point (or twice without one); if it did, the
     // requirements could not be told apart, so it is refused rather than signed once.
     let mut expected = BTreeMap::new();
-    for (message, item) in payout::signing_requirements(contract).map_err(invalid)? {
+    for (message, item) in requirements {
         if !item
             .signers
             .iter()
@@ -729,7 +730,7 @@ fn validate_signing_scope(
             continue;
         }
         if expected
-            .insert((escrow::sha256(&message), item.adaptor_point), item)
+            .insert((escrow::sha256(message), item.adaptor_point), item)
             .is_some()
         {
             return Err(invalid(
@@ -822,7 +823,7 @@ fn validate_signing_scope(
 fn expand_signing_scope(
     manifest: &SignedSessionManifest,
     bound: &BoundContract,
-    contract: &ContractCommitment,
+    requirements: &crate::signing_requirements::Requirements,
     items: &[ContractItem],
 ) -> Result<SigningScope, VerificationError> {
     // A message signed under several adaptor points (see `payout::signing_requirements`) takes
@@ -831,9 +832,9 @@ fn expand_signing_scope(
     // only points the contract pairs with the message, each once; it changes the permitted scope,
     // whose digest the Coordinator and the signing enclave then fail to match.
     let mut adaptor_points = BTreeMap::<_, VecDeque<_>>::new();
-    for (message, item) in payout::signing_requirements(contract).map_err(invalid)? {
+    for (message, item) in requirements {
         adaptor_points
-            .entry(escrow::sha256(&message))
+            .entry(escrow::sha256(message))
             .or_default()
             .push_back(item.adaptor_point);
     }
@@ -905,14 +906,24 @@ fn prepare_contract_signing(
     bound: &BoundContract,
     policy: &PayoutPolicy,
     ark_funding: Option<ArkFunding>,
-    scope: impl FnOnce(&ContractCommitment) -> Result<SigningScope, VerificationError>,
+    requirements: &crate::signing_requirements::SigningRequirements,
+    scope: impl FnOnce(
+        &crate::signing_requirements::Requirements,
+    ) -> Result<SigningScope, VerificationError>,
 ) -> Result<PreparedAction, VerificationError> {
     if context.rule != generic::CONTRACT_RULE || context.permission_id != generic::SIGN_CONTRACT {
         return Err(invalid("Contract signing permission differs"));
     }
     let contract = funded(bound, policy, ark_funding.as_ref())?;
-    let scope = scope(&contract)?;
-    validate_signing_scope(context.manifest, context.policy, bound, &contract, &scope)?;
+    let requirements = requirements.get(&contract).map_err(invalid)?;
+    let scope = scope(&requirements)?;
+    validate_signing_scope(
+        context.manifest,
+        context.policy,
+        bound,
+        &requirements,
+        &scope,
+    )?;
     let action = Action::Sign { scope };
     context
         .attempt
@@ -1319,13 +1330,25 @@ impl EscrowVerifier for CoordinatorVerifier {
                 ActionParameters::DeleteArkIntent { .. } => {
                     Err(invalid("An intent delete is prepared without a binding"))
                 }
-                ActionParameters::SignContract { scope, ark_funding } => {
-                    prepare_contract_signing(&context, &bound, &policy, ark_funding, |_| Ok(scope))
-                }
+                ActionParameters::SignContract { scope, ark_funding } => prepare_contract_signing(
+                    &context,
+                    &bound,
+                    &policy,
+                    ark_funding,
+                    &self.signing_requirements,
+                    |_| Ok(scope),
+                ),
                 ActionParameters::SignContractCompact { items, ark_funding } => {
-                    prepare_contract_signing(&context, &bound, &policy, ark_funding, |contract| {
-                        expand_signing_scope(context.manifest, &bound, contract, &items)
-                    })
+                    prepare_contract_signing(
+                        &context,
+                        &bound,
+                        &policy,
+                        ark_funding,
+                        &self.signing_requirements,
+                        |requirements| {
+                            expand_signing_scope(context.manifest, &bound, requirements, &items)
+                        },
+                    )
                 }
                 ActionParameters::SignArkEscrow { spend } => {
                     if context.rule != generic::ARK_ESCROW_RULE
@@ -1562,11 +1585,12 @@ impl EscrowVerifier for CoordinatorVerifier {
                         return Err(invalid("Prepared action is not contract signing"));
                     };
                     let contract = funded(&bound, &policy, ark_funding.as_ref())?;
+                    let requirements = self.signing_requirements.get(&contract).map_err(invalid)?;
                     validate_signing_scope(
                         context.manifest,
                         context.policy,
                         &bound,
-                        &contract,
+                        &requirements,
                         scope,
                     )?;
                 }
@@ -1682,11 +1706,12 @@ impl EscrowVerifier for CoordinatorVerifier {
                         return Err(invalid("Restored action is not contract signing"));
                     };
                     let contract = funded(&bound, &policy, ark_funding.as_ref())?;
+                    let requirements = self.signing_requirements.get(&contract).map_err(invalid)?;
                     validate_signing_scope(
                         context.manifest,
                         context.policy,
                         &bound,
-                        &contract,
+                        &requirements,
                         scope,
                     )?;
                 }

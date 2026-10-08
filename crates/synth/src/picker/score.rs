@@ -260,8 +260,17 @@ pub fn rank(mut scored: Vec<Scored>, prefer_known_airports: bool) -> Vec<Scored>
         candidate.components.score + bonus
     };
     scored.sort_by(|a, b| {
-        band(b)
-            .total_cmp(&band(a))
+        a.station
+            .coverage
+            .as_ref()
+            .is_none_or(|c| c.missed_report())
+            .cmp(
+                &b.station
+                    .coverage
+                    .as_ref()
+                    .is_none_or(|c| c.missed_report()),
+            )
+            .then_with(|| band(b).total_cmp(&band(a)))
             .then_with(|| {
                 (prefer_known_airports && b.known_airport())
                     .cmp(&(prefer_known_airports && a.known_airport()))
@@ -344,6 +353,15 @@ pub fn explain(picked: &[Picked]) -> String {
                 ];
                 facts.extend(weather.extreme_words().into_iter().map(str::to_string));
                 facts.push(format!("score {:.2}", scored.components.score));
+                if let Some(coverage) = &scored.station.coverage {
+                    facts.push(format!(
+                        "coverage {}/{} clean days, latest {}h gap at most {} min",
+                        coverage.clean_days,
+                        coverage.days_checked,
+                        coverage.recent_window_hours,
+                        coverage.max_report_gap_seconds.div_ceil(60)
+                    ));
+                }
                 words.push(facts.join(", "));
             }
             let role = match pick.role {
@@ -374,6 +392,20 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    #[test]
+    fn coverage_margin_ranks_before_weather_and_airport_bonus() {
+        let mut stormy = scored("KGAP", "GAP", (0.0, 0.0), 1.0);
+        stormy
+            .station
+            .coverage
+            .as_mut()
+            .unwrap()
+            .max_report_gap_seconds = 120 * 60;
+        let steady = scored("KCLN", "", (0.0, 0.0), 0.1);
+        let ranked = rank(vec![stormy, steady], true);
+        assert_eq!(ranked[0].station.station_id, "KCLN");
     }
 
     const DENVER: (f64, f64) = (39.86, -104.67);
@@ -449,7 +481,7 @@ mod tests {
         let line = explain(&choose(&rank(scored, true), 1, 0.0));
         assert_eq!(
             line,
-            "KDEN swing 31 °F, wind 35 mph, precip 70%, very cold, snow, score 1.00: leader"
+            "KDEN swing 31 °F, wind 35 mph, precip 70%, very cold, snow, score 1.00, coverage 3/3 clean days, latest 24h gap at most 60 min: leader"
         );
     }
 

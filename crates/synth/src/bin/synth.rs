@@ -140,6 +140,16 @@ async fn main() -> anyhow::Result<()> {
     let following = tracker.clone();
     tokio::spawn(async move { following.run().await });
 
+    // Keep-open includes visitor checks. Every other mode needs the same observation,
+    // including manual-only operation, without enabling competition creation.
+    if !config.scheduler.enabled
+        || config.scheduler.lanes.is_empty()
+        || config.scheduler.keep_open.is_none()
+    {
+        let observer = runner.clone();
+        tokio::spawn(async move { observer.run_visitor_checks().await });
+    }
+
     // Start scheduled runner if enabled
     if config.scheduler.enabled {
         let scheduler_runner = runner.clone();

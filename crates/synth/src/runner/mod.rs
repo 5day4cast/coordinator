@@ -350,7 +350,14 @@ impl Runner {
         self
     }
 
-    /// What the keep-open check last found: None before its first check, or without one.
+    /// Observe entry forms without starting any competitions.
+    pub async fn run_visitor_checks(&self) {
+        keep_open::KeepOpen::default()
+            .run(self.client.clone(), self.db.clone(), self.open.clone())
+            .await;
+    }
+
+    /// What the visitor check last found: None before its first successful check.
     pub fn open_status(&self) -> Option<keep_open::OpenStatus> {
         *self
             .open

@@ -28,6 +28,15 @@ When the observation window starts in the future and lasts 1 to 48 whole hours, 
 
 After synth starts, each lane's first run waits 45 seconds more than the lane before it. If a lane's run creates no competition, because its stations could not be picked or confirmed or the coordinator refused creation, the attempt is recorded as a failed run with the step it failed at (`pick_stations`, `plan_run` or `create_competition`) and counted in `synth_scenario_runs_total`. The lane tries again five minutes later, up to three times, and counts each retry in `synth_lane_start_retries_total{lane}`. A retry is skipped if the lane started another run meanwhile, or if it would leave less than half of an aligned lane's entry window. A failed start does not hold back the keep-open check, which starts the keep-open lane again at its next check when nothing else is open.
 
+Oracle 2.9.1 coverage evidence is required. Synth checks the requested history and
+window, report freshness, coverage timestamp, and forecast extent before selection.
+These checks also run against locally cached lists. Missing or expired evidence
+stops creation before players pay.
+
+Stations whose latest window needs no missed-report allowance rank first.
+Weather scores and the airport preference rank stations within that coverage group.
+Each saved selection includes its clean-day count and largest recent report gap.
+
 The default eligibility lookback is three days. Eligibility describes recent coverage; it cannot guarantee future reports. Settlement still waits for the Oracle's observation and coverage checks. Use the saved weather selection and the competition's Oracle event to investigate a delay.
 
 ## Authorize operator writes
