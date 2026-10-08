@@ -38,7 +38,7 @@ pub fn auth_modals(recovery: RecoveryHelp, satchel: Option<&str>) -> Markup {
         (login_modal())
 
         // Registration Modal
-        (register_modal(recovery))
+        (register_modal(recovery, satchel))
 
         // Forgot Password Modal
         (forgot_password_modal())
@@ -166,22 +166,59 @@ fn login_modal() -> Markup {
 
 /// Where winnings are paid. Required at signup so payouts need no further
 /// input from the winner.
-fn lightning_address_field(id: &str) -> Markup {
+fn lightning_address_field(id: &str, satchel: Option<&str>) -> Markup {
+    let choice_id = format!("{id}Source");
+    let help_id = format!("{id}Help");
     html! {
         div class="field" data-telemetry="off" {
-            label class="label" for=(id) { "Lightning Address" }
-            div class="control" {
-                input class="input" type="text" id=(id) placeholder="you@cash.app"
-                      autocomplete="off" spellcheck="false";
+            @if satchel.is_some() {
+                label class="label" for=(&choice_id) { "Wallet for your winnings" }
+                div class="control" {
+                    div class="select is-fullwidth" {
+                        select id=(&choice_id) data-wallet-choice=(id) aria-describedby=(&help_id) {
+                            option value="satchel" { "Set up Satchel (recommended)" }
+                            option value="address" { "I already have a Lightning Address" }
+                        }
+                    }
+                }
+                p class="help" id=(&help_id) {
+                    "Satchel works in your browser. Next, connect a wallet to this account to pay entry fees and receive winnings."
+                }
             }
-            p class="help" {
-                "Winnings are paid here automatically. Cash App users: your $cashtag followed by @cash.app."
+            div id=(format!("{id}Fields")) class=(if satchel.is_some() { "mt-3 is-hidden" } else { "" }) {
+                label class="label" for=(id) { "Lightning Address" }
+                div class="control" {
+                    input class="input" type="text" id=(id) placeholder="you@wallet.com"
+                          autocomplete="off" spellcheck="false" aria-describedby=(format!("{id}Hint"));
+                }
+                p class="help" id=(format!("{id}Hint")) {
+                    "Winnings are paid here automatically. Use your wallet's address in name@domain format (LNURL-pay), not an invoice."
+                }
             }
         }
     }
 }
 
-fn register_modal(recovery: RecoveryHelp) -> Markup {
+fn signup_satchel_setup(satchel: &str, id: &str) -> Markup {
+    html! {
+        div id=(id) class="notification is-info is-light mt-4 is-hidden" {
+            p class="has-text-weight-semibold" { "Connect your Satchel wallet" }
+            ol class="ml-4 mt-2" {
+                li { "Open Satchel below. It uses this account, so you do not need another password." }
+                li { "Create your wallet, or continue with the wallet you already have for this account." }
+                li { "Return to this tab and finish signup. We will fill in your Lightning Address automatically." }
+            }
+            a class="button is-info mt-3" href=(format!("{satchel}/wallet")) target="_blank" rel="noopener"
+              data-satchel-next="/wallet" data-signup-satchel {
+                "Set up Satchel"
+            }
+            p class="help mt-2" { "Satchel opens in a new tab. Keep this signup tab open." }
+            p class="help is-danger" data-satchel-status role="status" {}
+        }
+    }
+}
+
+fn register_modal(recovery: RecoveryHelp, satchel: Option<&str>) -> Markup {
     html! {
         // The worker that solves the sign-up proof of work (signup_pow.js).
         div id="registerModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="registerModalTitle" tabindex="-1"
@@ -221,7 +258,7 @@ fn register_modal(recovery: RecoveryHelp) -> Markup {
                                           placeholder="Confirm your password";
                                 }
                             }
-                            (lightning_address_field("registerLightningAddress"))
+                            (lightning_address_field("registerLightningAddress", satchel))
                             p class="help is-danger mt-2" id="usernameRegisterError" {}
                             button class="button is-info is-fullwidth mt-4" id="usernameRegisterStep1Button" {
                                 "Continue"
@@ -254,6 +291,9 @@ fn register_modal(recovery: RecoveryHelp) -> Markup {
                                     " I have saved my recovery key in a safe place"
                                 }
                             }
+                            @if let Some(satchel) = satchel {
+                                (signup_satchel_setup(satchel, "usernameSatchelSetup"))
+                            }
                             p class="help is-danger mt-2" id="usernameRegisterStep2Error" {}
                             button class="button is-success is-fullwidth mt-4"
                                    id="usernameRegisterStep2Button" disabled {
@@ -271,11 +311,15 @@ fn register_modal(recovery: RecoveryHelp) -> Markup {
 
                     div id="registerExtension" role="tabpanel" aria-labelledby="registerExtensionTab" class="is-hidden" {
                         (extension_note())
-                        (lightning_address_field("extensionLightningAddress"))
+                        (lightning_address_field("extensionLightningAddress", satchel))
+                        @if let Some(satchel) = satchel {
+                            (signup_satchel_setup(satchel, "extensionSatchelSetup"))
+                        }
                         div class="field" {
                             div class="control" {
                                 button class="button is-info is-fullwidth" id="extensionRegisterButton" {
-                                    "Register with Extension"
+                                    @if satchel.is_some() { "Connect extension to continue" }
+                                    @else { "Register with Extension" }
                                 }
                             }
                             p class="help is-danger mt-2" id="extensionRegisterError" {}
@@ -387,19 +431,24 @@ fn payment_modal(satchel: bool) -> Markup {
                         // so the invoice text itself is not shown.
                         div id="qrContainer" class="has-text-centered mb-2" {}
                         p id="copyFeedback" class="has-text-centered has-text-weight-semibold mb-3" role="status" aria-live="polite" {
-                            "Tap the QR code to copy the invoice"
+                            "Scan with your wallet, or click the QR code to copy the invoice"
                         }
 
                         // Links that hand the invoice to a wallet app on this
                         // device; entry_form.js fills in their hrefs.
                         div id="walletLinks" class="buttons is-centered mb-4" {
-                            a id="walletLinkLightning" class="button is-link is-light" { "Open in wallet" }
-                            a id="walletLinkZeus" class="button is-light" { "Pay with Zeus" }
+                            a id="walletLinkLightning" class="button is-light is-hidden" { "Open wallet app" }
+                            a id="walletLinkZeus" class="button is-light is-hidden" { "Pay with Zeus" }
                             // Opens the invoice in Satchel, signed in as the player (shared/satchel.js).
                             @if satchel {
-                                a id="walletLinkSatchel" class="button is-light" target="_blank" rel="noopener" { "Pay with Satchel" }
+                                a id="walletLinkSatchel" class="button is-info" target="_blank" rel="noopener" { "Pay with Satchel" }
                             }
-                            a id="walletLinkCashApp" class="button is-light" target="_blank" rel="noopener noreferrer" { "Pay with Cash App" }
+                            a id="walletLinkCashApp" class="button is-light is-hidden" target="_blank" rel="noopener noreferrer" { "Pay with Cash App" }
+                        }
+                        @if satchel {
+                            p class="help has-text-centered" {
+                                "Satchel opens in your browser with this invoice ready to pay. Return here after paying."
+                            }
                         }
 
                         div id="paymentStatus" class="mt-4" {
@@ -502,5 +551,25 @@ mod tests {
             r#"id="registerModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="registerModalTitle" tabindex="-1" data-pow-worker="{}""#,
             POW_WORKER_JS.url
         )));
+    }
+
+    #[test]
+    fn sign_up_offers_linked_wallet_setup_only_when_satchel_is_configured() {
+        let html = auth_modals(RecoveryHelp::Off, Some("https://wallet.example.org")).into_string();
+        for id in [
+            "registerLightningAddressSource",
+            "extensionLightningAddressSource",
+        ] {
+            assert!(html.contains(&format!(r#"id="{id}""#)));
+        }
+        assert_eq!(html.matches("Set up Satchel (recommended)").count(), 2);
+        assert_eq!(html.matches("data-signup-satchel").count(), 2);
+        assert!(html.contains("fill in your Lightning Address automatically"));
+        assert!(html.contains(r#"href="https://wallet.example.org/wallet""#));
+
+        let html = auth_modals(RecoveryHelp::Off, None).into_string();
+        assert!(!html.contains("Satchel"));
+        assert!(!html.contains("data-wallet-choice"));
+        assert!(html.contains(r#"id="registerLightningAddress""#));
     }
 }

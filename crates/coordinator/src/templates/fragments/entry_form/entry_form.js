@@ -189,28 +189,35 @@ class Entry {
     $qrButton.setAttribute("aria-label", "Copy the Lightning invoice");
     const $qrBadge = document.createElement("span");
     $qrBadge.className = "payment-qr-badge";
-    $qrBadge.textContent = "Tap to copy";
+    $qrBadge.textContent = "Copy invoice";
     $qrButton.append($qrCode, $qrBadge);
     $qrContainer.replaceChildren($qrButton);
 
     // Deep links into wallet apps, set only after the invoice was checked above.
     document.getElementById("walletLinkLightning").href = `lightning:${invoice}`;
     document.getElementById("walletLinkZeus").href = `zeusln:lightning:${invoice}`;
+    const mobile = supportsWalletApps();
+    for (const id of ["walletLinkLightning", "walletLinkZeus"]) {
+      document.getElementById(id).classList.toggle("is-hidden", !mobile);
+    }
     // Cash App pays only mainnet invoices (lnbc…, but lnbcrt… is regtest):
     // https://docs.voltageapi.com/wallet-deep-linking
     const $cashApp = document.getElementById("walletLinkCashApp");
     const mainnet = /^lnbc(?!rt)/i.test(invoice);
-    $cashApp.classList.toggle("is-hidden", !mainnet);
+    $cashApp.classList.toggle("is-hidden", !mobile || !mainnet);
+    $cashApp.removeAttribute("href");
     if (mainnet) $cashApp.href = `https://cash.app/launch/lightning/${invoice}`;
     // Satchel, a test-network wallet, when this site offers it; shared/satchel.js signs the
     // player in there before it opens the invoice.
     const $satchel = document.getElementById("walletLinkSatchel");
     if ($satchel) {
-      $satchel.dataset.satchelNext = `/launch/lightning/${invoice}`;
+      $satchel.dataset.satchelNext = `/launch/lightning/${encodeURIComponent(invoice)}`;
       $satchel.href = `${document.body.dataset.satchelUrl}${$satchel.dataset.satchelNext}`;
     }
 
-    const hint = "Tap the QR code to copy the invoice";
+    const hint = mobile
+      ? "Tap the QR code to copy the invoice, or open a wallet below"
+      : "Scan with your phone wallet, or click the QR code to copy the invoice";
     $copyFeedback.textContent = hint;
     const copyInvoice = async () => {
       try {
@@ -228,7 +235,7 @@ class Entry {
         $text.remove();
         if (!copied) {
           console.error("Failed to copy:", err);
-          $copyFeedback.textContent = "Could not copy; use a wallet button below";
+          $copyFeedback.textContent = "Could not copy. Scan the QR code with your wallet instead.";
           return;
         }
       }
@@ -624,12 +631,24 @@ let pendingEntry = null;
 // Admission is synchronous: navigating while terms load must not start another ticket.
 let submissionBusy = false;
 
+// A narrow desktop window still cannot launch a phone's wallet app. iPadOS
+// identifies as a Mac, but unlike a Mac it has a touchscreen.
+function supportsWalletApps() {
+  if (typeof navigator === "undefined") return false;
+  return navigator.userAgentData?.mobile === true
+    || /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || "")
+    || (/Macintosh/i.test(navigator.userAgent || "") && navigator.maxTouchPoints > 1);
+}
+
 function clearPaymentModal(modal, qrContainer) {
   const idle = document.createElement("div");
   idle.id = "paymentStatus";
   document.getElementById("paymentStatus")?.replaceWith(idle);
   qrContainer.replaceChildren();
-  document.querySelectorAll("#walletLinks a").forEach((a) => a.removeAttribute("href"));
+  document.querySelectorAll("#walletLinks a").forEach((a) => {
+    a.removeAttribute("href");
+    delete a.dataset.satchelNext;
+  });
   closeModal(modal);
   delete modal.dataset.ticketId;
 }

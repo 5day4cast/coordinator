@@ -35,6 +35,14 @@ function resetRegisterModal() {
   for (const id of ["registerLightningAddress", "extensionLightningAddress"]) {
     const input = document.getElementById(id);
     if (input) input.value = "";
+    const source = document.getElementById(`${id}Source`);
+    if (source) {
+      source.value = "satchel";
+      updateSignupWalletChoice(source);
+    }
+  }
+  for (const id of ["usernameSatchelSetup", "extensionSatchelSetup"]) {
+    document.getElementById(id)?.classList.add("is-hidden");
   }
 
   const display = document.getElementById("usernameNsecDisplay");
@@ -230,6 +238,9 @@ class AuthManager {
         }
       });
     });
+    document.querySelectorAll("[data-wallet-choice]").forEach((choice) => {
+      choice.addEventListener("change", () => updateSignupWalletChoice(choice));
+    });
     document.querySelectorAll('.auth-tabs [role="tab"]').forEach((tab) => {
       tab.addEventListener("keydown", (event) => {
         const tabs = Array.from(tab.closest('[role="tablist"]').querySelectorAll('[role="tab"]'));
@@ -402,7 +413,8 @@ class AuthManager {
     const lightningAddress = normalizeLightningAddress(
       document.getElementById("registerLightningAddress")?.value,
     );
-    const addressError = validateLightningAddress(lightningAddress);
+    const useSatchel = signupUsesSatchel("registerLightningAddress");
+    const addressError = useSatchel ? null : validateLightningAddress(lightningAddress);
     if (addressError) {
       if (errorElement) errorElement.textContent = addressError;
       return;
@@ -416,13 +428,19 @@ class AuthManager {
 
       this.pendingRegistration = {
         username,
-        lightningAddress,
+        lightningAddress: useSatchel ? null : lightningAddress,
+        useSatchel,
+        pubkey: await session.nostrClient.getPublicKey(),
         authKey: credentials.authKey,
         sealedNsec: session.nostrClient.sealForLogin(credentials),
       };
 
       const display = document.getElementById("usernameNsecDisplay");
       if (display) display.value = session.nostrClient.recoveryKey();
+      const setup = document.getElementById("usernameSatchelSetup");
+      setup?.classList.toggle("is-hidden", !useSatchel);
+      const link = setup?.querySelector("[data-signup-satchel]");
+      if (link) link.dataset.satchelName = username;
 
       document
         .getElementById("usernameRegisterStep1")
@@ -452,6 +470,12 @@ class AuthManager {
     }
 
     try {
+      if (pending.pubkey && pending.pubkey !== await session.nostrClient.getPublicKey()) {
+        throw new Error("The signup key changed. Start signup again.");
+      }
+      if (pending.useSatchel) {
+        pending.lightningAddress = await signupSatchelAddress();
+      }
       this.authorizedClient = new AuthorizedClient(
         session.nostrClient,
         this.apiBase,
@@ -511,7 +535,9 @@ class AuthManager {
     } catch (error) {
       console.error("Registration step 2 failed:", error);
       if (errorElement)
-        errorElement.textContent = "Registration failed. Please try again.";
+        errorElement.textContent = pending.useSatchel
+          ? error.message || "Could not connect to Satchel. Please try again."
+          : "Registration failed. Please try again.";
     }
   }
 
@@ -519,10 +545,11 @@ class AuthManager {
     const errorElement = document.querySelector("#extensionRegisterError");
     if (errorElement) errorElement.textContent = "";
 
-    const lightningAddress = normalizeLightningAddress(
+    let lightningAddress = normalizeLightningAddress(
       document.getElementById("extensionLightningAddress")?.value,
     );
-    const addressError = validateLightningAddress(lightningAddress);
+    const useSatchel = signupUsesSatchel("extensionLightningAddress");
+    const addressError = useSatchel ? null : validateLightningAddress(lightningAddress);
     if (addressError) {
       if (errorElement) errorElement.textContent = addressError;
       return;
@@ -531,6 +558,17 @@ class AuthManager {
 
     try {
       await session.nostrClient.initialize(session.wasm.SignerType.NIP07, null);
+      if (useSatchel) {
+        const setup = document.getElementById("extensionSatchelSetup");
+        // The first click connects the extension, then offers a separate,
+        // synchronous click to open Satchel without a popup blocker.
+        if (setup?.classList.contains("is-hidden")) {
+          setup.classList.remove("is-hidden");
+          document.getElementById("extensionRegisterButton").textContent = "Finish signup";
+          return;
+        }
+        lightningAddress = await signupSatchelAddress();
+      }
       this.authorizedClient = new AuthorizedClient(
         session.nostrClient,
         this.apiBase,
@@ -544,8 +582,8 @@ class AuthManager {
       if (errorElement) {
         errorElement.textContent = error.message.includes("No NIP-07")
           ? "No Nostr extension found. Please install nos2x, Alby, or another NIP-07 compatible extension."
-          : data?.code === "pow_rejected"
-            ? data.error
+          : useSatchel || data?.code === "pow_rejected"
+            ? data?.error || error.message
             : "Registration failed. If you have already registered, please log in.";
       }
     }
@@ -919,6 +957,22 @@ class AuthManager {
   }
 
   switchRegisterTab(tab) {
+    // Changing signers invalidates a prepared signup. Keep the typed fields,
+    // but require a fresh key/recovery step before submitting with a password.
+    if (!tab.classList.contains("is-active")) {
+      this.pendingRegistration = null;
+      const display = document.getElementById("usernameNsecDisplay");
+      if (display) display.value = "";
+      const saved = document.getElementById("usernameNsecSavedCheckbox");
+      if (saved) saved.checked = false;
+      const finish = document.getElementById("usernameRegisterStep2Button");
+      if (finish) finish.disabled = true;
+      document.getElementById("usernameRegisterStep1")?.classList.remove("is-hidden");
+      document.getElementById("usernameRegisterStep2")?.classList.add("is-hidden");
+      document.getElementById("extensionSatchelSetup")?.classList.add("is-hidden");
+      const choice = document.getElementById("extensionLightningAddressSource");
+      if (choice) updateSignupWalletChoice(choice);
+    }
     document
       .querySelectorAll("#registerModal .tabs li")
       .forEach((t) => this.updateAuthTab(t, t === tab));
@@ -939,6 +993,39 @@ class AuthManager {
     button.setAttribute("aria-selected", String(selected));
     button.tabIndex = selected ? 0 : -1;
   }
+}
+
+function signupUsesSatchel(id) {
+  return document.getElementById(`${id}Source`)?.value === "satchel";
+}
+
+function updateSignupWalletChoice(choice) {
+  const id = choice.dataset.walletChoice;
+  const satchel = choice.value === "satchel";
+  document.getElementById(`${id}Fields`)?.classList.toggle("is-hidden", satchel);
+  document.getElementById(`${id}Help`)?.classList.toggle("is-hidden", !satchel);
+  if (id === "extensionLightningAddress") {
+    document.getElementById("extensionSatchelSetup")?.classList.add("is-hidden");
+    const button = document.getElementById("extensionRegisterButton");
+    if (button) button.textContent = satchel ? "Connect extension to continue" : "Register with Extension";
+  }
+}
+
+async function signupSatchelAddress() {
+  let address;
+  try {
+    address = await satchelAddress(satchelOrigin(), session.nostrClient);
+  } catch {
+    throw new Error("Could not check your Satchel wallet. Keep this tab open and try again.");
+  }
+  if (!address) {
+    throw new Error("Open Satchel and finish creating your wallet, then return here and finish signup.");
+  }
+  address = normalizeLightningAddress(address);
+  if (validateLightningAddress(address)) {
+    throw new Error("Satchel did not return a valid Lightning Address. Try again.");
+  }
+  return address;
 }
 
 

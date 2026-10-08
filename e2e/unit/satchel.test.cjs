@@ -7,13 +7,13 @@ const INVOICE = "lntbs53000n1ticket";
 
 // A page with Satchel configured (or not), and a player logged in with `signer` (or nobody).
 // `answer` is Satchel's answer to the address lookup.
-function page({ satchel = SATCHEL, signer = null, username = "alice", elements = {}, answer = null } = {}) {
+function page({ satchel = SATCHEL, signer = null, username = "alice", elements = {}, answer = null, blocked = false } = {}) {
   const listeners = {};
   const forms = [];
   const opened = [];
   const lookups = [];
   const fetched = [];
-  const tab = { location: { href: "" } };
+  const tab = { location: { href: "" }, close() { this.closed = true; } };
   const document = {
     body: {
       dataset: { apiBase: "https://5day4cast.com", ...(satchel ? { satchelUrl: satchel } : {}) },
@@ -37,9 +37,10 @@ function page({ satchel = SATCHEL, signer = null, username = "alice", elements =
     },
   };
   const window = {
+    location: { href: "" },
     open: (...args) => {
       opened.push(args);
-      return tab;
+      return blocked ? null : tab;
     },
   };
   class AuthorizedClient {
@@ -60,7 +61,7 @@ function page({ satchel = SATCHEL, signer = null, username = "alice", elements =
   const satchel_js = loadBundle(["shared/satchel.js"],
     { document, window, session, AuthorizedClient, fetch, console: { warn: () => {} } },
     ["handOffToSatchel", "offerSatchelAddress", "setupSatchel"]);
-  return { ...satchel_js, listeners, forms, opened, lookups, fetched, tab, session };
+  return { ...satchel_js, listeners, forms, opened, lookups, fetched, tab, session, window };
 }
 
 // A logged-in player's signer: their key in the page, or a Nostr extension.
@@ -143,6 +144,41 @@ test("a refused signature opens Satchel's sign-in in the tab instead", async () 
   await handOffToSatchel(click(payLink()));
   assert.deepEqual(forms, []);
   assert.equal(tab.location.href, `${SATCHEL}/launch/lightning/${INVOICE}`);
+});
+
+test("a blocked popup still opens the invoice in the current browser tab", async () => {
+  const { handOffToSatchel, forms } = page({ signer: signer(), blocked: true });
+  await handOffToSatchel(click(payLink()));
+  assert.equal(forms[0].target, "_self");
+  assert.equal(forms[0].children.find(input => input.name === "next").value, `/launch/lightning/${INVOICE}`);
+
+  const refused = page({ signer: signer({ refuse: true }), blocked: true });
+  await refused.handOffToSatchel(click(payLink()));
+  assert.equal(refused.window.location.href, payLink().href);
+});
+
+test("signup hands off its new key and suggested username without logging into a nonexistent account", async () => {
+  const player = signer();
+  const state = page({ signer: player });
+  const link = { dataset: { satchelNext: "/wallet", signupSatchel: "", satchelName: "newplayer" }, href: `${SATCHEL}/wallet` };
+  await state.handOffToSatchel(click(link));
+  assert.deepEqual(state.lookups, []);
+  assert.deepEqual(player.signed, [{ url: `${SATCHEL}/auth/nostr/handoff`, name: "newplayer" }]);
+  assert.equal(state.forms[0].target, "satchel");
+});
+
+test("signup retains its unsaved key when popups or signing are refused", async () => {
+  for (const blocked of [false, true]) {
+    const status = { textContent: "" };
+    const state = page({ signer: signer({ refuse: true }), blocked });
+    const link = { dataset: { satchelNext: "/wallet", signupSatchel: "" }, href: `${SATCHEL}/wallet`,
+      parentElement: { querySelector: () => status } };
+    await state.handOffToSatchel(click(link));
+    assert.deepEqual(state.forms, []);
+    assert.equal(state.window.location.href, "");
+    assert.equal(state.tab.location.href, "");
+    assert.match(status.textContent, blocked ? /Allow popups/ : /Could not connect/);
+  }
 });
 
 test("without Satchel configured, nothing is set up and links are left alone", async () => {

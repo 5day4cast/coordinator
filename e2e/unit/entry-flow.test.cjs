@@ -601,7 +601,7 @@ function payingPlayer({ ticket = () => ({ ok: true, json: async () => ({ ticket_
   payment_request: "lnbc53000n1ticket", ...price(), keymeld_session_id: "session",
   keymeld_registration: { user_id: "ticket", session_id: "session", payout_policy: "policy" } }) }),
   entry = () => ({ ok: true, json: async () => ({ id: "entry" }) }), sessionStorage,
-  unpaid = null, listed = [], timers = null, paid = null, satchel = null } = {}) {
+  unpaid = null, listed = [], timers = null, paid = null, satchel = null, navigator = {} } = {}) {
   const { elements, document } = entryPage();
   // The Satchel wallet this site offers beside Zeus, when it names one.
   if (satchel) {
@@ -641,6 +641,7 @@ function payingPlayer({ ticket = () => ({ ok: true, json: async () => ({ ticket_
   };
   const requests = [];
   const page = loggedIn({
+    navigator,
     sessionStorage,
     htmx: { process: () => {} },
     openModal: (dialog) => dialog.classList.add("is-active"),
@@ -740,7 +741,7 @@ test("closing the payment dialog gives Pay back; Pay reopens the same invoice, a
   assert.equal(tickets().length, 1);
 });
 
-test("a site that offers Satchel links the invoice to it beside Zeus", async () => {
+test("desktop payments offer Satchel in the browser and hide phone app links", async () => {
   const { elements, modal, pay } = payingPlayer({ satchel: "https://wallet.example.org" });
   await pay();
   assert.ok(modal.classList.contains("is-active"));
@@ -748,6 +749,33 @@ test("a site that offers Satchel links the invoice to it beside Zeus", async () 
   // shared/satchel.js signs the player in there and then opens this page.
   assert.equal(elements.walletLinkSatchel.dataset.satchelNext, "/launch/lightning/lnbc53000n1ticket");
   assert.equal(elements.walletLinkSatchel.href, "https://wallet.example.org/launch/lightning/lnbc53000n1ticket");
+  for (const id of ["walletLinkLightning", "walletLinkZeus", "walletLinkCashApp"]) {
+    assert.ok(elements[id].classList.contains("is-hidden"));
+  }
+  assert.match(elements.copyFeedback.textContent, /Scan with your phone/);
+});
+
+test("mobile payments retain app links, while Cash App remains limited to mainnet", async () => {
+  for (const navigator of [
+    { userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)" },
+    { userAgent: "Mozilla/5.0 (Linux; Android 15)" },
+    { userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15)", maxTouchPoints: 5 },
+    { userAgentData: { mobile: true } },
+  ]) {
+    const mainnet = payingPlayer({ navigator });
+    await mainnet.pay();
+    for (const id of ["walletLinkLightning", "walletLinkZeus", "walletLinkCashApp"]) {
+      assert.ok(!mainnet.elements[id].classList.contains("is-hidden"));
+    }
+    const signet = payingPlayer({ navigator, ticket: () => ({ ok: true, json: async () => ({
+      ticket_id: "ticket", payment_request: "lntbs53000n1ticket", ...price(),
+      keymeld_session_id: "session",
+      keymeld_registration: { user_id: "ticket", session_id: "session", payout_policy: "policy" },
+    }) }) });
+    await signet.pay();
+    assert.ok(signet.elements.walletLinkCashApp.classList.contains("is-hidden"));
+    assert.ok(!signet.elements.walletLinkZeus.classList.contains("is-hidden"));
+  }
 });
 
 function closeDialog(modal) {
