@@ -1134,7 +1134,13 @@ fn featured_card(competition: &CompetitionView, now: OffsetDateTime) -> Markup {
                         @if let Some(rule) = competition.prize_rule() { span class="cell-note prize-note" { (rule) } }
                     }
                 }
-                div { dt { "Entries" } dd { (competition.entries()) } }
+                div {
+                    dt { "Entries" }
+                    dd title=(competition.entries()) {
+                        span aria-hidden="true" { (competition.entries_compact()) }
+                        span class="is-sr-only" { (competition.entries()) }
+                    }
+                }
             }
             a class=(if competition.can_enter { "button is-primary is-fullwidth" } else { "button is-fullwidth" })
               href=(competition.url()) hx-get=(competition.url())
