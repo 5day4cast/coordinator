@@ -42,6 +42,38 @@ async fn formed_from(queue: Queue, players: usize) -> (Queue, Competition, Vec<U
 }
 
 #[tokio::test]
+async fn pools_keep_the_consented_locktime_after_the_server_default_changes() {
+    let start = OffsetDateTime::now_utc() - Duration::minutes(10);
+    let mut queue =
+        Queue::paying_with_locktime(start, PoolRules::new(2, 3).unwrap(), 100, 1, None).await;
+    assert_eq!(
+        queue
+            .competition
+            .event_submission
+            .relative_locktime_block_delta,
+        None
+    );
+    assert_eq!(queue.settings.terms.relative_locktime_block_delta, 72);
+    queue.coordinator.relative_locktime_block_delta = 2880;
+    let (queue, mut pool, _) = formed_from(queue, 5).await;
+    assert_eq!(
+        pool.event_submission.relative_locktime_block_delta,
+        Some(72)
+    );
+    assert_eq!(
+        queue.coordinator.contract_locktime(&pool).await.unwrap(),
+        72
+    );
+    // A pool persisted by an older coordinator also gets the saved consent when it
+    // builds its first contract, rather than the new default.
+    pool.event_submission.relative_locktime_block_delta = None;
+    assert_eq!(
+        queue.coordinator.contract_locktime(&pool).await.unwrap(),
+        72
+    );
+}
+
+#[tokio::test]
 async fn a_pool_event_copies_the_reference_lines_and_its_statement_is_checked() {
     let (queue, mut pool, members) = formed().await;
     let coordinator = &queue.coordinator;

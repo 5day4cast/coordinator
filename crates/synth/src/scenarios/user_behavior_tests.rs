@@ -28,6 +28,8 @@ struct Protocol {
     first_replacement_blocked: bool,
     /// Ticket requests are refused as the competition no longer accepts entries.
     tickets_closed: bool,
+    /// A coordinator rejection to exercise the real HTTP admission boundary.
+    ticket_rejection: Option<(u16, &'static str)>,
     duplicate_status: u16,
     closed: bool,
     refund_failure: Option<Uuid>,
@@ -106,6 +108,12 @@ async fn ticket(State(state): State<Shared>, Json(body): Json<Value>) -> (Status
     let key = body["btc_pubkey"].clone();
     let entry_id = body["payout"]["entry_id"].as_str().map(str::to_owned);
     state.ticket_requests.push(body);
+    if let Some((status, message)) = state.ticket_rejection {
+        return (
+            StatusCode::from_u16(status).unwrap(),
+            Json(json!({"error": message})),
+        );
+    }
     if state.tickets_closed {
         return (
             StatusCode::BAD_REQUEST,
@@ -922,6 +930,55 @@ async fn a_seat_taken_by_an_outside_player_skips_the_entry() {
             assert_eq!(step.error.as_deref(), Some("seat taken by outside player"));
         }
         assert!(mock.state.lock().unwrap().events.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn full_competition_response_stands_down_without_masking_admission_failures() {
+    for (status, message, expected) in [
+        (
+            400,
+            "Competition full, total_allowed_entries matches total_entries",
+            StepStatus::Skipped,
+        ),
+        (
+            400,
+            "No ticket available for competition",
+            StepStatus::Skipped,
+        ),
+        (
+            500,
+            "Competition full, total_allowed_entries matches total_entries",
+            StepStatus::Failed,
+        ),
+        (400, "Invalid payout registration", StepStatus::Failed),
+    ] {
+        let mock = Mock::new(Protocol {
+            capacity: 1,
+            others: 1,
+            ticket_rejection: Some((status, message)),
+            ..Default::default()
+        })
+        .await;
+        let user = SynthUser::new_random("alice").unwrap();
+        let (step, trace) = run_actor(
+            &mock.client,
+            &user,
+            std::slice::from_ref(&user),
+            &Uuid::now_v7(),
+            &config(1),
+            &Payer::TestEndpoint,
+            &plan(EntryBehavior::Complete),
+            Instant::now(),
+            OffsetDateTime::now_utc() + time::Duration::hours(1),
+        )
+        .await;
+        assert_eq!(step.status, expected, "HTTP {status}: {message}");
+        assert_eq!(trace.seat_taken, expected == StepStatus::Skipped);
+        assert!(!trace.paid);
+        let state = mock.state.lock().unwrap();
+        assert_eq!(state.attempts, 1);
+        assert!(state.events.is_empty(), "a refused seat must never pay");
     }
 }
 

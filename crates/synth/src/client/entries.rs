@@ -34,7 +34,12 @@ impl ApiRejection {
     }
 
     pub fn is_no_capacity(&self) -> bool {
-        self.status == 400 && self.message == "No ticket available for competition"
+        self.status == 400
+            && matches!(
+                self.message.as_str(),
+                "No ticket available for competition"
+                    | "Competition full, total_allowed_entries matches total_entries"
+            )
     }
 
     /// The competition closed to new entries, as it does once every seat is filled.
