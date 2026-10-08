@@ -68,8 +68,14 @@ const server = createServer((request, response) => {
     } else if (url.pathname === "/stations") {
       response.end(JSON.stringify(stations));
     } else if (/^\/oracle\/events\/[^/]+$/.test(url.pathname)) {
-      // A newly created event has no stored readings. Its UI must obtain the early forecast.
-      response.end(JSON.stringify({ readings: [], entries: [], attestation: null }));
+      // A lines event has fixed Par bands even before readings arrive. The UI
+      // obtains the early forecast separately and refuses picks without a band.
+      const lines = stations.flatMap(({ station_id }) =>
+        ["temp_high", "temp_low", "wind_speed"].map(metric => ({
+          target: station_id, metric, lower: -1, upper: 1,
+        })),
+      );
+      response.end(JSON.stringify({ readings: [], lines, entries: [], attestation: null }));
     } else if (url.pathname === "/stations/forecasts") {
       response.end(JSON.stringify(forecastRows(url.searchParams)));
     } else if (url.pathname === "/stations/observations") {

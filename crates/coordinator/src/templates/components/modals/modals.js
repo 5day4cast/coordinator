@@ -199,7 +199,7 @@ class AuthManager {
       ?.addEventListener("click", () => this.handleCopyNsec());
 
     document
-      .getElementById("logoutContainer")
+      .getElementById("logoutNavClick")
       ?.addEventListener("click", () => this.handleLogout());
 
     document

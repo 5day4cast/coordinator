@@ -139,7 +139,7 @@ test.describe("Competitions", () => {
   });
 
   test("competitions table shows headers", async ({ page }) => {
-    const headers = page.locator("#competitions-page .competition-header").first().locator("span");
+    const headers = page.locator("#competitions-page .competition-header").first().locator(":scope > span, :scope > button");
     await expect(headers.nth(0)).toContainText("Status");
     await expect(headers.nth(1)).toContainText("Starts");
     // What it costs, all in, and what first place wins; nothing else about fees or places.
