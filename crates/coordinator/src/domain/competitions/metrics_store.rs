@@ -361,7 +361,7 @@ mod tests {
         );
         // Finished competitions must not decode their historical contract blobs at scrape time.
         database.execute_write(move |pool| async move {
-            sqlx::query("UPDATE competitions SET completed_at = datetime('now'), signed_contract = 'not-json' WHERE id = ?")
+            sqlx::query("UPDATE competitions SET completed_at = '2026-10-08T00:00:00Z', signed_contract = 'not-json' WHERE id = ?")
                 .bind(event_id.to_string()).execute(&pool).await?;
             Ok(())
         }).await.unwrap();

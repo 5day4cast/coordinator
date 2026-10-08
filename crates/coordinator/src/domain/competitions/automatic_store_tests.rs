@@ -1022,11 +1022,11 @@ async fn payout_discovery_filters_before_decoding_contracts() {
                 .bind(id.to_string())
                 .bind((excluded != "unsigned").then_some("unread-contract"))
                 .bind((!matches!(excluded, "expiry" | "unsettled")).then_some("unread-attestation"))
-                .bind((excluded == "expiry").then_some("2026-10-08 00:00:00"))
-                .bind((excluded != "unconfirmed").then_some("2026-10-08 00:00:00"))
-                .bind((excluded == "cancelled").then_some("2026-10-08 00:00:00"))
-                .bind((excluded == "completed").then_some("2026-10-08 00:00:00"))
-                .bind((excluded == "failed").then_some("2026-10-08 00:00:00"))
+                .bind((excluded == "expiry").then_some("2026-10-08T00:00:00Z"))
+                .bind((excluded != "unconfirmed").then_some("2026-10-08T00:00:00Z"))
+                .bind((excluded == "cancelled").then_some("2026-10-08T00:00:00Z"))
+                .bind((excluded == "completed").then_some("2026-10-08T00:00:00Z"))
+                .bind((excluded == "failed").then_some("2026-10-08T00:00:00Z"))
                 .bind(if excluded == "queued" { "queued" } else { "pool" })
                 .execute(&pool).await?;
             if excluded != "manual" {
