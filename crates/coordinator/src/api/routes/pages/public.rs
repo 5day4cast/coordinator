@@ -149,6 +149,7 @@ pub(super) fn page(
             },
             satchel_url: state.satchel_url.as_deref(),
             feedback: state.feedback.enabled,
+            mainnet_signup: state.mainnet_signup.enabled,
         };
         base(&config, content).into_string()
     };

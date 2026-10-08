@@ -364,6 +364,7 @@ pub struct AppState {
     pub telemetry_caps: Arc<crate::api::telemetry::TelemetryCaps>,
     /// The feedback form's messages, proof of work and limits.
     pub feedback: Arc<crate::domain::feedback::Feedback>,
+    pub mainnet_signup: Arc<crate::domain::mainnet_signup::MainnetSignup>,
     /// Visitor logs for the operator's Visitors page.
     pub visitor_logs: Arc<crate::infra::visitor_logs::VisitorLogs>,
 }
@@ -986,6 +987,10 @@ pub async fn build_app(
         signup_pow: Arc::new(SignupPow::new(config.pow_settings)),
         http_context: Arc::new(HttpContext::from_settings(&config.http_context)?),
         telemetry_caps: Arc::default(),
+        mainnet_signup: Arc::new(crate::domain::mainnet_signup::MainnetSignup::new(
+            config.mainnet_signup_settings.enabled,
+            users_db_clone.clone(),
+        )),
         feedback: Arc::new(crate::domain::feedback::Feedback::new(
             config.feedback_settings.enabled,
             feedback_store,
@@ -1215,6 +1220,19 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Result<Router, anyhow
     // client's request limit either.
     let feedback = Router::new()
         .route(
+            "/mainnet-signup",
+            get(crate::api::routes::mainnet_signup_page_handler)
+                .post(crate::api::routes::post_mainnet_signup),
+        )
+        .route(
+            "/api/v1/mainnet-signup",
+            post(crate::api::routes::post_mainnet_signup),
+        )
+        .route(
+            "/api/v1/mainnet-signup/challenge",
+            get(crate::api::routes::mainnet_signup_challenge),
+        )
+        .route(
             "/feedback",
             get(crate::api::routes::feedback_page_handler).post(crate::api::routes::post_feedback),
         )
@@ -1316,6 +1334,14 @@ pub fn admin_app(app_state: Arc<AppState>, access: Arc<AdminAccess>, network: Ne
         .route("/operations", get(crate::api::routes::operations_page))
         .route("/keymeld", get(crate::api::routes::keymeld_page))
         .route("/services", get(crate::api::routes::services_page))
+        .route(
+            "/mainnet-signups",
+            get(crate::api::routes::admin_mainnet_signups),
+        )
+        .route(
+            "/mainnet-signups.csv",
+            get(crate::api::routes::admin_mainnet_signups_csv),
+        )
         .route("/feedback", get(crate::api::routes::admin_feedback_list))
         .route(
             "/feedback/unread",
@@ -1668,6 +1694,8 @@ mod startup_tests {
         ("POST", "/admin/api/recovery/republish"),
         ("GET", "/api/v1/admin/recovery"),
         ("POST", "/api/v1/admin/recovery/republish"),
+        ("GET", "/admin/mainnet-signups"),
+        ("GET", "/admin/mainnet-signups.csv"),
         ("GET", "/admin/feedback"),
         ("GET", "/admin/feedback/unread"),
         ("GET", FEEDBACK_PATH),
@@ -2505,12 +2533,12 @@ mod startup_tests {
 
     /// Form fields carrying a solved feedback proof of work.
     async fn feedback_proof(public: &Router) -> String {
+        public_form_proof(public, "/api/v1/feedback/challenge").await
+    }
+
+    async fn public_form_proof(public: &Router, path: &str) -> String {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-        let (status, headers, body) = send(
-            public,
-            request("GET", "/api/v1/feedback/challenge", &[], ""),
-        )
-        .await;
+        let (status, headers, body) = send(public, request("GET", path, &[], "")).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(headers["cache-control"], "no-store");
         let issued: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -2543,6 +2571,205 @@ mod startup_tests {
             ));
         }
         request("POST", path, &headers, body)
+    }
+
+    #[tokio::test]
+    async fn mainnet_signup_stores_unique_emails_and_exports_only_to_the_operator() {
+        let test = TestState::start().await;
+        let public = test.public();
+        let store = &test.state.mainnet_signup.store;
+        let (status, _, home) = send(&public, request("GET", "/", &[], "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(home.contains("data-mainnet-signup-open"));
+        assert!(home.contains("id=\"mainnetSignupModal\""));
+        let (status, _, form) = send(&public, request("GET", "/mainnet-signup", &[], "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(form.contains("type=\"email\""));
+        assert!(form.contains("only for this announcement"));
+
+        for email in [
+            "",
+            "invalid",
+            "a%0Ab%40example.com",
+            "a%40example.com%2Cb%40example.com",
+        ] {
+            let (status, headers, body) = send(
+                &public,
+                feedback_post("/mainnet-signup", false, &format!("email={email}")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(headers["cache-control"]
+                .to_str()
+                .unwrap()
+                .contains("no-store"));
+            assert!(body.contains("Enter a valid email address."));
+        }
+        let (_, _, body) = send(
+            &public,
+            feedback_post(
+                "/api/v1/mainnet-signup",
+                true,
+                "email=%22%3E%3Cscript%3Ex%3C%2Fscript%3E",
+            ),
+        )
+        .await;
+        assert!(!body.contains("<script>"));
+        assert!(body.contains("&lt;script&gt;"));
+        let (status, _, body) = send(
+            &public,
+            feedback_post(
+                "/mainnet-signup",
+                false,
+                "email=bot%40example.com&website=filled",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("on the list"));
+        assert_eq!(store.count().await.unwrap(), 0);
+        let (status, _, _) = send(
+            &public,
+            feedback_post(
+                "/mainnet-signup",
+                false,
+                "email=a%40example.com&pow_challenge=invalid&pow_nonce=0",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        for email in [
+            "+Player%2BLaunch%40Example.COM+",
+            "player%2Blaunch%40example.com",
+        ] {
+            let proof = public_form_proof(&public, "/api/v1/mainnet-signup/challenge").await;
+            let (status, headers, body) = send(
+                &public,
+                feedback_post(
+                    "/api/v1/mainnet-signup",
+                    true,
+                    &format!("email={email}&{proof}"),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(headers["cache-control"]
+                .to_str()
+                .unwrap()
+                .contains("no-store"));
+            assert!(body.contains("on the list"));
+            assert!(!body.contains("player"));
+        }
+        assert_eq!(store.count().await.unwrap(), 1);
+        assert_eq!(
+            store.list(100, 0).await.unwrap()[0].email,
+            "player+launch@example.com"
+        );
+        // The plain HTML form works without a challenge, with a smaller rate allowance.
+        let (status, _, body) = send(
+            &public,
+            feedback_post("/mainnet-signup", false, "email=nojs%40example.com"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("on the list"));
+        let (status, _, body) = send(
+            &public,
+            feedback_post("/mainnet-signup", false, "email=limited%40example.com"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(body.contains("try again later"));
+        assert_eq!(store.count().await.unwrap(), 2);
+        let (status, _, _) = send(
+            &public,
+            feedback_post(
+                "/mainnet-signup",
+                false,
+                &format!("email={}", "x".repeat(17000)),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+
+        let admin = test.admin(token_access(), Network::Regtest);
+        for path in ["/admin/mainnet-signups", "/admin/mainnet-signups.csv"] {
+            let (status, _, _) = send(&public, request("GET", path, &[], "")).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            let (status, _, body) = send(&admin, request("GET", path, &[], "")).await;
+            assert!(status.is_redirection() || status == StatusCode::UNAUTHORIZED);
+            assert!(!body.contains("player+launch@example.com"));
+            let (status, headers, body) = send(
+                &admin,
+                request("GET", path, &[("authorization", BEARER)], ""),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(headers["cache-control"]
+                .to_str()
+                .unwrap()
+                .contains("no-store"));
+            assert!(body.contains("player+launch@example.com"));
+            assert!(body.contains("nojs@example.com"));
+            if path.ends_with(".csv") {
+                assert_eq!(headers["content-type"], "text/csv; charset=utf-8");
+                assert!(body.starts_with("email,created_at\r\n"));
+                assert_eq!(body.lines().count(), 3);
+            }
+        }
+        test.stop().await;
+    }
+
+    #[tokio::test]
+    async fn mainnet_signup_can_be_closed_without_removing_collected_emails() {
+        let test =
+            TestState::start_with(|settings| settings.mainnet_signup_settings.enabled = false)
+                .await;
+        let public = test.public();
+        test.state
+            .mainnet_signup
+            .store
+            .insert(
+                "existing@example.com".into(),
+                time::OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap();
+        for (method, path) in [
+            ("GET", "/mainnet-signup"),
+            ("POST", "/mainnet-signup"),
+            ("GET", "/api/v1/mainnet-signup/challenge"),
+            ("POST", "/api/v1/mainnet-signup"),
+        ] {
+            let (status, _, _) = send(
+                &public,
+                request(
+                    method,
+                    path,
+                    &[("content-type", FORM)],
+                    "email=a%40example.com",
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+        let (_, _, home) = send(&public, request("GET", "/", &[], "")).await;
+        assert!(!home.contains("data-mainnet-signup-open"));
+        let admin = test.admin(token_access(), Network::Regtest);
+        let (status, _, body) = send(
+            &admin,
+            request(
+                "GET",
+                "/admin/mainnet-signups.csv",
+                &[("authorization", BEARER)],
+                "",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("existing@example.com"));
+        test.stop().await;
     }
 
     #[tokio::test]

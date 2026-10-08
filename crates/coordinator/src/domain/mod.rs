@@ -2,6 +2,7 @@ mod competitions;
 pub mod feedback;
 mod invoices;
 pub mod leaderboard;
+pub mod mainnet_signup;
 pub mod recovery;
 pub mod users;
 

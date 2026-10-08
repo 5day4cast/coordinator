@@ -1,4 +1,5 @@
 pub mod feedback;
+pub mod mainnet_signup;
 mod modals;
 mod navbar;
 mod tip;

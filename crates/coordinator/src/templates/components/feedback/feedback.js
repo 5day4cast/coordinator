@@ -10,16 +10,17 @@
 // key itself; the form only adds the proof. A refused message comes back as a
 // new form, which gets a new proof.
 
-async function fetchAndSolveFeedbackPow(attempt) {
+async function fetchAndSolveFeedbackPow(attempt, path) {
   const apiBase = document.body?.dataset.apiBase ?? "";
-  const response = await fetch(`${apiBase}/api/v1/feedback/challenge`);
+  const response = await fetch(`${apiBase}${path}`);
   if (!response.ok) throw new Error(`feedback challenge: HTTP ${response.status}`);
   const { challenge, difficulty } = await response.json();
   const nonce = await solvePowInWorker(attempt, challenge, difficulty);
   return { challenge, nonce };
 }
 
-// Fills `form`'s proof fields once, holding its Send button meanwhile.
+// Shared by Feedback and Mainnet signup. Each form supplies its own challenge endpoint.
+// Fills `form`'s proof fields once, holding its submit button meanwhile.
 function prepareFeedbackForm(form) {
   if (!form || form.dataset.pow) return;
   form.dataset.pow = "solving";
@@ -30,7 +31,7 @@ function prepareFeedbackForm(form) {
     button.textContent = "Preparing…";
   }
   const attempt = { worker: null };
-  fetchAndSolveFeedbackPow(attempt)
+  fetchAndSolveFeedbackPow(attempt, form.dataset.powPath || "/api/v1/feedback/challenge")
     .then(
       ({ challenge, nonce }) => {
         form.elements.namedItem("pow_challenge").value = challenge;
@@ -48,7 +49,7 @@ function prepareFeedbackForm(form) {
 }
 
 function feedbackForm(element) {
-  return element instanceof Element ? element.closest("form[data-feedback]") : null;
+  return element instanceof Element ? element.closest("form[data-feedback], form[data-mainnet-signup]") : null;
 }
 
 function updateFeedbackCount(form) {
@@ -88,7 +89,7 @@ function setupFeedback() {
 
   // A form htmx swapped in (a refused message) needs its own proof.
   document.addEventListener("htmx:after:swap", () => {
-    for (const form of document.querySelectorAll("form[data-feedback]")) {
+    for (const form of document.querySelectorAll("form[data-feedback], form[data-mainnet-signup]")) {
       if (form.isConnected && form.closest(".modal.is-active, main")) prepareFeedbackForm(form);
     }
   });

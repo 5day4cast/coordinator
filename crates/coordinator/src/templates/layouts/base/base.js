@@ -10,6 +10,7 @@ function initApp() {
   setupPayoutModal();
   setupSatchel();
   setupFeedback();
+  setupMainnetSignup();
 
   const body = document.body;
   // Not on window: it holds the signer once someone logs in.
