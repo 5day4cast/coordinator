@@ -270,23 +270,40 @@ pub fn short_npub(npub: &str) -> String {
 }
 
 /// A station as players know it, by its city: `Anchorage, AK` for `Anchorage/Ted Stevens
-/// International, AK`. The station's full name and code stay beside it as secondary text.
+/// International, AK`. Full station details remain available separately.
 pub fn city_name(name: &str) -> String {
     let (name, state) = name.rsplit_once(", ").unwrap_or((name, ""));
-    let city = name.split('/').next().unwrap_or(name).trim();
-    let city = [
-        " International Airport",
+    let mut city = name.split('/').next().unwrap_or(name).trim();
+    // Strip only whole trailing airport descriptors. Repeat for names such as
+    // "Miami Exec Airport"; abbreviations can also precede a slash in the source.
+    // Keep geographic names such as counties and named fields when no city is given.
+    while let Some(shorter) = [
+        " State Airport",
+        " State Arpt",
         " International",
         " Intl",
-        " Regional Airport",
         " Regional",
-        " Municipal Airport",
+        " Rgnl",
         " Municipal",
+        " Muni",
+        " Executive",
+        " Exec",
+        " Metropolitan",
+        " Metro",
+        " Memorial",
+        " Mem",
+        " Air Park",
+        " Airpark",
         " Airport",
+        " Arpt",
     ]
     .iter()
     .find_map(|suffix| city.strip_suffix(suffix))
-    .unwrap_or(city);
+    .map(str::trim_end)
+    .filter(|shorter| !shorter.is_empty())
+    {
+        city = shorter;
+    }
     if state.is_empty() {
         city.to_owned()
     } else {
@@ -324,6 +341,29 @@ mod tests {
         );
         assert_eq!(city_name("New York/JFK International, NY"), "New York, NY");
         assert_eq!(city_name("Bangor"), "Bangor");
+        for (name, city) in [
+            ("Sacramento Exec, CA", "Sacramento, CA"),
+            ("Chicago Exec, IL", "Chicago, IL"),
+            ("Miami Exec Airport, FL", "Miami, FL"),
+            ("Toledo Executive Airport, OH", "Toledo, OH"),
+            ("Columbia Metro, SC", "Columbia, SC"),
+            ("Pueblo Mem Airport, CO", "Pueblo, CO"),
+            ("Norwood Memorial, MA", "Norwood, MA"),
+            ("Clearwater Air Park, FL", "Clearwater, FL"),
+            ("Midland Airpark, TX", "Midland, TX"),
+            ("Aurora State Airport, OR", "Aurora, OR"),
+            ("Rogers Muni/Carter Field, AR", "Rogers, AR"),
+            ("Portland Intl, ME", "Portland, ME"),
+            ("Schaumburg Rgnl, IL", "Schaumburg, IL"),
+            ("State College/Univ Park Airport, PA", "State College, PA"),
+            ("West Memphis Municipal, AR", "West Memphis, AR"),
+            ("Metropolis Municipal, IL", "Metropolis, IL"),
+            ("Maverick County Airport, TX", "Maverick County, TX"),
+            ("Waldron Field, TX", "Waldron Field, TX"),
+            ("Municipal Airport, TX", "Municipal, TX"),
+        ] {
+            assert_eq!(city_name(name), city, "{name}");
+        }
     }
 
     #[test]
