@@ -340,13 +340,24 @@ pub async fn get_competitions(
     list_response::response(&headers, &competitions, next, false)
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct CompetitionQuery {
+    /// Observers can skip the signed graph while retaining funding and payout evidence.
+    /// Existing clients receive the full response unless they explicitly opt out.
+    pub include_signed_contract: Option<bool>,
+}
+
 pub async fn get_competition(
     State(state): State<Arc<AppState>>,
     Path(competition_id): Path<Uuid>,
+    Query(query): Query<CompetitionQuery>,
 ) -> Result<Json<Competition>, ApiError> {
     let mut competition = state
         .coordinator
-        .get_competition(competition_id)
+        .get_competition_detail(
+            competition_id,
+            query.include_signed_contract.unwrap_or(true),
+        )
         .await
         .inspect_err(|e| {
             log_failure("getting competition", e);
