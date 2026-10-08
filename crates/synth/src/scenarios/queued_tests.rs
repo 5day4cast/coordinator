@@ -572,6 +572,43 @@ async fn a_split_queue_is_checked_and_each_pool_followed_to_its_attestation() {
 }
 
 #[tokio::test]
+async fn a_full_queue_follows_its_pool_when_an_outside_player_took_a_planned_seat() {
+    for case in [
+        "unpaid_refusal",
+        "paid",
+        "uncertain_payment",
+        "missing",
+        "abandoned",
+    ] {
+        let mut run = Run::new(QUEUED_ONE_POOL, &[20]).await;
+        // The pool contains 19 of our tickets and one outside player's ticket.
+        let last = run.traces.last_mut().unwrap();
+        *last = EntryTrace::new(run.users.last().unwrap());
+        last.behavior = Some(EntryBehavior::Complete);
+        last.seat_taken = true;
+        last.payment_started = Some(false);
+        match case {
+            "paid" => last.paid = true,
+            "uncertain_payment" => last.payment_started = Some(true),
+            "missing" => last.seat_taken = false,
+            "abandoned" => last.behavior = Some(EntryBehavior::AbandonUnpaid),
+            _ => {}
+        }
+        let (steps, result) = run.after_entries().await;
+        if case == "unpaid_refusal" {
+            assert!(result.is_ok(), "{:?}", result.err());
+            assert_eq!(
+                steps.names().last(),
+                Some(&"wait_pools_awaiting_attestation")
+            );
+        } else {
+            assert_eq!(result.unwrap_err().name, "verify_pools", "{case}");
+        }
+        assert!(run.mock.state.lock().unwrap().refund_lookups.is_empty());
+    }
+}
+
+#[tokio::test]
 async fn an_entry_left_on_the_queue_fails_the_split() {
     // 27 complete tickets, but the pools the queue lists hold only 26 of them.
     let run = Run::new(QUEUED_SPLIT, &[13, 13]).await;

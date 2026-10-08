@@ -300,6 +300,16 @@ impl Queue {
         max_entries: u32,
         places: usize,
     ) -> Self {
+        Self::paying_with_locktime(start, rules, max_entries, places, Some(72)).await
+    }
+
+    pub(super) async fn paying_with_locktime(
+        start: OffsetDateTime,
+        rules: PoolRules,
+        max_entries: u32,
+        places: usize,
+        locktime: Option<u16>,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let db = DBConnection::new(
             directory.path().to_str().unwrap(),
@@ -331,6 +341,7 @@ impl Queue {
         .unwrap();
 
         let mut request = request(start);
+        request.relative_locktime_block_delta = locktime;
         request.min_players = rules.min_players();
         request.max_pool_size = rules.max_players();
         request.number_of_places_win = places;

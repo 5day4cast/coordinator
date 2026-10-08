@@ -491,9 +491,23 @@ async fn verify_pools(
         .filter(|trace| trace.paid && trace.entry_submitted)
         .filter_map(|trace| trace.ticket_id)
         .collect();
+    // A full queue can refuse one of our planned players because someone else
+    // entered first. Still verify every ticket we funded and follow its pool.
+    // Never excuse a paid, uncertain, or intentionally abandoned entry here.
+    let stood_down = traces
+        .iter()
+        .filter(|trace| {
+            trace.behavior == Some(EntryBehavior::Complete)
+                && trace.seat_taken
+                && !trace.paid
+                && !trace.entry_submitted
+                && trace.payment_started == Some(false)
+                && trace.ticket_id.is_none()
+        })
+        .count();
     ensure!(
-        complete.len() == shape.players,
-        "{} players entered completely; expected {}",
+        complete.len() + stood_down == shape.players,
+        "{} players entered completely and {stood_down} stood down; expected {}",
         complete.len(),
         shape.players
     );

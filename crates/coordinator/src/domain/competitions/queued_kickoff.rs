@@ -349,16 +349,21 @@ fn pool_formation(
         .map(|(index, mut members)| {
             members.sort_unstable();
             let pool_id = Uuid::now_v7();
+            let mut event_submission = super::super::queued::pool_event(
+                &competition.event_submission,
+                pool_id,
+                members.len(),
+                settings.stake_sats,
+                settings.terms.pool_places(members.len()),
+            )?;
+            // The queue already committed to this delay when players entered. A later
+            // configuration change must not replace it with the server's new default.
+            event_submission.relative_locktime_block_delta =
+                Some(settings.terms.relative_locktime_block_delta);
             Ok(NewPool {
                 competition_id: pool_id,
                 pool_index: u32::try_from(index).map_err(|_| "too many pools")?,
-                event_submission: super::super::queued::pool_event(
-                    &competition.event_submission,
-                    pool_id,
-                    members.len(),
-                    settings.stake_sats,
-                    settings.terms.pool_places(members.len()),
-                )?,
+                event_submission,
                 members,
             })
         })
