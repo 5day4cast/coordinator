@@ -50,10 +50,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 
 # Keymeld: released SDK and services on the published dlctix crate.
 # keymeld-sdk and the coordinator must resolve dlctix from the same source.
-# Keymeld 0.10.4 reports a full shared preparation budget as retryable.
+# Keymeld 0.10.5 bounds preparation pressure and shares retained escrow state.
 # Every crate that names Keymeld pins the same rev.
-keymeld-sdk = { git = "https://github.com/tee8z/keymeld", rev = "28fcae180660382024bfc0760b8d2deee0556ff4", default-features = false, features = ["escrow", "dlctix"] }
-keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "28fcae180660382024bfc0760b8d2deee0556ff4", default-features = false, features = ["escrow"] }
+keymeld-sdk = { git = "https://github.com/tee8z/keymeld", rev = "3adce67a9d4d3c5667c5b7c2c1733f37973111c1", default-features = false, features = ["escrow", "dlctix"] }
+keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "3adce67a9d4d3c5667c5b7c2c1733f37973111c1", default-features = false, features = ["escrow"] }
 
 # Bitcoin
 bitcoin = { version = "0.32", features = ["serde", "base64", "rand-std"] }

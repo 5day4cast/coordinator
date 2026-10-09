@@ -3600,8 +3600,8 @@ dependencies = [
 
 [[package]]
 name = "keymeld-core"
-version = "0.10.4"
-source = "git+https://github.com/tee8z/keymeld?rev=28fcae180660382024bfc0760b8d2deee0556ff4#28fcae180660382024bfc0760b8d2deee0556ff4"
+version = "0.10.5"
+source = "git+https://github.com/tee8z/keymeld?rev=3adce67a9d4d3c5667c5b7c2c1733f37973111c1#3adce67a9d4d3c5667c5b7c2c1733f37973111c1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3640,8 +3640,8 @@ dependencies = [
 
 [[package]]
 name = "keymeld-enclave"
-version = "0.10.4"
-source = "git+https://github.com/tee8z/keymeld?rev=28fcae180660382024bfc0760b8d2deee0556ff4#28fcae180660382024bfc0760b8d2deee0556ff4"
+version = "0.10.5"
+source = "git+https://github.com/tee8z/keymeld?rev=3adce67a9d4d3c5667c5b7c2c1733f37973111c1#3adce67a9d4d3c5667c5b7c2c1733f37973111c1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3678,8 +3678,8 @@ dependencies = [
 
 [[package]]
 name = "keymeld-sdk"
-version = "0.10.4"
-source = "git+https://github.com/tee8z/keymeld?rev=28fcae180660382024bfc0760b8d2deee0556ff4#28fcae180660382024bfc0760b8d2deee0556ff4"
+version = "0.10.5"
+source = "git+https://github.com/tee8z/keymeld?rev=3adce67a9d4d3c5667c5b7c2c1733f37973111c1#3adce67a9d4d3c5667c5b7c2c1733f37973111c1"
 dependencies = [
  "dlctix",
  "flate2",
