@@ -104,7 +104,9 @@
             # Keymeld enclave measurements compiled into the browser WASM.
             || (builtins.match ".*/keymeld-trusted-pcrs\\.json$" path != null)
             # Coordinator recovery keys and relays compiled into the recovery tools.
-            || (builtins.match ".*/recovery-defaults\\.json$" path != null);
+            || (builtins.match ".*/recovery-defaults\\.json$" path != null)
+            # The recorded lab competition that synth and coordinator tests read.
+            || (builtins.match ".*/fixtures/lab-competition\\.json$" path != null);
         };
 
         # Build workspace dependencies once (for caching)

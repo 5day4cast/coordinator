@@ -1632,6 +1632,7 @@ async fn shutdown_signal() -> std::io::Result<()> {
 mod startup_tests {
     use super::*;
     use crate::api::admin_auth::{AdminCredentials, CSRF_HEADER, SESSION_COOKIE};
+    use crate::domain::Competition;
     use axum::{body::to_bytes, http::HeaderMap};
     use std::io::Write;
     use tower::ServiceExt;
@@ -2161,6 +2162,79 @@ mod startup_tests {
         assert_eq!(status, StatusCode::OK);
         let (status, _, _) = send(&public, request("GET", "/api/v1/competitions", &[], "")).await;
         assert_eq!(status, StatusCode::OK);
+        test.stop().await;
+    }
+
+    /// A settled competition in the list has neither its signed contract nor its event
+    /// announcement, and every other field as its own route has it. That route, which the
+    /// payouts page reads, keeps everything a payout authorization signs over.
+    #[tokio::test]
+    async fn the_list_leaves_the_signed_contract_and_announcement_to_the_competition_route() {
+        let test = TestState::start().await;
+        let public = test.public();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../synth/src/fixtures/lab-competition.json"
+        ))
+        .unwrap();
+        let field = |name: &str| fixture[name].clone();
+        let mut competition =
+            Competition::new(&serde_json::from_value(field("event_submission")).unwrap());
+        competition.contract_parameters =
+            serde_json::from_value(field("contract_parameters")).unwrap();
+        competition.event_announcement =
+            serde_json::from_value(field("event_announcement")).unwrap();
+        competition.signed_contract = serde_json::from_value(field("signed_contract")).unwrap();
+        competition.attestation = serde_json::from_value(field("attestation")).unwrap();
+        competition.funding_outpoint = serde_json::from_value(field("funding_outpoint")).unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        competition.signed_at = Some(now);
+        competition.funding_broadcasted_at = Some(now);
+        competition.outcome_broadcasted_at = Some(now);
+        competition.completed_at = Some(now);
+        let store = &test.state.coordinator.competition_store;
+        store
+            .add_competition_with_tickets(competition.clone(), vec![])
+            .await
+            .unwrap();
+        store
+            .update_competitions(vec![competition.clone()])
+            .await
+            .unwrap();
+
+        let (status, _, body) =
+            send(&public, request("GET", "/api/v1/competitions", &[], "")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let listed: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        let listed = listed
+            .iter()
+            .find(|listed| listed["id"] == competition.id.to_string())
+            .expect("a competition settled now is on the default page");
+        assert!(listed["signed_contract"].is_null(), "{listed}");
+        assert!(listed["event_announcement"].is_null(), "{listed}");
+
+        let path = format!("/api/v1/competitions/{}", competition.id);
+        let (status, _, body) = send(&public, request("GET", &path, &[], "")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let own: serde_json::Value = serde_json::from_str(&body).unwrap();
+        for read_by_payouts in [
+            "/contract_parameters/players",
+            "/contract_parameters/outcome_payouts",
+            "/contract_parameters/funding_value",
+            "/event_announcement/locking_points",
+            "/attestation",
+            "/funding_outpoint",
+            "/signed_contract/signatures",
+        ] {
+            assert!(
+                own.pointer(read_by_payouts)
+                    .is_some_and(|value| !value.is_null()),
+                "{read_by_payouts} missing from {own}"
+            );
+        }
+        let mut expected = own;
+        expected["signed_contract"] = serde_json::Value::Null;
+        expected["event_announcement"] = serde_json::Value::Null;
+        assert_eq!(listed, &expected);
         test.stop().await;
     }
 

@@ -349,6 +349,94 @@ async fn an_observer_read_preserves_settlement_evidence_without_decoding_the_sig
 }
 
 #[tokio::test]
+async fn a_lean_page_reads_neither_the_signed_graph_nor_the_announcement() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = DBConnection::new(
+        directory.path().to_str().unwrap(),
+        "competitions",
+        DatabasePoolConfig::default(),
+        DatabaseType::Competitions,
+    )
+    .await
+    .unwrap();
+    let store = CompetitionStore::new(database.clone());
+    let now = OffsetDateTime::now_utc();
+    let (params, event, attestation) = pot_return_contract();
+    let mut signed = competition(now - Duration::DAY, false);
+    signed.contract_parameters = Some(params);
+    signed.event_announcement = Some(event);
+    signed.signed_at = Some(now);
+    signed.attestation = Some(attestation);
+    let open = competition(now + Duration::DAY, false);
+    for (row, entries) in [(&signed, 3), (&open, 1)] {
+        store
+            .add_competition_with_tickets(row.clone(), vec![])
+            .await
+            .unwrap();
+        store.update_competitions(vec![row.clone()]).await.unwrap();
+        enter(&database, row.id, entries, entries).await;
+    }
+    let ids = [signed.id, open.id];
+    let by_id = |mut competitions: Vec<Competition>| {
+        competitions.sort_by_key(|competition| competition.id);
+        competitions
+    };
+    let expected: Vec<_> = by_id(
+        store
+            .get_competitions_selected(false, Some(&ids), false)
+            .await
+            .unwrap(),
+    )
+    .into_iter()
+    .map(|mut competition| {
+        competition.signed_contract = None;
+        competition.event_announcement = None;
+        serde_json::to_value(competition).unwrap()
+    })
+    .collect();
+
+    // Neither column decodes any more, so a read that touched either fails.
+    let id = signed.id;
+    database
+        .execute_write(move |pool| async move {
+            sqlx::query(
+                "UPDATE competitions SET signed_contract = ?, event_announcement = ? WHERE id = ?",
+            )
+            .bind(b"a graph that must not be decoded".to_vec())
+            .bind(b"an announcement that must not be decoded".to_vec())
+            .bind(id.to_string())
+            .execute(&pool)
+            .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let lean = by_id(
+        store
+            .get_competitions_selected(false, Some(&ids), true)
+            .await
+            .unwrap(),
+    );
+    let counted = lean.iter().find(|row| row.id == signed.id).unwrap();
+    assert_eq!((counted.total_entries, counted.total_paid_entries), (3, 3));
+    assert_eq!(
+        lean.into_iter()
+            .map(|competition| serde_json::to_value(competition).unwrap())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert!(
+        store
+            .get_competitions_selected(false, Some(&ids), false)
+            .await
+            .is_err(),
+        "full pages still decode both"
+    );
+    database.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn operator_summaries_keep_signing_errors_without_loading_contracts() {
     let directory = tempfile::tempdir().unwrap();
     let database = DBConnection::new(
@@ -564,7 +652,7 @@ async fn api_pages_bound_history_preserve_fields_and_keep_entry_owners_separate(
     };
     assert_eq!(store.competition_page_ids(&next).await.unwrap(), ids[2..]);
     let selected = store
-        .get_competitions_selected(false, Some(&ids[..2]))
+        .get_competitions_selected(false, Some(&ids[..2]), false)
         .await
         .unwrap();
     assert_eq!(selected.len(), 2);

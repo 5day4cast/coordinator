@@ -3779,10 +3779,16 @@ impl Coordinator {
         Ok(competitions)
     }
 
-    pub async fn get_competitions_page(&self, ids: &[Uuid]) -> Result<Vec<Competition>, Error> {
+    /// The competitions in `ids`, newest first, with their queues and kickoff checks; a `lean`
+    /// page as [`CompetitionStore::get_competitions_selected`] reads it.
+    pub async fn get_competitions_page(
+        &self,
+        ids: &[Uuid],
+        lean: bool,
+    ) -> Result<Vec<Competition>, Error> {
         let mut competitions = self
             .competition_store
-            .get_competitions_selected(false, Some(ids))
+            .get_competitions_selected(false, Some(ids), lean)
             .await?;
         self.attach_queue_details(&mut competitions).await?;
         self.attach_kickoff_checks(&mut competitions).await?;

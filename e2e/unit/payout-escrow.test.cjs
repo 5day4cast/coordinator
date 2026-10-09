@@ -155,12 +155,43 @@ test("failed invoice attempts remain eligible for authorization; paid entries do
   const bundle = load("payouts", {});
   const payouts = new bundle.Payouts("https://coordinator", "https://oracle");
   payouts.getUserEntries = async () => [
-    { id: "retry", payout_ln_invoice: "previous invoice", paid_out_at: null },
-    { id: "paid", payout_ln_invoice: "paid invoice", paid_out_at: "yesterday" },
+    { id: "retry", event_id: "competition", payout_ln_invoice: "previous invoice", paid_out_at: null },
+    { id: "paid", event_id: "competition", payout_ln_invoice: "paid invoice", paid_out_at: "yesterday" },
   ];
-  payouts.getCompetitions = async () => [];
+  payouts.getCompetition = async () => ({ id: "competition" });
   payouts.checkEntryPayout = async entry => entry;
-  assert.deepEqual(Array.from(await payouts.getPayableEntries(), entry => entry.id), ["retry"]);
+  assert.deepEqual(Array.from(await payouts.getPayableEntries("competition"), entry => entry.id), ["retry"]);
+});
+
+test("a payout reads its competition's own record, which keeps the signatures the list leaves out", async () => {
+  const requested = [];
+  const record = { id: "competition", attestation: "signed",
+    contract_parameters: { funding_value: 3000, players: [{ pubkey: "a" }, { pubkey: "b" }],
+      outcome_payouts: { att0: { 0: 1 } } },
+    signed_contract: { signatures: { outcome_tx_signatures: {} } } };
+  const bundle = load("payouts", {
+    AuthorizedClient: class {
+      async get(url) {
+        requested.push(url);
+        const body = url.endsWith("/api/v1/entries")
+          ? [{ id: "won", event_id: "competition", ephemeral_pubkey: "a", paid_out_at: null },
+            { id: "elsewhere", event_id: "another", ephemeral_pubkey: "a", paid_out_at: null }]
+          : record;
+        return { ok: true, json: async () => body };
+      }
+    },
+  });
+  const payouts = new bundle.Payouts("https://coordinator", "https://oracle");
+  payouts.getOracleEvent = async () => ({ attestation: "signed" });
+  payouts.getCurrentOutcome = () => "att0";
+  const payable = await payouts.getPayableEntries("competition");
+  assert.deepEqual(requested.sort(), [
+    "https://coordinator/api/v1/competitions/competition",
+    "https://coordinator/api/v1/entries",
+  ], "never the competition list");
+  assert.deepEqual(Array.from(payable, ({ entry }) => entry.id), ["won"]);
+  assert.equal(payable[0].competition.signed_contract, record.signed_contract);
+  assert.equal(payable[0].payout_amount, 3000);
 });
 
 function dialogFixture() {

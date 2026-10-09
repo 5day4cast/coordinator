@@ -2,6 +2,8 @@
 
 `GET /api/v1/competitions` and authenticated `GET /api/v1/entries` return JSON arrays. Each record retains the fields available before pagination.
 
+A competition list never carries a competition's signed contract or its event announcement: `signed_contract` and `event_announcement` are always `null` there. Together they were most of a list's bytes, and the signed contract's transaction graph is rebuilt to read it. Read them from `GET /api/v1/competitions/{id}`. Every other field matches that route.
+
 The default page contains at most 50 records. It includes active competitions and competitions changed in the last 14 days. Set `history=true` to include older records. Results use descending UUID order.
 
 | Parameter | Meaning |
