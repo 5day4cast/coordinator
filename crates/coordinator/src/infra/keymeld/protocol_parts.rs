@@ -2,19 +2,22 @@
 //! unchanged parts are retained without rewriting their ciphertext.
 use super::confidential_store::{failure, ProtocolState};
 use super::KeymeldError;
-use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+#[cfg(test)]
+use flate2::read::GzDecoder;
+use flate2::{write::GzEncoder, Compression};
 use hmac::{Hmac, Mac};
-use keymeld_core::{
-    crypto::{EncryptedData, SessionSecret},
-    SessionId,
-};
+#[cfg(test)]
+use keymeld_core::crypto::EncryptedData;
+use keymeld_core::{crypto::SessionSecret, SessionId};
 use keymeld_sdk::confidential_session::ConfidentialJournal;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::value::RawValue;
 use sha2::Sha256;
+#[cfg(test)]
+use std::io::Read;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{Read, Write},
+    io::Write,
 };
 use zeroize::Zeroizing;
 
@@ -22,6 +25,8 @@ use zeroize::Zeroizing;
 mod checkpoint_array;
 #[path = "checkpoint_fields.rs"]
 mod checkpoint_fields;
+#[path = "checkpoint_reader.rs"]
+mod checkpoint_reader;
 pub(super) use checkpoint_fields::EntryCache;
 
 const PART_BYTES: usize = 32 * 1024;
@@ -52,11 +57,16 @@ fn context(session: &SessionId, digest: &[u8; 32]) -> String {
     )
 }
 
-fn part_digest(key: &SessionSecret, session: &SessionId, text: &[u8]) -> [u8; 32] {
+fn part_mac(key: &SessionSecret, session: &SessionId) -> Hmac<Sha256> {
     let mut mac =
         Hmac::<Sha256>::new_from_slice(key.as_bytes()).expect("HMAC accepts a session key");
     mac.update(b"coordinator-protocol-content-v1/");
     mac.update(session.to_string().as_bytes());
+    mac
+}
+
+fn part_digest(key: &SessionSecret, session: &SessionId, text: &[u8]) -> [u8; 32] {
+    let mut mac = part_mac(key, session);
     mac.update(text);
     mac.finalize().into_bytes().into()
 }
@@ -164,6 +174,21 @@ fn split(
 }
 
 impl Manifest {
+    /// Project authenticated top-level fields before fetching any part bodies.
+    /// Older manifests may be one opaque part and must be decoded in full.
+    pub fn select_fields(&self, fields: &[&str]) -> Self {
+        match self {
+            Self::Object(values) => Self::Object(
+                values
+                    .iter()
+                    .filter(|(name, _)| fields.contains(&name.as_str()))
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
+            ),
+            _ => self.clone(),
+        }
+    }
+
     pub fn digests(&self, output: &mut BTreeSet<[u8; 32]>) {
         match self {
             Self::Part(digest) => {
@@ -182,18 +207,34 @@ impl Manifest {
         }
     }
 
+    #[cfg(test)]
     pub fn decode(
         &self,
         key: &SessionSecret,
         session: &SessionId,
         bodies: &BTreeMap<Vec<u8>, Vec<u8>>,
     ) -> Result<ProtocolState, KeymeldError> {
-        let mut json = Zeroizing::new(Vec::new());
-        self.append(key, session, bodies, &mut json)?;
-        crate::metrics::checkpoint_bytes("parts", "decode", json.len());
-        serde_json::from_slice(&json).map_err(|_| failure("Invalid confidential checkpoint schema"))
+        self.decode_as(key, session, bodies, "decode")
     }
 
+    pub fn decode_as<T: DeserializeOwned>(
+        &self,
+        key: &SessionSecret,
+        session: &SessionId,
+        bodies: &BTreeMap<Vec<u8>, Vec<u8>>,
+        operation: &'static str,
+    ) -> Result<T, KeymeldError> {
+        let mut reader =
+            checkpoint_reader::Reader::new(self, key, session, bodies, MAX_STATE_BYTES);
+        // Serde must consume EOF before returning. That also checks the final
+        // part's content MAC, compression trailer, and reconstructed size.
+        let state = serde_json::from_reader(checkpoint_reader::Buffered::new(&mut reader))
+            .map_err(|_| failure("Invalid or unauthenticated confidential checkpoint"))?;
+        crate::metrics::checkpoint_bytes("parts", operation, reader.bytes_read());
+        Ok(state)
+    }
+
+    #[cfg(test)]
     fn append(
         &self,
         key: &SessionSecret,

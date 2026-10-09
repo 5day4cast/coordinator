@@ -17,7 +17,7 @@ use keymeld_sdk::{
     dlctix::DlcBatchItems,
     SdkError,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sqlx::Row;
 use std::collections::{BTreeMap, BTreeSet};
 use tokio::sync::Mutex;
@@ -71,11 +71,68 @@ fn seal(
         .map_err(|_| failure("Cannot encrypt confidential protocol checkpoint"))
 }
 
+/// Read-only checkpoint fields used by registration and readiness checks.
+/// These reads never reconstruct the signing journal or settlement payloads.
+#[derive(Deserialize)]
+pub(super) struct ProtocolMetadata {
+    pub schema_version: u16,
+    pub session: StoredDlcKeygenSession,
+    pub epochs: BTreeMap<EnclaveId, u64>,
+    pub registrations: BTreeMap<UserId, ParticipantRegistrationData>,
+    pub roster: Option<SignedRoster>,
+}
+
+pub(super) async fn load_metadata(
+    db: &DBConnection,
+    key: &SessionSecret,
+    session: &SessionId,
+) -> Result<Option<(i64, ProtocolMetadata)>, KeymeldError> {
+    let result = load_record::<ProtocolMetadata>(
+        db,
+        key,
+        session,
+        Some(&[
+            "schema_version",
+            "session",
+            "epochs",
+            "registrations",
+            "roster",
+        ]),
+    )
+    .await?;
+    if let Some((_, state)) = &result {
+        validate_identity(state.schema_version, &state.session.session_id, session)?;
+    }
+    Ok(result)
+}
+
 pub(super) async fn load(
     db: &DBConnection,
     key: &SessionSecret,
     session: &SessionId,
 ) -> Result<Option<(i64, ProtocolState)>, KeymeldError> {
+    let result = load_record::<ProtocolState>(db, key, session, None).await?;
+    if let Some((_, state)) = &result {
+        validate_identity(state.schema_version, &state.session.session_id, session)?;
+    }
+    Ok(result)
+}
+
+fn validate_identity(version: u16, stored: &str, session: &SessionId) -> Result<(), KeymeldError> {
+    if version != 1 || stored != session.to_string() {
+        return Err(failure(
+            "Confidential checkpoint belongs to another session or version",
+        ));
+    }
+    Ok(())
+}
+
+async fn load_record<T: DeserializeOwned>(
+    db: &DBConnection,
+    key: &SessionSecret,
+    session: &SessionId,
+    fields: Option<&[&str]>,
+) -> Result<Option<(i64, T)>, KeymeldError> {
     let mut snapshot = db
         .read()
         .begin()
@@ -103,36 +160,65 @@ pub(super) async fn load(
     let state = match format {
         1 => {
             crate::metrics::checkpoint_bytes("monolithic", "decode", plaintext.len());
-            serde_json::from_slice::<ProtocolState>(&plaintext)
+            serde_json::from_slice::<T>(&plaintext)
                 .map_err(|_| failure("Invalid confidential checkpoint schema"))?
         }
         2 => {
             let manifest: Manifest = serde_json::from_slice(&plaintext)
                 .map_err(|_| failure("Invalid confidential checkpoint manifest"))?;
-            let rows =
-                sqlx::query("SELECT digest, body FROM keymeld_protocol_parts WHERE session_id = ?")
-                    .bind(session.to_string())
+            let manifest = match fields {
+                Some(fields) => manifest.select_fields(fields),
+                None => manifest,
+            };
+            let mut needed = BTreeSet::new();
+            manifest.digests(&mut needed);
+            let digests: Vec<_> = needed.into_iter().collect();
+            let mut bodies = BTreeMap::new();
+            // Bound each SQL result and fetch only the authenticated projection.
+            // All queries share the manifest's read transaction / CAS version.
+            for batch in digests.chunks(200) {
+                let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                    "SELECT digest, body FROM keymeld_protocol_parts WHERE session_id = ",
+                );
+                query
+                    .push_bind(session.to_string())
+                    .push(" AND digest IN (");
+                let mut list = query.separated(",");
+                for digest in batch {
+                    list.push_bind(digest.as_slice());
+                }
+                list.push_unseparated(")");
+                for row in query
+                    .build()
                     .fetch_all(&mut *snapshot)
                     .await
-                    .map_err(|e| failure(e.to_string()))?;
-            let bodies: BTreeMap<Vec<u8>, Vec<u8>> = rows
-                .into_iter()
-                .map(|row| Ok((row.try_get("digest")?, row.try_get("body")?)))
-                .collect::<Result<_, sqlx::Error>>()
-                .map_err(|e| failure(e.to_string()))?;
+                    .map_err(|e| failure(e.to_string()))?
+                {
+                    bodies.insert(
+                        row.try_get::<Vec<u8>, _>("digest")
+                            .map_err(|e| failure(e.to_string()))?,
+                        row.try_get::<Vec<u8>, _>("body")
+                            .map_err(|e| failure(e.to_string()))?,
+                    );
+                }
+            }
             snapshot
                 .commit()
                 .await
                 .map_err(|e| failure(e.to_string()))?;
-            manifest.decode(key, session, &bodies)?
+            manifest.decode_as::<T>(
+                key,
+                session,
+                &bodies,
+                if fields.is_some() {
+                    "metadata_decode"
+                } else {
+                    "decode"
+                },
+            )?
         }
         _ => return Err(failure("Unsupported confidential checkpoint format")),
     };
-    if state.schema_version != 1 || state.session.session_id != session.to_string() {
-        return Err(failure(
-            "Confidential checkpoint belongs to another session or version",
-        ));
-    }
     Ok(Some((version, state)))
 }
 

@@ -353,6 +353,31 @@ impl KeymeldService {
         }
         Ok((version, state))
     }
+    async fn load_metadata(
+        &self,
+        session: &DlcKeygenSession,
+    ) -> Result<confidential_store::ProtocolMetadata, KeymeldError> {
+        session.validate_credentials()?;
+        let (_, state) = confidential_store::load_metadata(
+            self.database()?,
+            &self.store_key,
+            &session.session_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            invalid("No confidential protocol checkpoint exists; fresh enrollment is required")
+        })?;
+        if state.session.authorization_manifest.digest()?
+            != session.authorization_manifest.digest()?
+            || state.session.recipient_authorization != session.recipient_authorization
+        {
+            return Err(invalid(
+                "Confidential checkpoint differs from the pinned session",
+            ));
+        }
+        Ok(state)
+    }
+
     async fn checkpoint(
         &self,
         session: &DlcKeygenSession,
@@ -995,7 +1020,7 @@ impl Keymeld for KeymeldService {
         session: &DlcKeygenSession,
     ) -> Result<KeygenSessionStatus, KeymeldError> {
         let _guard = self.lock_session(&session.session_id).await;
-        let (_, state) = self.load_state(session).await?;
+        let state = self.load_metadata(session).await?;
         // The lifecycle completes keygen (wait_for_keygen_completion, which
         // records the roster) only after this reports ready. Requiring the
         // roster here as well meant keygen never started. Every participant
@@ -1026,7 +1051,7 @@ impl Keymeld for KeymeldService {
         user: UserId,
     ) -> Result<RegistrationAssignment, KeymeldError> {
         let _guard = self.lock_session(&session.session_id).await;
-        let (_, state) = self.load_state(session).await?;
+        let state = self.load_metadata(session).await?;
         let enclave = *session
             .recipient_authorization
             .user_enclave_assignments
