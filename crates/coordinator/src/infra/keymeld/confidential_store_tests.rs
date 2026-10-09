@@ -566,13 +566,29 @@ fn partitioned_encoder_bounds_buffers_and_reuses_unchanged_ciphertext() {
     original.session.encrypted_session_secret = "private base field".repeat(64 * 1024);
     original.journal = large_journal(64, 64 * 1024);
     let mut base = Parts::base(&key, &session, &original, &BTreeSet::new()).unwrap();
-    let first = Parts::journal(&key, &session, &base, &original.journal, &BTreeSet::new()).unwrap();
+    let first = Parts::journal(
+        &key,
+        &session,
+        &base,
+        &original.journal,
+        &BTreeSet::new(),
+        &EntryCache::default(),
+    )
+    .unwrap();
     let mut known = BTreeSet::new();
     first.manifest.digests(&mut known);
     base.bodies.clear();
     base.serialized_len = 0;
     base.max_buffer_capacity = 0;
-    let unchanged = Parts::journal(&key, &session, &base, &original.journal, &known).unwrap();
+    let unchanged = Parts::journal(
+        &key,
+        &session,
+        &base,
+        &original.journal,
+        &known,
+        &first.entries,
+    )
+    .unwrap();
     assert!(
         unchanged.bodies.is_empty(),
         "unchanged parts must not be recompressed or encrypted"
@@ -582,8 +598,8 @@ fn partitioned_encoder_bounds_buffers_and_reuses_unchanged_ciphertext() {
         "the journal must not be buffered as one JSON document"
     );
     assert!(
-        unchanged.serialized_len < first.serialized_len - 1024 * 1024,
-        "static fields must not be reserialized on journal writes"
+        unchanged.serialized_len < 1024,
+        "unchanged journal entries and static fields must not be reserialized"
     );
     let bodies = first
         .bodies
@@ -599,6 +615,48 @@ fn partitioned_encoder_bounds_buffers_and_reuses_unchanged_ciphertext() {
         unchanged.plaintext_len,
         serde_json::to_vec(&restored).unwrap().len()
     );
+}
+
+#[test]
+fn reloaded_journal_cannot_reuse_runtime_entry_identities() {
+    let session = SessionId::new_v7();
+    let key = SessionSecret::from_bytes([48; 32]);
+    let mut original = state(&session);
+    original.journal = large_journal(8, 16 * 1024);
+    let mut base = Parts::base(&key, &session, &original, &BTreeSet::new()).unwrap();
+    let first = Parts::journal(
+        &key,
+        &session,
+        &base,
+        &original.journal,
+        &BTreeSet::new(),
+        &EntryCache::default(),
+    )
+    .unwrap();
+    let mut known = BTreeSet::new();
+    first.manifest.digests(&mut known);
+    base.bodies.clear();
+    base.serialized_len = 0;
+    base.max_buffer_capacity = 0;
+    let cloned = original.journal.clone();
+    let reused = Parts::journal(&key, &session, &base, &cloned, &known, &first.entries).unwrap();
+    assert!(reused.serialized_len < 1024);
+    let mut json = serde_json::to_value(&original.journal).unwrap();
+    json["commands"]["fixture/0/1"]["request"]["envelope"]["ciphertext"] =
+        "changed opaque request".into();
+    let replacement = serde_json::from_value(json.clone()).unwrap();
+    let fresh =
+        Parts::journal(&key, &session, &base, &replacement, &known, &first.entries).unwrap();
+    assert!(fresh.serialized_len > 7 * 16 * 1024);
+    assert!(!fresh.bodies.is_empty());
+    let bodies = first
+        .bodies
+        .into_iter()
+        .chain(fresh.bodies)
+        .map(|(key, body)| (key.to_vec(), body))
+        .collect();
+    let restored = fresh.manifest.decode(&key, &session, &bodies).unwrap();
+    assert_eq!(serde_json::to_value(restored.journal).unwrap(), json);
 }
 
 #[tokio::test]
@@ -730,5 +788,13 @@ fn cached_fields_count_toward_the_reconstructed_checkpoint_limit() {
     // Represent an already-sized cached base without allocating half a GiB.
     base.plaintext_len = 512 * 1024 * 1024;
     base.serialized_len = 0;
-    assert!(Parts::journal(&key, &session, &base, &original.journal, &BTreeSet::new()).is_err());
+    assert!(Parts::journal(
+        &key,
+        &session,
+        &base,
+        &original.journal,
+        &BTreeSet::new(),
+        &EntryCache::default()
+    )
+    .is_err());
 }

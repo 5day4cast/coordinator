@@ -8,18 +8,32 @@ use serde::ser::{self, Impossible, SerializeMap, SerializeStruct};
 enum Level {
     Base,
     Journal,
-    Entries,
+    Entries(&'static str),
 }
 
+#[derive(Clone)]
 struct Node {
     manifest: Manifest,
     len: usize,
 }
 
+#[derive(Clone)]
+struct CachedEntry {
+    revision: keymeld_sdk::confidential_session::JournalEntryRevision,
+    node: Node,
+}
+
+/// Authenticated metadata only. This cache belongs to one durable writer.
+#[derive(Default)]
+pub(in crate::infra::keymeld) struct EntryCache(BTreeMap<(String, String), CachedEntry>);
+
 struct Encoder<'a> {
     key: &'a SessionSecret,
     session: &'a SessionId,
     known: &'a BTreeSet<[u8; 32]>,
+    journal: Option<&'a ConfidentialJournal>,
+    previous: Option<&'a EntryCache>,
+    entries: EntryCache,
     bodies: BTreeMap<[u8; 32], Vec<u8>>,
     serialized: usize,
     max_buffer_capacity: usize,
@@ -30,10 +44,51 @@ impl<'a> Encoder<'a> {
             key,
             session,
             known,
+            journal: None,
+            previous: None,
+            entries: EntryCache::default(),
             bodies: BTreeMap::new(),
             serialized: 0,
             max_buffer_capacity: 0,
         }
+    }
+    fn entry<T: ?Sized + Serialize>(
+        &mut self,
+        collection: &str,
+        name: &str,
+        value: &T,
+    ) -> Result<Node, serde_json::Error> {
+        let revision = self
+            .journal
+            .and_then(|journal| journal.checkpoint_revision(collection, name));
+        let cache_key = (collection.to_string(), name.to_string());
+        let cached = self
+            .previous
+            .and_then(|cache| cache.0.get(&cache_key))
+            .filter(|entry| Some(&entry.revision) == revision.as_ref());
+        let node = if let Some(entry) = cached {
+            // Only durable parts can be reused, including when a caller has
+            // replaced a journal or removed an entry since the last save.
+            let mut digests = BTreeSet::new();
+            entry.node.manifest.digests(&mut digests);
+            if digests.is_subset(self.known) {
+                entry.node.clone()
+            } else {
+                self.value(value)?
+            }
+        } else {
+            self.value(value)?
+        };
+        if let Some(revision) = revision {
+            self.entries.0.insert(
+                cache_key,
+                CachedEntry {
+                    revision,
+                    node: node.clone(),
+                },
+            );
+        }
+        Ok(node)
     }
     fn value<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<Node, serde_json::Error> {
         let mut json = Zeroizing::new(Vec::new());
@@ -82,6 +137,7 @@ pub(super) fn encode_base(
         plaintext_len: node.len,
         serialized_len: encoder.serialized,
         max_buffer_capacity: encoder.max_buffer_capacity,
+        entries: EntryCache::default(),
     })
 }
 
@@ -91,8 +147,11 @@ pub(super) fn encode_journal(
     base: &Parts,
     journal: &ConfidentialJournal,
     known: &BTreeSet<[u8; 32]>,
+    previous: &EntryCache,
 ) -> Result<Parts, KeymeldError> {
     let mut encoder = Encoder::new(key, session, known);
+    encoder.journal = Some(journal);
+    encoder.previous = Some(previous);
     let journal = journal
         .serialize(Object::new(&mut encoder, Level::Journal))
         .map_err(|error| failure(error.to_string()))?;
@@ -113,6 +172,7 @@ pub(super) fn encode_journal(
         plaintext_len,
         serialized_len: base.serialized_len + encoder.serialized,
         max_buffer_capacity: base.max_buffer_capacity.max(encoder.max_buffer_capacity),
+        entries: encoder.entries,
     })
 }
 
@@ -141,12 +201,15 @@ impl<'a, 'b> Object<'a, 'b> {
         if matches!(self.level, Level::Base) && key == "journal" {
             return Ok(());
         }
-        let node = if matches!(self.level, Level::Journal)
-            && matches!(key, "commands" | "signing_batches")
-        {
-            value.serialize(Object::new(self.encoder, Level::Entries))?
-        } else {
-            self.encoder.value(value)?
+        let node = match (self.level, key) {
+            (Level::Journal, "commands") => {
+                value.serialize(Object::new(self.encoder, Level::Entries("commands")))?
+            }
+            (Level::Journal, "signing_batches") => {
+                value.serialize(Object::new(self.encoder, Level::Entries("signing_batches")))?
+            }
+            (Level::Entries(collection), _) => self.encoder.entry(collection, key, value)?,
+            _ => self.encoder.value(value)?,
         };
         self.len +=
             serde_json::to_string(key)?.len() + 1 + node.len + usize::from(!self.fields.is_empty());
@@ -294,5 +357,38 @@ impl<'a, 'b> ser::Serializer for Object<'a, 'b> {
         _len: usize,
     ) -> Result<Self::SerializeStructVariant, Self::Error> {
         Err(ser::Error::custom("Expected checkpoint object"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reused_entries_still_count_toward_state_limit() {
+        let key = SessionSecret::from_bytes([49; 32]);
+        let session = SessionId::new_v7();
+        let id = SessionId::new_v7().to_string();
+        let journal: ConfidentialJournal = serde_json::from_value(serde_json::json!({
+            "commands": {}, "signing_batches": {id.clone(): {"input_commitment": vec![0;32], "items": []}},
+            "opaque_route_id": null, "aborted_signing_sessions": []
+        })).unwrap();
+        let previous = EntryCache(BTreeMap::from([(
+            ("signing_batches".into(), id.clone()),
+            CachedEntry {
+                revision: journal.checkpoint_revision("signing_batches", &id).unwrap(),
+                node: Node {
+                    manifest: Manifest::Object(BTreeMap::new()),
+                    len: MAX_STATE_BYTES,
+                },
+            },
+        )]));
+        let known = BTreeSet::new();
+        let mut encoder = Encoder::new(&key, &session, &known);
+        encoder.journal = Some(&journal);
+        encoder.previous = Some(&previous);
+        assert!(journal
+            .serialize(Object::new(&mut encoder, Level::Journal))
+            .is_err());
     }
 }
