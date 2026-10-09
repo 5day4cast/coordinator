@@ -164,11 +164,9 @@ pub(super) fn encode_journal(
         return Err(failure("Confidential checkpoint exceeds size limit"));
     }
     fields.insert("journal".into(), journal.manifest);
-    let mut bodies = base.bodies.clone();
-    bodies.extend(encoder.bodies);
     Ok(Parts {
         manifest: Manifest::Object(fields),
-        bodies,
+        bodies: encoder.bodies,
         plaintext_len,
         serialized_len: base.serialized_len + encoder.serialized,
         max_buffer_capacity: base.max_buffer_capacity.max(encoder.max_buffer_capacity),

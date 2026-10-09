@@ -41,6 +41,7 @@ pub(super) enum Manifest {
 
 pub(super) struct Parts {
     pub manifest: Manifest,
+    /// Ciphertext of the parts this encode made that were not known to be stored.
     pub bodies: BTreeMap<[u8; 32], Vec<u8>>,
     /// Size of reconstructed JSON, including reused fields and delimiters.
     pub plaintext_len: usize,
@@ -78,15 +79,17 @@ impl Parts {
         session: &SessionId,
         state: &ProtocolState,
     ) -> Result<Self, KeymeldError> {
-        let base = Self::base(key, session, state, &BTreeSet::new())?;
-        Self::journal(
+        let mut base = Self::base(key, session, state, &BTreeSet::new())?;
+        let mut parts = Self::journal(
             key,
             session,
             &base,
             &state.journal,
             &BTreeSet::new(),
             &EntryCache::default(),
-        )
+        )?;
+        parts.bodies.append(&mut base.bodies);
+        Ok(parts)
     }
 
     /// Serialize the non-journal fields once per application-state update.
@@ -101,6 +104,8 @@ impl Parts {
 
     /// Keep the base manifest, and serialize journal entries individually. Never
     /// clone the journal or build a JSON buffer containing the entire checkpoint.
+    /// The result holds only the journal's new ciphertext: a write stores the base's
+    /// own new parts beside it.
     pub fn journal(
         key: &SessionSecret,
         session: &SessionId,

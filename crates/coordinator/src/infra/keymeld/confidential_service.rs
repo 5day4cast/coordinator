@@ -1,7 +1,7 @@
 //! Coordinator-owned orchestration over Keymeld's opaque relay. No application
 //! policy, roster, signing message, receipt or error goes to a gateway API.
 use super::confidential_store::{
-    self, DurableCheckpoint, ProtocolState, SettlementPlan, SigningPlan,
+    self, DurableCheckpoint, Loaded, ProtocolState, SettlementPlan, SigningPlan,
 };
 use super::*;
 use coordinator_escrow::{generic, payout_protocol::PreparedPayoutReceipts};
@@ -330,12 +330,9 @@ impl KeymeldService {
                 .map_err(|_| invalid("Invalid storage credentials"))?,
         ))
     }
-    async fn load_state(
-        &self,
-        session: &DlcKeygenSession,
-    ) -> Result<(i64, ProtocolState), KeymeldError> {
+    async fn load_state(&self, session: &DlcKeygenSession) -> Result<Loaded, KeymeldError> {
         session.validate_credentials()?;
-        let (version, state) =
+        let loaded =
             confidential_store::load(self.database()?, &self.store_key, &session.session_id)
                 .await?
                 .ok_or_else(|| {
@@ -343,6 +340,7 @@ impl KeymeldService {
                         "No confidential protocol checkpoint exists; fresh enrollment is required",
                     )
                 })?;
+        let state = &loaded.state;
         if state.session.authorization_manifest.digest()?
             != session.authorization_manifest.digest()?
             || state.session.recipient_authorization != session.recipient_authorization
@@ -351,7 +349,7 @@ impl KeymeldService {
                 "Confidential checkpoint differs from the pinned session",
             ));
         }
-        Ok((version, state))
+        Ok(loaded)
     }
     async fn load_metadata(
         &self,
@@ -382,16 +380,15 @@ impl KeymeldService {
         &self,
         session: &DlcKeygenSession,
     ) -> Result<(ProtocolState, DurableCheckpoint), KeymeldError> {
-        let (version, state) = self.load_state(session).await?;
+        let loaded = self.load_state(session).await?;
         let checkpoint = DurableCheckpoint::new(
             self.database()?.clone(),
             self.store_key.clone(),
             session.session_id.clone(),
-            version,
-            &state,
+            &loaded,
             self.settings.checkpoint_format,
         )?;
-        Ok((state, checkpoint))
+        Ok((loaded.state, checkpoint))
     }
     async fn connect<'a>(
         &'a self,
@@ -820,7 +817,9 @@ impl Keymeld for KeymeldService {
         let _guard = self.lock_session(&id).await;
         let db = self.database()?;
         let keys = self.storage_keys()?;
-        if let Some((_, state)) = confidential_store::load(db, &self.store_key, &id).await? {
+        if let Some(Loaded { state, .. }) =
+            confidential_store::load(db, &self.store_key, &id).await?
+        {
             let session = state.session.to_session(&keys)?;
             let manifest = &session.authorization_manifest.manifest;
             let expected: BTreeSet<_> = players
@@ -1309,7 +1308,7 @@ impl Keymeld for KeymeldService {
         spends: Vec<(UserId, coordinator_escrow::ark::ArkEscrowSpend)>,
     ) -> Result<Vec<Vec<(usize, [u8; 64])>>, KeymeldError> {
         let _guard = self.lock_session(&session.session_id).await;
-        let (_, mut state) = self.load_state(session).await?;
+        let mut state = self.load_state(session).await?.state;
         let credentials = SessionCredentials::from_session_secret(&session.session_secret)?;
         let mut journal = std::mem::take(&mut state.journal);
         let driver = self
