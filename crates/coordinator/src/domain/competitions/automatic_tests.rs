@@ -1025,6 +1025,52 @@ async fn paid_claim_survives_worker_restart_and_enclave_retry_without_second_inv
     f.database.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn an_unreadable_competition_does_not_stall_payouts_for_other_competitions() {
+    let f = Fixture::new().await;
+    let store = &f.coordinator.competition_store;
+    // A finalized automatic competition whose signed contract no longer decodes. Its id sorts
+    // before the fixture's, so the tick meets it first.
+    let unreadable_id = Uuid::from_u128(1);
+    let mut unreadable = Competition::new(&CreateEvent {
+        id: unreadable_id,
+        ..event(1, 2)
+    });
+    store
+        .add_competition_with_tickets(unreadable.clone(), vec![])
+        .await
+        .unwrap();
+    unreadable.attestation = Some(Scalar::from_slice(&[10; 32]).unwrap().into());
+    unreadable.funding_confirmed_at = Some(OffsetDateTime::now_utc());
+    store.update_competitions(vec![unreadable]).await.unwrap();
+    store.enable_automatic_payouts(unreadable_id).await.unwrap();
+    f.database
+        .execute_write(move |pool| async move {
+            sqlx::query("UPDATE competitions SET signed_contract = 'truncated {' WHERE id = ?")
+                .bind(unreadable_id.to_string())
+                .execute(&pool)
+                .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store.automatic_payout_candidates().await.unwrap(),
+        vec![unreadable_id, f.event_id]
+    );
+    assert!(store.get_competition(unreadable_id).await.is_err());
+
+    f.tick().await;
+
+    // The other competition's winner is still discovered, and its claim prepared, in this tick.
+    let jobs = store.due_payout_jobs().await.unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].entry_id, f.winner);
+    assert!(jobs[0].payout_id.is_some());
+    assert_eq!(f.escrow.prepare_calls.load(Ordering::SeqCst), 1);
+    f.database.close().await.unwrap();
+}
+
 fn event(places: usize, players: usize) -> CreateEvent {
     let now = OffsetDateTime::now_utc();
     CreateEvent {
