@@ -1051,7 +1051,7 @@ async fn metadata_reads_match_legacy_and_parts_without_loading_the_journal() {
     original.journal = large_journal(8, 128 * 1024);
     original.epochs.insert(EnclaveId::new(2), 7);
     create(&db, &key, &session, &original).await.unwrap();
-    for parts in [false, true] {
+    for format in [CheckpointFormat::Monolithic, CheckpointFormat::Parts] {
         let version = row(&db, &session).await.0;
         let writer = make_checkpoint(
             db.clone(),
@@ -1059,7 +1059,7 @@ async fn metadata_reads_match_legacy_and_parts_without_loading_the_journal() {
             session.clone(),
             version,
             &original,
-            parts,
+            format,
         );
         writer.finish(&original).await.unwrap();
         let (read_version, metadata) = load_metadata(&db, &key, &session).await.unwrap().unwrap();
@@ -1128,7 +1128,7 @@ async fn metadata_reads_reject_wrong_identity_and_schema() {
     let key = SessionSecret::from_bytes([63; 32]);
     let mut original = state(&session);
     create(&db, &key, &session, &original).await.unwrap();
-    for parts in [false, true] {
+    for format in [CheckpointFormat::Monolithic, CheckpointFormat::Parts] {
         for bad_schema in [false, true] {
             original.schema_version = if bad_schema { 2 } else { 1 };
             original.session.session_id = if bad_schema {
@@ -1143,7 +1143,7 @@ async fn metadata_reads_reject_wrong_identity_and_schema() {
                 session.clone(),
                 version,
                 &original,
-                parts,
+                format,
             );
             writer.finish(&original).await.unwrap();
             assert!(load_metadata(&db, &key, &session).await.is_err());
@@ -1161,7 +1161,14 @@ async fn metadata_projection_uses_one_committed_snapshot() {
     original.epochs.insert(EnclaveId::new(1), 0);
     original.session.encrypted_session_secret = "0".into();
     create(&db, &key, &session, &original).await.unwrap();
-    let writer = make_checkpoint(db.clone(), key.clone(), session.clone(), 0, &original, true);
+    let writer = make_checkpoint(
+        db.clone(),
+        key.clone(),
+        session.clone(),
+        0,
+        &original,
+        CheckpointFormat::Parts,
+    );
     let writes = async {
         for version in 1..=16 {
             original.epochs.insert(EnclaveId::new(1), version);
@@ -1192,7 +1199,14 @@ async fn checkpoint_read_memory_benchmark() {
     original.journal = large_journal(32, 256 * 1024);
     let full_bytes = serde_json::to_vec(&original).unwrap().len();
     create(&db, &key, &session, &original).await.unwrap();
-    let checkpoint = make_checkpoint(db.clone(), key.clone(), session.clone(), 0, &original, true);
+    let checkpoint = make_checkpoint(
+        db.clone(),
+        key.clone(),
+        session.clone(),
+        0,
+        &original,
+        CheckpointFormat::Parts,
+    );
     checkpoint.finish(&original).await.unwrap();
     drop(checkpoint);
     drop(original);
