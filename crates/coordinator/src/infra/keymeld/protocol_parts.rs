@@ -57,6 +57,7 @@ impl Parts {
         let json = Zeroizing::new(
             serde_json::to_string(state).map_err(|error| failure(error.to_string()))?,
         );
+        crate::metrics::checkpoint_bytes("parts", "encode", json.len());
         if json.len() > MAX_STATE_BYTES {
             return Err(failure("Confidential checkpoint exceeds size limit"));
         }
@@ -151,6 +152,7 @@ impl Manifest {
     ) -> Result<ProtocolState, KeymeldError> {
         let mut json = Zeroizing::new(Vec::new());
         self.append(key, session, bodies, &mut json)?;
+        crate::metrics::checkpoint_bytes("parts", "decode", json.len());
         serde_json::from_slice(&json).map_err(|_| failure("Invalid confidential checkpoint schema"))
     }
 

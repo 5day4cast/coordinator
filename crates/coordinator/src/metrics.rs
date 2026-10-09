@@ -29,6 +29,9 @@ use crate::{
     infra::{ark_swap::SwapWallet, lightning::PAYMENT_FAILURE_REASONS},
 };
 
+mod memory;
+pub(crate) use memory::checkpoint_bytes;
+
 /// How long database-derived gauges are reused between scrapes.
 pub const DB_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -534,6 +537,7 @@ impl Metrics {
         background_threads: Arc<HashMap<String, JoinHandle<()>>>,
     ) -> Result<Self, prometheus::Error> {
         let registry = Registry::new();
+        memory::register(&registry)?;
         let gauge_vec = |name: &str, help: &str, label: &str| {
             let gauge = IntGaugeVec::new(Opts::new(name, help), &[label])?;
             registry.register(Box::new(gauge.clone()))?;
@@ -729,6 +733,7 @@ impl Metrics {
 
     /// Render every metric in the Prometheus text format.
     pub async fn render(&self) -> String {
+        memory::refresh();
         self.refresh_threads();
         if let Some(arkade) = &self.arkade {
             arkade.unavailable(time::OffsetDateTime::now_utc());

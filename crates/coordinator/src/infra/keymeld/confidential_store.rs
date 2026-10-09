@@ -65,6 +65,7 @@ fn seal(
     state: &ProtocolState,
 ) -> Result<String, KeymeldError> {
     let plaintext = Zeroizing::new(serde_json::to_vec(state).map_err(|e| failure(e.to_string()))?);
+    crate::metrics::checkpoint_bytes("monolithic", "encode", plaintext.len());
     key.encrypt(&plaintext, &context(session, version))
         .and_then(|encrypted| encrypted.to_hex())
         .map_err(|_| failure("Cannot encrypt confidential protocol checkpoint"))
@@ -100,8 +101,11 @@ pub(super) async fn load(
     );
     let format: i64 = row.try_get("format").map_err(|e| failure(e.to_string()))?;
     let state = match format {
-        1 => serde_json::from_slice::<ProtocolState>(&plaintext)
-            .map_err(|_| failure("Invalid confidential checkpoint schema"))?,
+        1 => {
+            crate::metrics::checkpoint_bytes("monolithic", "decode", plaintext.len());
+            serde_json::from_slice::<ProtocolState>(&plaintext)
+                .map_err(|_| failure("Invalid confidential checkpoint schema"))?
+        }
         2 => {
             let manifest: Manifest = serde_json::from_slice(&plaintext)
                 .map_err(|_| failure("Invalid confidential checkpoint manifest"))?;
