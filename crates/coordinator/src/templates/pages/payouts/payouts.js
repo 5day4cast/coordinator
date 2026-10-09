@@ -10,18 +10,21 @@ class Payouts {
     return new AuthorizedClient(session.nostrClient, this.coordinator_url);
   }
 
-  async getPayableEntries() {
-    const [entries, competitions] = await Promise.all([
+  // The player's entries in one competition that are owed a payout. The
+  // competition's own record has the signed contract a payout signs over;
+  // the competition list leaves it out.
+  async getPayableEntries(competitionId) {
+    const [entries, competition] = await Promise.all([
       this.getUserEntries(),
-      this.getCompetitions(),
+      this.getCompetition(competitionId),
     ]);
 
     const payableEntries = await Promise.all(
       entries
         // A failed attempt can retain its invoice. The signed authorization
         // endpoint decides whether a replacement is still permitted.
-        .filter((entry) => !entry.paid_out_at)
-        .map((entry) => this.checkEntryPayout(entry, competitions)),
+        .filter((entry) => !entry.paid_out_at && entry.event_id === competitionId)
+        .map((entry) => this.checkEntryPayout(entry, [competition])),
     );
 
     return payableEntries.filter(Boolean);
@@ -90,12 +93,12 @@ class Payouts {
     return response.json();
   }
 
-  async getCompetitions() {
+  async getCompetition(competitionId) {
     const response = await this.client.get(
-      `${this.coordinator_url}/api/v1/competitions`,
+      `${this.coordinator_url}/api/v1/competitions/${competitionId}`,
     );
     if (!response.ok)
-      throw new Error(`Failed to get competitions: ${response.status}`);
+      throw new Error(`Failed to get competition: ${response.status}`);
     return response.json();
   }
 
@@ -321,7 +324,7 @@ async function submitPayoutInvoice() {
 
   try {
     // Get payable entries to find the entry details
-    const payableEntries = await payoutsInstance.getPayableEntries();
+    const payableEntries = await payoutsInstance.getPayableEntries(payout.competitionId);
     // Closing or reopening while the lookup runs cancels this submission.
     if (!isActive()) return;
     const payableEntry = payableEntries.find(

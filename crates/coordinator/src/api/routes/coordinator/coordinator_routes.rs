@@ -327,7 +327,9 @@ pub async fn get_competitions(
     let more = ids.len() > page.limit;
     ids.truncate(page.limit);
     let next = more.then(|| ids.last().copied()).flatten();
-    let mut competitions = state.coordinator.get_competitions_page(&ids).await?;
+    // A list never carries a signed contract or an event announcement (see docs/list-api.md):
+    // a client reads them from the competition's own route.
+    let mut competitions = state.coordinator.get_competitions_page(&ids, true).await?;
     for competition in &mut competitions {
         if !competition.is_funding_broadcasted() {
             competition.funding_transaction = None;

@@ -1466,17 +1466,26 @@ impl CompetitionStore {
         &self,
         active_only: bool,
     ) -> Result<Vec<Competition>, sqlx::Error> {
-        self.get_competitions_selected(active_only, None).await
+        self.get_competitions_selected(active_only, None, false)
+            .await
     }
 
+    /// Competitions with their entry counts: every one, or those in `ids`. A `lean` read
+    /// leaves out the signed contract and the event announcement, most of a signed
+    /// competition's bytes, in SQL: decoding the signed contract rebuilds its whole
+    /// transaction graph, and the announcement holds a locking point per outcome. Both read
+    /// as `None`; [`Self::get_competition`] has them.
     pub async fn get_competitions_selected(
         &self,
         active_only: bool,
         ids: Option<&[Uuid]>,
+        lean: bool,
     ) -> Result<Vec<Competition>, sqlx::Error> {
         if ids.is_some_and(|ids| ids.is_empty()) {
             return Ok(Vec::new());
         }
+        // Grouped by the primary key alone, as in `get_competition_detail`: a GROUP BY that
+        // names the contract columns copies them into a sort once per entry row.
         let base_query = r#"
             WITH payout_stats AS (
                 SELECT
@@ -1490,7 +1499,7 @@ impl CompetitionStore {
                 competitions.id as id,
                 created_at as created_at,
                 event_submission,
-                event_announcement,
+                CASE WHEN ? THEN NULL ELSE event_announcement END AS event_announcement,
                 COUNT(entries.id) as total_entries,
                 COUNT(CASE WHEN entries.public_nonces IS NOT NULL THEN entries.id END) as total_entry_nonces,
                 COUNT(CASE WHEN entries.signed_at IS NOT NULL THEN entries.id END) as total_signed_entries,
@@ -1504,7 +1513,7 @@ impl CompetitionStore {
                 competitions.public_nonces as public_nonces,
                 aggregated_nonces,
                 competitions.partial_signatures as partial_signatures,
-                signed_contract,
+                CASE WHEN ? THEN NULL ELSE signed_contract END AS signed_contract,
                 attestation,
                 cancelled_at as cancelled_at,
                 contracted_at as contracted_at,
@@ -1546,95 +1555,17 @@ impl CompetitionStore {
         };
         let final_query = if active_only {
             format!(
-                "{} WHERE expiry_broadcasted_at IS NULL AND completed_at IS NULL AND cancelled_at IS NULL
-                GROUP BY
-                    competitions.id,
-                    created_at,
-                    event_submission,
-                    event_announcement,
-                    outcome_transaction,
-                    competitions.funding_psbt_base64,
-                    funding_outpoint,
-                    funding_transaction,
-                    contract_parameters,
-                    competitions.public_nonces,
-                    aggregated_nonces,
-                    competitions.partial_signatures,
-                    signed_contract,
-                    attestation,
-                    cancelled_at,
-                    contracted_at,
-                    competitions.signed_at,
-                    escrow_funds_confirmed_at,
-                    event_created_at,
-                    entries_submitted_at,
-                    funding_broadcasted_at,
-                    funding_confirmed_at,
-                    funding_settled_at,
-                    awaiting_attestation_at,
-                    invoices_settled_at,
-                    expiry_broadcasted_at,
-                    outcome_broadcasted_at,
-                    delta_broadcasted_at,
-                    completed_at,
-                    failed_at,
-                    keymeld_keygen_completed_at,
-                    errors,
-                    competitions.kind,
-                    competitions.parent_id,
-                    competitions.pool_index,
-                    competitions.pools_formed_at,
-                    competitions.pools_finished_at,
-                    payout_stats.total_paid_out_entries",
-                base_query
+                "{base_query} WHERE expiry_broadcasted_at IS NULL AND completed_at IS NULL AND cancelled_at IS NULL
+                GROUP BY competitions.id"
             )
         } else {
-            format!(
-                "{}
-                GROUP BY
-                    competitions.id,
-                    created_at,
-                    event_submission,
-                    event_announcement,
-                    outcome_transaction,
-                    competitions.funding_psbt_base64,
-                    funding_outpoint,
-                    funding_transaction,
-                    contract_parameters,
-                    competitions.public_nonces,
-                    aggregated_nonces,
-                    competitions.partial_signatures,
-                    signed_contract,
-                    attestation,
-                    cancelled_at,
-                    contracted_at,
-                    competitions.signed_at,
-                    escrow_funds_confirmed_at,
-                    event_created_at,
-                    entries_submitted_at,
-                    funding_broadcasted_at,
-                    funding_confirmed_at,
-                    funding_settled_at,
-                    awaiting_attestation_at,
-                    invoices_settled_at,
-                    expiry_broadcasted_at,
-                    outcome_broadcasted_at,
-                    delta_broadcasted_at,
-                    completed_at,
-                    failed_at,
-                    keymeld_keygen_completed_at,
-                    errors,
-                    competitions.kind,
-                    competitions.parent_id,
-                    competitions.pool_index,
-                    competitions.pools_formed_at,
-                    competitions.pools_finished_at,
-                    payout_stats.total_paid_out_entries",
-                base_query
-            )
+            format!("{base_query} GROUP BY competitions.id")
         };
 
-        let mut query = sqlx::query_as::<_, Competition>(&final_query);
+        // Both `lean` placeholders come before the ids' in the text.
+        let mut query = sqlx::query_as::<_, Competition>(&final_query)
+            .bind(lean)
+            .bind(lean);
         if let Some(ids) = ids {
             for id in ids {
                 query = query.bind(id.to_string());

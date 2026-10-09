@@ -34,7 +34,8 @@ impl Coordinator {
         let mut ids: Vec<_> = entries.iter().map(|entry| entry.event_id).collect();
         ids.sort_unstable();
         ids.dedup();
-        let competitions = self.get_competitions_page(&ids).await?;
+        // The outcome needs the announcement, and an expiry refund the signed contract.
+        let competitions = self.get_competitions_page(&ids, false).await?;
         let store = &self.competition_store;
 
         let mut payouts = Vec::new();
