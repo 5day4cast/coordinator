@@ -17,6 +17,9 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+#[path = "checkpoint_array.rs"]
+mod checkpoint_array;
+
 const PART_BYTES: usize = 32 * 1024;
 const MAX_STATE_BYTES: usize = 512 * 1024 * 1024;
 
@@ -87,14 +90,14 @@ fn split(
             return Ok(Manifest::Object(parts));
         }
         if text.starts_with('[') {
-            let array: Vec<&RawValue> =
-                serde_json::from_str(text).map_err(|error| failure(error.to_string()))?;
             // Binary vectors serialize as arrays of scalars. Keep them as one compressed
-            // part instead of expanding each byte into a manifest reference.
-            if array
-                .iter()
-                .any(|value| value.get().starts_with('{') || value.get().starts_with('['))
+            // part. Classify without a Vec<&RawValue>: that temporary index costs two
+            // machine words per byte, before compression or encryption even begins.
+            if checkpoint_array::has_nested_values(text)
+                .map_err(|error| failure(error.to_string()))?
             {
+                let array: Vec<&RawValue> =
+                    serde_json::from_str(text).map_err(|error| failure(error.to_string()))?;
                 let parts = array
                     .into_iter()
                     .map(|value| split(key, session, value, bodies))
