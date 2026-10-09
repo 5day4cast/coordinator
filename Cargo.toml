@@ -52,8 +52,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # keymeld-sdk and the coordinator must resolve dlctix from the same source.
 # Keymeld 0.10.1 includes bounded command history and concurrent signing rounds.
 # Every crate that names Keymeld pins the same rev.
-keymeld-sdk = { git = "https://github.com/tee8z/keymeld", rev = "f082e28b384a9236c69162838b8a68f832c75f82", default-features = false, features = ["escrow", "dlctix"] }
-keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "f082e28b384a9236c69162838b8a68f832c75f82", default-features = false, features = ["escrow"] }
+keymeld-sdk = { git = "https://github.com/tee8z/keymeld", rev = "565b760088f0435d7a46b81c493b7faa895832e9", default-features = false, features = ["escrow", "dlctix"] }
+keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "565b760088f0435d7a46b81c493b7faa895832e9", default-features = false, features = ["escrow"] }
 
 # Bitcoin
 bitcoin = { version = "0.32", features = ["serde", "base64", "rand-std"] }

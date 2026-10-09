@@ -74,17 +74,17 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1791551802,
+        "lastModified": 1791553333,
         "narHash": "sha256-CwjzX8ZNZ9eV3J+YbeFZ4C2vzMUgvKM3x4I3HTehyls=",
         "owner": "tee8z",
         "repo": "keymeld",
-        "rev": "f082e28b384a9236c69162838b8a68f832c75f82",
+        "rev": "565b760088f0435d7a46b81c493b7faa895832e9",
         "type": "github"
       },
       "original": {
         "owner": "tee8z",
         "repo": "keymeld",
-        "rev": "f082e28b384a9236c69162838b8a68f832c75f82",
+        "rev": "565b760088f0435d7a46b81c493b7faa895832e9",
         "type": "github"
       }
     },
