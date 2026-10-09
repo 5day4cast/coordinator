@@ -221,3 +221,48 @@ impl Manifest {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn large_scalar_array_retains_its_authenticated_part_and_exact_bytes() {
+        let key = SessionSecret::from_bytes([31; 32]);
+        let session = SessionId::new_v7();
+        let json = serde_json::to_string(&vec![255_u8; PART_BYTES]).unwrap();
+        let raw: &RawValue = serde_json::from_str(&json).unwrap();
+        let mut bodies = BTreeMap::new();
+        let manifest = split(&key, &session, raw, &mut bodies).unwrap();
+        let expected = part_digest(&key, &session, json.as_bytes());
+        assert!(matches!(&manifest, Manifest::Part(digest) if *digest == expected));
+        assert_eq!(bodies.len(), 1);
+        let bodies = bodies.into_iter().map(|(k, v)| (k.to_vec(), v)).collect();
+        let mut restored = Vec::new();
+        manifest
+            .append(&key, &session, &bodies, &mut restored)
+            .unwrap();
+        assert_eq!(restored, json.as_bytes());
+    }
+
+    #[test]
+    fn large_mixed_array_keeps_scalar_prefix_and_nested_values() {
+        let key = SessionSecret::from_bytes([32; 32]);
+        let session = SessionId::new_v7();
+        let value = serde_json::json!([0, {"payload": vec![255_u8; PART_BYTES]}, "[", null]);
+        let json = serde_json::to_string(&value).unwrap();
+        let raw: &RawValue = serde_json::from_str(&json).unwrap();
+        let mut bodies = BTreeMap::new();
+        let manifest = split(&key, &session, raw, &mut bodies).unwrap();
+        assert!(matches!(&manifest, Manifest::Array(values) if values.len() == 4));
+        let bodies = bodies.into_iter().map(|(k, v)| (k.to_vec(), v)).collect();
+        let mut restored = Vec::new();
+        manifest
+            .append(&key, &session, &bodies, &mut restored)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&restored).unwrap(),
+            value
+        );
+    }
+}
