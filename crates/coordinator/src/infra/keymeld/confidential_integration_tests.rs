@@ -2,7 +2,10 @@
 //! real encrypted HTTP transport. Deterministic enclave keys simulate custody;
 //! this test does not exercise Nitro attestation, KMS, or a Lightning node.
 use super::*;
-use crate::infra::db::{DatabasePoolConfig, DatabaseType};
+use crate::{
+    config::CheckpointFormat,
+    infra::db::{DatabasePoolConfig, DatabaseType},
+};
 use axum::{
     extract::State,
     routing::{get, post},
@@ -303,6 +306,16 @@ async fn prepare_candidates_before_restart(
 
 #[tokio::test]
 async fn coordinator_service_executes_confidential_dlc_and_recovers_late_paid_candidate() {
+    executes_dlc_and_recovers_late_paid_candidate(CheckpointFormat::Monolithic).await;
+}
+
+/// The restarted service resumes from format-2 checkpoints, and every save is read back.
+#[tokio::test]
+async fn coordinator_service_recovers_late_paid_candidate_from_partitioned_checkpoints() {
+    executes_dlc_and_recovers_late_paid_candidate(CheckpointFormat::Parts).await;
+}
+
+async fn executes_dlc_and_recovers_late_paid_candidate(format: CheckpointFormat) {
     let relay_state = Relay {
         operator: Arc::new(Mutex::new(operator())),
         requests: Default::default(),
@@ -335,6 +348,7 @@ async fn coordinator_service_executes_confidential_dlc_and_recovers_late_paid_ca
         gateway_url: url,
         initial_polling_delay_ms: 1,
         max_polling_delay_ms: 10,
+        checkpoint_format: format,
         ..Default::default()
     };
     let service = create_keymeld_service(settings.clone(), maker, &[18; 32], db.clone()).unwrap();
@@ -674,6 +688,15 @@ impl PoolHarness {
 
     /// Register the players of `params`, whose keys are the entry keys from [`entry_secret`].
     async fn start_with(params: ContractParameters, consent: Consent<'_>) -> Self {
+        Self::start_in(CheckpointFormat::Monolithic, params, consent).await
+    }
+
+    /// As [`PoolHarness::start_with`], with the service writing checkpoints in `format`.
+    async fn start_in(
+        format: CheckpointFormat,
+        params: ContractParameters,
+        consent: Consent<'_>,
+    ) -> Self {
         let Consent {
             escrows,
             lightning_address,
@@ -734,6 +757,7 @@ impl PoolHarness {
             gateway_url: url,
             initial_polling_delay_ms: 1,
             max_polling_delay_ms: 10,
+            checkpoint_format: format,
             ..Default::default()
         };
         let maker = Uuid::now_v7();
@@ -1378,11 +1402,24 @@ async fn an_enclave_failing_its_share_fails_the_kickoff_step() {
     pool.harness.stop().await;
 }
 
-/// Outside a batch, permits remain sequential and each concurrent signing round
-/// checkpoints all of its requests. A completed retry reloads the saved results.
 #[tokio::test]
 async fn durable_contract_signing_checkpoints_concurrent_rounds_and_replays_them() {
-    let pool = PoolHarness::start_with(
+    contract_signing_replays_its_rounds(CheckpointFormat::Monolithic).await;
+}
+
+/// The same signing in format 2. Every save is read back and compared with the SDK's journal,
+/// after each round's outcomes change their entries in place while the writer reuses the
+/// other entries' parts.
+#[tokio::test]
+async fn durable_contract_signing_replays_rounds_from_partitioned_checkpoints() {
+    contract_signing_replays_its_rounds(CheckpointFormat::Parts).await;
+}
+
+/// Outside a batch, permits remain sequential and each concurrent signing round
+/// checkpoints all of its requests. A completed retry reloads the saved results.
+async fn contract_signing_replays_its_rounds(format: CheckpointFormat) {
+    let pool = PoolHarness::start_in(
+        format,
         pool_parameters(6),
         Consent {
             enclaves: 3,

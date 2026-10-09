@@ -1008,6 +1008,24 @@ pub struct KeymeldSettings {
     pub max_polling_delay_ms: u64,
     /// Polling backoff multiplier
     pub polling_backoff_multiplier: f64,
+    /// How new confidential protocol checkpoints are written. Only `COORDINATOR_PROTOCOL_PARTS`
+    /// sets it; see [`KeymeldSettings::apply_protocol_parts_env`].
+    #[serde(skip)]
+    pub checkpoint_format: CheckpointFormat,
+}
+
+/// Environment variable that selects the confidential checkpoint format. See
+/// docs/protocol-checkpoints.md.
+pub const PROTOCOL_PARTS_ENV: &str = "COORDINATOR_PROTOCOL_PARTS";
+
+/// How the coordinator writes confidential protocol checkpoints. It reads both formats.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CheckpointFormat {
+    /// Format 1: one encrypted JSON document.
+    #[default]
+    Monolithic,
+    /// Format 2: an encrypted manifest over compressed, encrypted parts.
+    Parts,
 }
 
 fn default_automatic_payout_fee_ceiling() -> u64 {
@@ -1030,6 +1048,7 @@ impl Default for KeymeldSettings {
             initial_polling_delay_ms: 500,
             max_polling_delay_ms: 5000,
             polling_backoff_multiplier: 1.5,
+            checkpoint_format: CheckpointFormat::Monolithic,
         }
     }
 }
@@ -1272,6 +1291,22 @@ impl KeymeldSettings {
             .unwrap_or(&self.gateway_url)
     }
 
+    /// Apply `COORDINATOR_PROTOCOL_PARTS`: unset, `0` or `false` writes format 1, and `1` or
+    /// `true` writes format 2. Any other value is refused, so a mistyped value stops startup
+    /// instead of silently choosing a format.
+    pub fn apply_protocol_parts_env(&mut self, value: Option<String>) -> Result<(), anyhow::Error> {
+        self.checkpoint_format = match value.as_deref() {
+            None | Some("0" | "false") => CheckpointFormat::Monolithic,
+            Some("1" | "true") => CheckpointFormat::Parts,
+            Some(other) => {
+                return Err(anyhow!(
+                    "{PROTOCOL_PARTS_ENV} must be unset, 0, false, 1 or true, not {other:?}"
+                ))
+            }
+        };
+        Ok(())
+    }
+
     pub fn validate(&self, network: Network) -> Result<(), anyhow::Error> {
         if self.automatic_payouts && !self.enabled {
             return Err(anyhow::anyhow!("Automatic payouts require Keymeld"));
@@ -1351,6 +1386,36 @@ mod keymeld_config_tests {
         let parsed: KeymeldSettings = toml::from_str(&text).unwrap();
         assert_eq!(parsed.trusted_pcrs, settings.trusted_pcrs);
         assert_eq!(parsed.public_gateway_url, settings.public_gateway_url);
+    }
+
+    #[test]
+    fn protocol_parts_variable_selects_the_checkpoint_format_or_stops_startup() {
+        let selected = |value: Option<&str>| {
+            let mut settings = KeymeldSettings::default();
+            settings
+                .apply_protocol_parts_env(value.map(String::from))
+                .map(|()| settings.checkpoint_format)
+        };
+        assert_eq!(selected(None).unwrap(), CheckpointFormat::Monolithic);
+        for value in ["0", "false"] {
+            assert_eq!(selected(Some(value)).unwrap(), CheckpointFormat::Monolithic);
+        }
+        for value in ["1", "true"] {
+            assert_eq!(selected(Some(value)).unwrap(), CheckpointFormat::Parts);
+        }
+        // These once fell back to format 1 without a word.
+        for value in ["", "yes", "TRUE", " 1", "2"] {
+            let refused = selected(Some(value)).unwrap_err();
+            assert!(
+                refused.to_string().contains(PROTOCOL_PARTS_ENV),
+                "{refused}"
+            );
+        }
+        // Only the variable chooses the format, never the settings file.
+        let text = toml::to_string(&KeymeldSettings::default()).unwrap();
+        let parsed: KeymeldSettings =
+            toml::from_str(&format!("checkpoint_format = \"Parts\"\n{text}")).unwrap();
+        assert_eq!(parsed.checkpoint_format, CheckpointFormat::Monolithic);
     }
 
     #[test]
@@ -1784,6 +1849,9 @@ fn server_settings_with_env(
     settings
         .http_context
         .apply_env_overrides(var(TRUSTED_PROXIES_ENV), var(CLIENT_IP_HEADER_ENV));
+    settings
+        .keymeld_settings
+        .apply_protocol_parts_env(var(PROTOCOL_PARTS_ENV))?;
     settings.feedback_settings.apply_env(&var)?;
     settings.admin_settings.logs.apply_env(var);
     Ok(settings)
@@ -2371,6 +2439,7 @@ mod feedback_settings_tests {
                     "https://notify.example.com",
                 ),
                 ("COORDINATOR_LOGS_URL", "https://monitoring.example.com"),
+                (PROTOCOL_PARTS_ENV, "1"),
             ]),
         )
         .unwrap();
@@ -2391,6 +2460,10 @@ mod feedback_settings_tests {
         assert_eq!(
             settings.admin_settings.logs.url.as_deref(),
             Some("https://monitoring.example.com")
+        );
+        assert_eq!(
+            settings.keymeld_settings.checkpoint_format,
+            CheckpointFormat::Parts
         );
     }
 

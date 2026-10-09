@@ -207,7 +207,9 @@ impl KeymeldService {
         let _guard = self.lock_session(&id).await;
         let db = self.database()?;
         let keys = self.storage_keys()?;
-        if let Some((_, state)) = confidential_store::load(db, &self.store_key, &id).await? {
+        if let Some(Loaded { state, .. }) =
+            confidential_store::load(db, &self.store_key, &id).await?
+        {
             let session = state.session.to_session(&keys)?;
             let manifest = &session.authorization_manifest.manifest;
             let assignments = &session.recipient_authorization.user_enclave_assignments;

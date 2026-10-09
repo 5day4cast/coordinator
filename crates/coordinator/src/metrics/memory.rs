@@ -48,7 +48,7 @@ static SYSTEM: LazyLock<Gauge> = LazyLock::new(|| {
 });
 static CHECKPOINT: LazyLock<HistogramVec> = LazyLock::new(|| {
     HistogramVec::new(
-    HistogramOpts::new("coordinator_checkpoint_plaintext_bytes", "Serialized confidential checkpoint bytes before encryption or after authenticated decoding")
+    HistogramOpts::new("coordinator_checkpoint_plaintext_bytes", "Confidential checkpoint plaintext bytes per write or authenticated read. Format-1 writes and all reads count the whole document; format-2 writes count only the fields and journal entries serialized for that write")
         .buckets(vec![65_536., 262_144., 1_048_576., 4_194_304., 16_777_216., 67_108_864., 268_435_456., 536_870_912.]),
     &["format", "operation"],
 ).expect("valid metric")
