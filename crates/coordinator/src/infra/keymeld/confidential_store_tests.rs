@@ -71,16 +71,19 @@ pub(super) async fn assert_stored_state(
     );
 }
 
+/// What the store holds, decoded without the identity checks `load` applies: some tests write a
+/// state for another session or schema on purpose to prove that reads refuse it.
 async fn stored(checkpoint: &DurableCheckpoint, version: i64) -> ProtocolState {
-    let stored = load(&checkpoint.db, &checkpoint.key, &checkpoint.session)
-        .await
-        .unwrap()
-        .unwrap();
+    let (stored_version, state, _) =
+        load_record::<ProtocolState>(&checkpoint.db, &checkpoint.key, &checkpoint.session, None)
+            .await
+            .unwrap()
+            .unwrap();
     assert_eq!(
-        stored.version, version,
+        stored_version, version,
         "another writer committed in between"
     );
-    stored.state
+    state
 }
 
 async fn database() -> (TempDir, DBConnection) {
