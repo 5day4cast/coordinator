@@ -618,12 +618,14 @@ impl Coordinator {
             .index_existing_payment_hashes()
             .await?;
         for id in self.competition_store.automatic_payout_candidates().await? {
-            let competition = self.competition_store.get_competition(id).await?;
-            if let Err(error) = self.queue_automatic_competition(&competition).await {
-                warn!(
-                    "Cannot discover payouts for competition {}: {}",
-                    competition.id, error
-                );
+            // A competition that cannot be read is skipped like one that cannot be queued.
+            // Returning instead would hold back the due jobs below for every competition.
+            let discovered = match self.competition_store.get_competition(id).await {
+                Ok(competition) => self.queue_automatic_competition(&competition).await,
+                Err(error) => Err(error.into()),
+            };
+            if let Err(error) = discovered {
+                warn!("Cannot discover payouts for competition {}: {}", id, error);
             }
         }
         // Include paid claims from completed competitions: escrow release is
