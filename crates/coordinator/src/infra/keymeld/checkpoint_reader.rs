@@ -1,7 +1,7 @@
 //! Reconstruct checkpoint JSON without retaining its complete plaintext.
 //! AEAD authenticates each compressed part before it is read. Its content MAC
 //! and gzip trailer are checked before advancing to the next manifest token.
-use super::{context, part_mac, Manifest};
+use super::{context, part_mac, Manifest, PartLengths};
 use flate2::read::GzDecoder;
 use hmac::{Hmac, Mac};
 use keymeld_core::{
@@ -44,6 +44,7 @@ struct Part {
     decoder: GzDecoder<Compressed>,
     mac: Hmac<Sha256>,
     digest: [u8; 32],
+    len: usize,
 }
 
 pub(super) struct Reader<'a> {
@@ -54,6 +55,8 @@ pub(super) struct Reader<'a> {
     bodies: &'a BTreeMap<Vec<u8>, Vec<u8>>,
     limit: usize,
     read: usize,
+    /// The plaintext length of each part read to its authenticated end.
+    pub(super) lengths: PartLengths,
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -110,6 +113,7 @@ impl<'a> Reader<'a> {
             bodies,
             limit,
             read: 0,
+            lengths: PartLengths::new(),
         }
     }
 
@@ -136,6 +140,7 @@ impl<'a> Reader<'a> {
                         decoder: GzDecoder::new(Compressed { bytes, offset: 0 }),
                         mac: part_mac(self.key, self.session),
                         digest: *digest,
+                        len: 0,
                     }))));
                 }
                 Task::Value(Manifest::Object(values)) => {
@@ -200,6 +205,7 @@ impl Read for Reader<'_> {
                 Chunk::Part(part) => {
                     let count = part.decoder.read(&mut output[..allowed])?;
                     part.mac.update(&output[..count]);
+                    part.len += count;
                     count
                 }
             };
@@ -211,9 +217,12 @@ impl Read for Reader<'_> {
                 return Ok(count);
             }
             if let Some(Chunk::Part(part)) = self.current.take() {
-                let Part { mac, digest, .. } = *part;
+                let Part {
+                    mac, digest, len, ..
+                } = *part;
                 mac.verify_slice(&digest)
                     .map_err(|_| invalid("Checkpoint part digest differs"))?;
+                self.lengths.insert(digest, len);
             }
         }
     }
@@ -297,7 +306,8 @@ mod tests {
         assert_eq!(
             manifest
                 .decode_as::<serde_json::Value>(&key, &session, &bodies, "test")
-                .unwrap(),
+                .unwrap()
+                .0,
             serde_json::Value::Null
         );
         let mut tampered = bodies.clone();
@@ -345,8 +355,9 @@ mod tests {
                 serde_json::from_slice(&json).unwrap()
             } else {
                 manifest
-                    .decode_as(&key, &session, &bodies, "benchmark")
+                    .decode_as::<Vec<String>>(&key, &session, &bodies, "benchmark")
                     .unwrap()
+                    .0
             };
             std::hint::black_box(result);
         }

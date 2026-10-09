@@ -6,6 +6,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use futures::FutureExt;
 use keymeld_core::{
     authorization::{
         EnclaveRecipientAuthorization, SessionAuthorizationManifest, SignedSessionManifest,
@@ -24,9 +25,9 @@ use std::sync::{
 };
 use tempfile::TempDir;
 
-/// A writer for a state the test wrote itself. It knows of no stored parts, as after loading a
-/// format-1 row.
-fn make_checkpoint(
+/// A writer for a state the test wrote itself. It knows of no stored parts or entry encodings,
+/// as after loading a format-1 row.
+async fn make_checkpoint(
     db: DBConnection,
     key: SessionSecret,
     session: SessionId,
@@ -38,8 +39,30 @@ fn make_checkpoint(
         version,
         state: state.clone(),
         parts: BTreeSet::new(),
+        entries: EntryCache::default(),
     };
-    DurableCheckpoint::new(db, key, session, &written, format).unwrap()
+    DurableCheckpoint::resume(db, key, session, written, format)
+        .await
+        .unwrap()
+        .0
+}
+
+/// A partitioned writer resumed from what the store holds, as a new operation starts one.
+async fn resume_parts(
+    db: &DBConnection,
+    key: &SessionSecret,
+    session: &SessionId,
+) -> (DurableCheckpoint, ProtocolState) {
+    let loaded = load(db, key, session).await.unwrap().unwrap();
+    DurableCheckpoint::resume(
+        db.clone(),
+        key.clone(),
+        session.clone(),
+        loaded,
+        CheckpointFormat::Parts,
+    )
+    .await
+    .unwrap()
 }
 
 /// A partitioned write in a test build reads back what it committed and compares it with what
@@ -288,7 +311,8 @@ async fn assert_checkpoint_roundtrip(db: &DBConnection) {
         version,
         &loaded,
         CheckpointFormat::Monolithic,
-    );
+    )
+    .await;
     checkpoint
         .save(&ConfidentialJournal::default())
         .await
@@ -318,7 +342,8 @@ async fn assert_checkpoint_compare_and_swap(db: &DBConnection, format: Checkpoin
         0,
         &original,
         format,
-    );
+    )
+    .await;
     let second = make_checkpoint(
         db.clone(),
         key.clone(),
@@ -326,12 +351,13 @@ async fn assert_checkpoint_compare_and_swap(db: &DBConnection, format: Checkpoin
         0,
         &original,
         format,
-    );
+    )
+    .await;
     let mut left = original.clone();
     left.session.encrypted_session_secret = "first committed state".into();
     let mut right = original;
     right.session.encrypted_session_secret = "second committed state".into();
-    let (a, b) = tokio::join!(first.finish(&left), second.finish(&right));
+    let (a, b) = tokio::join!(first.finish(left), second.finish(right));
     assert_ne!(a.is_ok(), b.is_ok());
     let Loaded {
         version,
@@ -372,7 +398,8 @@ async fn assert_stale_checkpoint_stops_command(
         0,
         &state,
         format,
-    );
+    )
+    .await;
     let winner = make_checkpoint(
         db.clone(),
         key.clone(),
@@ -380,7 +407,8 @@ async fn assert_stale_checkpoint_stops_command(
         0,
         &state,
         format,
-    );
+    )
+    .await;
     winner.save(&ConfidentialJournal::default()).await.unwrap();
     let count = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
@@ -455,8 +483,9 @@ async fn partitioned_checkpoints_reuse_ciphertext_and_fail_closed_on_missing_par
         0,
         &original,
         CheckpointFormat::Parts,
-    );
-    checkpoint.finish(&original).await.unwrap();
+    )
+    .await;
+    checkpoint.finish(original.clone()).await.unwrap();
     let read_parts = || async {
         sqlx::query_as::<_, (Vec<u8>, Vec<u8>)>(
             "SELECT digest, body FROM keymeld_protocol_parts WHERE session_id = ? ORDER BY digest",
@@ -474,7 +503,7 @@ async fn partitioned_checkpoints_reuse_ciphertext_and_fail_closed_on_missing_par
     );
     let encoded_bytes: usize = first.iter().map(|(_, body)| body.len()).sum();
     assert!(encoded_bytes < serde_json::to_vec(&original).unwrap().len() / 4);
-    checkpoint.finish(&original).await.unwrap();
+    checkpoint.finish(original.clone()).await.unwrap();
     assert_eq!(
         read_parts().await,
         first,
@@ -497,8 +526,9 @@ async fn partitioned_checkpoints_reuse_ciphertext_and_fail_closed_on_missing_par
         1,
         &original,
         CheckpointFormat::Parts,
-    );
-    assert!(stale.finish(&original).await.is_err());
+    )
+    .await;
+    assert!(stale.finish(original.clone()).await.is_err());
     assert_eq!(
         read_parts().await,
         first,
@@ -506,7 +536,7 @@ async fn partitioned_checkpoints_reuse_ciphertext_and_fail_closed_on_missing_par
     );
     let mut changed = original.clone();
     changed.session.encrypted_session_secret = "another private checkpoint ".repeat(8192);
-    checkpoint.finish(&changed).await.unwrap();
+    checkpoint.finish(changed.clone()).await.unwrap();
     let after = read_parts().await;
     assert!(
         after.iter().any(|part| first.contains(part)),
@@ -557,8 +587,9 @@ async fn compatible_reader_can_write_a_partitioned_checkpoint_back_to_legacy_for
         0,
         &original,
         CheckpointFormat::Parts,
-    );
-    writer.finish(&original).await.unwrap();
+    )
+    .await;
+    writer.finish(original.clone()).await.unwrap();
     let Loaded {
         version,
         state: restored,
@@ -571,8 +602,9 @@ async fn compatible_reader_can_write_a_partitioned_checkpoint_back_to_legacy_for
         version,
         &restored,
         CheckpointFormat::Monolithic,
-    );
-    legacy.finish(&original).await.unwrap();
+    )
+    .await;
+    legacy.finish(original.clone()).await.unwrap();
     let (version, ciphertext) = row(&db, &session).await;
     let plaintext = key
         .decrypt(
@@ -798,7 +830,8 @@ async fn failed_part_insert_leaves_version_and_committed_parts_for_the_retry() {
         0,
         &original,
         CheckpointFormat::Parts,
-    );
+    )
+    .await;
     writer.save(&original.journal).await.unwrap();
     let before = row(&db, &session).await;
     db.execute_write(|pool| async move {
@@ -854,7 +887,8 @@ async fn journal_replacement_and_removal_survive_reload_and_legacy_rollback() {
         0,
         &original,
         CheckpointFormat::Parts,
-    );
+    )
+    .await;
     writer.save(&original.journal).await.unwrap();
     let mut value = serde_json::to_value(&original.journal).unwrap();
     value["commands"]
@@ -886,18 +920,18 @@ async fn journal_replacement_and_removal_survive_reload_and_legacy_rollback() {
     let loaded = load(&db, &key, &session).await.unwrap().unwrap();
     assert_eq!(serde_json::to_value(&loaded.state.journal).unwrap(), value);
     // A writer resumed after a process restart reuses the parts its load authenticated.
-    let restarted = DurableCheckpoint::new(
+    let (restarted, mut restored) = DurableCheckpoint::resume(
         db.clone(),
         key.clone(),
         session.clone(),
-        &loaded,
+        loaded,
         CheckpointFormat::Parts,
     )
+    .await
     .unwrap();
-    let mut restored = loaded.state;
     restarted.save(&restored.journal).await.unwrap();
     restored.session.encrypted_session_secret = "updated static state".into();
-    restarted.finish(&restored).await.unwrap();
+    let restored = restarted.finish(restored).await.unwrap();
     restarted.save(&restored.journal).await.unwrap();
     let Loaded {
         version,
@@ -916,8 +950,9 @@ async fn journal_replacement_and_removal_survive_reload_and_legacy_rollback() {
         version,
         &restored,
         CheckpointFormat::Monolithic,
-    );
-    legacy.finish(&restored).await.unwrap();
+    )
+    .await;
+    legacy.finish(restored.clone()).await.unwrap();
     let rolled_back = load(&db, &key, &session).await.unwrap().unwrap().state;
     assert_eq!(
         serde_json::to_value(rolled_back).unwrap(),
@@ -961,41 +996,33 @@ async fn resumed_writer_reuses_loaded_parts_and_fails_closed_after_a_conflicting
         &original,
         CheckpointFormat::Parts,
     )
-    .finish(&original)
+    .await
+    .finish(original)
     .await
     .unwrap();
     let stored = part_rows(&db, &session).await;
-    let loaded = load(&db, &key, &session).await.unwrap().unwrap();
-    assert_eq!(loaded.version, 1);
-    let resume = |loaded: &Loaded| {
-        DurableCheckpoint::new(
-            db.clone(),
-            key.clone(),
-            session.clone(),
-            loaded,
-            CheckpointFormat::Parts,
-        )
-        .unwrap()
-    };
     // Two operations resume from the same version.
-    let (first, second) = (resume(&loaded), resume(&loaded));
+    let (first, loaded) = resume_parts(&db, &key, &session).await;
+    let (second, _) = resume_parts(&db, &key, &session).await;
     for writer in [&first, &second] {
+        let current = writer.current.lock().await;
+        assert_eq!(current.0, 1);
         assert!(
-            matches!(&writer.current.lock().await.1, Snapshot::Parts { pending, .. } if pending.is_empty()),
+            matches!(&current.1, Snapshot::Parts { pending, .. } if pending.is_empty()),
             "a resumed writer encrypts none of the fields it loaded"
         );
     }
 
     // Saving the unchanged journal compresses, encrypts and inserts no part.
     run(&db, "CREATE TRIGGER refuse_part_insert BEFORE INSERT ON keymeld_protocol_parts BEGIN SELECT RAISE(ABORT, 'no part may be inserted'); END").await;
-    first.save(&loaded.state.journal).await.unwrap();
+    first.save(&loaded.journal).await.unwrap();
     run(&db, "DROP TRIGGER refuse_part_insert").await;
     assert_eq!(row(&db, &session).await.0, 2);
     assert_eq!(part_rows(&db, &session).await, stored);
 
     // `first` removes an entry and with it the entry's part. `second` still counts that part as
     // stored, but its compare-and-swap names version 1, so it fails and changes nothing.
-    let mut shorter = serde_json::to_value(&loaded.state.journal).unwrap();
+    let mut shorter = serde_json::to_value(&loaded.journal).unwrap();
     shorter["commands"]
         .as_object_mut()
         .unwrap()
@@ -1004,25 +1031,204 @@ async fn resumed_writer_reuses_loaded_parts_and_fails_closed_after_a_conflicting
     first.save(&removed).await.unwrap();
     let after_removal = part_rows(&db, &session).await;
     assert_eq!(after_removal.len(), stored.len() - 1);
-    assert!(second.save(&loaded.state.journal).await.is_err());
+    assert!(second.save(&loaded.journal).await.is_err());
     assert_eq!(second.current.lock().await.0, 1);
     assert_eq!(row(&db, &session).await.0, 3);
     assert_eq!(part_rows(&db, &session).await, after_removal);
 
     // A reload resumes from the version that won and stores the removed entry's part again.
-    let reloaded = load(&db, &key, &session).await.unwrap().unwrap();
-    assert_eq!(
-        serde_json::to_value(&reloaded.state.journal).unwrap(),
-        shorter
-    );
-    resume(&reloaded).save(&loaded.state.journal).await.unwrap();
+    let (third, reloaded) = resume_parts(&db, &key, &session).await;
+    assert_eq!(serde_json::to_value(&reloaded.journal).unwrap(), shorter);
+    third.save(&loaded.journal).await.unwrap();
     let restored = load(&db, &key, &session).await.unwrap().unwrap();
     assert_eq!(restored.version, 4);
     assert_eq!(
         serde_json::to_value(&restored.state.journal).unwrap(),
-        serde_json::to_value(&loaded.state.journal).unwrap()
+        serde_json::to_value(&loaded.journal).unwrap()
     );
     db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn resumed_writer_reuses_the_journal_entry_encodings_it_loaded() {
+    let (_directory, db) = database().await;
+    let session = SessionId::new_v7();
+    let key = SessionSecret::from_bytes([51; 32]);
+    let mut original = state(&session);
+    original.journal = large_journal(8, 16 * 1024);
+    create(&db, &key, &session, &original).await.unwrap();
+    make_checkpoint(
+        db.clone(),
+        key.clone(),
+        session.clone(),
+        0,
+        &original,
+        CheckpointFormat::Parts,
+    )
+    .await
+    .finish(original)
+    .await
+    .unwrap();
+    let (writer, loaded) = resume_parts(&db, &key, &session).await;
+    {
+        // What the writer's next save encodes for the journal it loaded.
+        let current = writer.current.lock().await;
+        let Snapshot::Parts {
+            base,
+            committed,
+            entries,
+            ..
+        } = &current.1
+        else {
+            panic!("a partitioned writer");
+        };
+        let unchanged =
+            Parts::journal(&key, &session, base, &loaded.journal, committed, entries).unwrap();
+        assert!(
+            unchanged.serialized_len - base.serialized_len < 1024,
+            "no loaded command or signing batch is serialized again"
+        );
+        assert!(unchanged.bodies.is_empty());
+        assert_eq!(
+            unchanged.plaintext_len,
+            serde_json::to_vec(&loaded).unwrap().len(),
+            "reused entries keep their exact size for the state limit"
+        );
+        // Equal contents decoded again are other entries: each one is serialized again.
+        let decoded: ConfidentialJournal =
+            serde_json::from_value(serde_json::to_value(&loaded.journal).unwrap()).unwrap();
+        let fresh = Parts::journal(&key, &session, base, &decoded, committed, entries).unwrap();
+        assert!(fresh.serialized_len - base.serialized_len > 8 * 16 * 1024);
+    }
+    run(&db, "CREATE TRIGGER refuse_part_insert BEFORE INSERT ON keymeld_protocol_parts BEGIN SELECT RAISE(ABORT, 'no part may be inserted'); END").await;
+    writer.save(&loaded.journal).await.unwrap();
+    run(&db, "DROP TRIGGER refuse_part_insert").await;
+    let restored = load(&db, &key, &session).await.unwrap().unwrap();
+    assert_eq!(restored.version, 2);
+    assert_eq!(
+        serde_json::to_vec(&restored.state).unwrap(),
+        serde_json::to_vec(&loaded).unwrap()
+    );
+    db.close().await.unwrap();
+}
+
+/// Encoding moved to the blocking pool; the stored formats did not change. Format 1 seals the
+/// state's exact JSON, format 2 the manifest an inline encode builds over the same parts, and
+/// both load back as the state's exact JSON.
+#[tokio::test]
+async fn checkpoints_encoded_off_the_runtime_store_and_load_the_same_bytes() {
+    let (_directory, db) = database().await;
+    let key = SessionSecret::from_bytes([52; 32]);
+    for format in [CheckpointFormat::Monolithic, CheckpointFormat::Parts] {
+        let session = SessionId::new_v7();
+        let mut original = state(&session);
+        original.journal = large_journal(4, 16 * 1024);
+        let json = serde_json::to_vec(&original).unwrap();
+        create(&db, &key, &session, &original).await.unwrap();
+        make_checkpoint(
+            db.clone(),
+            key.clone(),
+            session.clone(),
+            0,
+            &original,
+            format,
+        )
+        .await
+        .finish(original.clone())
+        .await
+        .unwrap();
+        let (version, ciphertext) = row(&db, &session).await;
+        let sealed = key
+            .decrypt(
+                &EncryptedData::from_hex(&ciphertext).unwrap(),
+                &context(&session, version),
+            )
+            .unwrap();
+        let inline = Parts::encode(&key, &session, &original).unwrap();
+        let (expected, digests): (_, Vec<_>) = match format {
+            CheckpointFormat::Monolithic => (json.clone(), vec![]),
+            CheckpointFormat::Parts => (
+                serde_json::to_vec(&inline.manifest).unwrap(),
+                inline.bodies.keys().map(|digest| digest.to_vec()).collect(),
+            ),
+        };
+        assert_eq!(sealed, expected);
+        let stored: Vec<_> = part_rows(&db, &session)
+            .await
+            .into_iter()
+            .map(|(digest, _)| digest)
+            .collect();
+        assert_eq!(stored, digests);
+        let loaded = load(&db, &key, &session).await.unwrap().unwrap();
+        assert_eq!(serde_json::to_vec(&loaded.state).unwrap(), json);
+    }
+    db.close().await.unwrap();
+}
+
+/// A save cancelled while its encoding waits for the blocking pool keeps the writer locked
+/// until that encoding ends, then leaves the version, the cache and the database as they were,
+/// so the retry commits.
+#[test]
+fn cancelled_save_leaves_the_writer_and_store_unchanged_for_the_retry() {
+    // One blocking thread, so the test decides when the save's encoding can run.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (_directory, db) = database().await;
+        let session = SessionId::new_v7();
+        let key = SessionSecret::from_bytes([53; 32]);
+        let mut original = state(&session);
+        original.session.encrypted_session_secret = "pending base field ".repeat(4096);
+        create(&db, &key, &session, &original).await.unwrap();
+        let writer = make_checkpoint(
+            db.clone(),
+            key.clone(),
+            session.clone(),
+            0,
+            &original,
+            CheckpointFormat::Parts,
+        )
+        .await;
+        let before = row(&db, &session).await;
+        let pending = match &writer.current.lock().await.1 {
+            Snapshot::Parts { pending, .. } => Arc::clone(pending),
+            Snapshot::Legacy(_) => panic!("a partitioned writer"),
+        };
+        assert!(!pending.is_empty(), "the base waits for its first write");
+
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let blocker = tokio::task::spawn_blocking(move || blocked.recv());
+        let journal = large_journal(2, 16 * 1024);
+        assert!(writer.save(&journal).now_or_never().is_none());
+        assert!(
+            writer.current.try_lock().is_err(),
+            "the cancelled save's encoding still holds the writer"
+        );
+        release.send(()).unwrap();
+        blocker.await.unwrap().unwrap();
+        {
+            let current = writer.current.lock().await;
+            assert_eq!(current.0, 0);
+            let Snapshot::Parts {
+                pending: kept,
+                committed,
+                ..
+            } = &current.1
+            else {
+                panic!("a partitioned writer");
+            };
+            assert!(Arc::ptr_eq(kept, &pending), "the base still waits");
+            assert!(committed.is_empty());
+        }
+        assert_eq!(row(&db, &session).await, before);
+
+        writer.save(&journal).await.unwrap();
+        assert_eq!(row(&db, &session).await.0, 1);
+        db.close().await.unwrap();
+    });
 }
 
 #[test]
@@ -1063,8 +1269,9 @@ async fn metadata_reads_match_legacy_and_parts_without_loading_the_journal() {
             version,
             &original,
             format,
-        );
-        writer.finish(&original).await.unwrap();
+        )
+        .await;
+        writer.finish(original.clone()).await.unwrap();
         let (read_version, metadata) = load_metadata(&db, &key, &session).await.unwrap().unwrap();
         assert_eq!(read_version, version + 1);
         assert_eq!(metadata.epochs, original.epochs);
@@ -1147,8 +1354,9 @@ async fn metadata_reads_reject_wrong_identity_and_schema() {
                 version,
                 &original,
                 format,
-            );
-            writer.finish(&original).await.unwrap();
+            )
+            .await;
+            writer.finish(original.clone()).await.unwrap();
             assert!(load_metadata(&db, &key, &session).await.is_err());
         }
     }
@@ -1171,12 +1379,13 @@ async fn metadata_projection_uses_one_committed_snapshot() {
         0,
         &original,
         CheckpointFormat::Parts,
-    );
+    )
+    .await;
     let writes = async {
         for version in 1..=16 {
             original.epochs.insert(EnclaveId::new(1), version);
             original.session.encrypted_session_secret = version.to_string();
-            writer.finish(&original).await.unwrap();
+            writer.finish(original.clone()).await.unwrap();
             tokio::task::yield_now().await;
         }
     };
@@ -1209,8 +1418,9 @@ async fn checkpoint_read_memory_benchmark() {
         0,
         &original,
         CheckpointFormat::Parts,
-    );
-    checkpoint.finish(&original).await.unwrap();
+    )
+    .await;
+    checkpoint.finish(original.clone()).await.unwrap();
     drop(checkpoint);
     drop(original);
     let full = std::env::var_os("CHECKPOINT_BENCH_FULL").is_some();

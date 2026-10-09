@@ -27,6 +27,85 @@ struct CachedEntry {
 #[derive(Default)]
 pub(in crate::infra::keymeld) struct EntryCache(BTreeMap<(String, String), CachedEntry>);
 
+impl EntryCache {
+    /// The stored encoding of each entry of a journal a load just decoded from `manifest`,
+    /// under the identity that load gave the entry. A writer resumed from the load reuses an
+    /// entry only while it keeps that identity, so only while nothing has changed it.
+    /// A collection that the manifest stores as one part seeds none of its entries.
+    pub(in crate::infra::keymeld) fn loaded(
+        manifest: &Manifest,
+        journal: &ConfidentialJournal,
+        lengths: &PartLengths,
+    ) -> Self {
+        let mut cache = Self::default();
+        let Manifest::Object(fields) = manifest else {
+            return cache;
+        };
+        let Some(Manifest::Object(collections)) = fields.get("journal") else {
+            return cache;
+        };
+        for collection in ["commands", "signing_batches"] {
+            let Some(Manifest::Object(entries)) = collections.get(collection) else {
+                continue;
+            };
+            // Loading decodes names that spell one signing session differently into one entry,
+            // and a save looks each entry up by the one name it serializes. Only when every
+            // stored name is that name was each entry decoded from its own node.
+            if !entries.keys().all(|name| serialized_name(collection, name)) {
+                continue;
+            }
+            for (name, node) in entries {
+                let (Some(revision), Some(len)) = (
+                    journal.checkpoint_revision(collection, name),
+                    reconstructed_len(node, lengths),
+                ) else {
+                    continue;
+                };
+                cache.0.insert(
+                    (collection.to_string(), name.clone()),
+                    CachedEntry {
+                        revision,
+                        node: Node {
+                            manifest: node.clone(),
+                            len,
+                        },
+                    },
+                );
+            }
+        }
+        cache
+    }
+}
+
+/// Whether `name` is how the journal serializes the key it names in `collection`.
+fn serialized_name(collection: &str, name: &str) -> bool {
+    match collection {
+        "signing_batches" => SessionId::parse(name).is_ok_and(|id| id.to_string() == name),
+        _ => true,
+    }
+}
+
+/// The length of the JSON that `manifest` reconstructs, with the reader's delimiters, or
+/// `None` if a part's length is unknown.
+fn reconstructed_len(manifest: &Manifest, lengths: &PartLengths) -> Option<usize> {
+    match manifest {
+        Manifest::Part(digest) => lengths.get(digest).copied(),
+        Manifest::Object(fields) => {
+            fields
+                .iter()
+                .try_fold(2 + fields.len().saturating_sub(1), |len, (name, value)| {
+                    let name = serde_json::to_string(name).ok()?.len();
+                    Some(len + name + 1 + reconstructed_len(value, lengths)?)
+                })
+        }
+        Manifest::Array(values) => values
+            .iter()
+            .try_fold(2 + values.len().saturating_sub(1), |len, value| {
+                Some(len + reconstructed_len(value, lengths)?)
+            }),
+    }
+}
+
 struct Encoder<'a> {
     key: &'a SessionSecret,
     session: &'a SessionId,
@@ -388,5 +467,41 @@ mod tests {
         assert!(journal
             .serialize(Object::new(&mut encoder, Level::Journal))
             .is_err());
+    }
+
+    #[test]
+    fn a_signing_batch_stored_under_another_spelling_seeds_no_encoding() {
+        let canonical = SessionId::new_v7().to_string();
+        let braced = format!("{{{canonical}}}");
+        let seeded = |names: &[&String]| {
+            let batches: serde_json::Map<_, _> = names
+                .iter()
+                .map(|name| {
+                    let batch = serde_json::json!({"input_commitment": vec![0; 32], "items": []});
+                    (name.to_string(), batch)
+                })
+                .collect();
+            let journal: ConfidentialJournal = serde_json::from_value(serde_json::json!({
+                "commands": {}, "signing_batches": batches,
+                "opaque_route_id": null, "aborted_signing_sessions": []
+            }))
+            .unwrap();
+            let nodes = names
+                .iter()
+                .map(|name| (name.to_string(), Manifest::Part([1; 32])))
+                .collect();
+            let manifest = Manifest::Object(BTreeMap::from([(
+                "journal".to_string(),
+                Manifest::Object(BTreeMap::from([(
+                    "signing_batches".to_string(),
+                    Manifest::Object(nodes),
+                )])),
+            )]));
+            EntryCache::loaded(&manifest, &journal, &BTreeMap::from([([1; 32], 64)])).0
+        };
+        assert!(seeded(&[&canonical]).contains_key(&("signing_batches".into(), canonical.clone())));
+        // Both names load as one entry, decoded from the braced node, while a save looks the
+        // entry up under the canonical name.
+        assert!(seeded(&[&canonical, &braced]).is_empty());
     }
 }

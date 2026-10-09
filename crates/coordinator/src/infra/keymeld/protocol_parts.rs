@@ -39,6 +39,9 @@ pub(super) enum Manifest {
     Array(Vec<Manifest>),
 }
 
+/// The plaintext length of each part, keyed by its content address.
+pub(super) type PartLengths = BTreeMap<[u8; 32], usize>;
+
 pub(super) struct Parts {
     pub manifest: Manifest,
     /// Ciphertext of the parts this encode made that were not known to be stored.
@@ -219,16 +222,20 @@ impl Manifest {
         session: &SessionId,
         bodies: &BTreeMap<Vec<u8>, Vec<u8>>,
     ) -> Result<ProtocolState, KeymeldError> {
-        self.decode_as(key, session, bodies, "decode")
+        Ok(self
+            .decode_as::<ProtocolState>(key, session, bodies, "decode")?
+            .0)
     }
 
+    /// Decode a value, and the plaintext length of every part it authenticated: a resumed
+    /// writer sizes the encodings it reuses from them.
     pub fn decode_as<T: DeserializeOwned>(
         &self,
         key: &SessionSecret,
         session: &SessionId,
         bodies: &BTreeMap<Vec<u8>, Vec<u8>>,
         operation: &'static str,
-    ) -> Result<T, KeymeldError> {
+    ) -> Result<(T, PartLengths), KeymeldError> {
         let mut reader =
             checkpoint_reader::Reader::new(self, key, session, bodies, MAX_STATE_BYTES);
         // Serde must consume EOF before returning. That also checks the final
@@ -236,7 +243,7 @@ impl Manifest {
         let state = serde_json::from_reader(checkpoint_reader::Buffered::new(&mut reader))
             .map_err(|_| failure("Invalid or unauthenticated confidential checkpoint"))?;
         crate::metrics::checkpoint_bytes("parts", operation, reader.bytes_read());
-        Ok(state)
+        Ok((state, reader.lengths))
     }
 
     #[cfg(test)]

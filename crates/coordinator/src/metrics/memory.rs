@@ -1,9 +1,16 @@
 //! Read-only process and allocator accounting. RSS includes live allocations and retained
 //! pages; glibc's free arena bytes are reusable, not necessarily resident or reclaimable.
 use prometheus::{Gauge, Histogram, HistogramOpts, HistogramVec, Registry};
-use std::sync::LazyLock;
+use std::{sync::LazyLock, time::Duration};
+use tokio::{sync::Mutex, time::Instant};
 
 use super::unknown;
+
+/// How long one allocator read serves scrapes: see [`AllocatorSample`].
+const ALLOCATOR_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+
+/// glibc's in-use, free arena and system bytes, as the allocator gauges report them.
+type AllocatorBytes = (usize, usize, usize);
 
 static RESIDENT: LazyLock<Gauge> = LazyLock::new(|| {
     unknown(Gauge::new(
@@ -113,7 +120,37 @@ fn status_bytes(status: &str, field: &str) -> Option<u64> {
     kib.checked_mul(1024)
 }
 
-pub(super) fn refresh() {
+/// The last allocator read, and when it was taken.
+///
+/// `mallinfo2` walks the free lists of every arena while holding that arena's lock. A read
+/// costs most, and stalls allocating threads longest, when the heap is fragmented: just when
+/// these gauges matter. Scrapes therefore share one read for [`ALLOCATOR_REFRESH_INTERVAL`],
+/// taken on the blocking pool instead of an async worker.
+#[derive(Default)]
+pub(super) struct AllocatorSample(Mutex<Option<(Instant, Option<AllocatorBytes>)>>);
+
+impl AllocatorSample {
+    /// What `read` returns, or the last read while it is younger than
+    /// [`ALLOCATOR_REFRESH_INTERVAL`]. Concurrent scrapes wait for one read.
+    async fn bytes(
+        &self,
+        read: impl FnOnce() -> Option<AllocatorBytes> + Send + 'static,
+    ) -> Option<AllocatorBytes> {
+        let mut last = self.0.lock().await;
+        if let Some((at, bytes)) = *last {
+            if at.elapsed() < ALLOCATOR_REFRESH_INTERVAL {
+                return bytes;
+            }
+        }
+        // A read that panicked keeps the gauges as they were; the next scrape reads again.
+        let bytes = tokio::task::spawn_blocking(read).await.ok()?;
+        *last = Some((Instant::now(), bytes));
+        bytes
+    }
+}
+
+/// Refresh the process gauges, and the allocator gauges from `allocator`.
+pub(super) async fn refresh(allocator: &AllocatorSample) {
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
         for (gauge, field) in [
             (&*RESIDENT, "VmRSS"),
@@ -124,7 +161,7 @@ pub(super) fn refresh() {
             gauge.set(status_bytes(&status, field).map_or(f64::NAN, |bytes| bytes as f64));
         }
     }
-    if let Some((allocated, free, system)) = allocator_bytes() {
+    if let Some((allocated, free, system)) = allocator.bytes(allocator_bytes).await {
         ALLOCATED.set(allocated as f64);
         FREE.set(free as f64);
         SYSTEM.set(system as f64);
@@ -132,7 +169,7 @@ pub(super) fn refresh() {
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn allocator_bytes() -> Option<(usize, usize, usize)> {
+fn allocator_bytes() -> Option<AllocatorBytes> {
     // glibc mallinfo2 uses ten size_t fields, in this ABI order. It takes its own locks.
     // This reads accounting only: no malloc_trim, allocator tuning, or process attachment.
     #[repr(C)]
@@ -161,13 +198,17 @@ fn allocator_bytes() -> Option<(usize, usize, usize)> {
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-fn allocator_bytes() -> Option<(usize, usize, usize)> {
+fn allocator_bytes() -> Option<AllocatorBytes> {
     None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     #[test]
     fn process_status_distinguishes_resident_anonymous_swap_and_high_water() {
@@ -206,6 +247,30 @@ mod tests {
         assert_eq!(metric.get_label().len(), 2);
         assert!(metric.get_histogram().get_sample_count() >= 1);
         assert!(metric.get_histogram().get_sample_sum() >= 70_000.);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn allocator_reads_are_reused_until_the_refresh_interval_passes() {
+        let sample = AllocatorSample::default();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let read = |bytes: AllocatorBytes| {
+            let reads = Arc::clone(&reads);
+            move || {
+                reads.fetch_add(1, Ordering::SeqCst);
+                Some(bytes)
+            }
+        };
+        assert_eq!(sample.bytes(read((1, 2, 3))).await, Some((1, 2, 3)));
+        tokio::time::advance(ALLOCATOR_REFRESH_INTERVAL - Duration::from_millis(1)).await;
+        assert_eq!(
+            sample.bytes(read((4, 5, 6))).await,
+            Some((1, 2, 3)),
+            "a scrape within the interval reuses the last read"
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(sample.bytes(read((4, 5, 6))).await, Some((4, 5, 6)));
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
     }
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
