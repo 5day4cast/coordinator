@@ -515,6 +515,7 @@ pub struct Metrics {
     /// Reads the outputs at its key's address again when a scrape finds the last read old.
     coordinator: Option<Arc<Coordinator>>,
     last_refresh: Mutex<Option<Instant>>,
+    allocator: memory::AllocatorSample,
     competitions: IntGaugeVec,
     entries: IntGaugeVec,
     tickets: IntGaugeVec,
@@ -609,6 +610,7 @@ impl Metrics {
             arkade: None,
             coordinator: None,
             last_refresh: Mutex::new(None),
+            allocator: memory::AllocatorSample::default(),
         };
 
         let build_info = IntGaugeVec::new(
@@ -733,7 +735,7 @@ impl Metrics {
 
     /// Render every metric in the Prometheus text format.
     pub async fn render(&self) -> String {
-        memory::refresh();
+        memory::refresh(&self.allocator).await;
         self.refresh_threads();
         if let Some(arkade) = &self.arkade {
             arkade.unavailable(time::OffsetDateTime::now_utc());
