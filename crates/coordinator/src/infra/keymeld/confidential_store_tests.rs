@@ -30,9 +30,9 @@ fn make_checkpoint(
     session: SessionId,
     version: i64,
     state: &ProtocolState,
-    parts: bool,
+    format: CheckpointFormat,
 ) -> DurableCheckpoint {
-    DurableCheckpoint::with_parts(db, key, session, version, state, parts).unwrap()
+    DurableCheckpoint::new(db, key, session, version, state, format).unwrap()
 }
 
 async fn database() -> (TempDir, DBConnection) {
@@ -188,8 +188,8 @@ async fn checkpoint_rejects_wrong_key_session_version_schema_and_ciphertext() {
 #[tokio::test]
 async fn independently_loaded_checkpoints_use_compare_and_swap_without_lost_updates() {
     let (_directory, db) = database().await;
-    for parts in [false, true] {
-        assert_checkpoint_compare_and_swap(&db, parts).await;
+    for format in [CheckpointFormat::Monolithic, CheckpointFormat::Parts] {
+        assert_checkpoint_compare_and_swap(&db, format).await;
     }
     db.close().await.unwrap();
 }
@@ -207,8 +207,8 @@ async fn should_not_send(State(count): State<Arc<AtomicUsize>>) -> StatusCode {
 #[tokio::test]
 async fn sdk_sends_no_enclave_command_after_durable_checkpoint_cas_failure() {
     let (_directory, db) = database().await;
-    for parts in [false, true] {
-        let server = assert_stale_checkpoint_stops_command(&db, parts).await;
+    for format in [CheckpointFormat::Monolithic, CheckpointFormat::Parts] {
+        let server = assert_stale_checkpoint_stops_command(&db, format).await;
         server.abort();
     }
     db.close().await.unwrap();
@@ -236,7 +236,7 @@ async fn assert_checkpoint_roundtrip(db: &DBConnection) {
         session.clone(),
         version,
         &loaded,
-        false,
+        CheckpointFormat::Monolithic,
     );
     checkpoint
         .save(&ConfidentialJournal::default())
@@ -255,7 +255,7 @@ async fn assert_checkpoint_roundtrip(db: &DBConnection) {
     );
 }
 
-async fn assert_checkpoint_compare_and_swap(db: &DBConnection, parts: bool) {
+async fn assert_checkpoint_compare_and_swap(db: &DBConnection, format: CheckpointFormat) {
     let session = SessionId::new_v7();
     let key = SessionSecret::from_bytes([26; 32]);
     let original = state(&session);
@@ -266,7 +266,7 @@ async fn assert_checkpoint_compare_and_swap(db: &DBConnection, parts: bool) {
         session.clone(),
         0,
         &original,
-        parts,
+        format,
     );
     let second = make_checkpoint(
         db.clone(),
@@ -274,7 +274,7 @@ async fn assert_checkpoint_compare_and_swap(db: &DBConnection, parts: bool) {
         session.clone(),
         0,
         &original,
-        parts,
+        format,
     );
     let mut left = original.clone();
     left.session.encrypted_session_secret = "first committed state".into();
@@ -304,7 +304,7 @@ async fn assert_checkpoint_compare_and_swap(db: &DBConnection, parts: bool) {
 
 async fn assert_stale_checkpoint_stops_command(
     db: &DBConnection,
-    parts: bool,
+    format: CheckpointFormat,
 ) -> tokio::task::JoinHandle<()> {
     let session_id = SessionId::new_v7();
     let key = SessionSecret::from_bytes([27; 32]);
@@ -316,7 +316,7 @@ async fn assert_stale_checkpoint_stops_command(
         session_id.clone(),
         0,
         &state,
-        parts,
+        format,
     );
     let winner = make_checkpoint(
         db.clone(),
@@ -324,7 +324,7 @@ async fn assert_stale_checkpoint_stops_command(
         session_id.clone(),
         0,
         &state,
-        parts,
+        format,
     );
     winner.save(&ConfidentialJournal::default()).await.unwrap();
     let count = Arc::new(AtomicUsize::new(0));
@@ -393,7 +393,14 @@ async fn partitioned_checkpoints_reuse_ciphertext_and_fail_closed_on_missing_par
     original.session.encrypted_session_secret = "large private checkpoint ".repeat(8192);
     original.session.aggregate_key = (0..=255).cycle().take(64 * 1024).collect();
     create(&db, &key, &session, &original).await.unwrap();
-    let checkpoint = make_checkpoint(db.clone(), key.clone(), session.clone(), 0, &original, true);
+    let checkpoint = make_checkpoint(
+        db.clone(),
+        key.clone(),
+        session.clone(),
+        0,
+        &original,
+        CheckpointFormat::Parts,
+    );
     checkpoint.finish(&original).await.unwrap();
     let read_parts = || async {
         sqlx::query_as::<_, (Vec<u8>, Vec<u8>)>(
@@ -424,7 +431,14 @@ async fn partitioned_checkpoints_reuse_ciphertext_and_fail_closed_on_missing_par
         serde_json::to_value(&restored).unwrap(),
         serde_json::to_value(&original).unwrap()
     );
-    let stale = make_checkpoint(db.clone(), key.clone(), session.clone(), 1, &original, true);
+    let stale = make_checkpoint(
+        db.clone(),
+        key.clone(),
+        session.clone(),
+        1,
+        &original,
+        CheckpointFormat::Parts,
+    );
     assert!(stale.finish(&original).await.is_err());
     assert_eq!(
         read_parts().await,
@@ -477,7 +491,14 @@ async fn compatible_reader_can_write_a_partitioned_checkpoint_back_to_legacy_for
     let key = SessionSecret::from_bytes([43; 32]);
     let original = state(&session);
     create(&db, &key, &session, &original).await.unwrap();
-    let writer = make_checkpoint(db.clone(), key.clone(), session.clone(), 0, &original, true);
+    let writer = make_checkpoint(
+        db.clone(),
+        key.clone(),
+        session.clone(),
+        0,
+        &original,
+        CheckpointFormat::Parts,
+    );
     writer.finish(&original).await.unwrap();
     let (version, restored) = load(&db, &key, &session).await.unwrap().unwrap();
     let legacy = make_checkpoint(
@@ -486,7 +507,7 @@ async fn compatible_reader_can_write_a_partitioned_checkpoint_back_to_legacy_for
         session.clone(),
         version,
         &restored,
-        false,
+        CheckpointFormat::Monolithic,
     );
     legacy.finish(&original).await.unwrap();
     let (version, ciphertext) = row(&db, &session).await;
@@ -667,7 +688,14 @@ async fn failed_part_insert_rolls_back_manifest_and_cache_before_retry() {
     let mut original = state(&session);
     original.journal = large_journal(4, 64 * 1024);
     create(&db, &key, &session, &original).await.unwrap();
-    let writer = make_checkpoint(db.clone(), key.clone(), session.clone(), 0, &original, true);
+    let writer = make_checkpoint(
+        db.clone(),
+        key.clone(),
+        session.clone(),
+        0,
+        &original,
+        CheckpointFormat::Parts,
+    );
     writer.save(&original.journal).await.unwrap();
     let before = row(&db, &session).await;
     db.execute_write(|pool| async move {
@@ -712,7 +740,14 @@ async fn journal_replacement_and_removal_survive_reload_and_legacy_rollback() {
     let mut original = state(&session);
     original.journal = large_journal(3, 64 * 1024);
     create(&db, &key, &session, &original).await.unwrap();
-    let writer = make_checkpoint(db.clone(), key.clone(), session.clone(), 0, &original, true);
+    let writer = make_checkpoint(
+        db.clone(),
+        key.clone(),
+        session.clone(),
+        0,
+        &original,
+        CheckpointFormat::Parts,
+    );
     writer.save(&original.journal).await.unwrap();
     let mut value = serde_json::to_value(&original.journal).unwrap();
     value["commands"]
@@ -749,7 +784,7 @@ async fn journal_replacement_and_removal_survive_reload_and_legacy_rollback() {
         session.clone(),
         version,
         &restored,
-        true,
+        CheckpointFormat::Parts,
     );
     // Saving again after a process restart must reconstruct all required parts.
     restarted.save(&restored.journal).await.unwrap();
@@ -768,7 +803,7 @@ async fn journal_replacement_and_removal_survive_reload_and_legacy_rollback() {
         session.clone(),
         version,
         &restored,
-        false,
+        CheckpointFormat::Monolithic,
     );
     legacy.finish(&restored).await.unwrap();
     let (_, rolled_back) = load(&db, &key, &session).await.unwrap().unwrap();

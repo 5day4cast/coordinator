@@ -4,7 +4,7 @@ use super::{
     protocol_parts::{EntryCache, Manifest, Parts},
     KeymeldError, StoredDlcKeygenSession,
 };
-use crate::infra::db::DBConnection;
+use crate::{config::CheckpointFormat, infra::db::DBConnection};
 use keymeld_core::{
     authorization::SignedRoster,
     crypto::{EncryptedData, SessionSecret},
@@ -260,27 +260,15 @@ impl DurableCheckpoint {
         session: SessionId,
         version: i64,
         state: &ProtocolState,
+        format: CheckpointFormat,
     ) -> Result<Self, KeymeldError> {
-        let parts = std::env::var("COORDINATOR_PROTOCOL_PARTS")
-            .is_ok_and(|value| value == "1" || value == "true");
-        Self::with_parts(db, key, session, version, state, parts)
-    }
-    fn with_parts(
-        db: DBConnection,
-        key: SessionSecret,
-        session: SessionId,
-        version: i64,
-        state: &ProtocolState,
-        parts: bool,
-    ) -> Result<Self, KeymeldError> {
-        let snapshot = if parts {
-            Snapshot::Parts {
+        let snapshot = match format {
+            CheckpointFormat::Parts => Snapshot::Parts {
                 base: Parts::base(&key, &session, state, &BTreeSet::new())?,
                 committed: BTreeSet::new(),
                 entries: EntryCache::default(),
-            }
-        } else {
-            Snapshot::Legacy(Box::new(state.clone()))
+            },
+            CheckpointFormat::Monolithic => Snapshot::Legacy(Box::new(state.clone())),
         };
         Ok(Self {
             db,

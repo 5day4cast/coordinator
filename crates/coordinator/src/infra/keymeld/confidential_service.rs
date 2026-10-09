@@ -389,6 +389,7 @@ impl KeymeldService {
             session.session_id.clone(),
             version,
             &state,
+            self.settings.checkpoint_format,
         )?;
         Ok((state, checkpoint))
     }

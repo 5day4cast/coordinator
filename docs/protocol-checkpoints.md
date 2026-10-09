@@ -9,6 +9,8 @@ The coordinator saves a durable checkpoint before sending a confidential command
 | 1 | One encrypted JSON document, encoded as hex | Default |
 | 2 | An encrypted manifest and compressed, encrypted binary parts | `COORDINATOR_PROTOCOL_PARTS=1` or `true` |
 
+Leaving `COORDINATOR_PROTOCOL_PARTS` unset, or setting it to `0` or `false`, selects format 1. The coordinator reads the variable once at startup and refuses to start with any other value.
+
 The reader supports both formats. The additive migration leaves existing rows in format 1. Creating a session also writes format 1.
 
 With format 2 enabled, the next checkpoint converts that session. Application fields and journal entries each have manifest nodes. Larger nested objects and structured arrays split further at field or element boundaries.
