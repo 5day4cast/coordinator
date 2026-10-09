@@ -550,6 +550,11 @@ fn large_journal(entries: usize, payload_bytes: usize) -> ConfidentialJournal {
     }
     let mut value = serde_json::to_value(ConfidentialJournal::default()).unwrap();
     value["commands"] = commands.into();
+    value["signing_batches"] = serde_json::json!({SessionId::new_v7().to_string(): {
+        "input_commitment": vec![7; 32],
+        "items": [{"batch_item_id": Uuid::now_v7(), "encrypted_message": "opaque\"batch\nvalue",
+            "encrypted_adaptor_configs": null, "encrypted_taproot_tweak": "fixture", "subset_id": null}]
+    }});
     serde_json::from_value(value).unwrap()
 }
 
@@ -658,6 +663,22 @@ async fn journal_replacement_and_removal_survive_reload_and_legacy_rollback() {
         .remove("fixture/0/1");
     value["commands"]["fixture/1/1"]["request"]["envelope"]["ciphertext"] =
         "cd".repeat(8192).into();
+    value["commands"]["fixture/1/1"]["outcome"] =
+        serde_json::to_value(keymeld_core::protocol::Outcome {
+            command_id: serde_json::from_value(
+                value["commands"]["fixture/1/1"]["request"]["request"]["command"]["command_id"]
+                    .clone(),
+            )
+            .unwrap(),
+            created_at: std::time::UNIX_EPOCH,
+            completed_at: std::time::UNIX_EPOCH,
+            response: keymeld_core::protocol::EnclaveOutcome::Musig(
+                keymeld_core::protocol::MusigOutcome::Keygen(
+                    keymeld_core::protocol::KeygenOutcome::Success,
+                ),
+            ),
+        })
+        .unwrap();
     value["aborted_signing_sessions"] = serde_json::json!([SessionId::new_v7()]);
     let journal: ConfidentialJournal = serde_json::from_value(value.clone()).unwrap();
     writer.save(&journal).await.unwrap();
@@ -698,4 +719,16 @@ async fn journal_replacement_and_removal_survive_reload_and_legacy_rollback() {
         serde_json::to_value(restored).unwrap()
     );
     db.close().await.unwrap();
+}
+
+#[test]
+fn cached_fields_count_toward_the_reconstructed_checkpoint_limit() {
+    let session = SessionId::new_v7();
+    let key = SessionSecret::from_bytes([47; 32]);
+    let original = state(&session);
+    let mut base = Parts::base(&key, &session, &original, &BTreeSet::new()).unwrap();
+    // Represent an already-sized cached base without allocating half a GiB.
+    base.plaintext_len = 512 * 1024 * 1024;
+    base.serialized_len = 0;
+    assert!(Parts::journal(&key, &session, &base, &original.journal, &BTreeSet::new()).is_err());
 }
