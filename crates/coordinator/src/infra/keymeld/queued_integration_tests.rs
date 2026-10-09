@@ -5,7 +5,10 @@
 //! signs it at an Arkade commitment's outpoint. Deterministic enclave keys simulate custody; this
 //! does not exercise Nitro attestation, KMS, an oracle server or an Arkade server.
 use super::*;
-use crate::infra::db::{DatabasePoolConfig, DatabaseType};
+use crate::{
+    config::CheckpointFormat,
+    infra::db::{DatabasePoolConfig, DatabaseType},
+};
 use axum::{
     extract::{Path, State},
     routing::{get, post},
@@ -209,6 +212,17 @@ fn refused<T>(what: &str, result: Result<T, KeymeldError>) {
 
 #[tokio::test]
 async fn a_queued_pool_registers_deposits_binds_its_statement_and_signs() {
+    queued_pool_signs(CheckpointFormat::Monolithic).await;
+}
+
+/// Every save in format 2 is read back and compared with the SDK's journal, as deposits,
+/// bindings and signing rounds change their entries in place.
+#[tokio::test]
+async fn a_queued_pool_signs_from_partitioned_checkpoints() {
+    queued_pool_signs(CheckpointFormat::Parts).await;
+}
+
+async fn queued_pool_signs(format: CheckpointFormat) {
     let started = std::time::Instant::now();
     let enclaves = Enclaves(Arc::new(
         ENCLAVES
@@ -240,6 +254,7 @@ async fn a_queued_pool_registers_deposits_binds_its_statement_and_signs() {
         gateway_url: url,
         initial_polling_delay_ms: 1,
         max_polling_delay_ms: 10,
+        checkpoint_format: format,
         ..Default::default()
     };
     let service =
@@ -676,7 +691,7 @@ async fn a_queued_pool_registers_deposits_binds_its_statement_and_signs() {
     );
 
     println!(
-        "queued pool of {} on {} enclaves: {:.2}s",
+        "queued pool of {} on {} enclaves, {format:?} checkpoints: {:.2}s",
         members.len(),
         used_enclaves.len(),
         started.elapsed().as_secs_f64()

@@ -375,6 +375,8 @@ impl DurableCheckpoint {
                     entries: next_entries,
                 };
                 *version = next;
+                #[cfg(test)]
+                tests::assert_stored_state(self, next, state).await;
             }
         }
         Ok(())
@@ -413,6 +415,8 @@ impl ConfidentialCheckpoint for DurableCheckpoint {
                     *committed = digests;
                     *entries = next_entries;
                     *version = next;
+                    #[cfg(test)]
+                    tests::assert_stored_journal(self, next, journal).await;
                 }
             }
             Ok(())

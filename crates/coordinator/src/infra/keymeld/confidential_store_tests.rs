@@ -35,6 +35,44 @@ fn make_checkpoint(
     DurableCheckpoint::new(db, key, session, version, state, format).unwrap()
 }
 
+/// A partitioned write in a test build reads back what it committed and compares it with what
+/// it was given. Every flow that writes format 2, including those the SDK drives through the
+/// Coordinator service, then checks each journal it saves: the entry the SDK just changed in
+/// place, and the others whose encodings the writer reused.
+pub(super) async fn assert_stored_journal(
+    checkpoint: &DurableCheckpoint,
+    version: i64,
+    journal: &ConfidentialJournal,
+) {
+    let stored = stored(checkpoint, version).await;
+    assert!(
+        serde_json::to_value(&stored.journal).unwrap() == serde_json::to_value(journal).unwrap(),
+        "the stored journal differs from the one in memory"
+    );
+}
+
+/// As [`assert_stored_journal`], for a write of the whole state.
+pub(super) async fn assert_stored_state(
+    checkpoint: &DurableCheckpoint,
+    version: i64,
+    state: &ProtocolState,
+) {
+    let stored = stored(checkpoint, version).await;
+    assert!(
+        serde_json::to_value(&stored).unwrap() == serde_json::to_value(state).unwrap(),
+        "the stored state differs from the one in memory"
+    );
+}
+
+async fn stored(checkpoint: &DurableCheckpoint, version: i64) -> ProtocolState {
+    let (stored, state) = load(&checkpoint.db, &checkpoint.key, &checkpoint.session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored, version, "another writer committed in between");
+    state
+}
+
 async fn database() -> (TempDir, DBConnection) {
     let directory = tempfile::tempdir().unwrap();
     let db = DBConnection::new(
@@ -639,7 +677,7 @@ fn partitioned_encoder_bounds_buffers_and_reuses_unchanged_ciphertext() {
 }
 
 #[test]
-fn reloaded_journal_cannot_reuse_runtime_entry_identities() {
+fn cloned_journal_reuses_entry_encodings_and_a_reloaded_one_reserializes_them() {
     let session = SessionId::new_v7();
     let key = SessionSecret::from_bytes([48; 32]);
     let mut original = state(&session);
@@ -669,7 +707,11 @@ fn reloaded_journal_cannot_reuse_runtime_entry_identities() {
     let fresh =
         Parts::journal(&key, &session, &base, &replacement, &known, &first.entries).unwrap();
     assert!(fresh.serialized_len > 7 * 16 * 1024);
-    assert!(!fresh.bodies.is_empty());
+    assert_eq!(
+        fresh.bodies.len(),
+        1,
+        "reserialized entries still reuse their committed parts; only the changed one is new"
+    );
     let bodies = first
         .bodies
         .into_iter()
@@ -681,7 +723,7 @@ fn reloaded_journal_cannot_reuse_runtime_entry_identities() {
 }
 
 #[tokio::test]
-async fn failed_part_insert_rolls_back_manifest_and_cache_before_retry() {
+async fn failed_part_insert_leaves_version_and_committed_parts_for_the_retry() {
     let (_directory, db) = database().await;
     let session = SessionId::new_v7();
     let key = SessionSecret::from_bytes([45; 32]);
