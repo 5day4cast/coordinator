@@ -1,6 +1,6 @@
 //! Read-only process and allocator accounting. RSS includes live allocations and retained
 //! pages; glibc's free arena bytes are reusable, not necessarily resident or reclaimable.
-use prometheus::{Gauge, HistogramOpts, HistogramVec, Registry};
+use prometheus::{Gauge, Histogram, HistogramOpts, HistogramVec, Registry};
 use std::sync::LazyLock;
 
 use super::unknown;
@@ -54,6 +54,30 @@ static CHECKPOINT: LazyLock<HistogramVec> = LazyLock::new(|| {
 ).expect("valid metric")
 });
 
+static CHECKPOINT_BUFFER: LazyLock<Histogram> = LazyLock::new(|| {
+    Histogram::with_opts(
+        HistogramOpts::new(
+            "coordinator_checkpoint_encode_buffer_bytes",
+            "Largest serialized plaintext buffer capacity in one partitioned checkpoint write",
+        )
+        .buckets(vec![
+            65_536.,
+            262_144.,
+            1_048_576.,
+            4_194_304.,
+            16_777_216.,
+            67_108_864.,
+            268_435_456.,
+            536_870_912.,
+        ]),
+    )
+    .expect("valid metric")
+});
+
+pub(crate) fn checkpoint_encode_buffer_bytes(bytes: usize) {
+    CHECKPOINT_BUFFER.observe(bytes as f64);
+}
+
 pub(super) fn register(registry: &Registry) -> prometheus::Result<()> {
     for gauge in [
         &*RESIDENT,
@@ -67,6 +91,7 @@ pub(super) fn register(registry: &Registry) -> prometheus::Result<()> {
         registry.register(Box::new(gauge.clone()))?;
     }
     registry.register(Box::new(CHECKPOINT.clone()))?;
+    registry.register(Box::new(CHECKPOINT_BUFFER.clone()))?;
     Ok(())
 }
 

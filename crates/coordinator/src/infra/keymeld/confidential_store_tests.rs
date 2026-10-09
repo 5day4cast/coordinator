@@ -24,6 +24,17 @@ use std::sync::{
 };
 use tempfile::TempDir;
 
+fn make_checkpoint(
+    db: DBConnection,
+    key: SessionSecret,
+    session: SessionId,
+    version: i64,
+    state: &ProtocolState,
+    parts: bool,
+) -> DurableCheckpoint {
+    DurableCheckpoint::with_parts(db, key, session, version, state, parts).unwrap()
+}
+
 async fn database() -> (TempDir, DBConnection) {
     let directory = tempfile::tempdir().unwrap();
     let db = DBConnection::new(
@@ -177,7 +188,9 @@ async fn checkpoint_rejects_wrong_key_session_version_schema_and_ciphertext() {
 #[tokio::test]
 async fn independently_loaded_checkpoints_use_compare_and_swap_without_lost_updates() {
     let (_directory, db) = database().await;
-    assert_checkpoint_compare_and_swap(&db).await;
+    for parts in [false, true] {
+        assert_checkpoint_compare_and_swap(&db, parts).await;
+    }
     db.close().await.unwrap();
 }
 
@@ -194,8 +207,10 @@ async fn should_not_send(State(count): State<Arc<AtomicUsize>>) -> StatusCode {
 #[tokio::test]
 async fn sdk_sends_no_enclave_command_after_durable_checkpoint_cas_failure() {
     let (_directory, db) = database().await;
-    let server = assert_stale_checkpoint_stops_command(&db).await;
-    server.abort();
+    for parts in [false, true] {
+        let server = assert_stale_checkpoint_stops_command(&db, parts).await;
+        server.abort();
+    }
     db.close().await.unwrap();
 }
 
@@ -215,8 +230,14 @@ async fn assert_checkpoint_roundtrip(db: &DBConnection) {
         serde_json::to_value(&loaded).unwrap(),
         serde_json::to_value(&state).unwrap()
     );
-    let checkpoint =
-        DurableCheckpoint::new(db.clone(), key.clone(), session.clone(), version, loaded);
+    let checkpoint = make_checkpoint(
+        db.clone(),
+        key.clone(),
+        session.clone(),
+        version,
+        &loaded,
+        false,
+    );
     checkpoint
         .save(&ConfidentialJournal::default())
         .await
@@ -234,30 +255,32 @@ async fn assert_checkpoint_roundtrip(db: &DBConnection) {
     );
 }
 
-async fn assert_checkpoint_compare_and_swap(db: &DBConnection) {
+async fn assert_checkpoint_compare_and_swap(db: &DBConnection, parts: bool) {
     let session = SessionId::new_v7();
     let key = SessionSecret::from_bytes([26; 32]);
     let original = state(&session);
     create(db, &key, &session, &original).await.unwrap();
-    let first = DurableCheckpoint::new(
+    let first = make_checkpoint(
         db.clone(),
         key.clone(),
         session.clone(),
         0,
-        original.clone(),
+        &original,
+        parts,
     );
-    let second = DurableCheckpoint::new(
+    let second = make_checkpoint(
         db.clone(),
         key.clone(),
         session.clone(),
         0,
-        original.clone(),
+        &original,
+        parts,
     );
     let mut left = original.clone();
     left.session.encrypted_session_secret = "first committed state".into();
     let mut right = original;
     right.session.encrypted_session_secret = "second committed state".into();
-    let (a, b) = tokio::join!(first.finish(left), second.finish(right));
+    let (a, b) = tokio::join!(first.finish(&left), second.finish(&right));
     assert_ne!(a.is_ok(), b.is_ok());
     let (version, loaded) = load(db, &key, &session).await.unwrap().unwrap();
     assert_eq!(version, 1);
@@ -279,24 +302,29 @@ async fn assert_checkpoint_compare_and_swap(db: &DBConnection) {
     assert_eq!(row(db, &session).await.0, 1);
 }
 
-async fn assert_stale_checkpoint_stops_command(db: &DBConnection) -> tokio::task::JoinHandle<()> {
+async fn assert_stale_checkpoint_stops_command(
+    db: &DBConnection,
+    parts: bool,
+) -> tokio::task::JoinHandle<()> {
     let session_id = SessionId::new_v7();
     let key = SessionSecret::from_bytes([27; 32]);
     let state = state(&session_id);
     create(db, &key, &session_id, &state).await.unwrap();
-    let stale = DurableCheckpoint::new(
+    let stale = make_checkpoint(
         db.clone(),
         key.clone(),
         session_id.clone(),
         0,
-        state.clone(),
+        &state,
+        parts,
     );
-    let winner = DurableCheckpoint::new(
+    let winner = make_checkpoint(
         db.clone(),
         key.clone(),
         session_id.clone(),
         0,
-        state.clone(),
+        &state,
+        parts,
     );
     winner.save(&ConfidentialJournal::default()).await.unwrap();
     let count = Arc::new(AtomicUsize::new(0));
@@ -365,15 +393,8 @@ async fn partitioned_checkpoints_reuse_ciphertext_and_fail_closed_on_missing_par
     original.session.encrypted_session_secret = "large private checkpoint ".repeat(8192);
     original.session.aggregate_key = (0..=255).cycle().take(64 * 1024).collect();
     create(&db, &key, &session, &original).await.unwrap();
-    let mut checkpoint = DurableCheckpoint::new(
-        db.clone(),
-        key.clone(),
-        session.clone(),
-        0,
-        original.clone(),
-    );
-    checkpoint.parts = true;
-    checkpoint.finish(original.clone()).await.unwrap();
+    let checkpoint = make_checkpoint(db.clone(), key.clone(), session.clone(), 0, &original, true);
+    checkpoint.finish(&original).await.unwrap();
     let read_parts = || async {
         sqlx::query_as::<_, (Vec<u8>, Vec<u8>)>(
             "SELECT digest, body FROM keymeld_protocol_parts WHERE session_id = ? ORDER BY digest",
@@ -391,7 +412,7 @@ async fn partitioned_checkpoints_reuse_ciphertext_and_fail_closed_on_missing_par
     );
     let encoded_bytes: usize = first.iter().map(|(_, body)| body.len()).sum();
     assert!(encoded_bytes < serde_json::to_vec(&original).unwrap().len() / 4);
-    checkpoint.finish(original.clone()).await.unwrap();
+    checkpoint.finish(&original).await.unwrap();
     assert_eq!(
         read_parts().await,
         first,
@@ -403,15 +424,8 @@ async fn partitioned_checkpoints_reuse_ciphertext_and_fail_closed_on_missing_par
         serde_json::to_value(&restored).unwrap(),
         serde_json::to_value(&original).unwrap()
     );
-    let mut stale = DurableCheckpoint::new(
-        db.clone(),
-        key.clone(),
-        session.clone(),
-        1,
-        original.clone(),
-    );
-    stale.parts = true;
-    assert!(stale.finish(original.clone()).await.is_err());
+    let stale = make_checkpoint(db.clone(), key.clone(), session.clone(), 1, &original, true);
+    assert!(stale.finish(&original).await.is_err());
     assert_eq!(
         read_parts().await,
         first,
@@ -419,7 +433,7 @@ async fn partitioned_checkpoints_reuse_ciphertext_and_fail_closed_on_missing_par
     );
     let mut changed = original.clone();
     changed.session.encrypted_session_secret = "another private checkpoint ".repeat(8192);
-    checkpoint.finish(changed.clone()).await.unwrap();
+    checkpoint.finish(&changed).await.unwrap();
     let after = read_parts().await;
     assert!(
         after.iter().any(|part| first.contains(part)),
@@ -463,20 +477,18 @@ async fn compatible_reader_can_write_a_partitioned_checkpoint_back_to_legacy_for
     let key = SessionSecret::from_bytes([43; 32]);
     let original = state(&session);
     create(&db, &key, &session, &original).await.unwrap();
-    let mut writer = DurableCheckpoint::new(
+    let writer = make_checkpoint(db.clone(), key.clone(), session.clone(), 0, &original, true);
+    writer.finish(&original).await.unwrap();
+    let (version, restored) = load(&db, &key, &session).await.unwrap().unwrap();
+    let legacy = make_checkpoint(
         db.clone(),
         key.clone(),
         session.clone(),
-        0,
-        original.clone(),
+        version,
+        &restored,
+        false,
     );
-    writer.parts = true;
-    writer.finish(original.clone()).await.unwrap();
-    let (version, restored) = load(&db, &key, &session).await.unwrap().unwrap();
-    let mut legacy =
-        DurableCheckpoint::new(db.clone(), key.clone(), session.clone(), version, restored);
-    legacy.parts = false;
-    legacy.finish(original.clone()).await.unwrap();
+    legacy.finish(&original).await.unwrap();
     let (version, ciphertext) = row(&db, &session).await;
     let plaintext = key
         .decrypt(
@@ -497,4 +509,226 @@ async fn compatible_reader_can_write_a_partitioned_checkpoint_back_to_legacy_for
             .unwrap();
     assert_eq!(count, 0);
     db.close().await.unwrap();
+}
+
+/// Synthetic opaque command bodies: no fixture is sent to an enclave.
+fn large_journal(entries: usize, payload_bytes: usize) -> ConfidentialJournal {
+    use keymeld_core::{
+        confidential::{ConfidentialRequest, EnclaveEnvelope},
+        protocol::Command,
+    };
+    let mut commands = serde_json::Map::new();
+    for index in 0..entries {
+        let envelope = EnclaveEnvelope {
+            transport_version: 1,
+            destination_enclave: EnclaveId::new(1),
+            opaque_route_id: Uuid::now_v7(),
+            correlation_id: "ab".repeat(32),
+            ciphertext: format!("{index:08x}{}", "ab".repeat(payload_bytes / 2)),
+        };
+        let request = ConfidentialRequest {
+            header: envelope.header(),
+            enclave_public_key: vec![2; 33],
+            enclave_key_epoch: 1,
+            authority_public_key: vec![3; 33],
+            response_public_key: vec![4; 33],
+            command: Command::new(EnclaveCommand::Musig(MusigCommand::Keygen(
+                KeygenCommand::GetAggregatePublicKey(GetAggregatePublicKeyCommand {
+                    keygen_session_id: SessionId::new_v7(),
+                }),
+            ))),
+            request_nonce: [0; 32],
+            signature: vec![0; 64],
+        };
+        commands.insert(
+            format!("fixture/{index}/1"),
+            serde_json::json!({
+                "input_commitment": vec![index as u8; 32],
+                "request": {"envelope": envelope, "request": request}, "outcome": null,
+            }),
+        );
+    }
+    let mut value = serde_json::to_value(ConfidentialJournal::default()).unwrap();
+    value["commands"] = commands.into();
+    value["signing_batches"] = serde_json::json!({SessionId::new_v7().to_string(): {
+        "input_commitment": vec![7; 32],
+        "items": [{"batch_item_id": Uuid::now_v7(), "encrypted_message": "opaque\"batch\nvalue",
+            "encrypted_adaptor_configs": null, "encrypted_taproot_tweak": "fixture", "subset_id": null}]
+    }});
+    serde_json::from_value(value).unwrap()
+}
+
+#[test]
+fn partitioned_encoder_bounds_buffers_and_reuses_unchanged_ciphertext() {
+    let session = SessionId::new_v7();
+    let key = SessionSecret::from_bytes([44; 32]);
+    let mut original = state(&session);
+    original.session.encrypted_session_secret = "private base field".repeat(64 * 1024);
+    original.journal = large_journal(64, 64 * 1024);
+    let mut base = Parts::base(&key, &session, &original, &BTreeSet::new()).unwrap();
+    let first = Parts::journal(&key, &session, &base, &original.journal, &BTreeSet::new()).unwrap();
+    let mut known = BTreeSet::new();
+    first.manifest.digests(&mut known);
+    base.bodies.clear();
+    base.serialized_len = 0;
+    base.max_buffer_capacity = 0;
+    let unchanged = Parts::journal(&key, &session, &base, &original.journal, &known).unwrap();
+    assert!(
+        unchanged.bodies.is_empty(),
+        "unchanged parts must not be recompressed or encrypted"
+    );
+    assert!(
+        unchanged.max_buffer_capacity < unchanged.plaintext_len / 20,
+        "the journal must not be buffered as one JSON document"
+    );
+    assert!(
+        unchanged.serialized_len < first.serialized_len - 1024 * 1024,
+        "static fields must not be reserialized on journal writes"
+    );
+    let bodies = first
+        .bodies
+        .into_iter()
+        .map(|(key, body)| (key.to_vec(), body))
+        .collect();
+    let restored = unchanged.manifest.decode(&key, &session, &bodies).unwrap();
+    assert_eq!(
+        serde_json::to_value(&restored).unwrap(),
+        serde_json::to_value(&original).unwrap()
+    );
+    assert_eq!(
+        unchanged.plaintext_len,
+        serde_json::to_vec(&restored).unwrap().len()
+    );
+}
+
+#[tokio::test]
+async fn failed_part_insert_rolls_back_manifest_and_cache_before_retry() {
+    let (_directory, db) = database().await;
+    let session = SessionId::new_v7();
+    let key = SessionSecret::from_bytes([45; 32]);
+    let mut original = state(&session);
+    original.journal = large_journal(4, 64 * 1024);
+    create(&db, &key, &session, &original).await.unwrap();
+    let writer = make_checkpoint(db.clone(), key.clone(), session.clone(), 0, &original, true);
+    writer.save(&original.journal).await.unwrap();
+    let before = row(&db, &session).await;
+    db.execute_write(|pool| async move {
+        sqlx::query("CREATE TRIGGER fail_checkpoint_insert BEFORE INSERT ON keymeld_protocol_parts BEGIN SELECT RAISE(ABORT, 'injected checkpoint write failure'); END").execute(&pool).await.map(|_| ())
+    }).await.unwrap();
+    let changed = large_journal(5, 64 * 1024);
+    assert!(writer.save(&changed).await.is_err());
+    assert_eq!(writer.current.lock().await.0, 1);
+    assert_eq!(
+        row(&db, &session).await,
+        before,
+        "manifest update must roll back with failed part insertion"
+    );
+    let (_, restored) = load(&db, &key, &session).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(restored.journal).unwrap(),
+        serde_json::to_value(&original.journal).unwrap()
+    );
+    db.execute_write(|pool| async move {
+        sqlx::query("DROP TRIGGER fail_checkpoint_insert")
+            .execute(&pool)
+            .await
+            .map(|_| ())
+    })
+    .await
+    .unwrap();
+    writer.save(&changed).await.unwrap();
+    let (version, restored) = load(&db, &key, &session).await.unwrap().unwrap();
+    assert_eq!(version, 2);
+    assert_eq!(
+        serde_json::to_value(restored.journal).unwrap(),
+        serde_json::to_value(changed).unwrap()
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn journal_replacement_and_removal_survive_reload_and_legacy_rollback() {
+    let (_directory, db) = database().await;
+    let session = SessionId::new_v7();
+    let key = SessionSecret::from_bytes([46; 32]);
+    let mut original = state(&session);
+    original.journal = large_journal(3, 64 * 1024);
+    create(&db, &key, &session, &original).await.unwrap();
+    let writer = make_checkpoint(db.clone(), key.clone(), session.clone(), 0, &original, true);
+    writer.save(&original.journal).await.unwrap();
+    let mut value = serde_json::to_value(&original.journal).unwrap();
+    value["commands"]
+        .as_object_mut()
+        .unwrap()
+        .remove("fixture/0/1");
+    value["commands"]["fixture/1/1"]["request"]["envelope"]["ciphertext"] =
+        "cd".repeat(8192).into();
+    value["commands"]["fixture/1/1"]["outcome"] =
+        serde_json::to_value(keymeld_core::protocol::Outcome {
+            command_id: serde_json::from_value(
+                value["commands"]["fixture/1/1"]["request"]["request"]["command"]["command_id"]
+                    .clone(),
+            )
+            .unwrap(),
+            created_at: std::time::UNIX_EPOCH,
+            completed_at: std::time::UNIX_EPOCH,
+            response: keymeld_core::protocol::EnclaveOutcome::Musig(
+                keymeld_core::protocol::MusigOutcome::Keygen(
+                    keymeld_core::protocol::KeygenOutcome::Success,
+                ),
+            ),
+        })
+        .unwrap();
+    value["aborted_signing_sessions"] = serde_json::json!([SessionId::new_v7()]);
+    let journal: ConfidentialJournal = serde_json::from_value(value.clone()).unwrap();
+    writer.save(&journal).await.unwrap();
+    drop(writer);
+    let (version, mut restored) = load(&db, &key, &session).await.unwrap().unwrap();
+    assert_eq!(serde_json::to_value(&restored.journal).unwrap(), value);
+    let restarted = make_checkpoint(
+        db.clone(),
+        key.clone(),
+        session.clone(),
+        version,
+        &restored,
+        true,
+    );
+    // Saving again after a process restart must reconstruct all required parts.
+    restarted.save(&restored.journal).await.unwrap();
+    restored.session.encrypted_session_secret = "updated static state".into();
+    restarted.finish(&restored).await.unwrap();
+    restarted.save(&restored.journal).await.unwrap();
+    let (version, restored) = load(&db, &key, &session).await.unwrap().unwrap();
+    assert_eq!(
+        restored.session.encrypted_session_secret,
+        "updated static state"
+    );
+    assert_eq!(serde_json::to_value(&restored.journal).unwrap(), value);
+    let legacy = make_checkpoint(
+        db.clone(),
+        key.clone(),
+        session.clone(),
+        version,
+        &restored,
+        false,
+    );
+    legacy.finish(&restored).await.unwrap();
+    let (_, rolled_back) = load(&db, &key, &session).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(rolled_back).unwrap(),
+        serde_json::to_value(restored).unwrap()
+    );
+    db.close().await.unwrap();
+}
+
+#[test]
+fn cached_fields_count_toward_the_reconstructed_checkpoint_limit() {
+    let session = SessionId::new_v7();
+    let key = SessionSecret::from_bytes([47; 32]);
+    let original = state(&session);
+    let mut base = Parts::base(&key, &session, &original, &BTreeSet::new()).unwrap();
+    // Represent an already-sized cached base without allocating half a GiB.
+    base.plaintext_len = 512 * 1024 * 1024;
+    base.serialized_len = 0;
+    assert!(Parts::journal(&key, &session, &base, &original.journal, &BTreeSet::new()).is_err());
 }

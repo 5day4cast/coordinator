@@ -330,10 +330,10 @@ impl KeymeldService {
                 .map_err(|_| invalid("Invalid storage credentials"))?,
         ))
     }
-    async fn checkpoint(
+    async fn load_state(
         &self,
         session: &DlcKeygenSession,
-    ) -> Result<(ProtocolState, DurableCheckpoint), KeymeldError> {
+    ) -> Result<(i64, ProtocolState), KeymeldError> {
         session.validate_credentials()?;
         let (version, state) =
             confidential_store::load(self.database()?, &self.store_key, &session.session_id)
@@ -351,13 +351,20 @@ impl KeymeldService {
                 "Confidential checkpoint differs from the pinned session",
             ));
         }
+        Ok((version, state))
+    }
+    async fn checkpoint(
+        &self,
+        session: &DlcKeygenSession,
+    ) -> Result<(ProtocolState, DurableCheckpoint), KeymeldError> {
+        let (version, state) = self.load_state(session).await?;
         let checkpoint = DurableCheckpoint::new(
             self.database()?.clone(),
             self.store_key.clone(),
             session.session_id.clone(),
             version,
-            state.clone(),
-        );
+            &state,
+        )?;
         Ok((state, checkpoint))
     }
     async fn connect<'a>(
@@ -961,7 +968,7 @@ impl Keymeld for KeymeldService {
             state.policies.insert(user, policy.clone());
         }
         state.journal = journal;
-        checkpoint.finish(state).await?;
+        checkpoint.finish(&state).await?;
         Ok(())
     }
 
@@ -979,7 +986,7 @@ impl Keymeld for KeymeldService {
         let roster = restore_roster(driver, &state.registrations).await?;
         state.roster = Some(roster.clone());
         state.journal = journal;
-        checkpoint.finish(state).await?;
+        checkpoint.finish(&state).await?;
         Ok(roster)
     }
 
@@ -988,7 +995,7 @@ impl Keymeld for KeymeldService {
         session: &DlcKeygenSession,
     ) -> Result<KeygenSessionStatus, KeymeldError> {
         let _guard = self.lock_session(&session.session_id).await;
-        let (state, _) = self.checkpoint(session).await?;
+        let (_, state) = self.load_state(session).await?;
         // The lifecycle completes keygen (wait_for_keygen_completion, which
         // records the roster) only after this reports ready. Requiring the
         // roster here as well meant keygen never started. Every participant
@@ -1019,7 +1026,7 @@ impl Keymeld for KeymeldService {
         user: UserId,
     ) -> Result<RegistrationAssignment, KeymeldError> {
         let _guard = self.lock_session(&session.session_id).await;
-        let (state, _) = self.checkpoint(session).await?;
+        let (_, state) = self.load_state(session).await?;
         let enclave = *session
             .recipient_authorization
             .user_enclave_assignments
@@ -1163,7 +1170,7 @@ impl Keymeld for KeymeldService {
             );
             // Record the replacement identity and its authenticated predecessors
             // before a resolver request can create an externally payable invoice.
-            checkpoint.finish(state.clone()).await?;
+            checkpoint.finish(&state).await?;
         }
         let settlement_plan = state.settlements[&user].clone();
         let credentials = SessionCredentials::from_session_secret(&session.session_secret)?;
@@ -1180,7 +1187,7 @@ impl Keymeld for KeymeldService {
         .prepare_payout(&user, request, &binding, &settlement_plan)
         .await?;
         state.journal = journal;
-        checkpoint.finish(state).await?;
+        checkpoint.finish(&state).await?;
         Ok(response)
     }
 
@@ -1230,7 +1237,7 @@ impl Keymeld for KeymeldService {
         .release_payout(self, &user, request.claim_id, &receipts, &evidence)
         .await?;
         state.journal = journal;
-        checkpoint.finish(state).await?;
+        checkpoint.finish(&state).await?;
         Ok(PayoutSecrets {
             entry_private_key: released[generic::RELEASE_ENTRY_KEY].to_string(),
             payout_preimage: released[generic::RELEASE_PREIMAGE].to_string(),
@@ -1276,7 +1283,7 @@ impl Keymeld for KeymeldService {
         spends: Vec<(UserId, coordinator_escrow::ark::ArkEscrowSpend)>,
     ) -> Result<Vec<Vec<(usize, [u8; 64])>>, KeymeldError> {
         let _guard = self.lock_session(&session.session_id).await;
-        let (mut state, _) = self.checkpoint(session).await?;
+        let (_, mut state) = self.load_state(session).await?;
         let credentials = SessionCredentials::from_session_secret(&session.session_secret)?;
         let mut journal = std::mem::take(&mut state.journal);
         let driver = self
@@ -1473,7 +1480,7 @@ impl KeymeldService {
             .collect();
         state.roster = Some(roster);
         state.journal = journal;
-        checkpoint.finish(state).await?;
+        checkpoint.finish(&state).await?;
         Ok(responses)
     }
 }
@@ -1539,7 +1546,7 @@ impl KeymeldService {
                 prior_preparations: BTreeMap::new(),
             });
             if durable {
-                checkpoint.finish(state.clone()).await?;
+                checkpoint.finish(&state).await?;
             }
         }
         let mut plan = state
@@ -1558,7 +1565,7 @@ impl KeymeldService {
             state.signing = Some(plan.clone());
             state.journal = journal.clone();
             if durable {
-                checkpoint.finish(state.clone()).await?;
+                checkpoint.finish(&state).await?;
             }
             driver = self
                 .connect(session, &state, &credentials, &mut journal, saver)
@@ -1639,7 +1646,7 @@ impl KeymeldService {
         if durable {
             state.roster = Some(roster);
             state.journal = journal;
-            checkpoint.finish(state).await?;
+            checkpoint.finish(&state).await?;
         }
         Ok(signatures)
     }

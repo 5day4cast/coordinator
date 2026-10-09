@@ -30,7 +30,7 @@ use crate::{
 };
 
 mod memory;
-pub(crate) use memory::checkpoint_bytes;
+pub(crate) use memory::{checkpoint_bytes, checkpoint_encode_buffer_bytes};
 
 /// How long database-derived gauges are reused between scrapes.
 pub const DB_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
