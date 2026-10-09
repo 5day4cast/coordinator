@@ -2,5 +2,5 @@ apiVersion: v2
 name: coordinator
 description: DLC competition platform coordinator service
 type: application
-version: "2.27.10"
-appVersion: "2.27.10"
+version: "2.27.11"
+appVersion: "2.27.11"
