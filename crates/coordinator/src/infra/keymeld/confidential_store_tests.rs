@@ -798,3 +798,185 @@ fn cached_fields_count_toward_the_reconstructed_checkpoint_limit() {
     )
     .is_err());
 }
+
+#[tokio::test]
+async fn metadata_reads_match_legacy_and_parts_without_loading_the_journal() {
+    let (_directory, db) = database().await;
+    let session = SessionId::new_v7();
+    let key = SessionSecret::from_bytes([61; 32]);
+    let mut original = state(&session);
+    original.journal = large_journal(8, 128 * 1024);
+    original.epochs.insert(EnclaveId::new(2), 7);
+    create(&db, &key, &session, &original).await.unwrap();
+    for parts in [false, true] {
+        let version = row(&db, &session).await.0;
+        let writer = make_checkpoint(
+            db.clone(),
+            key.clone(),
+            session.clone(),
+            version,
+            &original,
+            parts,
+        );
+        writer.finish(&original).await.unwrap();
+        let (read_version, metadata) = load_metadata(&db, &key, &session).await.unwrap().unwrap();
+        assert_eq!(read_version, version + 1);
+        assert_eq!(metadata.epochs, original.epochs);
+        assert_eq!(
+            serde_json::to_value(metadata.session).unwrap(),
+            serde_json::to_value(&original.session).unwrap()
+        );
+        assert_eq!(metadata.registrations.len(), original.registrations.len());
+        assert!(metadata.roster.is_none());
+        assert!(
+            load_metadata(&db, &SessionSecret::from_bytes([62; 32]), &session)
+                .await
+                .is_err()
+        );
+    }
+    let full = Parts::encode(&key, &session, &original).unwrap().manifest;
+    let selected = full.select_fields(&[
+        "schema_version",
+        "session",
+        "epochs",
+        "registrations",
+        "roster",
+    ]);
+    let mut all = BTreeSet::new();
+    full.digests(&mut all);
+    let mut needed = BTreeSet::new();
+    selected.digests(&mut needed);
+    let excluded = *all.difference(&needed).next().expect("journal-only part");
+    let id = session.to_string();
+    db.execute_write(move |pool| async move {
+        sqlx::query("DELETE FROM keymeld_protocol_parts WHERE session_id=? AND digest=?")
+            .bind(id)
+            .bind(excluded.to_vec())
+            .execute(&pool)
+            .await
+            .map(|_| ())
+    })
+    .await
+    .unwrap();
+    // This read certifies metadata only. Full recovery must still authenticate
+    // every journal part and reject the now-incomplete checkpoint.
+    assert!(load_metadata(&db, &key, &session).await.unwrap().is_some());
+    assert!(load(&db, &key, &session).await.is_err());
+    let required = *needed.first().unwrap();
+    let id = session.to_string();
+    db.execute_write(move |pool| async move {
+        sqlx::query("UPDATE keymeld_protocol_parts SET body=x'00' WHERE session_id=? AND digest=?")
+            .bind(id)
+            .bind(required.to_vec())
+            .execute(&pool)
+            .await
+            .map(|_| ())
+    })
+    .await
+    .unwrap();
+    assert!(load_metadata(&db, &key, &session).await.is_err());
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn metadata_reads_reject_wrong_identity_and_schema() {
+    let (_directory, db) = database().await;
+    let session = SessionId::new_v7();
+    let key = SessionSecret::from_bytes([63; 32]);
+    let mut original = state(&session);
+    create(&db, &key, &session, &original).await.unwrap();
+    for parts in [false, true] {
+        for bad_schema in [false, true] {
+            original.schema_version = if bad_schema { 2 } else { 1 };
+            original.session.session_id = if bad_schema {
+                session.to_string()
+            } else {
+                SessionId::new_v7().to_string()
+            };
+            let version = row(&db, &session).await.0;
+            let writer = make_checkpoint(
+                db.clone(),
+                key.clone(),
+                session.clone(),
+                version,
+                &original,
+                parts,
+            );
+            writer.finish(&original).await.unwrap();
+            assert!(load_metadata(&db, &key, &session).await.is_err());
+        }
+    }
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn metadata_projection_uses_one_committed_snapshot() {
+    let (_directory, db) = database().await;
+    let session = SessionId::new_v7();
+    let key = SessionSecret::from_bytes([64; 32]);
+    let mut original = state(&session);
+    original.epochs.insert(EnclaveId::new(1), 0);
+    original.session.encrypted_session_secret = "0".into();
+    create(&db, &key, &session, &original).await.unwrap();
+    let writer = make_checkpoint(db.clone(), key.clone(), session.clone(), 0, &original, true);
+    let writes = async {
+        for version in 1..=16 {
+            original.epochs.insert(EnclaveId::new(1), version);
+            original.session.encrypted_session_secret = version.to_string();
+            writer.finish(&original).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+    };
+    let reads = async {
+        for _ in 0..32 {
+            let (version, view) = load_metadata(&db, &key, &session).await.unwrap().unwrap();
+            assert_eq!(view.epochs[&EnclaveId::new(1)], version as u64);
+            assert_eq!(view.session.encrypted_session_secret, version.to_string());
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::join!(writes, reads);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "isolated checkpoint read comparison; CHECKPOINT_BENCH_FULL=1 selects full reads"]
+async fn checkpoint_read_memory_benchmark() {
+    let (_directory, db) = database().await;
+    let session = SessionId::new_v7();
+    let key = SessionSecret::from_bytes([65; 32]);
+    let mut original = state(&session);
+    original.journal = large_journal(32, 256 * 1024);
+    let full_bytes = serde_json::to_vec(&original).unwrap().len();
+    create(&db, &key, &session, &original).await.unwrap();
+    let checkpoint = make_checkpoint(db.clone(), key.clone(), session.clone(), 0, &original, true);
+    checkpoint.finish(&original).await.unwrap();
+    drop(checkpoint);
+    drop(original);
+    let full = std::env::var_os("CHECKPOINT_BENCH_FULL").is_some();
+    let start = std::time::Instant::now();
+    for _ in 0..40 {
+        if full {
+            std::hint::black_box(load(&db, &key, &session).await.unwrap().unwrap());
+        } else {
+            std::hint::black_box(load_metadata(&db, &key, &session).await.unwrap().unwrap());
+        }
+    }
+    println!(
+        "checkpoint_full_bytes={full_bytes} reads=40 full={full} elapsed_ms={:.3}",
+        start.elapsed().as_secs_f64() * 1000.0
+    );
+    #[cfg(target_os = "linux")]
+    for line in std::fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+    {
+        if ["VmRSS:", "VmHWM:", "VmSwap:"]
+            .iter()
+            .any(|field| line.starts_with(field))
+        {
+            println!("{line}");
+        }
+    }
+    db.close().await.unwrap();
+}
