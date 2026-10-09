@@ -23,13 +23,13 @@ The implementation limits reconstructed state to 512 MiB, including cached field
 
 The partitioned writer borrows the application state. It retains the non-journal manifest between journal saves, without cloning the complete state or journal. Each journal command and signing batch serializes separately, so no write buffer contains the complete journal.
 
-Content addresses still require serialization and hashing of journal entries. Parts from the writer's last successful commit skip compression, encryption, and insertion. The cache advances only after the transaction commits. A failed write retains the prior cache and version.
+The SDK gives each unchanged journal entry an opaque runtime identity. The writer reuses its authenticated manifest and length without serializing or hashing that entry again. New or changed entries still receive content addresses. Reused nodes must reference parts from the writer's last successful commit. The cache advances only after the transaction commits. A failed write retains the prior cache and version.
 
-Application-state updates rebuild the non-journal manifest. A new writer initializes its cache from scratch; it never trusts unverified persisted part identifiers. Reloads still decode the complete state, and individual large entries still need temporary buffers.
+Application-state updates rebuild the non-journal manifest. Deserialization gives every journal entry a fresh identity. A new writer initializes its cache from scratch; it never trusts unverified persisted part identifiers. Reloads still decode the complete state, and individual large entries still need temporary buffers.
 
 These changes retain format 2 compatibility. Older format-2 readers can reconstruct the new manifests. The default format-1 writer retains its existing allocation behavior.
 
-`coordinator_checkpoint_plaintext_bytes` reports bytes actually serialized during each encode. Cached application fields are omitted from subsequent journal-save samples. Decode samples still report the complete reconstructed document. `coordinator_checkpoint_encode_buffer_bytes` reports the largest plaintext buffer capacity during each partitioned write. Neither metric measures the total process peak.
+`coordinator_checkpoint_plaintext_bytes` reports bytes actually serialized during each encode. Cached application fields and unchanged journal entries are omitted from subsequent journal-save samples. Decode samples still report the complete reconstructed document. `coordinator_checkpoint_encode_buffer_bytes` reports the largest plaintext buffer capacity during each partitioned write. Neither metric measures the total process peak.
 
 ## Deployment
 

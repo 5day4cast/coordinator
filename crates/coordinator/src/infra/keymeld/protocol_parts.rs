@@ -22,6 +22,7 @@ use zeroize::Zeroizing;
 mod checkpoint_array;
 #[path = "checkpoint_fields.rs"]
 mod checkpoint_fields;
+pub(super) use checkpoint_fields::EntryCache;
 
 const PART_BYTES: usize = 32 * 1024;
 const MAX_STATE_BYTES: usize = 512 * 1024 * 1024;
@@ -41,6 +42,7 @@ pub(super) struct Parts {
     /// Bytes serialized in this operation, before compression.
     pub serialized_len: usize,
     pub max_buffer_capacity: usize,
+    pub entries: EntryCache,
 }
 
 fn context(session: &SessionId, digest: &[u8; 32]) -> String {
@@ -67,7 +69,14 @@ impl Parts {
         state: &ProtocolState,
     ) -> Result<Self, KeymeldError> {
         let base = Self::base(key, session, state, &BTreeSet::new())?;
-        Self::journal(key, session, &base, &state.journal, &BTreeSet::new())
+        Self::journal(
+            key,
+            session,
+            &base,
+            &state.journal,
+            &BTreeSet::new(),
+            &EntryCache::default(),
+        )
     }
 
     /// Serialize the non-journal fields once per application-state update.
@@ -88,8 +97,9 @@ impl Parts {
         base: &Self,
         journal: &ConfidentialJournal,
         known: &BTreeSet<[u8; 32]>,
+        previous: &EntryCache,
     ) -> Result<Self, KeymeldError> {
-        checkpoint_fields::encode_journal(key, session, base, journal, known)
+        checkpoint_fields::encode_journal(key, session, base, journal, known, previous)
     }
 }
 

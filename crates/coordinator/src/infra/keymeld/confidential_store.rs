@@ -1,7 +1,7 @@
 //! Authorized application storage for private protocol retries. The Keymeld
 //! gateway has no access to these records. Persist before any enclave side effect.
 use super::{
-    protocol_parts::{Manifest, Parts},
+    protocol_parts::{EntryCache, Manifest, Parts},
     KeymeldError, StoredDlcKeygenSession,
 };
 use crate::infra::db::DBConnection;
@@ -157,6 +157,7 @@ enum Snapshot {
         base: Parts,
         /// Only digests from this writer's last successful CAS are reusable.
         committed: BTreeSet<[u8; 32]>,
+        entries: EntryCache,
     },
 }
 
@@ -190,6 +191,7 @@ impl DurableCheckpoint {
             Snapshot::Parts {
                 base: Parts::base(&key, &session, state, &BTreeSet::new())?,
                 committed: BTreeSet::new(),
+                entries: EntryCache::default(),
             }
         } else {
             Snapshot::Legacy(Box::new(state.clone()))
@@ -272,14 +274,23 @@ impl DurableCheckpoint {
                 *snapshot = Snapshot::Legacy(Box::new(state.clone()));
                 *version = next;
             }
-            Snapshot::Parts { committed, .. } => {
+            Snapshot::Parts {
+                committed, entries, ..
+            } => {
                 let mut base = Parts::base(&self.key, &self.session, state, committed)
                     .map_err(|e| SdkError::Internal(e.to_string()))?;
-                let parts =
-                    Parts::journal(&self.key, &self.session, &base, &state.journal, committed)
-                        .map_err(|e| SdkError::Internal(e.to_string()))?;
+                let mut parts = Parts::journal(
+                    &self.key,
+                    &self.session,
+                    &base,
+                    &state.journal,
+                    committed,
+                    entries,
+                )
+                .map_err(|e| SdkError::Internal(e.to_string()))?;
                 let mut digests = BTreeSet::new();
                 parts.manifest.digests(&mut digests);
+                let next_entries = std::mem::take(&mut parts.entries);
                 let next = self.persist(*version, None, Some(parts)).await?;
                 base.bodies.clear();
                 base.serialized_len = 0;
@@ -287,6 +298,7 @@ impl DurableCheckpoint {
                 *snapshot = Snapshot::Parts {
                     base,
                     committed: digests,
+                    entries: next_entries,
                 };
                 *version = next;
             }
@@ -307,11 +319,17 @@ impl ConfidentialCheckpoint for DurableCheckpoint {
                     *snapshot = Snapshot::Legacy(Box::new(state));
                     *version = next;
                 }
-                Snapshot::Parts { base, committed } => {
-                    let parts = Parts::journal(&self.key, &self.session, base, journal, committed)
-                        .map_err(|e| SdkError::Internal(e.to_string()))?;
+                Snapshot::Parts {
+                    base,
+                    committed,
+                    entries,
+                } => {
+                    let mut parts =
+                        Parts::journal(&self.key, &self.session, base, journal, committed, entries)
+                            .map_err(|e| SdkError::Internal(e.to_string()))?;
                     let mut digests = BTreeSet::new();
                     parts.manifest.digests(&mut digests);
+                    let next_entries = std::mem::take(&mut parts.entries);
                     let next = self.persist(*version, None, Some(parts)).await?;
                     // Failed or cancelled writes never advance this cache. A later
                     // retry must perform CAS before any enclave command can run.
@@ -319,6 +337,7 @@ impl ConfidentialCheckpoint for DurableCheckpoint {
                     base.serialized_len = 0;
                     base.max_buffer_capacity = 0;
                     *committed = digests;
+                    *entries = next_entries;
                     *version = next;
                 }
             }
