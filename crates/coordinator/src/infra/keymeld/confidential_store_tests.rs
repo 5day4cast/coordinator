@@ -609,12 +609,36 @@ fn large_journal(entries: usize, payload_bytes: usize) -> ConfidentialJournal {
     }
     let mut value = serde_json::to_value(ConfidentialJournal::default()).unwrap();
     value["commands"] = commands.into();
+    // Over 1 KiB, so serializing the batch again shows in a save's serialized bytes.
+    let message = format!("opaque\"batch\nvalue{}", "ef".repeat(1024));
     value["signing_batches"] = serde_json::json!({SessionId::new_v7().to_string(): {
         "input_commitment": vec![7; 32],
-        "items": [{"batch_item_id": Uuid::now_v7(), "encrypted_message": "opaque\"batch\nvalue",
+        "items": [{"batch_item_id": Uuid::now_v7(), "encrypted_message": message,
             "encrypted_adaptor_configs": null, "encrypted_taproot_tweak": "fixture", "subset_id": null}]
     }});
     serde_json::from_value(value).unwrap()
+}
+
+/// The longest JSON of one application field or journal entry. The partitioned writer
+/// serializes each into its own buffer, so none needs more than about twice this.
+fn largest_item_json(state: &ProtocolState) -> usize {
+    let serde_json::Value::Object(mut fields) = serde_json::to_value(state).unwrap() else {
+        panic!("protocol state serializes as an object");
+    };
+    let journal = fields.remove("journal").unwrap();
+    let entries = ["commands", "signing_batches"]
+        .into_iter()
+        .flat_map(|collection| journal[collection].as_object().unwrap().values());
+    fields
+        .values()
+        .chain(entries)
+        .chain([
+            &journal["opaque_route_id"],
+            &journal["aborted_signing_sessions"],
+        ])
+        .map(|value| serde_json::to_vec(value).unwrap().len())
+        .max()
+        .unwrap()
 }
 
 #[test]
@@ -634,6 +658,20 @@ fn partitioned_encoder_bounds_buffers_and_reuses_unchanged_ciphertext() {
         &EntryCache::default(),
     )
     .unwrap();
+    let largest = largest_item_json(&original);
+    assert!(
+        2 * largest < first.plaintext_len,
+        "the fixture must tell one field's buffer from the whole document"
+    );
+    assert!(
+        first.max_buffer_capacity <= 2 * largest,
+        "a full write must buffer one field or journal entry at a time, not the document"
+    );
+    let batches = serde_json::to_value(&original.journal).unwrap()["signing_batches"].to_string();
+    assert!(
+        batches.len() > 1024,
+        "the signing batch alone exceeds the reuse bound below"
+    );
     let mut known = BTreeSet::new();
     first.manifest.digests(&mut known);
     base.bodies.clear();
@@ -653,12 +691,8 @@ fn partitioned_encoder_bounds_buffers_and_reuses_unchanged_ciphertext() {
         "unchanged parts must not be recompressed or encrypted"
     );
     assert!(
-        unchanged.max_buffer_capacity < unchanged.plaintext_len / 20,
-        "the journal must not be buffered as one JSON document"
-    );
-    assert!(
         unchanged.serialized_len < 1024,
-        "unchanged journal entries and static fields must not be reserialized"
+        "unchanged journal entries, signing batches and static fields must not be reserialized"
     );
     let bodies = first
         .bodies
