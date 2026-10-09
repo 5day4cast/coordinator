@@ -247,6 +247,13 @@ enum Snapshot {
     },
 }
 
+/// What one compare-and-swap stores: the whole state as one sealed document, or a sealed
+/// manifest and the parts it references that are not stored yet.
+enum CheckpointWrite<'a> {
+    Monolithic(&'a ProtocolState),
+    Parts(Parts),
+}
+
 pub(super) struct DurableCheckpoint {
     db: DBConnection,
     key: SessionSecret,
@@ -277,49 +284,44 @@ impl DurableCheckpoint {
             current: Mutex::new((version, snapshot)),
         })
     }
-    async fn persist(
-        &self,
-        previous: i64,
-        state: Option<&ProtocolState>,
-        parts: Option<Parts>,
-    ) -> Result<i64, SdkError> {
+    async fn persist(&self, previous: i64, write: CheckpointWrite<'_>) -> Result<i64, SdkError> {
         let next = previous.checked_add(1).ok_or_else(|| {
             SdkError::Internal("Confidential checkpoint version exhausted".into())
         })?;
-        let encrypted = if let Some(parts) = &parts {
-            crate::metrics::checkpoint_bytes("parts", "encode", parts.serialized_len);
-            crate::metrics::checkpoint_encode_buffer_bytes(parts.max_buffer_capacity);
-            let plaintext = Zeroizing::new(
-                serde_json::to_vec(&parts.manifest)
+        // A format-1 row keeps no parts, so its write removes every stored part.
+        let mut keep = BTreeSet::new();
+        let (encrypted, format, bodies) = match write {
+            CheckpointWrite::Monolithic(state) => (
+                seal(&self.key, &self.session, next, state)
                     .map_err(|e| SdkError::Internal(e.to_string()))?,
-            );
-            self.key
-                .encrypt(&plaintext, &context(&self.session, next))
-                .and_then(|value| value.to_hex())
-                .map_err(|_| SdkError::Internal("Cannot seal checkpoint manifest".into()))?
-        } else {
-            seal(
-                &self.key,
-                &self.session,
-                next,
-                state.expect("legacy state supplied"),
-            )
-            .map_err(|e| SdkError::Internal(e.to_string()))?
+                1,
+                BTreeMap::new(),
+            ),
+            CheckpointWrite::Parts(parts) => {
+                crate::metrics::checkpoint_bytes("parts", "encode", parts.serialized_len);
+                crate::metrics::checkpoint_encode_buffer_bytes(parts.max_buffer_capacity);
+                let plaintext = Zeroizing::new(
+                    serde_json::to_vec(&parts.manifest)
+                        .map_err(|e| SdkError::Internal(e.to_string()))?,
+                );
+                let encrypted = self
+                    .key
+                    .encrypt(&plaintext, &context(&self.session, next))
+                    .and_then(|value| value.to_hex())
+                    .map_err(|_| SdkError::Internal("Cannot seal checkpoint manifest".into()))?;
+                parts.manifest.digests(&mut keep);
+                (encrypted, 2, parts.bodies)
+            }
         };
         let id = self.session.to_string();
-        let format = if parts.is_some() { 2 } else { 1 };
         let count = self.db.execute_write(move |pool| async move {
             let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
             let count = sqlx::query("UPDATE keymeld_protocol_state SET version=?, encrypted_state=?, format=? WHERE session_id=? AND version=?")
                 .bind(next).bind(encrypted).bind(format).bind(&id).bind(previous).execute(&mut *tx).await?.rows_affected();
             if count != 1 { tx.rollback().await?; return Ok(count); }
-            let mut keep = std::collections::BTreeSet::new();
-            if let Some(parts) = parts {
-                parts.manifest.digests(&mut keep);
-                for (digest, body) in parts.bodies {
-                    sqlx::query("INSERT INTO keymeld_protocol_parts(session_id, digest, body) VALUES (?, ?, ?) ON CONFLICT(session_id,digest) DO NOTHING")
-                        .bind(&id).bind(digest.to_vec()).bind(body).execute(&mut *tx).await?;
-                }
+            for (digest, body) in bodies {
+                sqlx::query("INSERT INTO keymeld_protocol_parts(session_id, digest, body) VALUES (?, ?, ?) ON CONFLICT(session_id,digest) DO NOTHING")
+                    .bind(&id).bind(digest.to_vec()).bind(body).execute(&mut *tx).await?;
             }
             let stored: Vec<Vec<u8>> = sqlx::query_scalar("SELECT digest FROM keymeld_protocol_parts WHERE session_id = ?")
                 .bind(&id).fetch_all(&mut *tx).await?;
@@ -344,7 +346,9 @@ impl DurableCheckpoint {
         let (version, snapshot) = &mut *current;
         match snapshot {
             Snapshot::Legacy(_) => {
-                let next = self.persist(*version, Some(state), None).await?;
+                let next = self
+                    .persist(*version, CheckpointWrite::Monolithic(state))
+                    .await?;
                 *snapshot = Snapshot::Legacy(Box::new(state.clone()));
                 *version = next;
             }
@@ -365,7 +369,9 @@ impl DurableCheckpoint {
                 let mut digests = BTreeSet::new();
                 parts.manifest.digests(&mut digests);
                 let next_entries = std::mem::take(&mut parts.entries);
-                let next = self.persist(*version, None, Some(parts)).await?;
+                let next = self
+                    .persist(*version, CheckpointWrite::Parts(parts))
+                    .await?;
                 base.bodies.clear();
                 base.serialized_len = 0;
                 base.max_buffer_capacity = 0;
@@ -391,7 +397,9 @@ impl ConfidentialCheckpoint for DurableCheckpoint {
                 Snapshot::Legacy(previous) => {
                     let mut state = (**previous).clone();
                     state.journal = journal.clone();
-                    let next = self.persist(*version, Some(&state), None).await?;
+                    let next = self
+                        .persist(*version, CheckpointWrite::Monolithic(&state))
+                        .await?;
                     *snapshot = Snapshot::Legacy(Box::new(state));
                     *version = next;
                 }
@@ -406,7 +414,9 @@ impl ConfidentialCheckpoint for DurableCheckpoint {
                     let mut digests = BTreeSet::new();
                     parts.manifest.digests(&mut digests);
                     let next_entries = std::mem::take(&mut parts.entries);
-                    let next = self.persist(*version, None, Some(parts)).await?;
+                    let next = self
+                        .persist(*version, CheckpointWrite::Parts(parts))
+                        .await?;
                     // Failed or cancelled writes never advance this cache. A later
                     // retry must perform CAS before any enclave command can run.
                     base.bodies.clear();
