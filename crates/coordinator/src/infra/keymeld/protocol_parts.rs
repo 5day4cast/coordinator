@@ -8,6 +8,7 @@ use keymeld_core::{
     crypto::{EncryptedData, SessionSecret},
     SessionId,
 };
+use keymeld_sdk::confidential_session::ConfidentialJournal;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use sha2::Sha256;
@@ -19,11 +20,13 @@ use zeroize::Zeroizing;
 
 #[path = "checkpoint_array.rs"]
 mod checkpoint_array;
+#[path = "checkpoint_fields.rs"]
+mod checkpoint_fields;
 
 const PART_BYTES: usize = 32 * 1024;
 const MAX_STATE_BYTES: usize = 512 * 1024 * 1024;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) enum Manifest {
     Part([u8; 32]),
     Object(BTreeMap<String, Manifest>),
@@ -33,6 +36,11 @@ pub(super) enum Manifest {
 pub(super) struct Parts {
     pub manifest: Manifest,
     pub bodies: BTreeMap<[u8; 32], Vec<u8>>,
+    /// Size of reconstructed JSON, including reused fields and delimiters.
+    pub plaintext_len: usize,
+    /// Bytes serialized in this operation, before compression.
+    pub serialized_len: usize,
+    pub max_buffer_capacity: usize,
 }
 
 fn context(session: &SessionId, digest: &[u8; 32]) -> String {
@@ -52,23 +60,36 @@ fn part_digest(key: &SessionSecret, session: &SessionId, text: &[u8]) -> [u8; 32
 }
 
 impl Parts {
+    #[cfg(test)]
     pub fn encode(
         key: &SessionSecret,
         session: &SessionId,
         state: &ProtocolState,
     ) -> Result<Self, KeymeldError> {
-        let json = Zeroizing::new(
-            serde_json::to_string(state).map_err(|error| failure(error.to_string()))?,
-        );
-        crate::metrics::checkpoint_bytes("parts", "encode", json.len());
-        if json.len() > MAX_STATE_BYTES {
-            return Err(failure("Confidential checkpoint exceeds size limit"));
-        }
-        let raw: &RawValue =
-            serde_json::from_str(&json).map_err(|error| failure(error.to_string()))?;
-        let mut bodies = BTreeMap::new();
-        let manifest = split(key, session, raw, &mut bodies)?;
-        Ok(Self { manifest, bodies })
+        let base = Self::base(key, session, state, &BTreeSet::new())?;
+        Self::journal(key, session, &base, &state.journal, &BTreeSet::new())
+    }
+
+    /// Serialize the non-journal fields once per application-state update.
+    pub fn base(
+        key: &SessionSecret,
+        session: &SessionId,
+        state: &ProtocolState,
+        known: &BTreeSet<[u8; 32]>,
+    ) -> Result<Self, KeymeldError> {
+        checkpoint_fields::encode_base(key, session, state, known)
+    }
+
+    /// Keep the base manifest, and serialize journal entries individually. Never
+    /// clone the journal or build a JSON buffer containing the entire checkpoint.
+    pub fn journal(
+        key: &SessionSecret,
+        session: &SessionId,
+        base: &Self,
+        journal: &ConfidentialJournal,
+        known: &BTreeSet<[u8; 32]>,
+    ) -> Result<Self, KeymeldError> {
+        checkpoint_fields::encode_journal(key, session, base, journal, known)
     }
 }
 
@@ -77,6 +98,7 @@ fn split(
     session: &SessionId,
     raw: &RawValue,
     bodies: &mut BTreeMap<[u8; 32], Vec<u8>>,
+    known: &BTreeSet<[u8; 32]>,
 ) -> Result<Manifest, KeymeldError> {
     let text = raw.get();
     if text.len() > PART_BYTES {
@@ -85,7 +107,7 @@ fn split(
                 serde_json::from_str(text).map_err(|error| failure(error.to_string()))?;
             let parts = object
                 .into_iter()
-                .map(|(name, value)| Ok((name, split(key, session, value, bodies)?)))
+                .map(|(name, value)| Ok((name, split(key, session, value, bodies, known)?)))
                 .collect::<Result<_, KeymeldError>>()?;
             return Ok(Manifest::Object(parts));
         }
@@ -100,7 +122,7 @@ fn split(
                     serde_json::from_str(text).map_err(|error| failure(error.to_string()))?;
                 let parts = array
                     .into_iter()
-                    .map(|value| split(key, session, value, bodies))
+                    .map(|value| split(key, session, value, bodies, known))
                     .collect::<Result<_, _>>()?;
                 return Ok(Manifest::Array(parts));
             }
@@ -109,6 +131,9 @@ fn split(
     // Bind the content address to this secret and session; equal public scalar values
     // cannot be guessed from hashes or correlated between sessions.
     let digest = part_digest(key, session, text.as_bytes());
+    if known.contains(&digest) {
+        return Ok(Manifest::Part(digest));
+    }
     if let std::collections::btree_map::Entry::Vacant(entry) = bodies.entry(digest) {
         let mut compressor = GzEncoder::new(Vec::new(), Compression::fast());
         compressor
@@ -233,7 +258,7 @@ mod tests {
         let json = serde_json::to_string(&vec![255_u8; PART_BYTES]).unwrap();
         let raw: &RawValue = serde_json::from_str(&json).unwrap();
         let mut bodies = BTreeMap::new();
-        let manifest = split(&key, &session, raw, &mut bodies).unwrap();
+        let manifest = split(&key, &session, raw, &mut bodies, &BTreeSet::new()).unwrap();
         let expected = part_digest(&key, &session, json.as_bytes());
         assert!(matches!(&manifest, Manifest::Part(digest) if *digest == expected));
         assert_eq!(bodies.len(), 1);
@@ -253,7 +278,7 @@ mod tests {
         let json = serde_json::to_string(&value).unwrap();
         let raw: &RawValue = serde_json::from_str(&json).unwrap();
         let mut bodies = BTreeMap::new();
-        let manifest = split(&key, &session, raw, &mut bodies).unwrap();
+        let manifest = split(&key, &session, raw, &mut bodies, &BTreeSet::new()).unwrap();
         assert!(matches!(&manifest, Manifest::Array(values) if values.len() == 4));
         let bodies = bodies.into_iter().map(|(k, v)| (k.to_vec(), v)).collect();
         let mut restored = Vec::new();

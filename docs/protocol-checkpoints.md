@@ -11,7 +11,7 @@ The coordinator saves a durable checkpoint before sending a confidential command
 
 The reader supports both formats. The additive migration leaves existing rows in format 1. Creating a session also writes format 1.
 
-With format 2 enabled, the next checkpoint converts that session. Objects larger than 32 KiB split at field boundaries. Structured arrays split at element boundaries.
+With format 2 enabled, the next checkpoint converts that session. Application fields and journal entries each have manifest nodes. Larger nested objects and structured arrays split further at field or element boundaries.
 
 Scalar arrays remain one part, including serialized byte vectors. Each part uses a session-bound HMAC-SHA256 content address. Compression precedes authenticated encryption.
 
@@ -19,7 +19,17 @@ A transaction updates the version and manifest with compare-and-swap, inserts ne
 
 Concurrent readers load the manifest and parts from one database snapshot. Missing parts, failed authentication, and conflicting checkpoint versions fail closed.
 
-The implementation limits reconstructed state to 512 MiB. It still serializes the complete state in memory and compresses each candidate part.
+The implementation limits reconstructed state to 512 MiB, including cached fields and JSON delimiters.
+
+The partitioned writer borrows the application state. It retains the non-journal manifest between journal saves, without cloning the complete state or journal. Each journal command and signing batch serializes separately, so no write buffer contains the complete journal.
+
+Content addresses still require serialization and hashing of journal entries. Parts from the writer's last successful commit skip compression, encryption, and insertion. The cache advances only after the transaction commits. A failed write retains the prior cache and version.
+
+Application-state updates rebuild the non-journal manifest. A new writer initializes its cache from scratch; it never trusts unverified persisted part identifiers. Reloads still decode the complete state, and individual large entries still need temporary buffers.
+
+These changes retain format 2 compatibility. Older format-2 readers can reconstruct the new manifests. The default format-1 writer retains its existing allocation behavior.
+
+`coordinator_checkpoint_plaintext_bytes` reports bytes actually serialized during each encode. Cached application fields are omitted from subsequent journal-save samples. Decode samples still report the complete reconstructed document. `coordinator_checkpoint_encode_buffer_bytes` reports the largest plaintext buffer capacity during each partitioned write. Neither metric measures the total process peak.
 
 ## Deployment
 
