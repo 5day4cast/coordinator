@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use super::oracle::{Forecast, StationInfo};
-use super::Weights;
+use super::{StormGuard, Weights};
 
 /// Miles per hour in a knot, the unit the oracle forecasts wind in.
 const MPH_PER_KNOT: f64 = 1.150_78;
@@ -125,23 +125,111 @@ impl Scored {
     }
 }
 
-/// Score each candidate with a forecast for the window, dropping those without one. Each
-/// component is scaled from the lowest to the highest value among the candidates, so a unit of
-/// one does not outweigh another; a component every candidate shares counts nothing.
+/// Score each candidate with a forecast for the window, dropping those without one.
 pub fn score(candidates: &[StationInfo], forecasts: &[Forecast], weights: &Weights) -> Vec<Scored> {
+    scale(weather(candidates, forecasts), weights)
+}
+
+/// The window's weather at each of `stations` with a forecast for it, dropping those without one.
+pub fn weather(stations: &[StationInfo], forecasts: &[Forecast]) -> Vec<(StationInfo, Weather)> {
     let mut rows: HashMap<&str, Vec<&Forecast>> = HashMap::new();
     for forecast in forecasts {
         rows.entry(forecast.station_id.as_str())
             .or_default()
             .push(forecast);
     }
-    let forecast: Vec<(StationInfo, Weather)> = candidates
+    stations
         .iter()
         .filter_map(|station| {
             let weather = Weather::of(rows.get(station.station_id.as_str())?)?;
             Some((station.clone(), weather))
         })
+        .collect()
+}
+
+/// A storm-strength forecast, as the run's page shows it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Storm {
+    pub station_id: String,
+    pub wind_mph: f64,
+    pub rain_in: f64,
+}
+
+/// What the storm guard left out of a pick.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Storms {
+    /// The storm-strength forecasts among the stations with one, the windiest first.
+    pub forecasts: Vec<Storm>,
+    /// Candidates left out: under one of those forecasts, or within `radius_km` of one.
+    pub left_out: Vec<String>,
+    pub radius_km: f64,
+}
+
+/// Leave out of `candidates` each one whose forecast is storm-strength under `guard`, and each
+/// within `guard.radius_km` of such a forecast. `others`, stations the lane will not pick this
+/// time, can be storms too, so how near a candidate is to one does not depend on what the lane
+/// picked recently. Only rain counts towards a storm: snow and ice are the extremes the picker
+/// looks for. A candidate whose place is unknown is never near.
+pub fn avoid_storms(
+    candidates: Vec<(StationInfo, Weather)>,
+    others: &[(StationInfo, Weather)],
+    guard: &StormGuard,
+) -> (Vec<(StationInfo, Weather)>, Storms) {
+    if !guard.enabled {
+        return (candidates, Storms::default());
+    }
+    let mut storms: Vec<&(StationInfo, Weather)> = candidates
+        .iter()
+        .chain(others)
+        .filter(|(_, weather)| {
+            weather.wind_mph >= guard.wind_mph && weather.rain_in >= guard.rain_in
+        })
         .collect();
+    storms.sort_by(|(a, a_weather), (b, b_weather)| {
+        b_weather
+            .wind_mph
+            .total_cmp(&a_weather.wind_mph)
+            .then_with(|| a.station_id.cmp(&b.station_id))
+    });
+    let ids: HashSet<String> = storms
+        .iter()
+        .map(|(station, _)| station.station_id.clone())
+        .collect();
+    let places: Vec<(f64, f64)> = storms
+        .iter()
+        .filter_map(|(station, _)| station.location())
+        .collect();
+    let forecasts = storms
+        .into_iter()
+        .map(|(station, weather)| Storm {
+            station_id: station.station_id.clone(),
+            wind_mph: weather.wind_mph,
+            rain_in: weather.rain_in,
+        })
+        .collect();
+    let (kept, left_out): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|(station, _)| {
+        !ids.contains(&station.station_id)
+            && station.location().is_none_or(|at| {
+                places
+                    .iter()
+                    .all(|storm| distance_km(at, *storm) > guard.radius_km)
+            })
+    });
+    let storms = Storms {
+        forecasts,
+        left_out: left_out
+            .into_iter()
+            .map(|(station, _)| station.station_id)
+            .collect(),
+        radius_km: guard.radius_km,
+    };
+    (kept, storms)
+}
+
+/// Score stations on their weather. Each component is scaled from the lowest to the highest
+/// value among them, so a unit of one does not outweigh another; a component every station
+/// shares counts nothing.
+pub fn scale(forecast: Vec<(StationInfo, Weather)>, weights: &Weights) -> Vec<Scored> {
     let raw: Vec<[f64; 4]> = forecast
         .iter()
         .map(|(_, weather)| {
@@ -595,5 +683,255 @@ mod tests {
             picked.iter().map(|p| p.role).collect::<Vec<_>>(),
             [Role::Leader, Role::Crowded, Role::Crowded]
         );
+    }
+
+    const PENSACOLA: (f64, f64) = (30.48, -87.19);
+    const SELMA: (f64, f64) = (32.34, -86.98);
+    const TUSCALOOSA: (f64, f64) = (33.21, -87.62);
+    const MOUNT_WASHINGTON: (f64, f64) = (44.27, -71.30);
+    const HELENA: (f64, f64) = (46.60, -111.99);
+
+    /// A station at `at` whose forecast for the window has `wind_kt` and `rain_in` of rain.
+    fn wet(id: &str, at: (f64, f64), wind_kt: i64, rain_in: f64) -> (StationInfo, Weather) {
+        let mut rows = forecast(id, 60, 75, wind_kt, 90);
+        rows.rain_amt = Some(rain_in);
+        (station(id, "", at), Weather::of(&[&rows]).unwrap())
+    }
+
+    fn ids(stations: &[(StationInfo, Weather)]) -> Vec<&str> {
+        stations
+            .iter()
+            .map(|(station, _)| station.station_id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_storm_and_the_stations_near_it_are_left_out() {
+        let mut snowstorm = wet("KHLN", HELENA, 50, 0.0);
+        snowstorm.1.snow_in = 6.0;
+        let candidates = vec![
+            // A landfalling storm, 89 mph and 5.41 in: Selma, 208 km inland at 28 mph, stopped
+            // reporting with it; Tuscaloosa, 307 km away, kept reporting.
+            wet("KPNS", PENSACOLA, 77, 5.41),
+            wet("KSEM", SELMA, 24, 2.07),
+            wet("KTCL", TUSCALOOSA, 11, 2.01),
+            // Wind alone is not a storm: a summit station settled at 93 mph.
+            wet("KMWN", MOUNT_WASHINGTON, 81, 1.11),
+            // Nor is snow, which the picker looks for.
+            snowstorm,
+        ];
+        let (kept, storms) = avoid_storms(candidates.clone(), &[], &StormGuard::default());
+        assert_eq!(ids(&kept), ["KTCL", "KMWN", "KHLN"]);
+        assert_eq!(storms.left_out, ["KPNS", "KSEM"]);
+        assert_eq!(storms.radius_km, 300.0);
+        assert_eq!(storms.forecasts.len(), 1);
+        assert_eq!(storms.forecasts[0].station_id, "KPNS");
+        assert!((storms.forecasts[0].wind_mph - 77.0 * MPH_PER_KNOT).abs() < 1e-9);
+        assert_eq!(storms.forecasts[0].rain_in, 5.41);
+
+        // Thresholds are inclusive and configurable; a guard that is off leaves out nothing.
+        let at_threshold = |wind_mph: f64, rain_in: f64| {
+            let mut station = wet("KPNS", PENSACOLA, 0, 0.0);
+            station.1.wind_mph = wind_mph;
+            station.1.rain_in = rain_in;
+            avoid_storms(vec![station], &[], &StormGuard::default())
+                .0
+                .is_empty()
+        };
+        assert!(at_threshold(45.0, 2.0));
+        assert!(!at_threshold(44.9, 2.0));
+        assert!(!at_threshold(45.0, 1.99));
+        let windier = StormGuard {
+            wind_mph: 90.0,
+            ..Default::default()
+        };
+        let (kept, storms) = avoid_storms(candidates.clone(), &[], &windier);
+        assert_eq!(kept.len(), 5);
+        assert_eq!(storms.left_out, Vec::<String>::new());
+        let only_the_storm = StormGuard {
+            radius_km: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            avoid_storms(candidates.clone(), &[], &only_the_storm)
+                .1
+                .left_out,
+            ["KPNS"]
+        );
+        let off = StormGuard {
+            enabled: false,
+            ..Default::default()
+        };
+        let (kept, storms) = avoid_storms(candidates, &[], &off);
+        assert_eq!(kept.len(), 5);
+        assert_eq!(storms, Storms::default());
+    }
+
+    #[test]
+    fn a_storm_the_lane_cannot_pick_still_keeps_its_neighbours_out() {
+        let recent = [wet("KPNS", PENSACOLA, 77, 5.41)];
+        let (kept, storms) = avoid_storms(
+            vec![
+                wet("KSEM", SELMA, 24, 2.07),
+                wet("KTCL", TUSCALOOSA, 11, 2.01),
+            ],
+            &recent,
+            &StormGuard::default(),
+        );
+        assert_eq!(ids(&kept), ["KTCL"]);
+        assert_eq!(
+            storms.left_out,
+            ["KSEM"],
+            "the storm itself was not a candidate"
+        );
+        assert_eq!(storms.forecasts[0].station_id, "KPNS");
+
+        // A storm whose place is unknown is still left out; a candidate whose place is unknown
+        // is never near one.
+        let mut nowhere = wet("KVOA", (0.0, 0.0), 70, 5.66);
+        nowhere.0.latitude = None;
+        let mut unplaced = wet("KXYZ", (0.0, 0.0), 10, 0.0);
+        unplaced.0.longitude = None;
+        let (kept, storms) = avoid_storms(
+            vec![nowhere, unplaced, wet("KSEM", SELMA, 24, 2.07)],
+            &recent,
+            &StormGuard::default(),
+        );
+        assert_eq!(ids(&kept), ["KXYZ"]);
+        assert_eq!(storms.left_out, ["KVOA", "KSEM"]);
+        assert_eq!(
+            storms
+                .forecasts
+                .iter()
+                .map(|storm| storm.station_id.as_str())
+                .collect::<Vec<_>>(),
+            ["KPNS", "KVOA"],
+            "the windiest first"
+        );
+    }
+
+    /// Each pool the weekend storm kept from settling, and the settled pools with the most wind
+    /// or rain, as their run pages recorded them: each pick's place, forecast wind in mph (whole
+    /// knots, rounded) and precipitation in inches (counted as rain, though some was snow). The
+    /// guard leaves out every station that stopped reporting, and no settled pool's picks.
+    #[test]
+    fn the_recorded_storm_picks_are_left_out_and_the_settled_ones_kept() {
+        type Recorded = (&'static str, (f64, f64), f64, f64);
+        let pools: [(&[Recorded], &[&str]); 12] = [
+            (
+                &[
+                    ("KVOA", (29.23, -87.78), 81.0, 5.66),
+                    ("KNPA", (30.36, -87.32), 44.0, 4.80),
+                    ("KDTS", (30.39, -86.47), 53.0, 4.42),
+                ],
+                &["KVOA", "KNPA", "KDTS"],
+            ),
+            (
+                &[
+                    ("KPNS", PENSACOLA, 89.0, 5.41),
+                    ("KSEM", SELMA, 28.0, 2.07),
+                    ("KTCL", TUSCALOOSA, 13.0, 2.01),
+                ],
+                &["KPNS", "KSEM"],
+            ),
+            (
+                &[
+                    ("KGZH", (31.42, -87.05), 52.0, 3.35),
+                    ("KBFM", (30.61, -88.06), 46.0, 5.00),
+                    ("KECP", (30.35, -85.79), 35.0, 3.56),
+                ],
+                &["KGZH", "KBFM", "KECP"],
+            ),
+            (
+                &[
+                    ("KPRN", (31.85, -86.61), 52.0, 2.18),
+                    ("KVPS", (30.48, -86.53), 45.0, 4.45),
+                    ("KGTR", (33.46, -88.59), 20.0, 1.99),
+                ],
+                &["KPRN", "KVPS", "KGTR"],
+            ),
+            (
+                &[
+                    ("KDTS", (30.39, -86.47), 66.0, 4.41),
+                    ("KDCU", (34.66, -86.94), 21.0, 2.14),
+                    ("KHSV", (34.64, -86.79), 21.0, 2.07),
+                ],
+                &["KDTS"],
+            ),
+            (
+                &[
+                    ("KPNS", PENSACOLA, 59.0, 2.93),
+                    ("KSEM", SELMA, 38.0, 2.97),
+                    ("KEGI", (30.65, -86.53), 36.0, 3.28),
+                ],
+                &["KPNS", "KSEM", "KEGI"],
+            ),
+            (
+                &[
+                    ("KMWN", MOUNT_WASHINGTON, 93.0, 1.11),
+                    ("KPQI", (46.70, -68.05), 24.0, 0.28),
+                    ("KFVE", (47.29, -68.31), 25.0, 0.51),
+                ],
+                &[],
+            ),
+            (
+                &[
+                    ("KMWN", MOUNT_WASHINGTON, 61.0, 0.30),
+                    ("KPQI", (46.70, -68.05), 13.0, 0.31),
+                    ("KFVE", (47.29, -68.31), 14.0, 0.05),
+                ],
+                &[],
+            ),
+            (
+                &[
+                    ("KHLN", HELENA, 21.0, 2.64),
+                    ("KMSO", (46.92, -114.09), 22.0, 0.35),
+                    ("KMVH", (46.84, -108.94), 21.0, 0.91),
+                ],
+                &[],
+            ),
+            (
+                &[
+                    ("KBZN", (45.79, -111.16), 12.0, 1.88),
+                    ("KGEY", (44.52, -108.08), 22.0, 0.20),
+                    ("KSBX", (48.54, -111.87), 20.0, 3.05),
+                ],
+                &[],
+            ),
+            (
+                &[
+                    ("KELY", (39.30, -114.85), 25.0, 1.32),
+                    ("KIGM", (35.26, -113.93), 41.0, 0.94),
+                    ("KINS", (36.59, -115.69), 35.0, 0.72),
+                ],
+                &[],
+            ),
+            (
+                &[
+                    ("KGTF", (47.47, -111.38), 30.0, 0.14),
+                    ("KLVM", (45.70, -110.44), 33.0, 0.01),
+                    ("KBTM", (45.96, -112.50), 23.0, 0.0),
+                ],
+                &[],
+            ),
+        ];
+        for (picks, left_out) in pools {
+            let stations: Vec<StationInfo> = picks
+                .iter()
+                .map(|(id, at, ..)| station(id, "", *at))
+                .collect();
+            let forecasts: Vec<Forecast> = picks
+                .iter()
+                .map(|(id, _, mph, rain_in)| {
+                    let knots = (mph / MPH_PER_KNOT).round() as i64;
+                    let mut row = forecast(id, 60, 75, knots, 90);
+                    row.rain_amt = Some(*rain_in);
+                    row
+                })
+                .collect();
+            let (_, storms) =
+                avoid_storms(weather(&stations, &forecasts), &[], &StormGuard::default());
+            assert_eq!(storms.left_out, left_out, "{picks:?}");
+        }
     }
 }

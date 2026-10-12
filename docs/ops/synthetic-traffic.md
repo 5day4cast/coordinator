@@ -37,6 +37,16 @@ Stations whose latest window needs no missed-report allowance rank first.
 Weather scores and the airport preference rank stations within that coverage group.
 Each saved selection includes its clean-day count and largest recent report gap.
 
+Weather selection skips storms. A forecast is storm-strength when its strongest wind is at least 45 mph and at least 2 inches of rain fall across the window. Snow and ice do not count toward it. Synth leaves out every station with a storm-strength forecast and every station within 300 km of one. Stations a lane cannot pick still count as storm sources: those it used recently, and those no longer reporting. Scores are scaled after the storm stations are removed. Stations in a landfalling tropical storm stop reporting, and their competitions cannot settle. Wind alone does not identify a storm: a mountain-summit station forecast at over 90 mph reported throughout. The run page lists the stations left out and the strongest storm forecasts. Each lane can change the thresholds below its `[[scheduler.lanes]]` entry, or set `enabled = false` to turn the guard off. The defaults are:
+
+```toml
+[scheduler.lanes.picker.storm]
+enabled = true
+wind_mph = 45
+rain_in = 2.0
+radius_km = 300
+```
+
 The default eligibility lookback is three days. Eligibility describes recent coverage; it cannot guarantee future reports. Settlement still waits for the Oracle's observation and coverage checks. Use the saved weather selection and the competition's Oracle event to investigate a delay.
 
 ## Authorize operator writes

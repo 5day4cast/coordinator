@@ -275,6 +275,171 @@ async fn a_lane_picks_the_storm_and_its_neighbours_from_the_eligible_stations() 
     assert!(page.contains("leader: the most weather"), "{page}");
 }
 
+const PENSACOLA: (f64, f64) = (30.48, -87.19);
+const SELMA: (f64, f64) = (32.34, -86.98);
+const EGLIN: (f64, f64) = (30.65, -86.53);
+
+/// [`weather`] with a landfalling storm on the Gulf coast that has more weather than Denver,
+/// a station inland under its rain, and a calm one on the coast beside it.
+fn storm_weather() -> (Vec<StationInfo>, Vec<Forecast>) {
+    let (mut stations, mut forecasts) = weather();
+    stations.extend([
+        station("KPNS", "PNS", PENSACOLA),
+        station("KSEM", "SEM", SELMA),
+        station("KEGI", "EGI", EGLIN),
+    ]);
+    let mut storm = forecast("KPNS", 66, 82, 77, 96);
+    storm.rain_amt = Some(5.41);
+    let mut inland = forecast("KSEM", 60, 80, 24, 90);
+    inland.rain_amt = Some(2.07);
+    forecasts.extend([storm, inland, forecast("KEGI", 70, 75, 5, 0)]);
+    (stations, forecasts)
+}
+
+#[tokio::test]
+async fn a_lane_leaves_out_a_storm_and_the_stations_near_it() {
+    let (stations, forecasts) = storm_weather();
+    let picking = fixture(Oracle {
+        eligible: Some(stations),
+        forecasts,
+        ..Default::default()
+    })
+    .await;
+    let guarded = lane("[picker]\nmode = \"weather\"\ncluster_km = 600\n");
+    let mut config = run(&guarded);
+    let pick = picking
+        .picker
+        .choose(&guarded, &ScenarioConfig::default(), &mut config)
+        .await
+        .unwrap();
+    // Scored without the storm, Denver's weather leads as it does without one.
+    assert_eq!(config.stations, ["KDEN", "KCOS", "KCYS"]);
+    assert_eq!((pick.candidates, pick.scored), (9, 9));
+    assert_eq!(pick.storms.left_out, ["KPNS", "KSEM", "KEGI"]);
+    let page = view::section(&pick).into_string();
+    assert!(
+        page.contains("Left out 3 under or within 300 km of a storm-strength forecast: KPNS 89 mph, 5.41 in of rain."),
+        "{page}"
+    );
+    let id = config.competition_id.unwrap();
+    assert_eq!(store::pick_for(&picking.db, id).await.unwrap(), pick);
+
+    // A pick saved before the guard reads back with nothing left out, and its page says none.
+    let mut saved = serde_json::to_value(&pick).unwrap();
+    saved.as_object_mut().unwrap().remove("storms");
+    let old: Pick = serde_json::from_value(saved).unwrap();
+    assert_eq!(old.storms, score::Storms::default());
+    assert!(!view::section(&old).into_string().contains("Left out"));
+
+    // With the guard off, the storm leads, and the station inland that went silent with it.
+    let unguarded =
+        lane("[picker]\nmode = \"weather\"\ncluster_km = 600\nstorm = { enabled = false }\n");
+    let mut config = run(&unguarded);
+    let pick = picking
+        .picker
+        .choose(&unguarded, &ScenarioConfig::default(), &mut config)
+        .await
+        .unwrap();
+    assert_eq!(config.stations[..2], ["KPNS", "KSEM"]);
+    assert!(pick.storms.left_out.is_empty());
+}
+
+/// A storm the lane picked last time is not picked again, and neither are the stations near it,
+/// whether the oracle sends every forecast at once or the lane asks for them in batches.
+#[tokio::test]
+async fn a_storm_used_recently_still_keeps_its_neighbours_out() {
+    for discovery in [false, true] {
+        let (stations, forecasts) = storm_weather();
+        let picking = fixture(Oracle {
+            eligible: Some(stations),
+            forecasts,
+            discovery,
+            ..Default::default()
+        })
+        .await;
+        // One-request discovery takes only windows in the future.
+        let close = if discovery {
+            crate::runner::lanes::next_half(OffsetDateTime::now_utc() + time::Duration::DAY)
+        } else {
+            datetime!(2026-10-02 00:00 UTC)
+        };
+        let run = |lane: &LaneConfig| {
+            lane.run_config(&ScenarioConfig::default(), 0, Some(close))
+                .1
+        };
+        let base = ScenarioConfig::default();
+        let without = lane(
+            "[picker]\nmode = \"weather\"\nrecent_runs_to_avoid = 1\nstorm = { enabled = false }\n",
+        );
+        let mut first = run(&without);
+        picking
+            .picker
+            .choose(&without, &base, &mut first)
+            .await
+            .unwrap();
+        // Independent picks: the storm, then the best 300 km or more from it and each other.
+        assert_eq!(first.stations, ["KPNS", "KDEN", "KORD"]);
+
+        let guarded = lane("[picker]\nmode = \"weather\"\nrecent_runs_to_avoid = 1\n");
+        let mut second = run(&guarded);
+        let pick = picking
+            .picker
+            .choose(&guarded, &base, &mut second)
+            .await
+            .unwrap();
+        assert_eq!(pick.avoided, ["KDEN", "KORD", "KPNS"]);
+        assert_eq!(
+            pick.storms.left_out,
+            ["KSEM", "KEGI"],
+            "discovery {discovery}"
+        );
+        assert_eq!(pick.storms.forecasts[0].station_id, "KPNS");
+        // Colorado Springs leads; Cheyenne is too close to it.
+        assert_eq!(second.stations, ["KCOS", "KSEA", "KJFK"]);
+        assert_eq!(
+            picking.oracle.lock().unwrap().discovery_calls,
+            if discovery { 2 } else { 0 }
+        );
+    }
+}
+
+/// A station that stopped reporting in a storm cannot be picked, but its forecast still keeps
+/// the stations near it out.
+#[tokio::test]
+async fn a_storm_whose_station_went_silent_still_keeps_its_neighbours_out() {
+    for discovery in [false, true] {
+        let (mut stations, forecasts) = storm_weather();
+        stations[6].coverage.as_mut().unwrap().last_report -= time::Duration::hours(2);
+        let picking = fixture(Oracle {
+            eligible: Some(stations),
+            forecasts,
+            discovery,
+            ..Default::default()
+        })
+        .await;
+        let lane = lane("[picker]\nmode = \"weather\"\ncluster_km = 600\n");
+        let mut config = run(&lane);
+        if discovery {
+            config.observation_start = Some(crate::runner::lanes::next_half(
+                OffsetDateTime::now_utc() + time::Duration::DAY,
+            ));
+        }
+        let pick = picking
+            .picker
+            .choose(&lane, &ScenarioConfig::default(), &mut config)
+            .await
+            .unwrap();
+        assert_eq!(config.stations, ["KDEN", "KCOS", "KCYS"]);
+        assert_eq!(pick.candidates, 8, "the silent station is not a candidate");
+        assert_eq!(
+            pick.storms.left_out,
+            ["KSEM", "KEGI"],
+            "discovery {discovery}"
+        );
+        assert_eq!(pick.storms.forecasts[0].station_id, "KPNS");
+    }
+}
+
 #[tokio::test]
 async fn the_last_runs_stations_are_not_picked_again() {
     let (stations, forecasts) = weather();
@@ -481,7 +646,7 @@ async fn a_fixed_lane_cannot_bypass_eligibility() {
 
 #[test]
 fn the_picker_table_loads_with_defaults_and_bad_settings_are_refused() {
-    let lane = lane(
+    let configured = lane(
         r#"
 [picker]
 mode = "weather"
@@ -491,17 +656,39 @@ cluster_km = 600
 recent_runs_to_avoid = 6
 "#,
     );
-    let picker = lane.picker.unwrap();
+    let picker = configured.picker.unwrap();
     assert_eq!(picker.candidates, Candidates::Configured);
     assert_eq!(picker.recent_runs_to_avoid, 6);
     assert_eq!(picker.weights, Weights::default());
     assert_eq!(picker.eligible_days, 3);
+    // The storm guard is on with the measured thresholds unless a lane says otherwise.
+    assert_eq!(
+        picker.storm,
+        StormGuard {
+            enabled: true,
+            wind_mph: 45.0,
+            rain_in: 2.0,
+            radius_km: 300.0
+        }
+    );
+    let storm = lane("[picker]\n[picker.storm]\nwind_mph = 50\nradius_km = 250\n")
+        .picker
+        .unwrap()
+        .storm;
+    assert_eq!(
+        (storm.wind_mph, storm.rain_in, storm.radius_km),
+        (50.0, 2.0, 250.0)
+    );
 
     let base = ScenarioConfig::default();
     for bad in [
         "[picker]\nmode = \"weather\"\ncluster_km = -1\n",
         "[picker]\nweights = { swing = 0, wind = 0, precip = 0, extremes = 0 }\n",
         "[picker]\nweights = { swing = -0.5 }\n",
+        "[picker]\nstorm = { wind_mph = 0 }\n",
+        "[picker]\nstorm = { rain_in = -1 }\n",
+        "[picker]\nstorm = { radius_km = -300 }\n",
+        "[picker]\nstorm = { radius_km = nan }\n",
     ] {
         let lane: LaneConfig = toml::from_str(&format!(
             "name = \"open\"\nscenarios = [\"full_lifecycle\"]\nobservation_windows_secs = [86400]\nstations = [\"KDEN\"]\n{bad}"
@@ -511,6 +698,10 @@ recent_runs_to_avoid = 6
     }
     let unknown: Result<LaneConfig, _> = toml::from_str(
         "name = \"open\"\nscenarios = [\"full_lifecycle\"]\n[picker]\nmode = \"weather\"\ncolour = 1\n",
+    );
+    assert!(unknown.is_err());
+    let unknown: Result<LaneConfig, _> = toml::from_str(
+        "name = \"open\"\nscenarios = [\"full_lifecycle\"]\n[picker]\nstorm = { gust_mph = 60 }\n",
     );
     assert!(unknown.is_err());
 }
