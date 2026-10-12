@@ -433,8 +433,11 @@ impl Picker {
         configured: &[String],
         window_hours: u64,
     ) -> anyhow::Result<(String, Vec<StationInfo>)> {
-        let eligible = self.eligible(settings.eligible_days, window_hours).await?;
-        Ok(narrow(settings, configured, eligible))
+        // The whole list, as the one-request answer has it: a station whose evidence lapsed
+        // cannot be picked, but its forecast can still mark a storm. One must be current.
+        let listed = self.listed(settings.eligible_days, window_hours).await?;
+        current_stations(listed.clone(), settings.eligible_days, window_hours)?;
+        Ok(narrow(settings, configured, listed))
     }
 
     /// Check explicit manual choices and already selected plans before recording a run.
@@ -484,10 +487,16 @@ impl Picker {
     }
 
     async fn eligible(&self, days: u32, window_hours: u64) -> anyhow::Result<Vec<StationInfo>> {
+        current_stations(self.listed(days, window_hours).await?, days, window_hours)
+    }
+
+    /// The oracle's eligible list, reused for up to [`LIST_TTL`]: stations whose coverage
+    /// evidence has lapsed since are still in it.
+    async fn listed(&self, days: u32, window_hours: u64) -> anyhow::Result<Vec<StationInfo>> {
         let mut cache = self.eligible.lock().await;
         if let Some((read, stations)) = cache.get(&(days, window_hours)) {
             if read.elapsed() < LIST_TTL {
-                return current_stations(stations.clone(), days, window_hours);
+                return Ok(stations.clone());
             }
         }
         // Never extend an expired success after an error, and never substitute a directory list.
@@ -503,7 +512,7 @@ impl Picker {
             "Oracle lists no eligible stations; no competition was created"
         );
         cache.insert((days, window_hours), (Instant::now(), stations.clone()));
-        current_stations(stations, days, window_hours)
+        Ok(stations)
     }
 }
 
