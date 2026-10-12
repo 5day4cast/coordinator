@@ -54,8 +54,10 @@ pub fn position(flow: &TicketFlow) -> &'static str {
         "Escrow refund in progress"
     } else if flow.payouts.iter().any(|p| p.failed_at.is_none()) {
         "Lightning payout pending · check sender"
-    } else if t.sellback_at.is_some() || t.reclaimed_at.is_some() {
-        "On-chain recovery recorded · verify destination"
+    } else if t.reclaimed_at.is_some() {
+        "Share swept to the coordinator · check owed winners"
+    } else if t.sellback_at.is_some() {
+        "Share closed to the coordinator · no Lightning payout recorded"
     } else if t.funded_at.is_some() {
         "Escrow funded · follow pool and payout evidence"
     } else if t.paid_at.is_some() {
@@ -281,11 +283,37 @@ fn payout_nodes(c: &Competition, flow: &TicketFlow) -> Markup {
                 } }
             }
         }
-        @if t.sellback_at.is_some() || t.reclaimed_at.is_some() { details.money-node.recovery-branch {
-            (node_summary("↳ Chain recovery",t,None,"Verify receipt"))
-            div.node-detail { (identity(t)) dl { (fact("Sellback broadcast",t.sellback_at.as_deref())) (fact("Reclaim broadcast",t.reclaimed_at.as_deref())) } p.note { "These timestamps do not prove receipt by the customer. Inspect the spending transactions and destinations." } }
-        } }
+        (coordinator_close(c,flow))
     } }
+}
+/// The winner's contract share, spent on chain to the coordinator's own key. A sellback follows
+/// a successful Lightning payout: the winner released their entry key, so the coordinator closes
+/// the share it paid for. A reclaim sweeps the share after its timelock without that key, so the
+/// winner is owed unless an operator recorded paying them. Neither pays the customer.
+fn coordinator_close(c: &Competition, flow: &TicketFlow) -> Markup {
+    let t = &flow.ticket;
+    let paid = flow.payouts.iter().any(|p| p.succeeded_at.is_some());
+    let share = payout_owed(c, t);
+    html! {
+        @if t.sellback_at.is_some() { details.money-node.close-branch {
+            (node_summary("↳ Share to coordinator",t,share,if paid{"Closed after LN payout"}else{"Closed · no LN payout recorded"}))
+            div.node-detail {
+                (identity(t))
+                dl { (fact("Close broadcast",t.sellback_at.as_deref())) }
+                p.note { "The winner was paid by Lightning and released their entry key, so the coordinator closed their contract share to its own key. This transaction pays the coordinator, not the customer. The amount is the contract share before network fees." }
+                @if !paid { p.attention { "No successful Lightning payout is recorded for this entry. Check its payouts before treating the winner as paid." } }
+            }
+        } }
+        @if t.reclaimed_at.is_some() { details.money-node.recovery-branch {
+            (node_summary("↳ Share swept to coordinator",t,share,if paid{"Swept · LN payout recorded"}else{"Swept · check owed winners"}))
+            div.node-detail {
+                (identity(t))
+                dl { (fact("Sweep broadcast",t.reclaimed_at.as_deref())) }
+                p.note { "The coordinator swept this winner's contract share to its own key after the timelock. This transaction pays the coordinator, not the customer. The amount is the contract share before network fees." }
+                @if !paid { p.attention { "No successful Lightning payout is recorded for this entry. The winner is owed until an operator records paying them: coordinator admin owed-winners list." } }
+            }
+        } }
+    }
 }
 fn pool_node(c: &Competition, page: &FundsPage, explorer: &str) -> Markup {
     let funding = c.funding_outpoint;
@@ -391,8 +419,12 @@ fn outgoing(c: &Competition, flow: &TicketFlow) -> (Option<u64>, &'static str) {
     if let Some(p) = flow.payouts.last() {
         return (sats(Some(p.amount_sats)), "LN payout · failed");
     }
-    if t.sellback_at.is_some() || t.reclaimed_at.is_some() {
-        return (None, "Chain recovery");
+    // The share went to the coordinator, so what the winner is owed is the share itself.
+    if t.reclaimed_at.is_some() {
+        return (payout_owed(c, t), "Share swept · check owed");
+    }
+    if t.sellback_at.is_some() {
+        return (payout_owed(c, t), "Share closed · no LN payout");
     }
     if payout_owed(c, t) == Some(0) {
         return (Some(0), "No payout owed");
@@ -544,5 +576,46 @@ mod tests {
         let escaped = fact("Hash", Some("<script>bad</script>")).into_string();
         assert!(!escaped.contains("<script>"));
         assert!(amount(None).into_string().contains("unknown"));
+    }
+
+    /// Closing a paid winner's share is the coordinator collecting it, not a recovery for the
+    /// customer; an unpaid winner's swept share points at the owed winners.
+    #[test]
+    fn a_closed_share_pays_the_coordinator_not_the_customer() {
+        let c = competition();
+        let mut flow = TicketFlow::default();
+        flow.ticket.sellback_at = Some("2026-10-12T10:00:00Z".into());
+        flow.payouts.push(FundsPayout {
+            amount_sats: 70_000,
+            succeeded_at: Some("paid".into()),
+            ..Default::default()
+        });
+        let html = payout_nodes(&c, &flow).into_string();
+        assert!(
+            html.contains("Share to coordinator") && html.contains("Closed after LN payout"),
+            "{html}"
+        );
+        assert!(
+            html.contains("not the customer") && !html.contains("Chain recovery"),
+            "{html}"
+        );
+        assert!(
+            !html.contains("recovery-branch") && !html.contains("attention"),
+            "{html}"
+        );
+
+        flow.payouts.clear();
+        flow.ticket.sellback_at = None;
+        flow.ticket.reclaimed_at = Some("2026-10-12T10:00:00Z".into());
+        let html = payout_nodes(&c, &flow).into_string();
+        assert!(
+            html.contains("Swept · check owed winners") && html.contains("owed-winners list"),
+            "{html}"
+        );
+        assert_eq!(
+            position(&flow),
+            "Share swept to the coordinator · check owed winners"
+        );
+        assert_eq!(outgoing(&c, &flow).1, "Share swept · check owed");
     }
 }
