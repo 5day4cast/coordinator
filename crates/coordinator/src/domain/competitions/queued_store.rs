@@ -351,11 +351,11 @@ impl CompetitionStore {
             .await?,
         )?;
         let live = counts(
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "SELECT event_id AS id, COUNT(*) AS count FROM tickets
                  WHERE event_id IN (SELECT value FROM json_each(?1)) AND {LIVE_TICKET}
                  GROUP BY event_id"
-            ))
+            )))
             .bind(&ids)
             .fetch_all(&mut *connection)
             .await?,
