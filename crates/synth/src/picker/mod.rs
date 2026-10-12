@@ -1,10 +1,11 @@
 //! Choose weather stations only from the oracle's eligible list.
 //!
 //! For each run of a lane with `picker.mode = "weather"`, the picker drops the stations the lane
-//! used in its last few competitions, scores the rest on their forecast for the window, and takes
-//! the best as the leader. The others are the best near the leader, in the same weather, or the
-//! best far enough from each other. The pick and why are saved with the competition and shown on
-//! the run's page. If eligibility or enough forecasts are unavailable, creation stops.
+//! used in its last few competitions, and those under or near a storm-strength forecast, scores
+//! the rest on their forecast for the window, and takes the best as the leader. The others are
+//! the best near the leader, in the same weather, or the best far enough from each other. The
+//! pick and why are saved with the competition and shown on the run's page. If eligibility or
+//! enough forecasts are unavailable, creation stops.
 
 pub mod oracle;
 pub mod score;
@@ -100,6 +101,51 @@ impl Weights {
     }
 }
 
+/// Which forecasts are storm-strength, and how far from one a station must be to be picked.
+/// Stations in a landfalling storm lose power or communications and stop reporting, and a
+/// competition on them cannot settle; the most weather is otherwise where the picker leads.
+/// Wind alone does not mark a storm: a summit station forecast at 93 mph settled every time.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StormGuard {
+    /// Set false to let the picker lead with a storm.
+    #[serde(default = "default_storm_enabled")]
+    pub enabled: bool,
+    /// A forecast with at least this wind, mph, ...
+    #[serde(default = "default_storm_wind_mph")]
+    pub wind_mph: f64,
+    /// ... and at least this much rain across the window, inches, is storm-strength.
+    #[serde(default = "default_storm_rain_in")]
+    pub rain_in: f64,
+    /// Stations within this many kilometres of a storm-strength forecast are left out too.
+    #[serde(default = "default_storm_radius_km")]
+    pub radius_km: f64,
+}
+
+fn default_storm_enabled() -> bool {
+    true
+}
+fn default_storm_wind_mph() -> f64 {
+    45.0
+}
+fn default_storm_rain_in() -> f64 {
+    2.0
+}
+fn default_storm_radius_km() -> f64 {
+    300.0
+}
+
+impl Default for StormGuard {
+    fn default() -> Self {
+        Self {
+            enabled: default_storm_enabled(),
+            wind_mph: default_storm_wind_mph(),
+            rain_in: default_storm_rain_in(),
+            radius_km: default_storm_radius_km(),
+        }
+    }
+}
+
 /// A lane's `picker` table.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -124,6 +170,8 @@ pub struct PickerConfig {
     pub eligible_days: u32,
     #[serde(default)]
     pub weights: Weights,
+    #[serde(default)]
+    pub storm: StormGuard,
 }
 
 fn default_prefer_known_airports() -> bool {
@@ -144,6 +192,7 @@ impl Default for PickerConfig {
             recent_runs_to_avoid: 0,
             eligible_days: default_eligible_days(),
             weights: Weights::default(),
+            storm: StormGuard::default(),
         }
     }
 }
@@ -171,6 +220,19 @@ impl PickerConfig {
             (1..=31).contains(&self.eligible_days),
             "picker eligible_days must be between 1 and 31"
         );
+        let storm = &self.storm;
+        anyhow::ensure!(
+            storm.wind_mph.is_finite() && storm.wind_mph > 0.0,
+            "picker storm wind_mph must be more than zero"
+        );
+        anyhow::ensure!(
+            storm.rain_in.is_finite() && storm.rain_in >= 0.0,
+            "picker storm rain_in must be zero or more"
+        );
+        anyhow::ensure!(
+            storm.radius_km.is_finite() && storm.radius_km >= 0.0,
+            "picker storm radius_km must be zero or more"
+        );
         Ok(())
     }
 }
@@ -192,6 +254,10 @@ pub struct Pick {
     pub scored: usize,
     /// Stations left out for being in the lane's recent competitions.
     pub avoided: Vec<String>,
+    /// Of the scored, those left out for a storm-strength forecast at or near them. Empty in
+    /// picks saved before the guard.
+    #[serde(default)]
+    pub storms: score::Storms,
     pub picked: Vec<Picked>,
     /// One line on each station picked.
     pub explanation: String,
@@ -256,7 +322,7 @@ impl Picker {
         // One request for the stations and their forecasts where the oracle offers it, rather
         // than one per batch of stations: lanes starting together sent the oracle more than it
         // takes at once.
-        let (source, mut all, forecasts) = match self
+        let (source, all, forecasts) = match self
             .oracle
             .eligible_forecasts(settings.eligible_days, start, end)
             .await?
@@ -275,17 +341,26 @@ impl Picker {
             }
         };
         let now = OffsetDateTime::now_utc();
-        all.retain(|station| {
-            station.coverage.as_ref().is_some_and(|coverage| {
-                coverage.current(settings.eligible_days, window_hours, now)
-                    && coverage.forecast_through >= end
-            })
-        });
+        let (all, stale): (Vec<StationInfo>, Vec<StationInfo>) =
+            all.into_iter().partition(|station| {
+                station.coverage.as_ref().is_some_and(|coverage| {
+                    coverage.current(settings.eligible_days, window_hours, now)
+                        && coverage.forecast_through >= end
+                })
+            });
         let (avoided, candidates): (Vec<StationInfo>, Vec<StationInfo>) = all
             .into_iter()
             .partition(|station| recent.contains(&station.station_id));
+        // Stations the lane will not pick still mark a storm: one the lane used recently, and
+        // one no longer current, as a station is once a storm stops its reports.
+        let others: Vec<StationInfo> = if settings.storm.enabled {
+            avoided.iter().chain(&stale).cloned().collect()
+        } else {
+            Vec::new()
+        };
         let ids: Vec<String> = candidates
             .iter()
+            .chain(&others)
             .map(|station| station.station_id.clone())
             .collect();
         let forecasts = match forecasts {
@@ -299,13 +374,34 @@ impl Picker {
                     Vec::new()
                 }),
         };
-        let scored = score::score(&candidates, &forecasts, &settings.weights);
-        let scored_count = scored.len();
+        let weather = score::weather(&candidates, &forecasts);
+        let scored_count = weather.len();
+        let (weather, storms) = score::avoid_storms(
+            weather,
+            &score::weather(&others, &forecasts),
+            &settings.storm,
+        );
+        if !storms.left_out.is_empty() {
+            info!(
+                "Lane {}: left out {} stations under or within {:.0} km of {} storm-strength forecasts",
+                lane.name,
+                storms.left_out.len(),
+                storms.radius_km,
+                storms.forecasts.len()
+            );
+        }
+        // Scaled after the storms are gone, so their wind does not flatten everyone else's.
+        let scored = score::scale(weather, &settings.weights);
         let ranked = score::rank(scored, settings.prefer_known_airports);
         let picked = score::choose(&ranked, count, settings.cluster_km);
         anyhow::ensure!(picked.len() == count,
-            "Only {} eligible stations have forecasts for this window; need {count}. No competition was created",
-            picked.len());
+            "Only {} eligible stations have forecasts for this window{}; need {count}. No competition was created",
+            picked.len(),
+            if storms.left_out.is_empty() {
+                String::new()
+            } else {
+                format!(" away from storm-strength forecasts ({} left out)", storms.left_out.len())
+            });
 
         let pick = Pick {
             lane: lane.name.clone(),
@@ -319,6 +415,7 @@ impl Picker {
                 .into_iter()
                 .map(|station| station.station_id)
                 .collect(),
+            storms,
             explanation: score::explain(&picked),
             picked,
         };

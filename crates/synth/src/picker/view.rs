@@ -2,7 +2,7 @@
 
 use maud::{html, Markup};
 
-use super::score::Role;
+use super::score::{Role, Storm};
 use super::Pick;
 
 pub fn section(pick: &Pick) -> Markup {
@@ -16,6 +16,13 @@ pub fn section(pick: &Pick) -> Markup {
                     ", leaving out " (pick.avoided.len()) " used in the lane's recent competitions"
                 }
                 "."
+            }
+            @if !pick.storms.left_out.is_empty() {
+                p {
+                    "Left out " (pick.storms.left_out.len()) " under or within "
+                    (format!("{:.0}", pick.storms.radius_km)) " km of a storm-strength forecast: "
+                    (storms(&pick.storms.forecasts)) "."
+                }
             }
             div.scroll {
                 table {
@@ -58,6 +65,25 @@ pub fn section(pick: &Pick) -> Markup {
             }
         }
     }
+}
+
+/// The windiest storm-strength forecasts, a few by name.
+fn storms(forecasts: &[Storm]) -> String {
+    const NAMED: usize = 5;
+    let mut words: Vec<String> = forecasts
+        .iter()
+        .take(NAMED)
+        .map(|storm| {
+            format!(
+                "{} {:.0} mph, {:.2} in of rain",
+                storm.station_id, storm.wind_mph, storm.rain_in
+            )
+        })
+        .collect();
+    if forecasts.len() > NAMED {
+        words.push(format!("{} more", forecasts.len() - NAMED));
+    }
+    words.join("; ")
 }
 
 fn role(role: Role) -> &'static str {
