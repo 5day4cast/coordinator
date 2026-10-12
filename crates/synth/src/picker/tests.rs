@@ -646,7 +646,7 @@ async fn a_fixed_lane_cannot_bypass_eligibility() {
 
 #[test]
 fn the_picker_table_loads_with_defaults_and_bad_settings_are_refused() {
-    let lane = lane(
+    let configured = lane(
         r#"
 [picker]
 mode = "weather"
@@ -656,7 +656,7 @@ cluster_km = 600
 recent_runs_to_avoid = 6
 "#,
     );
-    let picker = lane.picker.unwrap();
+    let picker = configured.picker.unwrap();
     assert_eq!(picker.candidates, Candidates::Configured);
     assert_eq!(picker.recent_runs_to_avoid, 6);
     assert_eq!(picker.weights, Weights::default());
