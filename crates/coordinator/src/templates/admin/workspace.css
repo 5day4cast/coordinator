@@ -365,6 +365,7 @@
 .node-detail a { display:inline-block; margin:.4rem 0; }
 .node-detail details { margin:.7rem 0; }
 .refund-branch,.recovery-branch { border-left:3px solid #bb8d49; }
+.close-branch { border-left:3px solid var(--line); }
 .escrow-refund { margin:.55rem 0 1.25rem; padding:.65rem 0 0 .7rem; border-left:1px dashed #bb8d49; }
 .admin-workspace .refund-caption { display:flex; flex-wrap:wrap; gap:.2rem .6rem; margin:0 0 .55rem; color:var(--muted); font-size:.68rem; }
 .refund-caption strong { color:var(--ink); }
