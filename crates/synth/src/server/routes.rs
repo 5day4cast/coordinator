@@ -493,48 +493,55 @@ fn stuck_money(
                 h3 { "Competitions that didn't run" }
                 @if let Some(error) = &unrefunded.error {
                     p.error { "The coordinator did not list them: " (error) }
-                } @else if competitions.is_empty() {
-                    p.note { "None holds an escrow that is not refunded yet." }
-                } @else {
-                    p {
-                        strong { (format::sats(competitions.iter().filter_map(|competition| competition.sats).sum::<u64>())) " sats" }
-                        " of entry fees not yet returned by " (competitions.len()) " competition(s) that were cancelled, "
-                        "failed or never filled, before their contract. Not all are synth's."
+                }
+                // A failed ask keeps the last list: refunds still owed stay in view, with its age.
+                @if let Some(listed_at) = unrefunded.listed_at {
+                    @if unrefunded.error.is_some() {
+                        p.note { "Its last list, from " (format::time(listed_at, now)) ", follows. Synth asks again within a minute." }
                     }
-                    div.scroll { table.stack {
-                        thead { tr { th { "Competition" } th { "Stopped" } th.num { "Not returned" } th { "Refunds open" } th { "Run" } } }
-                        tbody {
-                            @for competition in competitions {
-                                tr {
-                                    td data-label="Competition" {
-                                        a href=(format!("{}/competitions/{}/leaderboard", coordinator.trim_end_matches('/'), competition.competition_id))
-                                            rel="noreferrer" title=(competition.competition_id) { (short_id(&competition.competition_id.to_string())) }
-                                        br; span.note { (competition.state) }
-                                    }
-                                    td data-label="Stopped" { (format::time(competition.stopped, now)) }
-                                    td.num data-label="Not returned" {
-                                        @match competition.sats {
-                                            Some(sats) => { (format::sats(sats)) " sats" },
-                                            None => span.note { "entry fee not known" },
+                    @if competitions.is_empty() {
+                        p.note { "None holds an escrow that is not refunded yet." }
+                    } @else {
+                        p {
+                            strong { (format::sats(competitions.iter().filter_map(|competition| competition.sats).sum::<u64>())) " sats" }
+                            " of entry fees not yet returned by " (competitions.len()) " competition(s) that were cancelled, "
+                            "failed or never filled, before their contract. Not all are synth's."
+                        }
+                        div.scroll { table.stack {
+                            thead { tr { th { "Competition" } th { "Stopped" } th.num { "Not returned" } th { "Refunds open" } th { "Run" } } }
+                            tbody {
+                                @for competition in competitions {
+                                    tr {
+                                        td data-label="Competition" {
+                                            a href=(format!("{}/competitions/{}/leaderboard", coordinator.trim_end_matches('/'), competition.competition_id))
+                                                rel="noreferrer" title=(competition.competition_id) { (short_id(&competition.competition_id.to_string())) }
+                                            br; span.note { (competition.state) }
                                         }
-                                        br; span.note { (competition.unrefunded) " of " (competition.escrowed) " escrows" }
-                                    }
-                                    td data-label="Refunds open" {
-                                        @match competition.opens_at {
-                                            Some(at) => (format::time(at, now)),
-                                            None => span.note { "not said" },
+                                        td data-label="Stopped" { (format::time(competition.stopped, now)) }
+                                        td.num data-label="Not returned" {
+                                            @match competition.sats {
+                                                Some(sats) => { (format::sats(sats)) " sats" },
+                                                None => span.note { "entry fee not known" },
+                                            }
+                                            br; span.note { (competition.unrefunded) " of " (competition.escrowed) " escrows" }
                                         }
-                                    }
-                                    td data-label="Run" {
-                                        @match run_for(competition.competition_id) {
-                                            Some(run) => a href=(format!("/runs/{run}")) { (short_id(&run)) },
-                                            None => span.note { "not a stuck synth run" },
+                                        td data-label="Refunds open" {
+                                            @match competition.opens_at {
+                                                Some(at) => (format::time(at, now)),
+                                                None => span.note { "not said" },
+                                            }
+                                        }
+                                        td data-label="Run" {
+                                            @match run_for(competition.competition_id) {
+                                                Some(run) => a href=(format!("/runs/{run}")) { (short_id(&run)) },
+                                                None => span.note { "not a stuck synth run" },
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
-                    } }
+                        } }
+                    }
                 }
                 p.note { "Asked the coordinator " (format::time(unrefunded.checked_at, now)) "." }
             }
@@ -1500,6 +1507,7 @@ mod tests {
         let ours = runs[0].trail.competition_id;
         let unrefunded = UnrefundedCompetitions {
             checked_at: now,
+            listed_at: Some(now),
             competitions: vec![
                 Unrefunded {
                     competition_id: ours,
@@ -1567,6 +1575,7 @@ mod tests {
 
         let failed = UnrefundedCompetitions {
             checked_at: now,
+            listed_at: None,
             competitions: Vec::new(),
             error: Some("401 Unauthorized".into()),
         };
@@ -1576,6 +1585,28 @@ mod tests {
             panel.contains("The coordinator did not list them: 401 Unauthorized"),
             "{panel}"
         );
+        assert!(!panel.contains("None holds an escrow"), "{panel}");
+
+        // A failed ask keeps the last list in view, with its age, rather than an empty panel.
+        let kept = UnrefundedCompetitions {
+            checked_at: now,
+            listed_at: Some(time::macros::datetime!(2026-09-29 20:55:00 UTC)),
+            error: Some("List the operator's competitions failed (503)".into()),
+            ..unrefunded
+        };
+        let panel =
+            stuck_money(&runs, None, Some(&kept), "https://5day4cast.com", now).into_string();
+        let competitions = between(&panel, "Competitions that didn't run", "</section>");
+        assert!(
+            competitions.contains("The coordinator did not list them: List the operator"),
+            "{competitions}"
+        );
+        assert!(
+            competitions.contains("Its last list, from <time datetime=\"2026-09-29T20:55:00Z\""),
+            "{competitions}"
+        );
+        assert!(competitions.contains("5 of 6 escrows"), "{competitions}");
+        assert!(panel.contains("stuck-money held"), "{panel}");
     }
 
     #[test]

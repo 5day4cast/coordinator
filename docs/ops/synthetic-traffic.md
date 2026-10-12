@@ -327,4 +327,6 @@ An expected rejection must have the specific entry error being tested. Authentic
 
 Stress runs add `synth_stress_step_seconds{step}` for each ticket, registration, payment and submission, refused or not. They also add `synth_stress_admitted_total` and `synth_stress_refused_total{reason}`. The reason is one of `paused`, `full`, `ticket`, `payment`, `registration`, `submission` or `other`.
 
+Every five minutes, Synth asks the coordinator which competitions never ran and still hold escrows. It shows them under Stuck money as "Competitions that didn't run". A 503 that names a short `Retry-After` is retried twice. After a failure, Synth asks again a minute later and keeps the last list on the dashboard, with its age and the error. `synth_unrefunded_last_listed_timestamp_seconds` records the last successful check, and `synth_unrefunded_check_failures_total` counts failed checks. Alert on the timestamp's age, not on single failures.
+
 The dashboard's Last Run card reads the latest completed run and its money verdict from the database. Its link and steps belong to that same run, including after a restart or while a newer run is in progress.

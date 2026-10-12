@@ -128,6 +128,16 @@ lazy_static::lazy_static! {
         "synth_resumed_runs_total",
         "Runs carried on after a restart from their last finished step"
     ).unwrap();
+
+    pub static ref UNREFUNDED_LAST_LISTED: prometheus::Gauge = register_gauge!(
+        "synth_unrefunded_last_listed_timestamp_seconds",
+        "Unix timestamp when the coordinator last listed the competitions that never ran and still hold escrows"
+    ).unwrap();
+
+    pub static ref UNREFUNDED_CHECK_FAILURES: prometheus::Counter = register_counter!(
+        "synth_unrefunded_check_failures_total",
+        "Asks for the competitions that never ran and still hold escrows that the coordinator did not answer"
+    ).unwrap();
 }
 
 pub fn router(db: SynthDb) -> Router {
@@ -169,6 +179,11 @@ fn initialize() {
     }
     lazy_static::initialize(&LANE_START_RETRIES);
     lazy_static::initialize(&RESUMED_RUNS);
+    lazy_static::initialize(&UNREFUNDED_CHECK_FAILURES);
+    // Set by the tracker once the coordinator has listed them.
+    if UNREFUNDED_LAST_LISTED.get() == 0.0 {
+        UNREFUNDED_LAST_LISTED.set(f64::NAN);
+    }
     for scenario in crate::runner::SCENARIOS {
         for status in ["passed", "failed"] {
             SCENARIO_RUNS.with_label_values(&[scenario, status]);

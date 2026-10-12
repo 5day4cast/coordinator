@@ -11,9 +11,11 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use log::warn;
 use serde::{Deserialize, Serialize};
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration};
 use time::OffsetDateTime;
+use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::{
@@ -22,8 +24,24 @@ use crate::{
         Competition, CompetitionError, CompetitionKind, CreateEvent, Error, OwedWinner, PayoutHold,
         QueueSummary, RefundProgress, RefundWriteOff, WriteOffReport, WriteOffTarget,
     },
+    infra::refresh_cache::{RefreshCache, RETRY_AFTER},
+    metrics,
     startup::AppState,
 };
+
+/// How old the inventory may get before a request refreshes it.
+const INVENTORY_REFRESH_AFTER: Duration = Duration::from_secs(5);
+
+/// How long a request waits for the refresh it started or joined. Loading every competition with
+/// its refunds can take longer than a page would wait, and the callers poll minutes apart, so
+/// each poll needs a fresh load: a shorter wait failed polls whose load then succeeded.
+const INVENTORY_WAIT: Duration = Duration::from_secs(2);
+
+/// The oldest inventory a request is given, so refund progress is never minutes behind.
+const INVENTORY_MAX_AGE: Duration = Duration::from_secs(30);
+
+/// When to ask again after a 503 whose load is still running; that request shares the load.
+const INVENTORY_RETRY_SECS: u64 = 2;
 
 /// A competition as the operator sees it: its terms, its state, and its money's progress.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,24 +153,58 @@ fn found(id: Uuid, error: Error) -> ApiError {
 }
 
 /// Every competition, newest first.
-pub async fn operator_competitions(
-    State(state): State<Arc<AppState>>,
-) -> Result<Response, ApiError> {
+pub async fn operator_competitions(State(state): State<Arc<AppState>>) -> Response {
     let coordinator = state.coordinator.clone();
-    let cached = state
-        .operator_inventory
-        .get_fresh(
-            (),
-            Duration::from_secs(5),
-            Duration::from_millis(250),
-            move || async move { load_operator_inventory(&coordinator).await },
-        )
+    inventory_response(&state.operator_inventory, move || async move {
+        load_operator_inventory(&coordinator).await
+    })
+    .await
+}
+
+/// The cached inventory, refreshed with `load` when due. A request waits at most
+/// [`INVENTORY_WAIT`] and is never given an inventory older than [`INVENTORY_MAX_AGE`]; without
+/// one it gets a 503 whose `Retry-After` says when to ask again.
+async fn inventory_response<F, Fut>(cache: &Arc<RefreshCache<(), Bytes>>, load: F) -> Response
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = anyhow::Result<Bytes>> + Send + 'static,
+{
+    let cached = cache
+        .get_fresh((), INVENTORY_REFRESH_AFTER, INVENTORY_WAIT, load)
         .await;
-    let latest = cached
+    let Some(latest) = cached
         .latest
-        .filter(|value| value.age() <= Duration::from_secs(30))
-        .ok_or(ApiError::Status(StatusCode::SERVICE_UNAVAILABLE))?;
-    Ok((
+        .filter(|value| value.age() <= INVENTORY_MAX_AGE)
+    else {
+        // Still loading, the next request shares the load; otherwise the last load failed, and
+        // the next starts once the cache's backoff ends.
+        let (reason, retry_after, error) = if cached.refreshing {
+            (
+                "refreshing",
+                INVENTORY_RETRY_SECS,
+                "the competition inventory is still loading",
+            )
+        } else {
+            (
+                "failed",
+                RETRY_AFTER.as_secs(),
+                "the competition inventory could not be loaded",
+            )
+        };
+        metrics::OPERATOR_INVENTORY_UNAVAILABLE
+            .with_label_values(&[reason])
+            .inc();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [
+                ("retry-after", retry_after.to_string()),
+                ("cache-control", "private, no-store".to_owned()),
+            ],
+            Json(serde_json::json!({ "error": error })),
+        )
+            .into_response();
+    };
+    (
         [
             ("content-type", "application/json".to_owned()),
             ("cache-control", "private, no-store".to_owned()),
@@ -163,32 +215,98 @@ pub async fn operator_competitions(
         ],
         latest.value.clone(),
     )
-        .into_response())
+        .into_response()
 }
 
 async fn load_operator_inventory(
     coordinator: &crate::domain::Coordinator,
 ) -> anyhow::Result<Bytes> {
-    let competitions = coordinator.list_operator_competitions().await?;
-    let ids: Vec<_> = competitions
-        .iter()
-        .map(|competition| competition.id)
-        .collect();
-    let refunds = coordinator.refund_status(&ids).await?;
-    let write_offs = coordinator.refund_write_offs(None).await?;
-    let mut competitions: Vec<_> = competitions
-        .iter()
-        .map(|c| {
-            let written_off = write_offs
+    let mut timer = LoadTimer::new();
+    let loaded = async {
+        let competitions = coordinator.list_operator_competitions().await?;
+        timer.stage("competitions");
+        let ids: Vec<_> = competitions
+            .iter()
+            .map(|competition| competition.id)
+            .collect();
+        let refunds = coordinator.refund_status(&ids).await?;
+        timer.stage("refunds");
+        let write_offs = coordinator.refund_write_offs(None).await?;
+        timer.stage("write_offs");
+        let mut competitions: Vec<_> = competitions
+            .iter()
+            .map(|c| {
+                let written_off = write_offs
+                    .iter()
+                    .filter(|write_off| write_off.competition_id == c.id)
+                    .cloned()
+                    .collect();
+                OperatorCompetition::new(c, refunds.get(&c.id).copied(), written_off)
+            })
+            .collect();
+        competitions.sort_by_key(|c| std::cmp::Reverse(c.created_at));
+        let encoded: Bytes = serde_json::to_vec(&competitions)?.into();
+        timer.stage("encode");
+        anyhow::Ok(encoded)
+    }
+    .await;
+    timer.finish(loaded.is_ok());
+    loaded
+}
+
+/// Times the stages of one inventory load, so a load slower than a request waits names the
+/// stage that took the time.
+struct LoadTimer {
+    started: Instant,
+    last: Instant,
+    stages: Vec<(&'static str, Duration)>,
+}
+
+impl LoadTimer {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            last: now,
+            stages: Vec::new(),
+        }
+    }
+
+    fn stage(&mut self, name: &'static str) {
+        let now = Instant::now();
+        let took = now - self.last;
+        self.last = now;
+        metrics::OPERATOR_INVENTORY_LOAD_SECONDS
+            .with_label_values(&[name])
+            .observe(took.as_secs_f64());
+        self.stages.push((name, took));
+    }
+
+    fn finish(self, ok: bool) {
+        let total = self.started.elapsed();
+        metrics::OPERATOR_INVENTORY_LOAD_SECONDS
+            .with_label_values(&["total"])
+            .observe(total.as_secs_f64());
+        metrics::OPERATOR_INVENTORY_LOADS
+            .with_label_values(&[if ok { "ok" } else { "failed" }])
+            .inc();
+        if ok {
+            metrics::OPERATOR_INVENTORY_LOADED
+                .set(OffsetDateTime::now_utc().unix_timestamp() as f64);
+        }
+        if total >= INVENTORY_WAIT {
+            let stages: Vec<String> = self
+                .stages
                 .iter()
-                .filter(|write_off| write_off.competition_id == c.id)
-                .cloned()
+                .map(|(name, took)| format!("{name} {took:.2?}"))
                 .collect();
-            OperatorCompetition::new(c, refunds.get(&c.id).copied(), written_off)
-        })
-        .collect();
-    competitions.sort_by_key(|c| std::cmp::Reverse(c.created_at));
-    Ok(serde_json::to_vec(&competitions)?.into())
+            warn!(
+                "Loading the operator's competition inventory took {total:.2?}, longer than a \
+                 request waits ({})",
+                stages.join(", ")
+            );
+        }
+    }
 }
 
 pub async fn operator_competition(
@@ -389,4 +507,86 @@ pub async fn operator_delete_competition(
         .await
         .map_err(|e| found(id, e))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::time::sleep;
+
+    /// Ask for the inventory, loading it, when due, in `delay` with the given outcome.
+    async fn ask(
+        cache: &Arc<RefreshCache<(), Bytes>>,
+        loads: &Arc<AtomicUsize>,
+        delay: Duration,
+        fail: bool,
+    ) -> Response {
+        let loads = loads.clone();
+        inventory_response(cache, move || async move {
+            loads.fetch_add(1, Ordering::SeqCst);
+            sleep(delay).await;
+            anyhow::ensure!(!fail, "the database is unavailable");
+            Ok(Bytes::from_static(b"[]"))
+        })
+        .await
+    }
+
+    fn retry_after(response: &Response) -> &str {
+        response.headers()["retry-after"].to_str().unwrap()
+    }
+
+    /// Synth polls every five minutes, so every poll needs a fresh load. One slower than the old
+    /// 250 ms wait was answered 503 at every poll, although each load then succeeded.
+    #[tokio::test(start_paused = true)]
+    async fn polls_minutes_apart_get_a_load_slower_than_a_page_would_wait() {
+        let cache = Arc::new(RefreshCache::new());
+        let loads = Arc::new(AtomicUsize::new(0));
+        for _ in 0..4 {
+            let response = ask(&cache, &loads, Duration::from_millis(300), false).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["x-inventory-age-seconds"], "0");
+            sleep(Duration::from_secs(300)).await;
+        }
+        assert_eq!(loads.load(Ordering::SeqCst), 4);
+    }
+
+    /// A load longer than the wait is a bounded 503 that says when to ask again, and the request
+    /// that does shares the load rather than starting another.
+    #[tokio::test(start_paused = true)]
+    async fn a_load_past_the_wait_is_a_503_with_a_retry_hint_the_retry_shares() {
+        let cache = Arc::new(RefreshCache::new());
+        let loads = Arc::new(AtomicUsize::new(0));
+        let started = Instant::now();
+        let response = ask(&cache, &loads, Duration::from_secs(3), false).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(started.elapsed() >= INVENTORY_WAIT);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(retry_after(&response), INVENTORY_RETRY_SECS.to_string());
+
+        sleep(Duration::from_secs(INVENTORY_RETRY_SECS)).await;
+        let response = ask(&cache, &loads, Duration::from_secs(3), false).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    /// Refund progress is never served from an inventory older than the limit: a failed refresh
+    /// is a 503 until the cache's backoff ends, without another load before then.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_refresh_never_serves_an_expired_inventory() {
+        let cache = Arc::new(RefreshCache::new());
+        let loads = Arc::new(AtomicUsize::new(0));
+        let quick = Duration::from_millis(1);
+        assert_eq!(
+            ask(&cache, &loads, quick, false).await.status(),
+            StatusCode::OK
+        );
+        sleep(Duration::from_secs(300)).await;
+        let response = ask(&cache, &loads, quick, true).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(retry_after(&response), RETRY_AFTER.as_secs().to_string());
+        let response = ask(&cache, &loads, quick, true).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+    }
 }

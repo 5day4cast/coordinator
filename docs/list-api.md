@@ -27,6 +27,9 @@ Health probes check database connectivity and supervised task status. A supervis
 
 `GET /api/v1/admin/competitions` keeps its complete inventory and existing response fields.
 It uses a lean database projection and shares a serialized response for five seconds.
-Requests wait at most 250 ms for a refresh. Responses include `X-Inventory-Age-Seconds` and `Cache-Control: private, no-store`.
-If no snapshot exists, or the last snapshot exceeds 30 seconds, the endpoint returns 503.
+Requests wait at most two seconds for a refresh. Responses include `X-Inventory-Age-Seconds` and `Cache-Control: private, no-store`.
+If no snapshot exists, or the last snapshot exceeds 30 seconds, the endpoint returns 503 with `Retry-After`.
+That is two seconds while the refresh is still running, and the next request shares that refresh.
+After a failed refresh it is 30 seconds, the cache's backoff.
+`coordinator_operator_inventory_load_seconds{stage}` times each load stage, and a load slower than the wait logs its stages.
 The single-competition operator endpoint continues to read current state directly.

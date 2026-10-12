@@ -619,7 +619,7 @@ impl CoordinatorClient {
     /// Every competition as the operator listener reports it, with its escrow refunds.
     pub async fn list_operator_competitions(&self) -> Result<Vec<OperatorCompetition>> {
         let url = format!("{}/api/v1/admin/competitions", self.admin_url());
-        let resp = super::retry_transport(3, || async {
+        let resp = super::retry_busy(3, || async {
             anyhow::Ok(self.admin_get(&url).send().await?)
         })
         .await
