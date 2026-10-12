@@ -109,6 +109,9 @@ const UNRECORDED_SWAPS_EVERY: Duration = Duration::from_secs(5 * 60);
 /// How often the coordinator is asked which competitions that never ran hold escrows.
 const UNREFUNDED_EVERY: Duration = Duration::from_secs(5 * 60);
 
+/// How soon it is asked again after it did not answer, so refunds are not unseen for long.
+const UNREFUNDED_RETRY: Duration = Duration::from_secs(60);
+
 /// A Lightning node synth can reach, by the name it gives itself.
 struct Node {
     lnd: Lnd,
@@ -189,8 +192,13 @@ pub struct Unrefunded {
 /// What the coordinator last said about competitions that never ran and still hold escrows.
 #[derive(Debug, Clone)]
 pub struct UnrefundedCompetitions {
+    /// When it was last asked.
     pub checked_at: OffsetDateTime,
+    /// When it last listed them, which `competitions` holds; None until it first does. A failed
+    /// ask keeps the last list, so refunds still owed stay in view while it is retried.
+    pub listed_at: Option<OffsetDateTime>,
     pub competitions: Vec<Unrefunded>,
+    /// Why the last ask failed, if it did.
     pub error: Option<String>,
 }
 
@@ -1530,7 +1538,8 @@ impl Tracker {
     }
 
     /// Ask the coordinator, every few minutes, which competitions that never ran still hold
-    /// escrows. Its competition list is large, so pages never wait on it.
+    /// escrows, and sooner after it did not answer. Its competition list is large, so pages never
+    /// wait on it.
     async fn check_unrefunded_competitions(&self) {
         let due = self
             .inner
@@ -1538,22 +1547,46 @@ impl Tracker {
             .lock()
             .expect("unrefunded competitions lock")
             .as_ref()
-            .is_none_or(|(at, _)| at.elapsed() >= UNREFUNDED_EVERY);
+            .is_none_or(|(at, found)| {
+                let every = if found.error.is_some() {
+                    UNREFUNDED_RETRY
+                } else {
+                    UNREFUNDED_EVERY
+                };
+                at.elapsed() >= every
+            });
         if !due {
             return;
         }
         let now = OffsetDateTime::now_utc();
         let checked = match self.inner.client.list_operator_competitions().await {
-            Ok(competitions) => UnrefundedCompetitions {
-                checked_at: now,
-                competitions: unrefunded(&competitions, now),
-                error: None,
-            },
-            Err(e) => UnrefundedCompetitions {
-                checked_at: now,
-                competitions: Vec::new(),
-                error: Some(format!("{e:#}")),
-            },
+            Ok(competitions) => {
+                crate::server::metrics::UNREFUNDED_LAST_LISTED.set(now.unix_timestamp() as f64);
+                UnrefundedCompetitions {
+                    checked_at: now,
+                    listed_at: Some(now),
+                    competitions: unrefunded(&competitions, now),
+                    error: None,
+                }
+            }
+            Err(e) => {
+                warn!("The coordinator did not list competitions holding escrows: {e:#}");
+                crate::server::metrics::UNREFUNDED_CHECK_FAILURES.inc();
+                let (listed_at, competitions) = self
+                    .inner
+                    .unrefunded
+                    .lock()
+                    .expect("unrefunded competitions lock")
+                    .as_ref()
+                    .map(|(_, found)| (found.listed_at, found.competitions.clone()))
+                    .unwrap_or_default();
+                UnrefundedCompetitions {
+                    checked_at: now,
+                    listed_at,
+                    competitions,
+                    error: Some(format!("{e:#}")),
+                }
+            }
         };
         *self
             .inner
@@ -2602,6 +2635,80 @@ mod tests {
         assert_eq!(payouts[0].entry_id, accepted_id, "use the coordinator's id");
         assert_eq!(payouts[0].pubkey, "entry-key");
         assert!(!interrupted.entry_submitted, "intent is not acceptance");
+    }
+
+    /// A failed ask for the competitions that never ran keeps the last list, so refunds still
+    /// owed stay on the dashboard, and asks again after a minute rather than five.
+    #[tokio::test]
+    async fn a_failed_unrefunded_check_keeps_the_last_list_and_asks_again_sooner() {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counted = asked.clone();
+        let cancelled = serde_json::json!([{
+            "id": Uuid::now_v7(),
+            "state": "cancelled",
+            "event_submission": {
+                "entry_fee": 1000,
+                "start_observation_date": "2026-09-28T21:00:00Z",
+            },
+            "total_paid_entries": 5,
+            "milestones": [{ "name": "cancelled", "at": "2026-09-28T21:26:00Z" }],
+            "refunds": { "escrowed": 5, "refunded": 1, "opens_at": "2026-09-29T21:26:00Z" },
+        }]);
+        let fixture = fixture(
+            Router::new().route(
+                "/api/v1/admin/competitions",
+                get(move || {
+                    let asked = counted.clone();
+                    let cancelled = cancelled.clone();
+                    async move {
+                        match asked.fetch_add(1, Ordering::SeqCst) {
+                            0 => Json(cancelled).into_response(),
+                            _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                        }
+                    }
+                }),
+            ),
+            false,
+            false,
+        )
+        .await;
+        let tracker = &fixture.tracker;
+        // Pretend the last ask was `by` earlier than it was.
+        let backdate = |by: Duration| {
+            let mut last = tracker.inner.unrefunded.lock().unwrap();
+            let (at, _) = last.as_mut().unwrap();
+            *at = at.checked_sub(by).expect("the clock has run for minutes");
+        };
+
+        tracker.check_unrefunded_competitions().await;
+        let listed = tracker.unrefunded_competitions().unwrap();
+        assert!(listed.error.is_none());
+        assert_eq!(listed.competitions.len(), 1);
+        assert_eq!(listed.competitions[0].unrefunded, 4);
+        tracker.check_unrefunded_competitions().await;
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "not due yet");
+
+        backdate(UNREFUNDED_EVERY);
+        tracker.check_unrefunded_competitions().await;
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
+        let failed = tracker.unrefunded_competitions().unwrap();
+        assert!(failed.error.as_deref().is_some_and(|e| e.contains("503")));
+        assert_eq!(
+            failed.competitions, listed.competitions,
+            "the last list stays"
+        );
+        assert_eq!(failed.listed_at, listed.listed_at);
+        assert!(failed.checked_at >= listed.checked_at);
+
+        tracker.check_unrefunded_competitions().await;
+        assert_eq!(asked.load(Ordering::SeqCst), 2, "not within the minute");
+        backdate(UNREFUNDED_RETRY);
+        tracker.check_unrefunded_competitions().await;
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            3,
+            "asked again after a minute"
+        );
     }
 
     #[tokio::test]

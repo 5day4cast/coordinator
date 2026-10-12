@@ -14,8 +14,8 @@ use axum::{
 };
 use log::warn;
 use prometheus::{
-    Encoder, Gauge, GaugeVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
-    TextEncoder,
+    Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Opts, Registry, TextEncoder,
 };
 use std::{
     collections::HashMap,
@@ -389,6 +389,59 @@ pub static SETTLED_OUTPUTS_READ: LazyLock<Gauge> = LazyLock::new(|| {
     ))
 });
 
+/// How long loading the operator's competition inventory took, by stage: `competitions` (the
+/// summary query and queue details), `refunds`, `write_offs`, `encode`, and `total`.
+pub static OPERATOR_INVENTORY_LOAD_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    HistogramVec::new(
+        HistogramOpts::new(
+            "coordinator_operator_inventory_load_seconds",
+            "Time to load the operator's competition inventory, by stage",
+        )
+        .buckets(vec![0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0]),
+        &["stage"],
+    )
+    .expect("valid metric")
+});
+
+/// Every stage [`OPERATOR_INVENTORY_LOAD_SECONDS`] reports.
+pub const OPERATOR_INVENTORY_STAGES: [&str; 5] =
+    ["competitions", "refunds", "write_offs", "encode", "total"];
+
+/// Loads of the operator's competition inventory, by result: `ok` or `failed`.
+pub static OPERATOR_INVENTORY_LOADS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "coordinator_operator_inventory_loads_total",
+            "Loads of the operator's competition inventory, by result",
+        ),
+        &["result"],
+    )
+    .expect("valid metric")
+});
+
+/// When the operator's competition inventory last loaded, in UNIX seconds: the age of what the
+/// endpoint serves is the time since.
+pub static OPERATOR_INVENTORY_LOADED: LazyLock<Gauge> = LazyLock::new(|| {
+    unknown(Gauge::new(
+        "coordinator_operator_inventory_loaded_timestamp_seconds",
+        "When the operator's competition inventory last loaded",
+    ))
+});
+
+/// Requests for the operator's competition inventory answered 503, by why: `refreshing` (its
+/// load was still running when the request stopped waiting) or `failed` (the last load failed
+/// and nothing fresh enough is kept).
+pub static OPERATOR_INVENTORY_UNAVAILABLE: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "coordinator_operator_inventory_unavailable_total",
+            "Requests for the operator's competition inventory answered 503, by why",
+        ),
+        &["reason"],
+    )
+    .expect("valid metric")
+});
+
 /// Transactions the Arkade escrow subscription reported.
 pub static ESCROW_EVENTS: LazyLock<IntCounter> = LazyLock::new(|| {
     IntCounter::new(
@@ -694,7 +747,17 @@ impl Metrics {
         metrics
             .registry
             .register(Box::new(ARK_WALLET_SAT.clone()))?;
+        metrics
+            .registry
+            .register(Box::new(OPERATOR_INVENTORY_LOAD_SECONDS.clone()))?;
+        metrics
+            .registry
+            .register(Box::new(OPERATOR_INVENTORY_LOADS.clone()))?;
+        metrics
+            .registry
+            .register(Box::new(OPERATOR_INVENTORY_UNAVAILABLE.clone()))?;
         for gauge in [
+            &*OPERATOR_INVENTORY_LOADED,
             &*ARK_WALLET_EARLIEST_EXPIRY,
             &*ARK_WALLET_LAST_BOARD_SUCCESS,
             &*ARK_WALLET_LAST_BOARD_FAILURE,
@@ -708,6 +771,15 @@ impl Metrics {
         // Show both results from the start, so a rate over them is defined.
         for result in ["succeeded", "failed"] {
             PAYOUT_ATTEMPTS.with_label_values(&[result]);
+        }
+        for stage in OPERATOR_INVENTORY_STAGES {
+            OPERATOR_INVENTORY_LOAD_SECONDS.with_label_values(&[stage]);
+        }
+        for result in ["ok", "failed"] {
+            OPERATOR_INVENTORY_LOADS.with_label_values(&[result]);
+        }
+        for reason in ["refreshing", "failed"] {
+            OPERATOR_INVENTORY_UNAVAILABLE.with_label_values(&[reason]);
         }
         for reason in PAYMENT_FAILURE_REASONS {
             PAYOUT_SEND_FAILURES.with_label_values(&[reason]);

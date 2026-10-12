@@ -175,6 +175,52 @@ where
     }
 }
 
+/// The longest `Retry-After` a busy coordinator's 503 is waited out for, rather than failing.
+const BUSY_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Like [`retry_transport`], and a 503 that says when to ask again, within [`BUSY_WAIT_LIMIT`],
+/// is sent again after that wait, up to `attempts` times in all. The coordinator answers so while
+/// a slow load it already started is still running, and the next request shares that load.
+pub(crate) async fn retry_busy<F, Fut>(attempts: u32, mut send: F) -> Result<reqwest::Response>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<reqwest::Response>>,
+{
+    let mut attempt = 1;
+    loop {
+        let response = retry_transport(attempts, &mut send).await?;
+        match busy_for(&response) {
+            Some(wait) if attempt < attempts => {
+                log::info!(
+                    "the coordinator is busy ({}), asking again in {}s",
+                    response.url().path(),
+                    wait.as_secs()
+                );
+                tokio::time::sleep(wait).await;
+                attempt += 1;
+            }
+            _ => return Ok(response),
+        }
+    }
+}
+
+/// How long a 503 asks to wait before the next request, if it says and it is short enough.
+fn busy_for(response: &reqwest::Response) -> Option<std::time::Duration> {
+    if response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return None;
+    }
+    let seconds: u64 = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let wait = std::time::Duration::from_secs(seconds);
+    (wait <= BUSY_WAIT_LIMIT).then_some(wait)
+}
+
 /// The request never got a response: the connection was refused or dropped.
 fn transport_error(error: &anyhow::Error) -> bool {
     error
@@ -329,6 +375,69 @@ mod tests {
         };
         assert!(retry_transport(3, not_transport).await.is_err());
         assert_eq!(failed.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    /// A 503 that says when to ask again is asked again, a bounded number of times; one that does
+    /// not, or asks for too long a wait, is returned as it is.
+    #[tokio::test]
+    async fn a_busy_coordinator_is_asked_again_when_it_says() {
+        use axum::{http::StatusCode, response::IntoResponse};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let asked = Arc::new(AtomicU32::new(0));
+        let counted = asked.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let router = Router::new()
+            .route(
+                "/busy-once",
+                get(move || {
+                    let asked = counted.clone();
+                    async move {
+                        match asked.fetch_add(1, Ordering::SeqCst) {
+                            0 => (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "0")], "")
+                                .into_response(),
+                            _ => "listed".into_response(),
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/always-busy",
+                get(|| async { (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "0")], "") }),
+            )
+            .route(
+                "/busy-for-long",
+                get(|| async {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        [("retry-after", "600")],
+                        "",
+                    )
+                }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let http = Client::new();
+        let ask = |path: &'static str| {
+            let (http, url) = (http.clone(), url.clone());
+            move || {
+                let (http, url) = (http.clone(), url.clone());
+                async move { anyhow::Ok(http.get(format!("{url}{path}")).send().await?) }
+            }
+        };
+
+        let response = retry_busy(3, ask("/busy-once")).await.unwrap();
+        assert_eq!(response.text().await.unwrap(), "listed");
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
+
+        let response = retry_busy(3, ask("/always-busy")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let started = std::time::Instant::now();
+        let response = retry_busy(3, ask("/busy-for-long")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
 
         server.abort();
         let _ = server.await;
