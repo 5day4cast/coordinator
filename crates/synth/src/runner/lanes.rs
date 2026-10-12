@@ -647,7 +647,7 @@ mod tests {
         let lanes = [open.clone()];
         let restart = datetime!(2026-10-12 16:46:07 UTC);
         let morning = resumed(&open, &base, datetime!(2026-10-12 11:00:33 UTC), Some(5));
-        let carry = carry_on(&lanes, &base, &[morning.clone()], restart);
+        let carry = carry_on(&lanes, &base, std::slice::from_ref(&morning), restart);
         assert_eq!(
             carry,
             [Some(CarryOn {
@@ -672,7 +672,7 @@ mod tests {
         // it always has.
         let after_close = datetime!(2026-10-12 23:00:33 UTC);
         assert_eq!(
-            carry_on(&lanes, &base, &[morning.clone()], after_close),
+            carry_on(&lanes, &base, std::slice::from_ref(&morning), after_close),
             [None]
         );
         let mut unmade = morning.clone();
@@ -700,7 +700,12 @@ mod tests {
         let open = open_lane();
         let restart = datetime!(2026-10-12 20:20:29 UTC);
         let earlier = resumed(&open, &base, datetime!(2026-10-12 19:53:06 UTC), None);
-        let carry = carry_on(&[open.clone()], &base, &[earlier.clone()], restart);
+        let carry = carry_on(
+            std::slice::from_ref(&open),
+            &base,
+            std::slice::from_ref(&earlier),
+            restart,
+        );
         assert_eq!(
             carry[0].as_ref().map(|carry| (carry.after, carry.cycle)),
             Some((datetime!(2026-10-13 07:53:06 UTC), 0))
@@ -715,7 +720,7 @@ mod tests {
             created: true,
         };
         assert_eq!(
-            carry_on(&[open.clone()], &base, &[operator], restart),
+            carry_on(std::slice::from_ref(&open), &base, &[operator], restart),
             [None]
         );
 
