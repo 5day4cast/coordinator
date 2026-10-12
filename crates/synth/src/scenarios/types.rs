@@ -116,6 +116,16 @@ pub enum Fill {
     Backfill,
 }
 
+/// The lane that started a run, which of its runs it was, and when the lane started it: a
+/// restarted synth carries the lane's schedule on from the runs it resumes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LaneCycle {
+    pub lane: String,
+    pub cycle: usize,
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: OffsetDateTime,
+}
+
 /// A run that fills its competition late, with only the players it still needs.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -453,6 +463,9 @@ pub struct ScenarioConfig {
     /// when unset.
     #[serde(default)]
     pub picks_per_entry: Option<usize>,
+    /// The lane run this is; None for a run an operator started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<LaneCycle>,
 }
 
 /// What an observation window can score, as the oracle attests it: a window of 24 hours or more
@@ -540,6 +553,7 @@ impl Default for ScenarioConfig {
             stress: None,
             backfill: None,
             picks_per_entry: None,
+            lane: None,
         }
     }
 }

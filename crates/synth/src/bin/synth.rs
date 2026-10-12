@@ -125,18 +125,27 @@ async fn main() -> anyhow::Result<()> {
         .with_picker(picker)
         .with_schedule(&config.scheduler);
     // Nothing runs yet, so a run still marked running was cut short by the last shutdown: each
-    // carries on from its last finished step, or is marked interrupted, saying why.
-    match runner.resume_unfinished().await {
-        Ok(0) => {}
-        Ok(resumed) => info!("Resuming {resumed} run(s) the last shutdown cut short"),
+    // carries on from its last finished step, or is marked interrupted, saying why. The lanes
+    // carry their schedules on from the runs resumed.
+    let resumed = match runner.resume_unfinished().await {
+        Ok(resumed) => {
+            if !resumed.is_empty() {
+                info!(
+                    "Resuming {} run(s) the last shutdown cut short",
+                    resumed.len()
+                );
+            }
+            resumed
+        }
         Err(error) => {
             warn!("Cannot resume the runs the last shutdown cut short: {error:#}");
             let interrupted = runner.db().interrupt_unfinished_runs().await?;
             if interrupted > 0 {
                 warn!("Marked {interrupted} run(s) the last shutdown cut short as interrupted");
             }
+            Vec::new()
         }
-    }
+    };
     let following = tracker.clone();
     tokio::spawn(async move { following.run().await });
 
@@ -167,6 +176,7 @@ async fn main() -> anyhow::Result<()> {
                         &scheduler.lanes,
                         scenario_config,
                         scheduler.keep_open.as_ref(),
+                        &resumed,
                     )
                     .await
             };

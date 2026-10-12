@@ -307,13 +307,15 @@ Without timing fields, all waits and the configured margin remain zero. Existing
 The scalar `defaults.observation_window_secs` remains supported. The plural field accepts either a scalar or a list.
 
 An omitted seed is generated before the run is saved. Set `defaults.seed` for a reproducible scheduled sequence; each successive run increments that seed.
-The sequence restarts when synth restarts.
+The sequence restarts when synth restarts, except in a lane that carries on from a resumed run (see below).
 
 ## Resume runs after a restart
 
 At startup, synth carries on each run the last shutdown left running from its last finished step. Finished steps stand as saved. Waits on the coordinator run again and return at once for states already reached. Entries that had not started run as planned, at their planned arrival times. An entry that stopped before payment, holding a ticket it had not paid, starts again with a new ticket, under a new entry id once the old one is too old to pay for. An entry that reached payment is never paid again. Synth checks whether its ticket is paid. For a normal entry, Synth saves the exact submission body before payment. After restart, it checks for an accepted entry, then submits that saved body if registration is still open. It preserves the planned submission delay and checks the deadline margin. Lost responses are reconciled against the authenticated entry list. Intentional abandonment, duplicate, and late-submission cases retain their original behavior. Older traces without a saved body, entries whose deadline passed, and entries started over an hour before they could be submitted remain under refund tracking. The trace's `resumed` note records the outcome. A step that was running at the restart finishes in its own row. `synth_resumed_runs_total` counts resumed runs.
 
 A run is marked interrupted, with the reason in its error, when its plan cannot be read, when it is a stress run, or when the coordinator does not have its competition. If the coordinator is unavailable during startup, synth retries every 10 seconds for five minutes before marking the run interrupted.
+
+A restart does not start a lane over. Each lane run saves its lane, its cycle and when the lane started it. When a resumed run made its competition and that competition still takes entries, its lane starts no run at startup. The lane's next run starts when it was due without the restart: one interval after the latest such run, or at the next half for an aligned lane. Its scenario and window rotation continue from that run's cycle. A keep-open lane may still start early when its check finds nothing open. Runs saved by older releases do not record their lane; such a run counts for a lane when exactly one lane plans runs like it. A lane with no resumed run taking entries starts as before.
 
 ## Check recorded results
 

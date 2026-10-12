@@ -101,6 +101,27 @@ pub struct ResumePoint {
     pub created: bool,
 }
 
+/// A run a restart took up again, as the lanes see it when they carry on their schedules.
+#[derive(Debug, Clone)]
+pub struct Resumed {
+    pub scenario: String,
+    /// When the run was recorded, just before it created its competition.
+    pub started_at: OffsetDateTime,
+    pub plan: ScenarioConfig,
+    /// Whether it had created its competition before the restart.
+    pub created: bool,
+}
+
+impl Resumed {
+    /// When its competition stops taking entries: the planned start of observations, or the
+    /// entry window after the run started.
+    pub fn entries_close(&self) -> OffsetDateTime {
+        self.plan.observation_start.unwrap_or(
+            self.started_at + time::Duration::seconds(self.plan.entry_window_secs as i64),
+        )
+    }
+}
+
 /// The plan a recorded run executes, and its competition: what [`super::Runner::run_recorded`]
 /// checks before running it, and what a resumed run starts from.
 pub fn recorded_plan(run: &TestRun) -> anyhow::Result<(ScenarioConfig, Uuid)> {
