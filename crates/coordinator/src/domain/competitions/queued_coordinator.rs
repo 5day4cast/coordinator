@@ -155,43 +155,39 @@ impl Coordinator {
             })
     }
 
-    /// Fill in each queued competition's settings, entries and pools, for the API.
-    pub(super) async fn attach_queue_details(
+    /// Fill in each queued competition's settings, entries and pools, for the API. They are read
+    /// for all of them at once (see [`CompetitionStore::queue_details`]).
+    pub(crate) async fn attach_queue_details(
         &self,
         competitions: &mut [Competition],
     ) -> Result<(), Error> {
+        let ids: Vec<Uuid> = competitions
+            .iter()
+            .filter(|competition| competition.kind == CompetitionKind::Queued)
+            .map(|competition| competition.id)
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let details = self.competition_store.queue_details(&ids).await?;
         for competition in competitions
             .iter_mut()
             .filter(|competition| competition.kind == CompetitionKind::Queued)
         {
-            let Some(settings) = self
-                .competition_store
-                .queue_settings(competition.id)
-                .await?
-            else {
+            let Some(details) = details.get(&competition.id) else {
                 continue;
             };
-            let entries = self
-                .competition_store
-                .queued_entry_count(competition.id)
-                .await?;
-            let held = self
-                .competition_store
-                .queued_held_count(competition.id)
-                .await?;
-            let pools = self
-                .competition_store
-                .competition_pools(competition.id)
-                .await?
-                .into_iter()
+            let pools = details
+                .pools
+                .iter()
                 .map(|pool| PoolSummary {
                     competition_id: pool.competition_id,
                     pool_index: pool.pool_index,
                     players: pool.members.len(),
                 })
                 .collect();
-            let mut summary = queue_summary(&settings, entries, pools);
-            summary.held = held;
+            let mut summary = queue_summary(&details.settings, details.entries, pools);
+            summary.held = details.held;
             competition.queue = Some(summary);
         }
         Ok(())

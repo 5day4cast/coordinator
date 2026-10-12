@@ -32,4 +32,5 @@ If no snapshot exists, or the last snapshot exceeds 30 seconds, the endpoint ret
 That is two seconds while the refresh is still running, and the next request shares that refresh.
 After a failed refresh it is 30 seconds, the cache's backoff.
 `coordinator_operator_inventory_load_seconds{stage}` times each load stage, and a load slower than the wait logs its stages.
+The stages are `competitions` (the summary query), `queues` (every queued competition's settings, entries and pools, read in one batch), `refunds`, `write_offs`, `encode` and `total`.
 The single-competition operator endpoint continues to read current state directly.

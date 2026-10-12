@@ -409,7 +409,8 @@ pub static SETTLED_OUTPUTS_READ: LazyLock<Gauge> = LazyLock::new(|| {
 });
 
 /// How long loading the operator's competition inventory took, by stage: `competitions` (the
-/// summary query and queue details), `refunds`, `write_offs`, `encode`, and `total`.
+/// summary query), `queues` (the queued competitions' settings, entries and pools), `refunds`,
+/// `write_offs`, `encode`, and `total`.
 pub static OPERATOR_INVENTORY_LOAD_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     HistogramVec::new(
         HistogramOpts::new(
@@ -423,8 +424,14 @@ pub static OPERATOR_INVENTORY_LOAD_SECONDS: LazyLock<HistogramVec> = LazyLock::n
 });
 
 /// Every stage [`OPERATOR_INVENTORY_LOAD_SECONDS`] reports.
-pub const OPERATOR_INVENTORY_STAGES: [&str; 5] =
-    ["competitions", "refunds", "write_offs", "encode", "total"];
+pub const OPERATOR_INVENTORY_STAGES: [&str; 6] = [
+    "competitions",
+    "queues",
+    "refunds",
+    "write_offs",
+    "encode",
+    "total",
+];
 
 /// Loads of the operator's competition inventory, by result: `ok` or `failed`.
 pub static OPERATOR_INVENTORY_LOADS: LazyLock<IntCounterVec> = LazyLock::new(|| {
