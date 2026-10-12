@@ -18,7 +18,8 @@ use coordinator_escrow::{
 };
 use keymeld_sdk::types::RegistrationContext;
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
+use sqlx::{sqlite::SqliteRow, Row};
+use std::collections::HashMap;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -152,17 +153,56 @@ where
     .await?;
     let mut lapsed = Vec::new();
     for row in &rows {
-        let ticket_id = Uuid::parse_str(&row.try_get::<String, _>("id")?)
-            .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
-        let kind: String = row.try_get("kind")?;
-        let policy: Option<String> = row.try_get("policy_json")?;
-        if ticket_entry_id(&kind, ticket_id, policy.as_deref())
-            .is_some_and(|entry_id| entry_window_passed(entry_id, now))
-        {
+        if let Some(ticket_id) = lapsed_ticket(row, now)? {
             lapsed.push(ticket_id);
         }
     }
     Ok(lapsed)
+}
+
+/// How many paid tickets of each competition in `event_ids`, a JSON array of ids, have lapsed
+/// at `now`: [`lapsed_ticket_ids`] for many competitions in one read. A competition with none
+/// is left out.
+pub(super) async fn lapsed_ticket_counts<'c, E>(
+    executor: E,
+    event_ids: &str,
+    now: OffsetDateTime,
+) -> Result<HashMap<Uuid, i64>, sqlx::Error>
+where
+    E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
+{
+    let rows = sqlx::query(
+        "SELECT t.event_id, t.id, c.kind, p.policy_json
+         FROM tickets t
+         JOIN competitions c ON c.id = t.event_id
+         LEFT JOIN ticket_payout_policies p ON p.ticket_id = t.id AND p.ticket_hash = t.hash
+         WHERE t.event_id IN (SELECT value FROM json_each(?1)) AND t.paid_at IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM entries e WHERE e.ticket_id = t.id)",
+    )
+    .bind(event_ids)
+    .fetch_all(executor)
+    .await?;
+    let mut lapsed = HashMap::new();
+    for row in &rows {
+        if lapsed_ticket(row, now)?.is_some() {
+            let event_id = Uuid::parse_str(&row.try_get::<String, _>("event_id")?)
+                .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+            *lapsed.entry(event_id).or_default() += 1;
+        }
+    }
+    Ok(lapsed)
+}
+
+/// The ticket of a row of `id`, `kind` and `policy_json`, a paid ticket without an entry, if it
+/// has lapsed at `now`.
+fn lapsed_ticket(row: &SqliteRow, now: OffsetDateTime) -> Result<Option<Uuid>, sqlx::Error> {
+    let ticket_id = Uuid::parse_str(&row.try_get::<String, _>("id")?)
+        .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+    let kind: String = row.try_get("kind")?;
+    let policy: Option<String> = row.try_get("policy_json")?;
+    Ok(ticket_entry_id(&kind, ticket_id, policy.as_deref())
+        .is_some_and(|entry_id| entry_window_passed(entry_id, now))
+        .then_some(ticket_id))
 }
 
 /// A ticket the player paid for and has not entered yet, while its competition takes entries and

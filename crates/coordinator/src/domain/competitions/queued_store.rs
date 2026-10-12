@@ -5,16 +5,31 @@ use coordinator_escrow::{pools::PoolRules, queued::QueuedTerms};
 use dlctix::bitcoin::BlockHash;
 use dlctix::hashlock;
 use sqlx::Row;
-use std::str::FromStr;
+use std::{collections::HashMap, str::FromStr};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
 
 use super::{
-    admission::before_deadline, queued::MAX_UNPAID_TICKETS_PER_PLAYER,
-    store::paid_entries_of_player, ticket_registration::lapsed_ticket_ids, Competition,
-    CompetitionStore, CreateEvent, Lease, ReservedTicket, Ticket,
+    admission::before_deadline,
+    queued::MAX_UNPAID_TICKETS_PER_PLAYER,
+    store::paid_entries_of_player,
+    ticket_registration::{lapsed_ticket_counts, lapsed_ticket_ids},
+    Competition, CompetitionStore, CreateEvent, Lease, ReservedTicket, Ticket,
 };
 use crate::infra::{db::DatabaseWriteError, oracle::AddEventEntry};
+
+/// What a list shows of a queued competition beside its own row (see
+/// [`CompetitionStore::queue_details`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueueDetails {
+    pub settings: QueueSettings,
+    /// Paid entries, in the queue and in the pools it formed.
+    pub entries: u64,
+    /// The tickets that count against its entry cap.
+    pub held: u64,
+    /// The pools it formed, by index.
+    pub pools: Vec<PoolRecord>,
+}
 
 /// A queued competition's settings and the terms its players consent to.
 #[derive(Debug, Clone, PartialEq)]
@@ -137,6 +152,61 @@ fn rfc3339(at: OffsetDateTime) -> Result<String, sqlx::Error> {
         .map_err(|error| sqlx::Error::Encode(Box::new(error)))
 }
 
+/// `ids` as the JSON array `json_each` reads, so one statement takes any number of them.
+fn json_ids(ids: &[Uuid]) -> Result<String, sqlx::Error> {
+    serde_json::to_string(&ids.iter().map(Uuid::to_string).collect::<Vec<_>>())
+        .map_err(|error| sqlx::Error::Encode(Box::new(error)))
+}
+
+/// Rows of `id` and `count`, by id.
+fn counts(rows: Vec<sqlx::sqlite::SqliteRow>) -> Result<HashMap<Uuid, i64>, sqlx::Error> {
+    rows.iter()
+        .map(|row| -> Result<(Uuid, i64), sqlx::Error> {
+            Ok((
+                uuid(&row.try_get::<String, _>("id")?)?,
+                row.try_get("count")?,
+            ))
+        })
+        .collect()
+}
+
+/// The settings stored for queued competition `competition_id`. The stored digest must be the
+/// terms' own, and the settings must be the terms', or the row is refused: deposits are sealed
+/// under the digest players were given.
+fn settings_row(
+    competition_id: Uuid,
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<QueueSettings, sqlx::Error> {
+    let decode = |message: String| sqlx::Error::Decode(message.into());
+    let pool_rules: PoolRules = serde_json::from_str(&row.try_get::<String, _>("pool_rules")?)
+        .map_err(|error| decode(error.to_string()))?;
+    let terms: QueuedTerms = serde_json::from_str(&row.try_get::<String, _>("terms_json")?)
+        .map_err(|error| decode(error.to_string()))?;
+    let digest = terms.digest().map_err(|error| decode(error.to_string()))?;
+    let stored: String = row.try_get("terms_digest")?;
+    let stake_sats = u64::try_from(row.try_get::<i64, _>("stake_sats")?)
+        .map_err(|error| decode(error.to_string()))?;
+    let max_entries = u32::try_from(row.try_get::<i64, _>("max_entries")?)
+        .map_err(|error| decode(error.to_string()))?;
+    if hex::encode(digest) != stored
+        || terms.competition_id != competition_id
+        || terms.pool_rules != pool_rules
+        || terms.stake_sats != stake_sats
+    {
+        return Err(decode(format!(
+            "queued competition {competition_id}'s stored terms do not match its digest or settings"
+        )));
+    }
+    Ok(QueueSettings {
+        competition_id,
+        pool_rules,
+        stake_sats,
+        max_entries,
+        terms,
+        terms_digest: digest,
+    })
+}
+
 fn pool_row(row: &sqlx::sqlite::SqliteRow) -> Result<PoolRecord, sqlx::Error> {
     Ok(PoolRecord {
         competition_id: uuid(&row.try_get::<String, _>("competition_id")?)?,
@@ -237,34 +307,95 @@ impl CompetitionStore {
         else {
             return Ok(None);
         };
-        let decode = |message: String| sqlx::Error::Decode(message.into());
-        let pool_rules: PoolRules = serde_json::from_str(&row.try_get::<String, _>("pool_rules")?)
-            .map_err(|error| decode(error.to_string()))?;
-        let terms: QueuedTerms = serde_json::from_str(&row.try_get::<String, _>("terms_json")?)
-            .map_err(|error| decode(error.to_string()))?;
-        let digest = terms.digest().map_err(|error| decode(error.to_string()))?;
-        let stored: String = row.try_get("terms_digest")?;
-        let stake_sats = u64::try_from(row.try_get::<i64, _>("stake_sats")?)
-            .map_err(|error| decode(error.to_string()))?;
-        let max_entries = u32::try_from(row.try_get::<i64, _>("max_entries")?)
-            .map_err(|error| decode(error.to_string()))?;
-        if hex::encode(digest) != stored
-            || terms.competition_id != competition_id
-            || terms.pool_rules != pool_rules
-            || terms.stake_sats != stake_sats
-        {
-            return Err(decode(format!(
-                "queued competition {competition_id}'s stored terms do not match its digest or settings"
-            )));
+        settings_row(competition_id, &row).map(Some)
+    }
+
+    /// The settings, paid entries, held tickets and pools of each queued competition in `ids`,
+    /// keyed by its id; a competition that is not queued is left out. Its settings and pools are
+    /// what [`Self::queue_settings`] and [`Self::competition_pools`] give, its entries the paid
+    /// ones in the queue and its pools, and its held tickets those that count against its entry
+    /// cap, as [`Self::reserve_queued_ticket`] counts them.
+    ///
+    /// A list asks for every queue it shows, so these are five reads on one connection however
+    /// many queues there are, not five for each.
+    pub async fn queue_details(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, QueueDetails>, sqlx::Error> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
         }
-        Ok(Some(QueueSettings {
-            competition_id,
-            pool_rules,
-            stake_sats,
-            max_entries,
-            terms,
-            terms_digest: digest,
-        }))
+        let ids = json_ids(ids)?;
+        let now = OffsetDateTime::now_utc();
+        let mut connection = self.db_connection.read().acquire().await?;
+        let settings = sqlx::query(
+            "SELECT competition_id, pool_rules, stake_sats, max_entries, terms_json, terms_digest
+             FROM queued_competitions WHERE competition_id IN (SELECT value FROM json_each(?1))",
+        )
+        .bind(&ids)
+        .fetch_all(&mut *connection)
+        .await?;
+        // An entry counts for its queue, or for the queue that formed its pool.
+        let entries = counts(
+            sqlx::query(
+                "SELECT COALESCE(p.parent_id, e.event_id) AS id, COUNT(*) AS count
+                 FROM entries e
+                 JOIN tickets t ON t.id = e.ticket_id
+                 LEFT JOIN competition_pools p ON p.competition_id = e.event_id
+                 WHERE t.paid_at IS NOT NULL
+                   AND COALESCE(p.parent_id, e.event_id) IN (SELECT value FROM json_each(?1))
+                 GROUP BY 1",
+            )
+            .bind(&ids)
+            .fetch_all(&mut *connection)
+            .await?,
+        )?;
+        let live = counts(
+            sqlx::query(&format!(
+                "SELECT event_id AS id, COUNT(*) AS count FROM tickets
+                 WHERE event_id IN (SELECT value FROM json_each(?1)) AND {LIVE_TICKET}
+                 GROUP BY event_id"
+            ))
+            .bind(&ids)
+            .fetch_all(&mut *connection)
+            .await?,
+        )?;
+        let lapsed = lapsed_ticket_counts(&mut *connection, &ids, now).await?;
+        let mut pools: HashMap<Uuid, Vec<PoolRecord>> = HashMap::new();
+        for row in sqlx::query(
+            "SELECT * FROM competition_pools WHERE parent_id IN (SELECT value FROM json_each(?1))
+             ORDER BY parent_id, pool_index",
+        )
+        .bind(&ids)
+        .fetch_all(&mut *connection)
+        .await?
+        .iter()
+        {
+            let pool = pool_row(row)?;
+            pools.entry(pool.parent_id).or_default().push(pool);
+        }
+
+        let mut details = HashMap::with_capacity(settings.len());
+        for row in &settings {
+            let competition_id = uuid(&row.try_get::<String, _>("competition_id")?)?;
+            let entries = entries.get(&competition_id).copied().unwrap_or(0);
+            // As in `queued_held_count`: its two reads share no transaction, so it is held at
+            // zero rather than trusted to be.
+            let taken = live.get(&competition_id).copied().unwrap_or(0)
+                - lapsed.get(&competition_id).copied().unwrap_or(0);
+            details.insert(
+                competition_id,
+                QueueDetails {
+                    settings: settings_row(competition_id, row)?,
+                    entries: u64::try_from(entries)
+                        .map_err(|error| sqlx::Error::Decode(Box::new(error)))?,
+                    held: u64::try_from(taken.max(0))
+                        .map_err(|error| sqlx::Error::Decode(Box::new(error)))?,
+                    pools: pools.remove(&competition_id).unwrap_or_default(),
+                },
+            );
+        }
+        Ok(details)
     }
 
     /// Reserve a queued competition's ticket `ticket_id` for `player`, creating it if it does not
@@ -496,7 +627,8 @@ impl CompetitionStore {
 
     /// The tickets that count against a queued competition's entry cap: paid, or held for an
     /// unexpired invoice, as [`Self::reserve_queued_ticket`] counts them, so not the paid ones
-    /// that lapsed.
+    /// that lapsed. The lists read it for many at once, with [`Self::queue_details`].
+    #[cfg(test)]
     pub async fn queued_held_count(&self, competition_id: Uuid) -> Result<u64, sqlx::Error> {
         let mut connection = self.db_connection.read().acquire().await?;
         let taken = queued_places_taken(
@@ -509,7 +641,9 @@ impl CompetitionStore {
         u64::try_from(taken.max(0)).map_err(|error| sqlx::Error::Decode(Box::new(error)))
     }
 
-    /// Paid entries of a queued competition, in the queue and in the pools it formed.
+    /// Paid entries of a queued competition, in the queue and in the pools it formed. The lists
+    /// read it for many at once, with [`Self::queue_details`].
+    #[cfg(test)]
     pub async fn queued_entry_count(&self, competition_id: Uuid) -> Result<u64, sqlx::Error> {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM entries e JOIN tickets t ON t.id = e.ticket_id

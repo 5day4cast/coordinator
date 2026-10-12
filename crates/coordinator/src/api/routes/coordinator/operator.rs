@@ -223,8 +223,13 @@ async fn load_operator_inventory(
 ) -> anyhow::Result<Bytes> {
     let mut timer = LoadTimer::new();
     let loaded = async {
-        let competitions = coordinator.list_operator_competitions().await?;
+        let mut competitions = coordinator
+            .competition_store
+            .list_operator_competitions()
+            .await?;
         timer.stage("competitions");
+        coordinator.attach_queue_details(&mut competitions).await?;
+        timer.stage("queues");
         let ids: Vec<_> = competitions
             .iter()
             .map(|competition| competition.id)

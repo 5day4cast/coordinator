@@ -24,6 +24,8 @@ mod metrics_store;
 pub use list_api::ListPage;
 mod operator_payouts;
 mod payout;
+#[cfg(test)]
+mod queue_details_tests;
 mod queued;
 #[cfg(test)]
 mod queued_admission_tests;
@@ -71,7 +73,7 @@ pub use queued::{
     CompetitionKind, CreateQueuedCompetition, PoolSummary, QueueSummary, UnpaidTicket,
     DEFAULT_MAX_ENTRIES, DEFAULT_MIN_PLAYERS,
 };
-pub use queued_store::{PoolRecord, QueueSettings};
+pub use queued_store::{PoolRecord, QueueDetails, QueueSettings};
 pub use recovery_store::*;
 pub(crate) use reported::Reported;
 pub use runners::*;
