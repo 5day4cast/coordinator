@@ -52,6 +52,9 @@ fn default_payment_timeout_secs() -> u64 {
     60
 }
 
+/// How long a payment lookup waits for LND to say how the payment ended.
+const TRACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub struct Lnd {
     client: reqwest::Client,
     base_url: String,
@@ -193,8 +196,16 @@ impl Lnd {
 
     /// Where a payment this node may have made stands, by its hash.
     pub async fn track(&self, payment_hash: &str) -> Result<Tracked> {
+        self.track_within(payment_hash, TRACK_TIMEOUT).await
+    }
+
+    async fn track_within(
+        &self,
+        payment_hash: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Tracked> {
         let hash = hex::decode(payment_hash).context("the payment hash is not hex")?;
-        let response = self
+        let sent = self
             .client
             .get(format!(
                 "{}v2/router/track/{}",
@@ -203,10 +214,17 @@ impl Lnd {
             ))
             .query(&[("no_inflight_updates", "true")])
             .header(MACAROON_HEADER, &self.macaroon)
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(timeout)
             .send()
-            .await
-            .context("look the payment up")?;
+            .await;
+        let response = match sent {
+            Ok(response) => response,
+            // With `no_inflight_updates` LND sends nothing, not even the response's headers,
+            // until the payment ends, so one still in flight times out here. A node that cannot
+            // be reached fails to connect instead.
+            Err(e) if e.is_timeout() && !e.is_connect() => return Ok(Tracked::InFlight),
+            Err(e) => return Err(e).context("look the payment up"),
+        };
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
@@ -908,6 +926,49 @@ mod tests {
                 "sat_per_vbyte": "2",
             })
         );
+    }
+
+    fn lnd_at(address: std::net::SocketAddr, directory: &tempfile::TempDir) -> Lnd {
+        let macaroon = directory.path().join("payer.macaroon");
+        std::fs::write(&macaroon, [0xab, 0xcd]).unwrap();
+        Lnd::new(&LndConfig {
+            rest_url: format!("http://{address}"),
+            macaroon_file: macaroon,
+            tls_cert_file: None,
+            fee_limit_sats: 0,
+            payment_timeout_secs: 5,
+        })
+        .unwrap()
+    }
+
+    /// A payment held by its receiver, as ark-swapd holds an entry payment while it pays the
+    /// escrow, gets no answer from LND's lookup until it ends. That is a payment in flight,
+    /// not a failed lookup; a node that cannot be reached still is one.
+    #[tokio::test]
+    async fn a_lookup_that_gets_no_answer_finds_the_payment_in_flight() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Accept, read nothing and answer nothing, like LND before the payment ends.
+            let (_held, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let hash = "ab".repeat(32);
+        let tracked = lnd_at(address, &directory)
+            .track_within(&hash, std::time::Duration::from_millis(300))
+            .await
+            .unwrap();
+        assert_eq!(tracked, Tracked::InFlight);
+
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        assert!(lnd_at(closed, &directory)
+            .track_within(&hash, std::time::Duration::from_millis(300))
+            .await
+            .is_err());
     }
 
     #[test]
