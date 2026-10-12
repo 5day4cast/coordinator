@@ -107,6 +107,23 @@ pub static PAYOUT_SEND_FAILURES: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("valid metric")
 });
 
+/// Writes of a payout's payment outcome that the database refused, by reason: `busy` (another
+/// connection held SQLite's write lock past the busy timeout), `queue_full` (the write queue was
+/// full) or `error`. Every refused write counts, also one that a retry or the payout watcher's
+/// next sweep recorded later.
+pub static PAYMENT_PERSIST_FAILURES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "coordinator_payment_persist_failures_total",
+            "Refused writes of a payout's payment outcome by reason",
+        ),
+        &["reason"],
+    )
+    .expect("valid metric")
+});
+
+pub const PAYMENT_PERSIST_FAILURE_REASONS: [&str; 3] = ["busy", "queue_full", "error"];
+
 /// Fee-bumps of the coordinator's own stuck settlement transactions through their anchors, by
 /// the transaction (`outcome`, `expiry`, `split`) and the result: `broadcast`; `capped`
 /// (broadcast at the rate `cpfp_settings.max_fee_percent` allows); `over_budget` (that rate is
@@ -558,6 +575,12 @@ pub fn record_payout_send_failure(reason: &'static str) {
     PAYOUT_SEND_FAILURES.with_label_values(&[reason]).inc();
 }
 
+/// Record a refused write of a payment outcome; `reason` is one of
+/// [`PAYMENT_PERSIST_FAILURE_REASONS`].
+pub fn record_payment_persist_failure(reason: &'static str) {
+    PAYMENT_PERSIST_FAILURES.with_label_values(&[reason]).inc();
+}
+
 /// The coordinator's metrics and what they are computed from.
 pub struct Metrics {
     registry: Registry,
@@ -682,6 +705,9 @@ impl Metrics {
             .register(Box::new(PAYOUT_SEND_FAILURES.clone()))?;
         metrics
             .registry
+            .register(Box::new(PAYMENT_PERSIST_FAILURES.clone()))?;
+        metrics
+            .registry
             .register(Box::new(COMPETITION_STEP_FAILURES.clone()))?;
         metrics
             .registry
@@ -783,6 +809,9 @@ impl Metrics {
         }
         for reason in PAYMENT_FAILURE_REASONS {
             PAYOUT_SEND_FAILURES.with_label_values(&[reason]);
+        }
+        for reason in PAYMENT_PERSIST_FAILURE_REASONS {
+            PAYMENT_PERSIST_FAILURES.with_label_values(&[reason]);
         }
         for result in ["accepted", "failed"] {
             RECOVERY_RELAY_PUBLISHES.with_label_values(&[result]);
@@ -989,6 +1018,7 @@ mod tests {
             "coordinator_background_thread_up",
             "coordinator_payout_attempts_total",
             "coordinator_payout_send_failures_total",
+            "coordinator_payment_persist_failures_total",
             "coordinator_competition_step_failures_total",
             "coordinator_telemetry_events_dropped_total",
             "coordinator_arkade_unavailable",
@@ -1033,6 +1063,9 @@ mod tests {
             "coordinator_signup_pow_checks_total{result=\"too_easy\"}",
             "coordinator_payout_send_failures_total{reason=\"FAILURE_REASON_NO_ROUTE\"}",
             "coordinator_payout_send_failures_total{reason=\"other\"}",
+            "coordinator_payment_persist_failures_total{reason=\"busy\"}",
+            "coordinator_payment_persist_failures_total{reason=\"queue_full\"}",
+            "coordinator_payment_persist_failures_total{reason=\"error\"}",
         ] {
             assert!(body.contains(sample), "missing {sample} in:\n{body}");
         }

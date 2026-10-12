@@ -432,7 +432,7 @@ impl CompetitionStore {
         }
         self.db_connection
             .execute_write(move |pool| async move {
-                let mut tx = pool.begin().await?;
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
                 for event in &events {
                     sqlx::query(
                         "INSERT INTO recovery_outbox (d_tag, kind, user_pubkey, competition_id, content_sha256,
@@ -512,7 +512,7 @@ impl CompetitionStore {
         }
         self.db_connection
             .execute_write(move |pool| async move {
-                let mut tx = pool.begin().await?;
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
                 for attempt in &attempts {
                     let accepted = serde_json::to_string(&attempt.accepted_relays)
                         .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
@@ -591,7 +591,7 @@ impl CompetitionStore {
         let per_tick = per_tick.max(1);
         self.db_connection
             .execute_write(move |pool| async move {
-                let mut tx = pool.begin().await?;
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
                 let rows: Vec<(String, String)> = sqlx::query_as(
                     "SELECT d_tag, accepted_relays FROM recovery_outbox WHERE deleted_at IS NULL
                      ORDER BY kind = 'wallet' DESC, created_at DESC, d_tag",
@@ -641,7 +641,7 @@ impl CompetitionStore {
         }
         self.db_connection
             .execute_write(move |pool| async move {
-                let mut tx = pool.begin().await?;
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
                 for d_tag in &settled {
                     sqlx::query(
                         "UPDATE recovery_outbox SET settled_at = ? WHERE d_tag = ? AND settled_at IS NULL",
@@ -673,7 +673,7 @@ impl CompetitionStore {
                AND e.settled_at IS NULL AND e.deleted_at IS NULL";
         self.db_connection
             .execute_write(move |pool| async move {
-                let mut tx = pool.begin().await?;
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
                 sqlx::query(&format!(
                     "UPDATE recovery_outbox SET settled_at = ?
                      WHERE kind = 'wallet' AND settled_at IS NULL AND deleted_at IS NULL
@@ -754,7 +754,7 @@ impl CompetitionStore {
         }
         self.db_connection
             .execute_write(move |pool| async move {
-                let mut tx = pool.begin().await?;
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
                 let mut retired = 0;
                 for deletion in &deletions {
                     retired += sqlx::query(

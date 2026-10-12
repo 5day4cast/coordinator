@@ -266,7 +266,7 @@ impl CompetitionStore {
             let count = self
                 .db_connection
                 .execute_write(move |pool| async move {
-                    let mut tx = pool.begin().await?;
+                    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
                     let mut count = 0;
                     for (id, hash, legacy, sealed) in &updates {
                         // A preimage rotated since the read keeps its own ciphertext.

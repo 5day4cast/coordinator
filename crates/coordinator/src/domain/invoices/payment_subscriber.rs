@@ -1,9 +1,11 @@
 use log::{debug, error, info, warn};
 use std::sync::Arc;
-use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 
-use super::{payout_watcher::record_payment_failure, SubscriptionHealth};
+use super::{
+    payout_watcher::{persist_payment_outcome, record_payment_failure, record_payment_success},
+    SubscriptionHealth,
+};
 use crate::{
     domain::{Coordinator, PaymentStatus},
     infra::lightning::{Ln, PaymentUpdate},
@@ -105,15 +107,14 @@ impl PaymentSubscriber {
         match update.status {
             PaymentStatus::Succeeded => {
                 info!("Payment succeeded for payout {} (subscription)", payout.id);
-                if let Err(e) = self
-                    .coordinator
-                    .competition_store
-                    .mark_payout_succeeded(
-                        payout.id,
-                        OffsetDateTime::now_utc(),
-                        update.preimage.clone(),
-                    )
-                    .await
+                // A write still refused after its retries is left to the payout watcher's next
+                // sweep, which looks the payment up again.
+                if let Err(e) = record_payment_success(
+                    &self.coordinator.competition_store,
+                    &payout,
+                    &update.preimage,
+                )
+                .await
                 {
                     error!("Failed to mark payout {} as succeeded: {}", payout.id, e);
                 }
@@ -124,12 +125,14 @@ impl PaymentSubscriber {
                     .unwrap_or_else(|| "Unknown".to_string());
                 // The payout watcher sends the invoice again when the failure can pass, and
                 // records the same failure here at most once between the two.
-                if let Err(e) = record_payment_failure(
+                let (store, bitcoin) = (
                     &self.coordinator.competition_store,
                     self.coordinator.bitcoin.as_ref(),
-                    &payout,
-                    &reason,
-                )
+                );
+                let (failed, reason) = (&payout, reason.as_str());
+                if let Err(e) = persist_payment_outcome(payout.id, || {
+                    record_payment_failure(store, bitcoin, failed, reason)
+                })
                 .await
                 {
                     error!(

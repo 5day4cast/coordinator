@@ -43,6 +43,33 @@ pub enum DatabaseWriteError {
     Sqlx(#[from] sqlx::Error),
 }
 
+impl DatabaseWriteError {
+    /// Whether the write was refused before it ran: the write queue was full, or another
+    /// connection held SQLite's write lock past the busy timeout. The same write can be tried
+    /// again.
+    pub fn is_contention(&self) -> bool {
+        match self {
+            Self::QueueFull => true,
+            Self::Sqlx(error) => is_sqlite_busy(error),
+            Self::ChannelClosed | Self::ResultChannelClosed => false,
+        }
+    }
+}
+
+/// Whether SQLite refused a statement because another connection held a lock it needed:
+/// `SQLITE_BUSY` or `SQLITE_LOCKED`, with their extended codes.
+pub fn is_sqlite_busy(error: &sqlx::Error) -> bool {
+    const SQLITE_BUSY: i32 = 5;
+    const SQLITE_LOCKED: i32 = 6;
+    let sqlx::Error::Database(error) = error else {
+        return false;
+    };
+    error
+        .code()
+        .and_then(|code| code.parse::<i32>().ok())
+        .is_some_and(|code| matches!(code & 0xff, SQLITE_BUSY | SQLITE_LOCKED))
+}
+
 /// A boxed future representing a write operation
 type WriteOperation = Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -813,6 +840,12 @@ impl DBConnection {
     /// Commands run sequentially and retain ownership after callers disconnect.
     /// Return success only after SQL completes or an explicit transaction commits.
     /// Closures must contain only bounded database work.
+    ///
+    /// Open explicit transactions with `pool.begin_with("BEGIN IMMEDIATE")`. Other
+    /// processes, such as replication, also take SQLite's write lock. A deferred `BEGIN`
+    /// that reads first asks for that lock only at its first write, and if another
+    /// connection holds it then, SQLite fails the write with `SQLITE_BUSY` at once instead of
+    /// waiting out the busy timeout.
     ///
     /// # Example
     ///

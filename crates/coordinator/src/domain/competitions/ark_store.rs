@@ -263,7 +263,7 @@ impl CompetitionStore {
     ) -> Result<(), DatabaseWriteError> {
         self.db_connection
             .execute_write(move |pool| async move {
-                let mut tx = pool.begin().await?;
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
                 sqlx::query(
                     "DELETE FROM ticket_ark_escrows WHERE ticket_id = ? AND ticket_hash != ?",
                 )
@@ -339,7 +339,7 @@ impl CompetitionStore {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         self.db_connection
             .execute_write(move |pool| async move {
-                let mut tx = pool.begin().await?;
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
                 sqlx::query(
                     "UPDATE ticket_ark_escrows SET vtxo_outpoint = ?, vtxo_sats = ?, funded_at = ?
                      WHERE ticket_id = ? AND ticket_hash = ? AND funded_at IS NULL",

@@ -164,6 +164,49 @@ async fn readers_reject_persistent_and_temporary_writes() {
     bounded(database.close()).await.unwrap();
 }
 
+/// Writes share one connection, but other processes, such as replication, also take SQLite's
+/// write lock. A deferred transaction that reads first asks for that lock only at its first
+/// write, and then fails at once with `SQLITE_BUSY` instead of waiting out the busy timeout, so
+/// every transaction on the write pool begins immediate.
+#[test]
+fn write_transactions_take_the_write_lock_when_they_begin() {
+    fn sources(directory: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                sources(&path, found);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    sources(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut found,
+    );
+    let deferred: Vec<String> = found
+        .iter()
+        .filter(|path| {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            name != "tests.rs" && !name.ends_with("_tests.rs")
+        })
+        .flat_map(|path| {
+            std::fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| line.contains("pool.begin()") || line.contains("db.begin()"))
+                .map(|(number, _)| format!("{}:{}", path.display(), number + 1))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        deferred.is_empty(),
+        "begin write transactions with BEGIN IMMEDIATE: {deferred:?}"
+    );
+}
+
 #[tokio::test]
 async fn full_queue_rejects_new_writes_before_admission() {
     let (_directory, database) = database().await;

@@ -1,5 +1,5 @@
 use log::{debug, error, info, warn};
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 
@@ -11,13 +11,14 @@ use crate::{
     },
     infra::{
         bitcoin::{Bitcoin, PayoutOutputStatus},
+        db::DatabaseWriteError,
         lightning::{
             classify_payment_failure, extract_payment_hash_from_invoice, invoice_is_expired,
             invoice_payee_node_id, payout_cltv_limit, payout_htlc_expiry_height, Ln,
             PaymentDeadline, PaymentNotFound,
         },
     },
-    metrics::record_payout_send_failure,
+    metrics::{record_payment_persist_failure, record_payout_send_failure},
 };
 use lightning_invoice::Bolt11Invoice;
 
@@ -291,14 +292,12 @@ impl PayoutWatcher {
                                 payout.id
                             );
 
-                            match self
-                                .competition_store
-                                .mark_payout_succeeded(
-                                    payout.id,
-                                    OffsetDateTime::now_utc(),
-                                    payment.payment_preimage.clone(),
-                                )
-                                .await
+                            match record_payment_success(
+                                &self.competition_store,
+                                &payout,
+                                &payment.payment_preimage,
+                            )
+                            .await
                             {
                                 Ok(_) => {
                                     info!("Successfully marked payout {} as succeeded", payout.id);
@@ -405,6 +404,63 @@ impl PayoutWatcher {
 
         Ok(())
     }
+}
+
+/// Delays before the second and third tries of a payment outcome's write.
+const PERSIST_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(1)];
+
+/// Write a payment's outcome, trying again while the write is refused before it runs: the write
+/// queue full, or SQLite's write lock held by another connection past the busy timeout. The
+/// outcome writes are idempotent, so the payout watcher's next sweep also records one this gave
+/// up on. Every refused write counts in `coordinator_payment_persist_failures_total`.
+pub(crate) async fn persist_payment_outcome<T, F, Fut>(
+    payout_id: uuid::Uuid,
+    mut write: F,
+) -> Result<T, anyhow::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, anyhow::Error>>,
+{
+    let mut delays = PERSIST_RETRY_DELAYS.into_iter();
+    loop {
+        let error = match write().await {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        let refused = error.downcast_ref::<DatabaseWriteError>();
+        record_payment_persist_failure(match refused {
+            Some(DatabaseWriteError::QueueFull) => "queue_full",
+            Some(refused) if refused.is_contention() => "busy",
+            _ => "error",
+        });
+        match delays.next() {
+            Some(delay) if refused.is_some_and(DatabaseWriteError::is_contention) => {
+                warn!(
+                    "Recording the payment of payout {} was refused ({}); trying again in {} ms",
+                    payout_id,
+                    error,
+                    delay.as_millis()
+                );
+                tokio::time::sleep(delay).await;
+            }
+            _ => return Err(error),
+        }
+    }
+}
+
+/// Record a payment LND reports as succeeded, with its proof of payment.
+pub(crate) async fn record_payment_success(
+    store: &CompetitionStore,
+    payout: &EntryPayout,
+    preimage: &Option<String>,
+) -> Result<(), anyhow::Error> {
+    persist_payment_outcome(payout.id, || async move {
+        store
+            .mark_payout_succeeded(payout.id, OffsetDateTime::now_utc(), preimage.clone())
+            .await
+            .map_err(anyhow::Error::from)
+    })
+    .await
 }
 
 /// What a failed payment left of its payout.
@@ -885,11 +941,23 @@ mod tests {
         Uuid,
         Uuid,
     ) {
+        fixture_with(DatabasePoolConfig::default()).await
+    }
+
+    async fn fixture_with(
+        config: DatabasePoolConfig,
+    ) -> (
+        tempfile::TempDir,
+        DBConnection,
+        CompetitionStore,
+        Uuid,
+        Uuid,
+    ) {
         let directory = tempfile::tempdir().unwrap();
         let database = DBConnection::new(
             directory.path().to_str().unwrap(),
             "competitions",
-            DatabasePoolConfig::default(),
+            config,
             DatabaseType::Competitions,
         )
         .await
@@ -1284,5 +1352,144 @@ mod tests {
         assert_eq!(sent().len(), 4);
         server.abort();
         database.close().await.unwrap();
+    }
+
+    /// The payout of the fixture's entry, queued and not yet sent.
+    async fn pending_payout(store: &CompetitionStore, entry_id: Uuid) -> EntryPayout {
+        let payout_id = store
+            .store_payout_info_pending(
+                entry_id,
+                "preimage".into(),
+                "private".into(),
+                fresh_invoice(1),
+                10,
+            )
+            .await
+            .unwrap();
+        store.get_payout(payout_id).await.unwrap().unwrap()
+    }
+
+    /// Another process, such as replication, holding SQLite's write lock.
+    async fn hold_write_lock(
+        database: &DBConnection,
+    ) -> (sqlx::SqlitePool, sqlx::Transaction<'static, sqlx::Sqlite>) {
+        let other = sqlx::SqlitePool::connect(&format!("sqlite:{}", database.database_path))
+            .await
+            .unwrap();
+        let held = other.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        (other, held)
+    }
+
+    /// Marking a payout succeeded reads the payout before it writes. Its transaction takes the
+    /// write lock first, so it waits for another writer instead of failing at once with
+    /// `SQLITE_BUSY`, as it did when the lock was asked for only at the write.
+    #[tokio::test]
+    async fn a_payment_success_waits_for_another_sqlite_writer() {
+        let (_directory, database, store, _event_id, entry_id) = fixture().await;
+        let payout_id = pending_payout(&store, entry_id).await.id;
+        let (other, held) = hold_write_lock(&database).await;
+        let marking = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .mark_payout_succeeded(payout_id, OffsetDateTime::now_utc(), None)
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!marking.is_finished(), "a busy writer is waited for");
+        held.commit().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), marking)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let marked = store.get_payout(payout_id).await.unwrap().unwrap();
+        assert!(marked.succeed_at.is_some());
+        other.close().await;
+        database.close().await.unwrap();
+    }
+
+    /// A success write refused because the lock was held past the busy timeout is counted and
+    /// written again.
+    #[tokio::test]
+    async fn a_refused_payment_success_is_counted_and_written_again() {
+        let mut config = DatabasePoolConfig::default();
+        config.sqlite_config.busy_timeout_ms = 50;
+        let (_directory, database, store, _event_id, entry_id) = fixture_with(config).await;
+        let payout = pending_payout(&store, entry_id).await;
+        let busy = crate::metrics::PAYMENT_PERSIST_FAILURES.with_label_values(&["busy"]);
+        let refused_before = busy.get();
+        let (other, held) = hold_write_lock(&database).await;
+        let recording = {
+            let (store, payout) = (store.clone(), payout.clone());
+            tokio::spawn(async move { record_payment_success(&store, &payout, &None).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while busy.get() == refused_before {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first write is refused");
+        assert!(!recording.is_finished(), "a refused write is tried again");
+        held.commit().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), recording)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let marked = store.get_payout(payout.id).await.unwrap().unwrap();
+        assert!(marked.succeed_at.is_some());
+        other.close().await;
+        database.close().await.unwrap();
+    }
+
+    /// Only a write refused before it ran is tried again, at most three times in all; any other
+    /// error returns at once. Each refusal is counted by its reason.
+    #[tokio::test(start_paused = true)]
+    async fn only_refused_payment_writes_are_tried_again() {
+        let payout_id = Uuid::now_v7();
+        let counted = |reason: &str| {
+            crate::metrics::PAYMENT_PERSIST_FAILURES
+                .with_label_values(&[reason])
+                .get()
+        };
+        let (queue_full, other) = (counted("queue_full"), counted("error"));
+
+        let tries = AtomicUsize::new(0);
+        let attempts = &tries;
+        let written = persist_payment_outcome(payout_id, || async move {
+            match attempts.fetch_add(1, Ordering::SeqCst) {
+                0 => Err(anyhow::Error::from(DatabaseWriteError::QueueFull)),
+                _ => Ok(7),
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!((written, tries.load(Ordering::SeqCst)), (7, 2));
+
+        let tries = AtomicUsize::new(0);
+        let attempts = &tries;
+        persist_payment_outcome(payout_id, || async move {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(anyhow::Error::from(DatabaseWriteError::QueueFull))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(tries.load(Ordering::SeqCst), 3);
+
+        let tries = AtomicUsize::new(0);
+        let attempts = &tries;
+        persist_payment_outcome(payout_id, || async move {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(anyhow::anyhow!("the preimage does not match the invoice"))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(tries.load(Ordering::SeqCst), 1);
+
+        assert!(counted("queue_full") >= queue_full + 4);
+        assert!(counted("error") > other);
     }
 }
