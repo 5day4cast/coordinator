@@ -1,7 +1,9 @@
 //! Read-only process and allocator accounting, plus counts of the trims
 //! [`crate::infra::allocator`] makes. RSS includes live allocations and retained pages; glibc's
 //! free arena bytes are reusable, not necessarily resident or reclaimable.
-use prometheus::{Gauge, Histogram, HistogramOpts, HistogramVec, IntCounter, Registry};
+use prometheus::{
+    Gauge, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, Opts, Registry,
+};
 use std::{sync::LazyLock, time::Duration};
 use tokio::{sync::Mutex, time::Instant};
 
@@ -100,6 +102,28 @@ pub(crate) fn checkpoint_encode_buffer_bytes(bytes: usize) {
     CHECKPOINT_BUFFER.observe(bytes as f64);
 }
 
+/// What each committed write stores, by kind. `row` is the sealed document in format 1, the
+/// manifest in format 2 and the root in format 3.
+const CHECKPOINT_WRITE_KINDS: [&str; 3] = ["row", "part", "node"];
+
+static CHECKPOINT_WRITTEN: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "coordinator_checkpoint_written_bytes_total",
+            "Bytes committed confidential checkpoint writes stored: the sealed row, new parts, and new format-3 manifest nodes",
+        ),
+        &["kind"],
+    )
+    .expect("valid metric")
+});
+
+/// Count `bytes` of one kind that a committed checkpoint write stored.
+pub(crate) fn checkpoint_written_bytes(kind: &'static str, bytes: usize) {
+    CHECKPOINT_WRITTEN
+        .with_label_values(&[kind])
+        .inc_by(bytes as u64);
+}
+
 pub(super) fn register(registry: &Registry) -> prometheus::Result<()> {
     for gauge in [
         &*RESIDENT,
@@ -116,6 +140,10 @@ pub(super) fn register(registry: &Registry) -> prometheus::Result<()> {
     registry.register(Box::new(TRIMMED.clone()))?;
     registry.register(Box::new(CHECKPOINT.clone()))?;
     registry.register(Box::new(CHECKPOINT_BUFFER.clone()))?;
+    for kind in CHECKPOINT_WRITE_KINDS {
+        CHECKPOINT_WRITTEN.with_label_values(&[kind]);
+    }
+    registry.register(Box::new(CHECKPOINT_WRITTEN.clone()))?;
     Ok(())
 }
 
@@ -277,6 +305,32 @@ mod tests {
         assert_eq!(metric.get_label().len(), 2);
         assert!(metric.get_histogram().get_sample_count() >= 1);
         assert!(metric.get_histogram().get_sample_sum() >= 70_000.);
+    }
+
+    #[test]
+    fn checkpoint_writes_count_stored_bytes_by_kind_from_startup() {
+        let registry = Registry::new();
+        register(&registry).unwrap();
+        let written = |kind: &str| {
+            registry
+                .gather()
+                .iter()
+                .find(|m| m.get_name() == "coordinator_checkpoint_written_bytes_total")
+                .unwrap()
+                .get_metric()
+                .iter()
+                .find(|m| m.get_label()[0].get_value() == kind)
+                .map(|m| m.get_counter().get_value())
+        };
+        for kind in CHECKPOINT_WRITE_KINDS {
+            assert!(
+                written(kind).is_some(),
+                "{kind} is exported before any write"
+            );
+        }
+        let before = written("node").unwrap();
+        checkpoint_written_bytes("node", 4096);
+        assert!(written("node").unwrap() >= before + 4096.);
     }
 
     #[test]

@@ -8,10 +8,11 @@ The coordinator saves a durable checkpoint before sending a confidential command
 | --- | --- | --- |
 | 1 | One encrypted JSON document, encoded as hex | Default |
 | 2 | An encrypted manifest and compressed, encrypted binary parts | `COORDINATOR_PROTOCOL_PARTS=1` or `true` |
+| 3 | An encrypted root, compressed, encrypted manifest nodes, and the parts of format 2 | `COORDINATOR_PROTOCOL_PARTS=tree` |
 
 Leaving `COORDINATOR_PROTOCOL_PARTS` unset, or setting it to `0` or `false`, selects format 1. The coordinator reads the variable once at startup and refuses to start with any other value.
 
-The reader supports both formats. The additive migration leaves existing rows in format 1. Creating a session also writes format 1.
+The reader supports every format. The additive migration leaves existing rows in format 1. Creating a session also writes format 1.
 
 With format 2 enabled, the next checkpoint converts that session. Application fields and journal entries each have manifest nodes. Larger nested objects and structured arrays split further at field or element boundaries.
 
@@ -39,9 +40,29 @@ These changes retain format 2 compatibility. Older format-2 readers can reconstr
 
 `coordinator_checkpoint_plaintext_bytes` reports bytes actually serialized during each encode. Cached application fields and unchanged journal entries are omitted from subsequent journal-save samples. Decode samples still report the complete reconstructed document. `coordinator_checkpoint_encode_buffer_bytes` reports the largest plaintext buffer capacity during each partitioned write. Neither metric measures the total process peak.
 
+## Format 3: the manifest in nodes
+
+A format-2 manifest names every part of the state, so its size follows the whole state: about 120 bytes per part, doubled by the hex encoding. A session with thousands of parts rewrites close to a megabyte at every checkpoint, even when the step changed one journal entry. During a refund, which checkpoints before every enclave command, that is hundreds of megabytes a minute of database writes.
+
+Format 3 keeps the same parts and keeps the manifest itself in content-addressed nodes:
+
+- An object with more than 64 fields is split into chunks in key order. A field name ends a chunk when the low 6 bits of its session-keyed hash are zero, and a chunk ends at 256 fields regardless. Adding, changing or removing a journal entry therefore changes the chunk that holds it, not its neighbours.
+- An array with more than 64 elements is split every 64 elements.
+- A list of more than 64 chunks is grouped the same way, level by level.
+- Any other object or array whose packed text exceeds 1 KiB is stored as a node, and its parent names it by address.
+- The row seals a root that holds the state's top-level fields. It is a few hundred bytes to a few KiB.
+
+A node is stored in `keymeld_protocol_parts` beside the parts. Its text is compressed, then sealed under the address `HMAC-SHA256(session key, "coordinator-protocol-node-v1/" ‖ session ‖ text)`, a domain apart from part addresses. The authenticated root names node addresses, and each node names the addresses below it. A load fetches the nodes level by level in the row's read transaction, decrypts each one, checks its address, and only then reads the parts the rebuilt manifest names. A missing, altered or swapped node, a chunk out of key order, or nesting past 128 levels fails the load. A metadata read projects the root first and fetches no journal node.
+
+Packing is deterministic, so an unchanged subtree keeps its nodes and their addresses. A write seals and inserts only the nodes on the paths to what changed, and the root. A resumed writer reuses the nodes its load authenticated, as it reuses parts.
+
+Each write deletes the parts and nodes that the replaced version stored and the new one does not reference. A writer's first write after loading reads the table to find them, as every write did before. Later writes use what the writer's own previous write stored: the compare-and-swap proves that no other write came between. Format-1 and format-2 writers follow the same rules, so the table never holds an unreferenced part after a commit.
+
+`coordinator_checkpoint_written_bytes_total{kind="row|part|node"}` counts the bytes committed writes store: the sealed row (the whole document in format 1, the manifest in format 2, the root in format 3), new parts, and new nodes.
+
 ## Deployment
 
-1. Deploy a release that reads both formats. Leave `COORDINATOR_PROTOCOL_PARTS` unset.
+1. Deploy a release that reads every format. Leave `COORDINATOR_PROTOCOL_PARTS` unset.
 2. Verify that every running process supports both formats.
 3. Retain a tested rollback release that also reads both formats.
 4. Verify a recent backup restore before changing the writer.
@@ -49,6 +70,8 @@ These changes retain format 2 compatibility. Older format-2 readers can reconstr
 6. Monitor checkpoint errors, database size, write-ahead log size, memory, and payout progress.
 
 The prior reader cannot read format 2. Do not run it beside an enabled format-2 writer.
+
+Format 3 rolls out the same way. Deploy a release that reads it while the writer stays on format 2, keep a rollback release that also reads it, and then set `COORDINATOR_PROTOCOL_PARTS=tree`. Each session converts at its next checkpoint, which stores all of its nodes once. Earlier releases refuse a format-3 row, so do not run them beside a format-3 writer. Setting the variable back to `1` makes the next checkpoint of each session write format 2 again and delete its nodes.
 
 Disabling the flag changes future writes to format 1. Existing format-2 rows remain until a compatible writer saves them again.
 

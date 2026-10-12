@@ -315,6 +315,12 @@ async fn coordinator_service_recovers_late_paid_candidate_from_partitioned_check
     executes_dlc_and_recovers_late_paid_candidate(CheckpointFormat::Parts).await;
 }
 
+/// The same in format 3, whose test shape keeps even this state's manifest in many nodes.
+#[tokio::test]
+async fn coordinator_service_recovers_late_paid_candidate_from_tree_checkpoints() {
+    executes_dlc_and_recovers_late_paid_candidate(CheckpointFormat::Tree).await;
+}
+
 async fn executes_dlc_and_recovers_late_paid_candidate(format: CheckpointFormat) {
     let relay_state = Relay {
         operator: Arc::new(Mutex::new(operator())),
@@ -1413,6 +1419,12 @@ async fn durable_contract_signing_checkpoints_concurrent_rounds_and_replays_them
 #[tokio::test]
 async fn durable_contract_signing_replays_rounds_from_partitioned_checkpoints() {
     contract_signing_replays_its_rounds(CheckpointFormat::Parts).await;
+}
+
+/// The same signing in format 3: each save also stores and drops manifest nodes.
+#[tokio::test]
+async fn durable_contract_signing_replays_rounds_from_tree_checkpoints() {
+    contract_signing_replays_its_rounds(CheckpointFormat::Tree).await;
 }
 
 /// Outside a batch, permits remain sequential and each concurrent signing round

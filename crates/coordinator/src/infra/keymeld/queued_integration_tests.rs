@@ -222,6 +222,12 @@ async fn a_queued_pool_signs_from_partitioned_checkpoints() {
     queued_pool_signs(CheckpointFormat::Parts).await;
 }
 
+/// The same in format 3.
+#[tokio::test]
+async fn a_queued_pool_signs_from_tree_checkpoints() {
+    queued_pool_signs(CheckpointFormat::Tree).await;
+}
+
 async fn queued_pool_signs(format: CheckpointFormat) {
     let started = std::time::Instant::now();
     let enclaves = Enclaves(Arc::new(

@@ -27,7 +27,10 @@ mod checkpoint_array;
 mod checkpoint_fields;
 #[path = "checkpoint_reader.rs"]
 mod checkpoint_reader;
+#[path = "checkpoint_tree.rs"]
+mod checkpoint_tree;
 pub(super) use checkpoint_fields::EntryCache;
+pub(super) use checkpoint_tree::{pack, Nodes, Shape, Tree, MAX_DEPTH};
 
 const PART_BYTES: usize = 32 * 1024;
 const MAX_STATE_BYTES: usize = 512 * 1024 * 1024;
@@ -163,22 +166,33 @@ fn split(
         return Ok(Manifest::Part(digest));
     }
     if let std::collections::btree_map::Entry::Vacant(entry) = bodies.entry(digest) {
-        let mut compressor = GzEncoder::new(Vec::new(), Compression::fast());
-        compressor
-            .write_all(text.as_bytes())
-            .map_err(|error| failure(error.to_string()))?;
-        let compressed = Zeroizing::new(
-            compressor
-                .finish()
-                .map_err(|error| failure(error.to_string()))?,
-        );
-        let encrypted = key
-            .encrypt(&compressed, &context(session, &digest))
-            .and_then(|value| value.to_bytes())
-            .map_err(|_| failure("Cannot encrypt confidential checkpoint part"))?;
-        entry.insert(encrypted);
+        entry.insert(seal_compressed(
+            key,
+            &context(session, &digest),
+            text.as_bytes(),
+        )?);
     }
     Ok(Manifest::Part(digest))
+}
+
+/// Compress `text`, then seal it under `context`: the body of a part or a manifest node.
+fn seal_compressed(
+    key: &SessionSecret,
+    context: &str,
+    text: &[u8],
+) -> Result<Vec<u8>, KeymeldError> {
+    let mut compressor = GzEncoder::new(Vec::new(), Compression::fast());
+    compressor
+        .write_all(text)
+        .map_err(|error| failure(error.to_string()))?;
+    let compressed = Zeroizing::new(
+        compressor
+            .finish()
+            .map_err(|error| failure(error.to_string()))?,
+    );
+    key.encrypt(&compressed, context)
+        .and_then(|value| value.to_bytes())
+        .map_err(|_| failure("Cannot encrypt confidential checkpoint part"))
 }
 
 impl Manifest {
