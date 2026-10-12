@@ -76,6 +76,61 @@ async fn confidential_upgrade_preserves_published_payout_migration_checksums() {
     pool.close().await;
 }
 
+/// SQLite 3.51.3 fixed the WAL-reset bug: two connections that write or checkpoint one WAL
+/// database at the same instant (the coordinator and Litestream) could corrupt it.
+#[tokio::test]
+async fn bundled_sqlite_has_the_wal_reset_fix() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let version: String = sqlx::query_scalar("SELECT sqlite_version()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let parts: Vec<u32> = version
+        .split('.')
+        .map(|part| part.parse().unwrap())
+        .collect();
+    assert!(parts[..] >= [3, 51, 3][..], "bundled SQLite {version}");
+    pool.close().await;
+}
+
+/// Deployed databases record each applied migration's checksum, the SHA-384 of its file.
+/// A sqlx release that hashed migrations differently would refuse to start against them.
+#[test]
+fn migration_checksums_are_the_sha384_of_each_file() {
+    use sha2::{Digest, Sha384};
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for (directory, migrator) in [
+        ("competitions", &COMPETITIONS_MIGRATOR),
+        ("users", &USERS_MIGRATOR),
+    ] {
+        let mut checked = 0;
+        for entry in std::fs::read_dir(root.join(directory)).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+            if !name.ends_with(".sql") || name.ends_with(".down.sql") {
+                continue;
+            }
+            let version: i64 = name.split('_').next().unwrap().parse().unwrap();
+            let migration = migrator
+                .iter()
+                .find(|m| m.version == version && m.migration_type.is_up_migration())
+                .unwrap_or_else(|| panic!("{directory}/{name} is not embedded"));
+            let text = std::fs::read(path).unwrap();
+            assert_eq!(
+                &migration.checksum[..],
+                Sha384::digest(text).as_slice(),
+                "{directory}/{name}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "{directory} has no migrations");
+    }
+}
+
 async fn bounded<T>(future: impl Future<Output = T>) -> T {
     tokio::time::timeout(StdDuration::from_secs(10), future)
         .await
