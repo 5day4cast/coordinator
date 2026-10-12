@@ -48,8 +48,30 @@ pub struct Cadence {
     pub lookup_every: Duration,
     /// How often a boarding, and then a renewal, starts, once the last ones have ended.
     pub board_every: Duration,
-    /// How long a boarding, or a renewal, may take before it is given up.
+    /// How long a boarding may take before it is given up. See [`board_timeout`].
     pub board_timeout: Duration,
+    /// How long a renewal may take before it is given up. See [`renew_timeout`].
+    pub renew_timeout: Duration,
+}
+
+/// How long a boarding may take, for an Arkade server whose batch sessions last `session`.
+///
+/// A boarding registers its intent, waits for a batch that takes it, then for that batch to
+/// finish. The Arkade server has taken up to three sessions to take a boarding's intent, and its
+/// batches have run for up to half a session after that. One given up then is wasted, even if
+/// the batch goes on to take the coins, and the next starts its wait over: a 180-second bound
+/// gave up four boardings in a row, each seconds after its batch had started. Escrow payments
+/// do not wait for a boarding, so a longer one costs only the boarding.
+pub fn board_timeout(session: Duration) -> Duration {
+    4 * session + Duration::from_secs(60)
+}
+
+/// How long a renewal may take, for an Arkade server whose batch sessions last `session`.
+///
+/// Escrow payments wait for a renewal (see `wallet::SpendLocks`), so it keeps the bound of the
+/// rest of one session and the batch after.
+pub fn renew_timeout(session: Duration) -> Duration {
+    2 * session + Duration::from_secs(60)
 }
 
 /// Take the worker's steps while `holding` says this instance holds the lease, until `stopped`
@@ -62,7 +84,7 @@ pub async fn run<S: Steps>(
 ) {
     // A boarding waits for a whole batch, minutes, and so does a renewal. They run beside the
     // other steps, one settlement at a time: a renewal follows the boarding in the same task.
-    // The wallet's send lock still puts their spends in turn with the others'.
+    // The wallet's locks still hold escrow payments for a renewal (`wallet::SpendLocks`).
     let boarding = Arc::new(tokio::sync::Mutex::new(()));
     let mut interval = tokio::time::interval(cadence.tick);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -97,13 +119,13 @@ pub async fn run<S: Steps>(
                             cadence.board_timeout.as_secs()
                         );
                     }
-                    if tokio::time::timeout(cadence.board_timeout, steps.renew_tick())
+                    if tokio::time::timeout(cadence.renew_timeout, steps.renew_tick())
                         .await
                         .is_err()
                     {
                         log::warn!(
                             "gave up a renewal after {}s",
-                            cadence.board_timeout.as_secs()
+                            cadence.renew_timeout.as_secs()
                         );
                     }
                 });
@@ -129,6 +151,7 @@ mod tests {
         lookups: AtomicUsize,
         boardings: AtomicUsize,
         renewals: AtomicUsize,
+        renewals_finished: AtomicUsize,
         boarding_now: AtomicUsize,
         most_boarding_at_once: AtomicUsize,
         release: tokio::sync::Semaphore,
@@ -142,6 +165,7 @@ mod tests {
                 lookups: AtomicUsize::new(0),
                 boardings: AtomicUsize::new(0),
                 renewals: AtomicUsize::new(0),
+                renewals_finished: AtomicUsize::new(0),
                 boarding_now: AtomicUsize::new(0),
                 most_boarding_at_once: AtomicUsize::new(0),
                 release: tokio::sync::Semaphore::new(0),
@@ -185,6 +209,7 @@ mod tests {
             let _ended = Boarding(&self.boarding_now);
             self.most_boarding_at_once.fetch_max(now, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(30)).await;
+            self.renewals_finished.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -194,6 +219,7 @@ mod tests {
             lookup_every: Duration::from_millis(20),
             board_every: Duration::from_millis(20),
             board_timeout,
+            renew_timeout: board_timeout,
         }
     }
 
@@ -276,5 +302,45 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_renewal_is_given_up_on_its_own_bound() {
+        let steps = Arc::new(Counted::default());
+        // The boarding may wait longer than the test runs; the renewal, 30 ms long, may not.
+        let cadence = Cadence {
+            renew_timeout: Duration::from_millis(10),
+            ..cadence(Duration::from_secs(60))
+        };
+        let (stop, worker) = start(&steps, cadence);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(steps.boardings.load(Ordering::SeqCst), 1);
+        steps.release.add_permits(1);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(steps.renewals.load(Ordering::SeqCst) >= 1);
+        assert_eq!(steps.renewals_finished.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            steps.boardings.load(Ordering::SeqCst),
+            2,
+            "the next boarding starts once the renewal is given up"
+        );
+
+        stop.send(true).unwrap();
+        steps.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// Sessions of a minute, as on the Arkade server's Mutinynet deployment.
+    #[test]
+    fn a_boarding_outlasts_the_slowest_batch_seen_and_a_renewal_keeps_its_bound() {
+        let session = Duration::from_secs(60);
+        // Intents waited up to 176 s for a batch, which then ran for up to 28 s.
+        assert!(board_timeout(session) >= Duration::from_secs(176 + 28 + 60));
+        assert_eq!(board_timeout(session), Duration::from_secs(300));
+        assert_eq!(renew_timeout(session), Duration::from_secs(180));
     }
 }

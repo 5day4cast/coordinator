@@ -22,6 +22,21 @@ const MAX_CONCURRENT_OPERATIONS: usize = 2;
 const MAX_ENTRIES: usize = 10_000;
 const MAX_RPC_ROUND_TRIPS: usize = 1_024;
 const RPC_BATCH_SIZE: usize = 64;
+/// How many times a lookup runs, each on a fresh connection, while the chain tip moves under
+/// it. A block every thirty seconds moves the tip under about one lookup an hour.
+const TIP_ATTEMPTS: usize = 3;
+
+/// A lookup saw the chain tip change while it ran, so its answer may mix two chain states.
+#[derive(Debug)]
+struct TipChanged;
+
+impl std::fmt::Display for TipChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("chain tip changed during lookup")
+    }
+}
+
+impl std::error::Error for TipChanged {}
 
 pub struct Electrum {
     url: Arc<str>,
@@ -49,6 +64,47 @@ impl Electrum {
         T: Send + 'static,
         F: FnOnce(&mut Request) -> anyhow::Result<T> + Send + 'static,
     {
+        self.run(move |url, network, deadline| {
+            let mut request = Request::connect(url, network, deadline)?;
+            let result = operation(&mut request)?;
+            request.check_deadline()?;
+            Ok(result)
+        })
+        .await
+    }
+
+    /// `with_rpc` for a lookup that checks the chain tip did not move under it. One that did
+    /// runs again on a fresh connection, without anything the last attempt read, up to
+    /// `TIP_ATTEMPTS` times within the one deadline.
+    async fn with_consistent_rpc<T, F>(&self, operation: F) -> Result<T, Error>
+    where
+        T: Send + 'static,
+        F: Fn(&mut Request) -> anyhow::Result<T> + Send + 'static,
+    {
+        self.run(move |url, network, deadline| {
+            let mut attempt = 1;
+            loop {
+                let mut request = Request::connect(url, network, deadline)?;
+                match operation(&mut request) {
+                    Err(error) if attempt < TIP_ATTEMPTS && error.is::<TipChanged>() => {
+                        attempt += 1;
+                    }
+                    result => {
+                        let result = result?;
+                        request.check_deadline()?;
+                        return Ok(result);
+                    }
+                }
+            }
+        })
+        .await
+    }
+
+    async fn run<T, F>(&self, operation: F) -> Result<T, Error>
+    where
+        T: Send + 'static,
+        F: FnOnce(&str, Network, Instant) -> anyhow::Result<T> + Send + 'static,
+    {
         let permit = Arc::clone(&self.permits)
             .try_acquire_owned()
             .map_err(|_| Error::consumer("electrs chain lookups are busy"))?;
@@ -58,10 +114,7 @@ impl Electrum {
         let task = tokio::task::spawn_blocking(move || {
             // Cancellation of the async caller cannot admit another blocking operation early.
             let _permit = permit;
-            let mut request = Request::connect(&url, network, deadline)?;
-            let result = operation(&mut request)?;
-            request.check_deadline()?;
-            Ok::<_, anyhow::Error>(result)
+            operation(&url, network, deadline)
         });
         tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), task)
             .await
@@ -144,7 +197,9 @@ impl Request {
     }
 
     fn require_same_tip(&mut self, expected: (usize, BlockHash)) -> anyhow::Result<()> {
-        ensure!(self.tip()? == expected, "chain tip changed during lookup");
+        if self.tip()? != expected {
+            return Err(TipChanged.into());
+        }
         Ok(())
     }
 
@@ -275,7 +330,7 @@ fn transaction_not_found(error: &electrum_client::Error) -> bool {
 impl Blockchain for Electrum {
     async fn find_outpoints(&self, address: &Address) -> Result<Vec<ExplorerUtxo>, Error> {
         let script = address.script_pubkey();
-        self.with_rpc(move |request| {
+        self.with_consistent_rpc(move |request| {
             let tip = request.tip()?;
             let unspent = request.rpc(|client| client.script_list_unspent(&script))?;
             ensure!(
@@ -345,7 +400,7 @@ impl Blockchain for Electrum {
 
     async fn get_tx_status(&self, txid: &Txid) -> Result<TxStatus, Error> {
         let txid = *txid;
-        self.with_rpc(move |request| {
+        self.with_consistent_rpc(move |request| {
             let Some(transaction) = request.transaction(txid)? else {
                 return Ok(TxStatus { confirmed_at: None });
             };
@@ -382,7 +437,7 @@ impl Blockchain for Electrum {
 
     async fn get_output_status(&self, txid: &Txid, vout: u32) -> Result<SpendStatus, Error> {
         let outpoint = OutPoint::new(*txid, vout);
-        self.with_rpc(move |request| {
+        self.with_consistent_rpc(move |request| {
             let output_index = usize::try_from(vout)?;
             let transaction = request
                 .transaction(outpoint.txid)?

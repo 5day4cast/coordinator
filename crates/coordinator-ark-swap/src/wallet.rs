@@ -81,8 +81,8 @@ pub struct ArkWallet {
     server: ArkServer,
     /// The service's own key. It signs its sends, and claims the refund swaps that pay it.
     keypair: Keypair,
-    /// One send at a time, so concurrent swaps never select the same VTXOs.
-    sending: tokio::sync::Mutex<()>,
+    /// What may spend the wallet's coins at once; see `SpendLocks`.
+    locks: SpendLocks,
     /// Where the boarding address's on-chain coins are read from.
     chain: Arc<Electrum>,
     margins: Margins,
@@ -176,6 +176,46 @@ fn server_fault(message: &str) -> bool {
     FAULTS.iter().any(|fault| message.contains(fault))
 }
 
+/// The wallet's locks around spending its coins.
+///
+/// An escrow payment selects among the spendable coins, so payments go one at a time. A renewal
+/// settles coins a payment could select, so it holds payments for its whole batch. A boarding
+/// settles only boarding outputs and recoverable coins, which never pay an escrow, so payments,
+/// and the payers' HTLCs they hold, go ahead while it waits minutes for a batch. Boardings and
+/// renewals both settle the recoverable coins, so their batches take turns.
+#[derive(Default)]
+pub struct SpendLocks {
+    payments: tokio::sync::Mutex<()>,
+    batches: tokio::sync::Mutex<()>,
+}
+
+/// What a renewal holds for its batch: the batch's turn, and the payments.
+pub struct RenewalGuard<'a> {
+    _batch: tokio::sync::MutexGuard<'a, ()>,
+    _payments: tokio::sync::MutexGuard<'a, ()>,
+}
+
+impl SpendLocks {
+    /// Wait for the other payments, and for a renewal in flight.
+    pub async fn payment(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.payments.lock().await
+    }
+
+    /// Wait for the batch of another boarding or a renewal, but not for payments.
+    pub async fn boarding(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.batches.lock().await
+    }
+
+    /// Wait for the batch of a boarding or another renewal, then for the payment in flight.
+    pub async fn renewal(&self) -> RenewalGuard<'_> {
+        let batch = self.batches.lock().await;
+        RenewalGuard {
+            _batch: batch,
+            _payments: self.payments.lock().await,
+        }
+    }
+}
+
 /// A value kept for `ttl`, so callers in quick succession share one reading of it.
 pub struct Cached<T> {
     ttl: Duration,
@@ -242,7 +282,7 @@ impl ArkWallet {
             client,
             server,
             keypair,
-            sending: tokio::sync::Mutex::new(()),
+            locks: SpendLocks::default(),
             chain: blockchain,
             margins: Margins::from_days(config.renew_margin_days, config.pay_margin_days),
             view: Cached::new(VIEW_TTL),
@@ -308,7 +348,7 @@ impl ArkWallet {
     /// margin of life or more are spent, the longest-lived first. Without enough of them
     /// nothing is sent.
     pub async fn pay(&self, address: ArkAddress, amount: Amount) -> anyhow::Result<Txid> {
-        let _one_at_a_time = self.sending.lock().await;
+        let _one_at_a_time = self.locks.payment().await;
         let held = self.coins().await?;
         let now = unix_now();
         let pay_secs = self.margins.pay_secs;
@@ -420,7 +460,7 @@ impl ArkWallet {
             .map_err(|error| anyhow::anyhow!("sign the claim: {error}"))?;
         let ark_txid = ark_tx.unsigned_tx.compute_txid();
 
-        let _one_at_a_time = self.sending.lock().await;
+        let _one_at_a_time = self.locks.payment().await;
         let submitted = self
             .server
             .client()
@@ -570,8 +610,11 @@ impl ArkWallet {
 
     /// Move confirmed boarding outputs, and recoverable VTXOs, into fresh VTXOs in the next batch.
     /// VTXOs near expiry are left alone: `renew` settles those.
+    ///
+    /// Escrow payments go ahead while it waits for the batch: neither kind of coin it settles
+    /// ever pays an escrow.
     pub async fn board(&self) -> anyhow::Result<Option<Txid>> {
-        let _one_at_a_time = self.sending.lock().await;
+        let _batch = self.locks.boarding().await;
         let mut rng = <rand08::rngs::StdRng as rand08::SeedableRng>::from_entropy();
         let boarded = self
             .client
@@ -585,10 +628,10 @@ impl ArkWallet {
     /// Settle `coins` into one fresh VTXO in the next batch, which gives it a new batch's
     /// whole life. Recoverable coins come back this way, and only this way.
     ///
-    /// Like a boarding, it holds the wallet's sends for the batch, so no swap spends a coin
-    /// the batch is taking.
+    /// It holds escrow payments for the batch, so no swap spends a coin the batch is taking:
+    /// a coin near expiry may still have the pay margin of life.
     pub async fn renew(&self, coins: &[OutPoint]) -> anyhow::Result<Option<Txid>> {
-        let _one_at_a_time = self.sending.lock().await;
+        let _batch_and_payments = self.locks.renewal().await;
         let mut rng = <rand08::rngs::StdRng as rand08::SeedableRng>::from_entropy();
         let renewed = self
             .client
@@ -876,6 +919,51 @@ mod tests {
             .await;
         assert!(failed.is_err());
         assert_eq!(cached.get(read).await.unwrap(), 3);
+    }
+
+    /// Whether `lock` is had within a moment.
+    async fn had<T>(lock: impl Future<Output = T>) -> Option<T> {
+        tokio::time::timeout(Duration::from_millis(50), lock)
+            .await
+            .ok()
+    }
+
+    /// A boarding waited for minutes on its batch while a payer's HTLC waited on the escrow
+    /// payment behind it. Payments wait only for renewals, whose coins they could spend.
+    #[tokio::test]
+    async fn escrow_payments_go_ahead_while_a_boarding_waits_for_its_batch() {
+        let locks = SpendLocks::default();
+        {
+            let _boarding = locks.boarding().await;
+            assert!(had(locks.payment()).await.is_some());
+            assert!(
+                had(locks.renewal()).await.is_none(),
+                "a renewal settles recoverable coins too, so it waits for the boarding's batch"
+            );
+            assert!(
+                had(locks.boarding()).await.is_none(),
+                "one boarding at a time"
+            );
+        }
+        {
+            let _renewal = locks.renewal().await;
+            assert!(had(locks.payment()).await.is_none());
+            assert!(had(locks.boarding()).await.is_none());
+        }
+        {
+            let _payment = locks.payment().await;
+            assert!(had(locks.boarding()).await.is_some());
+            assert!(
+                had(locks.payment()).await.is_none(),
+                "one payment at a time"
+            );
+            assert!(
+                had(locks.renewal()).await.is_none(),
+                "a renewal waits for the payment in flight"
+            );
+        }
+        // Nothing is left held by the waits given up above.
+        assert!(had(locks.renewal()).await.is_some());
     }
 
     #[test]

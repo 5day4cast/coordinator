@@ -298,7 +298,7 @@ mod tests {
         let refund = minted(Sha256::digest(preimage).into());
         store.insert_refund(&refund).await.unwrap();
 
-        // A boarding holds the wallet's send lock for a whole batch.
+        // A boarding or a renewal holds one of the wallet's locks for a whole batch.
         let sending = std::sync::Arc::new(tokio::sync::Mutex::new(()));
         let _boarding = sending.clone().lock_owned().await;
 

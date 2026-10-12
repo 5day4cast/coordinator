@@ -435,3 +435,83 @@ async fn many_separate_deposits_remain_available_for_boarding() {
         550
     );
 }
+
+/// A server with one boarding deposit confirmed in block 1, whose chain tip at the `n`th look
+/// is block `next(n)`, 1 or 2. It counts the looks.
+async fn moving_tip(
+    next: impl Fn(usize) -> usize + Send + Sync + 'static,
+) -> (MockElectrs, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let funding = transaction(OutPoint::null());
+    let txid = funding.compute_txid();
+    let first = header();
+    let second = Header {
+        prev_blockhash: first.block_hash(),
+        time: first.time + 600,
+        ..first
+    };
+    let tips = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&tips);
+    let server = MockElectrs::start(Network::Regtest, move |request| {
+        match request["method"].as_str().unwrap() {
+            "blockchain.headers.subscribe" => {
+                let height = next(seen.fetch_add(1, Ordering::SeqCst));
+                let header = if height == 1 { first } else { second };
+                Ok(json!({"height": height, "hex": serialize_hex(&header)}))
+            }
+            "blockchain.block.header" => match request["params"][0].as_u64().unwrap() {
+                1 => Ok(json!(serialize_hex(&first))),
+                2 => Ok(json!(serialize_hex(&second))),
+                _ => unsupported(),
+            },
+            "blockchain.scripthash.listunspent" => Ok(json!([{
+                "height": 1,
+                "tx_hash": txid,
+                "tx_pos": 0,
+                "value": 5_000,
+            }])),
+            "blockchain.transaction.get" => Ok(json!(serialize_hex(&funding))),
+            _ => unsupported(),
+        }
+    })
+    .await;
+    (server, tips)
+}
+
+/// A block every thirty seconds lands during a lookup about once an hour. The lookup runs
+/// again rather than fail, which once answered the wallet's reader with a 502.
+#[tokio::test]
+async fn a_lookup_the_chain_tip_moved_under_runs_again_on_the_new_tip() {
+    use std::sync::atomic::Ordering;
+    // Block 2 arrives between the lookup's first and second look at the tip.
+    let (server, tips) = moving_tip(|call| if call == 0 { 1 } else { 2 }).await;
+    let outputs = server
+        .chain()
+        .await
+        .find_outpoints(&address())
+        .await
+        .unwrap();
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].confirmations, 2, "counted on the new tip");
+    assert_eq!(
+        tips.load(Ordering::SeqCst),
+        4,
+        "two lookups, two looks at the tip each"
+    );
+}
+
+#[tokio::test]
+async fn a_tip_that_keeps_moving_fails_the_lookup_after_its_attempts() {
+    use std::sync::atomic::Ordering;
+    let (server, tips) = moving_tip(|call| 1 + call % 2).await;
+    let error = server
+        .chain()
+        .await
+        .find_outpoints(&address())
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("chain tip changed during lookup"));
+    assert_eq!(tips.load(Ordering::SeqCst), 2 * TIP_ATTEMPTS);
+}
