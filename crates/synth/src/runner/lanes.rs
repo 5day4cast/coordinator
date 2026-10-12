@@ -5,11 +5,15 @@
 //! lane with an hourly cadence and an hour-long entry window always has a competition open. A lane
 //! aligned to the UTC halves times its runs so entries close at 00:00 and 12:00 UTC, the only
 //! starts the oracle takes for a 12-hour window.
+//!
+//! A restart does not start a lane over: a lane whose resumed run still takes entries starts its
+//! next run when it would have without the restart (see [`carry_on`]).
 
 use rand::seq::IndexedRandom;
 use serde::Deserialize;
 use time::{Duration, OffsetDateTime, Time};
 
+use super::resume::Resumed;
 use crate::scenarios::{queued::QUEUED_ONE_POOL, Backfill, Fill, ScenarioConfig};
 
 /// When a lane's runs close their entries.
@@ -278,6 +282,93 @@ impl LaneConfig {
         }
         (scenario, config)
     }
+
+    /// What the lane's next start is found from after a run it started at `at`, closing entries
+    /// at `close` if it is aligned.
+    pub fn after_run(&self, at: OffsetDateTime, close: Option<OffsetDateTime>) -> OffsetDateTime {
+        match close {
+            // The next half after this one.
+            Some(close) => close + Duration::seconds(1) - (close - at),
+            None => at + Duration::seconds(self.interval_secs as i64),
+        }
+    }
+
+    /// Whether the lane plans its runs of `scenario` as `plan` was planned: for a run saved
+    /// before runs carried the lane that started them.
+    fn could_have_planned(
+        &self,
+        base: &ScenarioConfig,
+        scenario: &str,
+        plan: &ScenarioConfig,
+    ) -> bool {
+        self.scenarios.iter().any(|ours| ours == scenario)
+            && plan.entry_window_secs == self.entry_window_secs.unwrap_or(base.entry_window_secs)
+            && self.windows(base).contains(&plan.observation_window_secs)
+            && plan.observation_start.is_some() == (self.align == Align::UtcHalf)
+            && plan.listed == (self.unlisted == Some(false))
+            && plan.backfill == self.backfill()
+            && self
+                .max_entries
+                .is_none_or(|max| plan.queue_max_entries == Some(max))
+            && self.places.is_none_or(|places| plan.places == Some(places))
+    }
+}
+
+/// Where a lane's schedule goes on after a restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CarryOn {
+    /// What its next start is found from, as if synth had not restarted.
+    pub after: OffsetDateTime,
+    /// Its next run's cycle.
+    pub cycle: usize,
+    /// When the resumed run it goes on from stops taking entries.
+    pub entries_close: OffsetDateTime,
+}
+
+/// Where each of `lanes` goes on after a restart at `now` that resumed `resumed`. A lane with a
+/// resumed run still taking entries starts no run now: its next one starts when it would have
+/// without the restart, after the latest of them. A lane without one starts as it always has.
+/// A run planned before runs carried their lane counts for the one lane that plans runs like
+/// it.
+pub fn carry_on(
+    lanes: &[LaneConfig],
+    base: &ScenarioConfig,
+    resumed: &[Resumed],
+    now: OffsetDateTime,
+) -> Vec<Option<CarryOn>> {
+    lanes
+        .iter()
+        .map(|lane| {
+            resumed
+                .iter()
+                .filter(|run| run.created && run.entries_close() > now)
+                .filter_map(|run| {
+                    let (at, cycle) = match &run.plan.lane {
+                        Some(mark) if mark.lane == lane.name => {
+                            (mark.at, mark.cycle.wrapping_add(1))
+                        }
+                        Some(_) => return None,
+                        None => {
+                            let mut planners = lanes.iter().filter(|other| {
+                                other.could_have_planned(base, &run.scenario, &run.plan)
+                            });
+                            match (planners.next(), planners.next()) {
+                                (Some(only), None) if std::ptr::eq(only, lane) => {
+                                    (run.started_at, 0)
+                                }
+                                _ => return None,
+                            }
+                        }
+                    };
+                    Some(CarryOn {
+                        after: lane.after_run(at, run.plan.observation_start),
+                        cycle,
+                        entries_close: run.entries_close(),
+                    })
+                })
+                .max_by_key(|carry| carry.after)
+        })
+        .collect()
 }
 
 /// Between the first runs of two lanes after synth starts. Lanes started together sent the
@@ -510,5 +601,165 @@ mod tests {
         let (scenario, config) = open.run_config(&base, 0, None);
         let shape = QueueShape::of(&scenario, &config).unwrap().unwrap();
         assert_eq!((shape.max_entries, shape.places), (Some(12), 2));
+    }
+
+    /// The default competition's lane: a run every 12 hours, each taking entries for 12.
+    fn open_lane() -> LaneConfig {
+        let mut open = lane(Align::Interval, &[DAY]);
+        open.name = "open".into();
+        open.scenarios = vec![QUEUED_ONE_POOL.into()];
+        open.interval_secs = HALF_DAY;
+        open.entry_window_secs = Some(HALF_DAY);
+        open.max_entries = Some(20);
+        open.places = Some(2);
+        open
+    }
+
+    /// A run of `lane`'s planned for `cycle`, started at `started`, as a restart resumes it;
+    /// without a cycle, as runs were saved before they carried their lane.
+    fn resumed(
+        lane: &LaneConfig,
+        base: &ScenarioConfig,
+        started: OffsetDateTime,
+        cycle: Option<usize>,
+    ) -> Resumed {
+        let (scenario, mut plan) = lane.run_config(base, cycle.unwrap_or(0), None);
+        plan.lane = cycle.map(|cycle| crate::scenarios::LaneCycle {
+            lane: lane.name.clone(),
+            cycle,
+            at: started - Duration::seconds(3),
+        });
+        Resumed {
+            scenario,
+            started_at: started,
+            plan,
+            created: true,
+        }
+    }
+
+    /// After a restart, a lane whose resumed run still takes entries starts its next run when it
+    /// was due, the cycle after that run's.
+    #[test]
+    fn a_restart_carries_a_lane_on_from_its_resumed_run_taking_entries() {
+        let base = ScenarioConfig::default();
+        let open = open_lane();
+        open.validate(&base).unwrap();
+        let lanes = [open.clone()];
+        let restart = datetime!(2026-10-12 16:46:07 UTC);
+        let morning = resumed(&open, &base, datetime!(2026-10-12 11:00:33 UTC), Some(5));
+        let carry = carry_on(&lanes, &base, &[morning.clone()], restart);
+        assert_eq!(
+            carry,
+            [Some(CarryOn {
+                after: datetime!(2026-10-12 23:00:30 UTC),
+                cycle: 6,
+                entries_close: datetime!(2026-10-12 23:00:33 UTC),
+            })]
+        );
+        let (next, close) = open.next_start(&base, carry[0].as_ref().unwrap().after);
+        assert_eq!((next, close), (datetime!(2026-10-12 23:00:30 UTC), None));
+
+        // Of several taking entries, the latest sets the schedule.
+        let evening = resumed(&open, &base, datetime!(2026-10-12 20:20:32 UTC), Some(9));
+        let later = datetime!(2026-10-12 20:46 UTC);
+        let carry = carry_on(&lanes, &base, &[evening, morning.clone()], later);
+        assert_eq!(
+            carry[0].as_ref().map(|carry| (carry.after, carry.cycle)),
+            Some((datetime!(2026-10-13 08:20:29 UTC), 10))
+        );
+
+        // Once its entries have closed, or if it never made its competition, the lane starts as
+        // it always has.
+        let after_close = datetime!(2026-10-12 23:00:33 UTC);
+        assert_eq!(
+            carry_on(&lanes, &base, &[morning.clone()], after_close),
+            [None]
+        );
+        let mut unmade = morning.clone();
+        unmade.created = false;
+        assert_eq!(carry_on(&lanes, &base, &[unmade], restart), [None]);
+
+        // Another lane's run does not hold it back.
+        let mut other = open.clone();
+        other.name = "other".into();
+        let theirs = resumed(&other, &base, datetime!(2026-10-12 11:00:33 UTC), Some(5));
+        assert_eq!(
+            carry_on(&[open.clone(), other.clone()], &base, &[theirs], restart)
+                .into_iter()
+                .map(|carry| carry.is_some())
+                .collect::<Vec<_>>(),
+            [false, true]
+        );
+    }
+
+    /// A run saved before runs carried their lane counts for the one lane that plans runs like
+    /// it; an operator's run of the same scenario does not.
+    #[test]
+    fn a_run_saved_without_its_lane_counts_for_the_lane_that_plans_it() {
+        let base = ScenarioConfig::default();
+        let open = open_lane();
+        let restart = datetime!(2026-10-12 20:20:29 UTC);
+        let earlier = resumed(&open, &base, datetime!(2026-10-12 19:53:06 UTC), None);
+        let carry = carry_on(&[open.clone()], &base, &[earlier.clone()], restart);
+        assert_eq!(
+            carry[0].as_ref().map(|carry| (carry.after, carry.cycle)),
+            Some((datetime!(2026-10-13 07:53:06 UTC), 0))
+        );
+
+        let mut manual = base.clone();
+        manual.planned_scenario = Some(QUEUED_ONE_POOL.into());
+        let operator = Resumed {
+            scenario: QUEUED_ONE_POOL.into(),
+            started_at: datetime!(2026-10-12 20:00 UTC),
+            plan: manual,
+            created: true,
+        };
+        assert_eq!(
+            carry_on(&[open.clone()], &base, &[operator], restart),
+            [None]
+        );
+
+        // Two lanes that plan alike cannot tell whose it is: both start as they always have.
+        let mut twin = open.clone();
+        twin.name = "twin".into();
+        assert_eq!(
+            carry_on(&[open, twin], &base, &[earlier], restart),
+            [None, None]
+        );
+    }
+
+    /// An aligned lane's resumed run carries it on to the half after that run's.
+    #[test]
+    fn a_restart_carries_an_aligned_lane_on_to_the_next_half() {
+        let base = ScenarioConfig::default();
+        let aligned = lane(Align::UtcHalf, &[HALF_DAY]);
+        let close = datetime!(2026-10-13 00:00 UTC);
+        let (scenario, mut plan) = aligned.run_config(&base, 2, Some(close));
+        plan.lane = Some(crate::scenarios::LaneCycle {
+            lane: aligned.name.clone(),
+            cycle: 2,
+            at: datetime!(2026-10-12 23:00 UTC),
+        });
+        let run = Resumed {
+            scenario,
+            started_at: datetime!(2026-10-12 23:00:04 UTC),
+            plan,
+            created: true,
+        };
+        let carry = carry_on(
+            std::slice::from_ref(&aligned),
+            &base,
+            &[run],
+            datetime!(2026-10-12 23:30 UTC),
+        );
+        let carry = carry[0].clone().unwrap();
+        assert_eq!((carry.cycle, carry.entries_close), (3, close));
+        assert_eq!(
+            aligned.next_start(&base, carry.after),
+            (
+                datetime!(2026-10-13 11:00 UTC),
+                Some(datetime!(2026-10-13 12:00 UTC))
+            )
+        );
     }
 }

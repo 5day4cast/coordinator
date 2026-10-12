@@ -439,16 +439,22 @@ impl Runner {
 
     /// Carry on every run the last shutdown left running from its last finished step, and mark
     /// those that cannot carry on as interrupted, saying why. Call once, before any new run
-    /// starts. Returns how many runs were taken up again; each goes on in its own task.
-    pub async fn resume_unfinished(&self) -> Result<usize> {
-        let mut resumed = 0;
+    /// starts. Returns the runs taken up again, for the lanes to carry on from; each goes on in
+    /// its own task.
+    pub async fn resume_unfinished(&self) -> Result<Vec<resume::Resumed>> {
+        let mut resumed = Vec::new();
         for run in self.db.unfinished_runs().await? {
             let steps = self.db.get_steps(&run.id).await?;
             match resume::resume_point(&run, &steps) {
                 Ok(point) => {
+                    resumed.push(resume::Resumed {
+                        scenario: run.scenario.clone(),
+                        started_at: started_at(&run),
+                        plan: point.config.clone(),
+                        created: point.created,
+                    });
                     let runner = self.clone();
                     tokio::spawn(async move { runner.resume(run, point, steps).await });
-                    resumed += 1;
                 }
                 Err(why) => {
                     warn!("Run {} ({}) cannot be resumed: {why}", run.id, run.scenario);
@@ -478,11 +484,7 @@ impl Runner {
             }
             return;
         }
-        let started_at = OffsetDateTime::parse(
-            &run.started_at,
-            &time::format_description::well_known::Rfc3339,
-        )
-        .unwrap_or_else(|_| OffsetDateTime::now_utc());
+        let started_at = started_at(&run);
         info!(
             "Resuming run {} ({}) from its last finished step",
             run.id, run.scenario
@@ -766,12 +768,15 @@ impl Runner {
 
     /// Run every lane side by side, each starting its runs on its own cadence without waiting
     /// for its earlier ones, and with `keep_open`, its lane's next run early whenever no
-    /// competition is open for visitors. Returns only if a lane is invalid.
+    /// competition is open for visitors. A lane with a run among `resumed` still taking entries
+    /// carries on its schedule from it rather than starting another. Returns only if a lane is
+    /// invalid.
     pub async fn run_lanes(
         &self,
         lanes: &[lanes::LaneConfig],
         base: ScenarioConfig,
         keep_open: Option<&KeepOpenConfig>,
+        resumed: &[resume::Resumed],
     ) -> Result<()> {
         for lane in lanes {
             lane.validate(&base)?;
@@ -779,6 +784,7 @@ impl Runner {
         if let Some(keep_open) = keep_open {
             keep_open.validate(lanes)?;
         }
+        let carry = lanes::carry_on(lanes, &base, resumed, OffsetDateTime::now_utc());
         let early = keep_open.map(|keep_open| {
             let start = Arc::new(keep_open::LaneStart::default());
             tokio::spawn(
@@ -803,8 +809,9 @@ impl Runner {
         let lanes: Vec<_> = lanes
             .iter()
             .cloned()
+            .zip(carry)
             .enumerate()
-            .map(|(index, lane)| {
+            .map(|(index, (lane, carry))| {
                 let (runner, base) = (self.clone(), base.clone());
                 let start = early
                     .as_ref()
@@ -812,7 +819,7 @@ impl Runner {
                     .map(|(_, start, grace)| (start.clone(), *grace));
                 // Lanes started together asked the oracle for more than it takes at once.
                 let offset = lanes::start_offset(index);
-                tokio::spawn(async move { runner.run_lane(lane, base, start, offset).await })
+                tokio::spawn(async move { runner.run_lane(lane, base, start, offset, carry).await })
             })
             .collect();
         futures::future::join_all(lanes).await;
@@ -825,9 +832,10 @@ impl Runner {
         base: ScenarioConfig,
         early: Option<(Arc<keep_open::LaneStart>, std::time::Duration)>,
         offset: std::time::Duration,
+        carry: Option<lanes::CarryOn>,
     ) {
         let start = early.as_ref().map(|(start, _)| start.clone());
-        lane_loop(&lane, &base, early, offset, |scenario, config| {
+        lane_loop(&lane, &base, early, offset, carry, |scenario, config| {
             let runner = self.clone();
             let (picking, defaults, start) = (lane.clone(), base.clone(), start.clone());
             tokio::spawn(async move {
@@ -963,19 +971,34 @@ impl Runner {
 }
 
 /// Start `lane`'s runs through `start` on its cadence, for ever, none sooner than `offset` from
-/// now. When `early` is notified, the lane's next run starts at once instead of when it was due:
-/// its scenario and window rotation carry on from it, and its next run follows a whole cadence
-/// after it.
+/// now. The first starts at once, or after a restart, where `carry` says the lane's schedule
+/// goes on. When `early` is notified, the lane's next run starts at once instead of when it was
+/// due: its scenario and window rotation carry on from it, and its next run follows a whole
+/// cadence after it.
 async fn lane_loop(
     lane: &lanes::LaneConfig,
     base: &ScenarioConfig,
     early: Option<(Arc<keep_open::LaneStart>, std::time::Duration)>,
     offset: std::time::Duration,
+    carry: Option<lanes::CarryOn>,
     mut start: impl FnMut(String, ScenarioConfig),
 ) {
-    let mut after = OffsetDateTime::now_utc();
-    let not_before = after + offset;
-    let mut cycle = 0usize;
+    let now = OffsetDateTime::now_utc();
+    let not_before = now + offset;
+    let (mut after, mut cycle) = match carry {
+        Some(carry) => {
+            info!(
+                "Lane {} carries on from its resumed run taking entries until {}: its next run \
+                 (cycle {}) starts at {}, when it was due",
+                lane.name,
+                carry.entries_close,
+                carry.cycle,
+                lane.next_start(base, carry.after).0.max(not_before)
+            );
+            (carry.after, carry.cycle)
+        }
+        None => (now, 0),
+    };
     loop {
         let (mut at, mut close) = lane.next_start(base, after);
         // An aligned lane keeps its close; only its start waits.
@@ -998,16 +1021,26 @@ async fn lane_loop(
         if let Some((early, _)) = &early {
             early.record();
         }
-        let (scenario, config) = lane.run_config(base, cycle, close);
+        let (scenario, mut config) = lane.run_config(base, cycle, close);
+        config.lane = Some(scenarios::LaneCycle {
+            lane: lane.name.clone(),
+            cycle,
+            at,
+        });
         info!("Lane {} starts {scenario} (cycle {cycle})", lane.name);
         start(scenario, config);
-        after = match close {
-            // The next half after this one.
-            Some(close) => close + time::Duration::seconds(1) - (close - at),
-            None => at + time::Duration::seconds(lane.interval_secs as i64),
-        };
+        after = lane.after_run(at, close);
         cycle = cycle.wrapping_add(1);
     }
+}
+
+/// When `run` started; now if that cannot be read.
+fn started_at(run: &TestRun) -> OffsetDateTime {
+    OffsetDateTime::parse(
+        &run.started_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap_or_else(|_| OffsetDateTime::now_utc())
 }
 
 /// Sleep until `at`, at once if it has passed.
@@ -1268,6 +1301,7 @@ mod tests {
                     &base,
                     Some((early, std::time::Duration::from_secs(300))),
                     std::time::Duration::ZERO,
+                    None,
                     |scenario, config| {
                         started
                             .send((
@@ -1373,7 +1407,7 @@ mod tests {
         db.create_step(&unplanned, "prepare_user_behavior")
             .await
             .unwrap();
-        assert_eq!(runner.resume_unfinished().await.unwrap(), 0);
+        assert!(runner.resume_unfinished().await.unwrap().is_empty());
         let stress = db.get_run(&stress).await.unwrap().unwrap();
         assert_eq!(stress.status, "interrupted");
         assert!(stress
@@ -1505,13 +1539,197 @@ mod tests {
         let (started, mut starts) = mpsc::unbounded_channel();
         let begun = tokio::time::Instant::now();
         let running = tokio::spawn(async move {
-            lane_loop(&lane, &base, None, lanes::start_offset(2), |_, _| {
+            lane_loop(&lane, &base, None, lanes::start_offset(2), None, |_, _| {
                 started.send(begun.elapsed().as_secs()).unwrap()
             })
             .await
         });
         let first = starts.recv().await.unwrap();
         assert!((89..=90).contains(&first), "first run at {first} s");
+        running.abort();
+    }
+
+    /// The default competition's lane: a run every 12 hours, each taking entries for 12.
+    fn open_lane() -> lanes::LaneConfig {
+        lanes::LaneConfig {
+            name: "open".into(),
+            interval_secs: 43_200,
+            align: lanes::Align::Interval,
+            scenarios: vec![scenarios::queued::QUEUED_ONE_POOL.into()],
+            observation_windows_secs: Some(vec![86_400]),
+            entry_window_secs: Some(43_200),
+            stations: None,
+            stations_per_run: None,
+            fill: scenarios::Fill::Immediate,
+            early_players: 1,
+            backfill_before_close_secs: 1800,
+            backfill_margin: 1,
+            unlisted: None,
+            stress: None,
+            picker: None,
+            picks_per_entry: None,
+            max_entries: Some(20),
+            places: Some(2),
+        }
+    }
+
+    /// A restart resumes the lane's run whose competition still takes entries and hands it to
+    /// the lanes; one cut short before it made its competition does not hold its lane back.
+    #[tokio::test]
+    async fn a_restart_hands_the_lanes_the_runs_it_resumed() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = SynthDb::new(directory.path().join("synth.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let lane = open_lane();
+        let base = ScenarioConfig::default();
+        lane.validate(&base).unwrap();
+        let at = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
+        let plan = |cycle: usize| {
+            let (scenario, mut plan) = lane.run_config(&base, cycle, None);
+            plan.lane = Some(scenarios::LaneCycle {
+                lane: lane.name.clone(),
+                cycle,
+                at,
+            });
+            serde_json::to_string(&plan.resolve_plan(&scenario).unwrap()).unwrap()
+        };
+        let taking_entries = db
+            .create_run("queued_one_pool", Some(&plan(5)))
+            .await
+            .unwrap();
+        let created = serde_json::json!({ "competition_id": Uuid::now_v7() }).to_string();
+        db.add_step(
+            &taking_entries,
+            "create_competition",
+            5,
+            None,
+            Some(&created),
+        )
+        .await
+        .unwrap();
+        let unmade = db
+            .create_run("queued_one_pool", Some(&plan(6)))
+            .await
+            .unwrap();
+        db.create_step(&unmade, "create_competition").await.unwrap();
+        let runner = Runner::new(
+            CoordinatorClient::new("http://127.0.0.1:1", None),
+            db.clone(),
+            Events::new(),
+        );
+
+        let resumed = runner.resume_unfinished().await.unwrap();
+        let mut taken_up: Vec<_> = resumed
+            .iter()
+            .map(|run| (run.plan.lane.as_ref().map(|mark| mark.cycle), run.created))
+            .collect();
+        taken_up.sort();
+        assert_eq!(taken_up, [(Some(5), true), (Some(6), false)]);
+        let now = OffsetDateTime::now_utc();
+        let carry = lanes::carry_on(std::slice::from_ref(&lane), &base, &resumed, now)
+            .pop()
+            .unwrap()
+            .expect("its run still takes entries");
+        assert_eq!(
+            (carry.after, carry.cycle),
+            (at + time::Duration::hours(12), 6),
+            "the next run is due 12 hours after the resumed one started"
+        );
+        assert!(carry.entries_close > now + time::Duration::hours(11));
+    }
+
+    /// After a restart, a lane whose resumed run still takes entries starts no run until its
+    /// next was due, and that one goes on with the lane's cycles.
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_starts_no_run_while_the_lanes_resumed_run_takes_entries() {
+        let lane = open_lane();
+        let base = ScenarioConfig::default();
+        lane.validate(&base).unwrap();
+        let now = OffsetDateTime::now_utc();
+        // Its run started four hours before the restart, so it takes entries for eight more.
+        let run_started = now - time::Duration::hours(4);
+        let (scenario, mut plan) = lane.run_config(&base, 5, None);
+        plan.lane = Some(scenarios::LaneCycle {
+            lane: lane.name.clone(),
+            cycle: 5,
+            at: run_started,
+        });
+        let resumed = [resume::Resumed {
+            scenario,
+            started_at: run_started,
+            plan,
+            created: true,
+        }];
+        let carry = lanes::carry_on(std::slice::from_ref(&lane), &base, &resumed, now).pop();
+        let (started, mut starts) = mpsc::unbounded_channel();
+        let begun = tokio::time::Instant::now();
+        let running = tokio::spawn(async move {
+            lane_loop(
+                &lane,
+                &base,
+                None,
+                std::time::Duration::ZERO,
+                carry.flatten(),
+                |scenario, config| {
+                    started
+                        .send((begun.elapsed().as_secs(), scenario, config.lane))
+                        .unwrap()
+                },
+            )
+            .await
+        });
+        let (at, scenario, mark) = starts.recv().await.unwrap();
+        assert!(
+            (28_790..=28_800).contains(&at),
+            "no run at the restart; the next at {at} s, 12 hours after the resumed one"
+        );
+        assert_eq!(scenario, "queued_one_pool");
+        let mark = mark.expect("a lane's run carries its lane");
+        assert_eq!((mark.lane.as_str(), mark.cycle), ("open", 6));
+        running.abort();
+    }
+
+    /// While a lane carries on from a resumed run, keep-open still starts its next run early
+    /// when it asks.
+    #[tokio::test(start_paused = true)]
+    async fn keep_open_still_starts_a_lane_early_that_carries_on_after_a_restart() {
+        let mut lane = open_lane();
+        lane.interval_secs = 3600;
+        lane.entry_window_secs = Some(7200);
+        lane.fill = scenarios::Fill::Backfill;
+        let base = ScenarioConfig::default();
+        lane.validate(&base).unwrap();
+        let carry = lanes::CarryOn {
+            after: OffsetDateTime::now_utc() + time::Duration::minutes(30),
+            cycle: 3,
+            entries_close: OffsetDateTime::now_utc() + time::Duration::minutes(90),
+        };
+        let early = Arc::new(keep_open::LaneStart::default());
+        let (started, mut starts) = mpsc::unbounded_channel();
+        let begun = tokio::time::Instant::now();
+        let running = tokio::spawn({
+            let early = early.clone();
+            async move {
+                lane_loop(
+                    &lane,
+                    &base,
+                    Some((early, std::time::Duration::from_secs(300))),
+                    std::time::Duration::ZERO,
+                    Some(carry),
+                    |_, config| {
+                        started
+                            .send((begun.elapsed().as_secs(), config.lane.unwrap().cycle))
+                            .unwrap()
+                    },
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+        assert!(starts.try_recv().is_err(), "nothing due yet");
+        early.notify.notify_one();
+        assert_eq!(starts.recv().await.unwrap(), (600, 3), "at once when asked");
         running.abort();
     }
 
