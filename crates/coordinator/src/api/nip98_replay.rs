@@ -81,8 +81,8 @@ impl Nip98ReplayGuard {
         let id = id.to_hex();
         database
             .execute_write(move |pool| async move {
-                let mut tx = pool.begin().await?;
-                // The first write acquires SQLite's writer lock before counting/admitting.
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+                // The transaction holds SQLite's writer lock before counting/admitting.
                 sqlx::query("DELETE FROM nip98_consumed_events WHERE expires_at < ?")
                     .bind(now)
                     .execute(&mut *tx)

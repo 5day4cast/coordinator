@@ -269,7 +269,7 @@ impl CompetitionStore {
     ) -> Result<Option<RegistrationStored>, DatabaseWriteError> {
         self.db_connection
             .execute_write(move |pool| async move {
-                let mut tx = pool.begin().await?;
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
                 if !before_deadline(deadline) {
                     tx.rollback().await?;
                     return Ok(None);

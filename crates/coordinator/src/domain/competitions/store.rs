@@ -249,7 +249,7 @@ impl CompetitionStore {
         let refused = self
             .db_connection
             .execute_write(move |pool| async move {
-                let mut tx = pool.begin().await?;
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
                 if !before_deadline(deadline) {
                     tx.rollback().await?;
                     return Ok(Some(EntryAdmission::Closed));
@@ -516,7 +516,7 @@ impl CompetitionStore {
 
         self.db_connection
             .execute_write(move |pool| async move {
-                let mut tx = pool.begin().await?;
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
                 sqlx::query(
                     "INSERT INTO payouts (
@@ -586,7 +586,7 @@ impl CompetitionStore {
         let newly_succeeded = self
             .db_connection
             .execute_write(move |pool| async move {
-                let mut tx = pool.begin().await?;
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
                 let was_open: Option<bool> = sqlx::query_scalar(
                     "SELECT succeed_at IS NULL AND failed_at IS NULL FROM payouts WHERE id = ?",
                 )
@@ -1048,7 +1048,7 @@ impl CompetitionStore {
 
         self.db_connection
             .execute_write(move |pool| async move {
-                let mut tx = pool.begin().await?;
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
                 sqlx::query(
                     "INSERT INTO competitions (
@@ -1837,7 +1837,7 @@ impl CompetitionStore {
 
         self.db_connection
             .execute_write(move |pool| async move {
-                let mut tx = pool.begin().await?;
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
                 if !before_deadline(deadline) {
                     tx.rollback().await?;
                     return Ok(TicketReservation::Closed);
@@ -2545,7 +2545,7 @@ impl CompetitionStore {
             .map_err(|e| DatabaseWriteError::Sqlx(sqlx::Error::Encode(Box::new(e))))?;
         self.db_connection
             .execute_write(move |pool| async move {
-                let mut tx = pool.begin().await?;
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
                 sqlx::query(
                     "UPDATE tickets SET network_fee_sats = ?, network_fee_hash = hash
                      WHERE id = ? AND hash = ? AND network_fee_hash IS NOT hash
@@ -2652,7 +2652,7 @@ impl CompetitionStore {
 
         self.db_connection
             .execute_write(move |pool| async move {
-                let mut tx = pool.begin().await?;
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
                 let result = sqlx::query(
                     "UPDATE tickets
                     SET encrypted_preimage = ?,
@@ -2734,7 +2734,7 @@ impl CompetitionStore {
 
         self.db_connection
             .execute_write(move |pool| async move {
-                let mut tx = pool.begin().await?;
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
                 let result = sqlx::query(
                     "UPDATE tickets
                     SET
@@ -2892,7 +2892,7 @@ impl CompetitionStore {
         let id_str = competition_id.to_string();
         self.db_connection
             .execute_write(move |pool| async move {
-                let mut transaction = pool.begin().await?;
+                let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
                 // Delete payouts for entries in this competition
                 sqlx::query(
                     "DELETE FROM payouts WHERE entry_id IN (SELECT id FROM entries WHERE event_id = ?)"

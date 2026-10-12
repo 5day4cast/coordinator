@@ -294,7 +294,7 @@ impl FeedbackStore {
         let at = stored_time(at);
         self.db
             .execute_write(move |pool| async move {
-                let mut tx = pool.begin().await?;
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
                 for id in ids {
                     sqlx::query("UPDATE feedback SET notified_at = ? WHERE id = ?")
                         .bind(&at)

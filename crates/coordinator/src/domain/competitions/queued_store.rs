@@ -181,7 +181,7 @@ impl CompetitionStore {
         let max_entries = i64::from(settings.max_entries);
         self.db_connection
             .execute_write(move |pool| async move {
-                let mut tx = pool.begin().await?;
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
                 sqlx::query(
                     "INSERT INTO competitions (id, created_at, event_submission, event_announcement, kind)
                      VALUES (?, ?, ?, ?, 'queued')",
@@ -296,7 +296,7 @@ impl CompetitionStore {
             .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
         self.db_connection
             .execute_write(move |pool| async move {
-                let mut tx = pool.begin().await?;
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
                 if !before_deadline(Some(deadline)) {
                     tx.rollback().await?;
                     return Ok(QueuedReservation::Closed);
@@ -581,7 +581,7 @@ impl CompetitionStore {
         let lease = lease.clone();
         self.db_connection
             .execute_write(move |db| async move {
-                let mut tx = db.begin().await?;
+                let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
                 let eligible: bool = sqlx::query_scalar(
                     "SELECT EXISTS (SELECT 1 FROM competitions
                         WHERE id = ? AND kind = 'queued' AND pools_formed_at IS NULL
