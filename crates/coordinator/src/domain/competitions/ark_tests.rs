@@ -2895,7 +2895,10 @@ impl Fixture {
         );
         self.database
             .execute_write(move |pool| async move {
-                sqlx::query(&query).bind(ticket_id).execute(&pool).await?;
+                sqlx::query(sqlx::AssertSqlSafe(query))
+                    .bind(ticket_id)
+                    .execute(&pool)
+                    .await?;
                 Ok(())
             })
             .await

@@ -1,6 +1,6 @@
 use dlctix::{bitcoin::XOnlyPublicKey, hashlock, musig2::PubNonce, SigMap};
 use log::debug;
-use sqlx::{Execute, Sqlite};
+use sqlx::Sqlite;
 use std::collections::HashMap;
 use std::sync::Arc;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -762,9 +762,8 @@ impl CompetitionStore {
 
         query_builder.push(" ORDER BY initiated_at DESC");
 
-        let query = query_builder.build();
-
-        let entry_payouts = sqlx::query_as::<_, EntryPayout>(query.sql())
+        let entry_payouts = query_builder
+            .build_query_as::<EntryPayout>()
             .fetch_all(self.db_connection.read())
             .await?;
 
@@ -834,7 +833,7 @@ impl CompetitionStore {
             }
         }
 
-        let user_entries = sqlx::query_as::<_, UserEntry>(&base_query)
+        let user_entries = sqlx::query_as::<_, UserEntry>(sqlx::AssertSqlSafe(base_query))
             .bind(event_id.to_string())
             .fetch_all(self.db_connection.read())
             .await?;
@@ -937,7 +936,7 @@ impl CompetitionStore {
             params.extend(ids.iter().map(Uuid::to_string));
         }
         final_query.push_str(" ORDER BY entries.id DESC");
-        let mut query_builder = sqlx::query_as::<_, UserEntry>(&final_query);
+        let mut query_builder = sqlx::query_as::<_, UserEntry>(sqlx::AssertSqlSafe(final_query));
 
         for param in params {
             query_builder = query_builder.bind(param);
@@ -1374,11 +1373,11 @@ impl CompetitionStore {
                 let mut written = 0;
 
                 for (columns, competition_id) in prepared_updates {
-                    let mut update = sqlx::query(if fence.is_some() {
+                    let mut update = sqlx::query(sqlx::AssertSqlSafe(if fence.is_some() {
                         fenced_query.as_str()
                     } else {
                         query
-                    });
+                    }));
                     for column in columns {
                         update = update.bind(column);
                     }
@@ -1563,7 +1562,7 @@ impl CompetitionStore {
         };
 
         // Both `lean` placeholders come before the ids' in the text.
-        let mut query = sqlx::query_as::<_, Competition>(&final_query)
+        let mut query = sqlx::query_as::<_, Competition>(sqlx::AssertSqlSafe(final_query))
             .bind(lean)
             .bind(lean);
         if let Some(ids) = ids {

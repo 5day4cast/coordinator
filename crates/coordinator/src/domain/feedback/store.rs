@@ -191,10 +191,10 @@ impl FeedbackStore {
         status: Option<FeedbackStatus>,
         limit: i64,
     ) -> Result<Vec<FeedbackRow>, Error> {
-        let rows = sqlx::query_as::<_, FeedbackRow>(&format!(
+        let rows = sqlx::query_as::<_, FeedbackRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {COLUMNS} FROM feedback WHERE ?1 IS NULL OR status = ?1 \
              ORDER BY created_at DESC, id DESC LIMIT ?2"
-        ))
+        )))
         .bind(status.map(FeedbackStatus::as_str))
         .bind(limit)
         .fetch_all(self.db.read())
@@ -203,9 +203,9 @@ impl FeedbackStore {
     }
 
     pub async fn get(&self, id: Uuid) -> Result<Option<FeedbackRow>, Error> {
-        let row = sqlx::query_as::<_, FeedbackRow>(&format!(
+        let row = sqlx::query_as::<_, FeedbackRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {COLUMNS} FROM feedback WHERE id = ?"
-        ))
+        )))
         .bind(id.to_string())
         .fetch_optional(self.db.read())
         .await?;
@@ -275,10 +275,10 @@ impl FeedbackStore {
         since: OffsetDateTime,
         limit: i64,
     ) -> Result<Vec<FeedbackRow>, Error> {
-        let rows = sqlx::query_as::<_, FeedbackRow>(&format!(
+        let rows = sqlx::query_as::<_, FeedbackRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {COLUMNS} FROM feedback WHERE notified_at IS NULL AND created_at >= ? \
              ORDER BY created_at ASC, id ASC LIMIT ?"
-        ))
+        )))
         .bind(stored_time(since))
         .bind(limit)
         .fetch_all(self.db.read())

@@ -245,7 +245,8 @@ async fn queued_reservation_registration_and_entry_cannot_cross_the_deadline() {
         "ticket_keymeld_registrations",
     ] {
         let count: i64 = bounded(
-            sqlx::query_scalar(&format!("SELECT count(*) FROM {table}")).fetch_one(db.read()),
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
+                .fetch_one(db.read()),
         )
         .await
         .unwrap();
@@ -799,7 +800,8 @@ async fn an_entry_that_reaches_the_writer_after_its_hour_is_refused() {
     ));
     for table in ["entries", "entry_payout_policies"] {
         let count: i64 = bounded(
-            sqlx::query_scalar(&format!("SELECT count(*) FROM {table}")).fetch_one(db.read()),
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
+                .fetch_one(db.read()),
         )
         .await
         .unwrap();

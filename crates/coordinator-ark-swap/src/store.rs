@@ -974,9 +974,9 @@ mod tests {
         table: &str,
         id: Uuid,
     ) -> (Option<String>, Option<Vec<u8>>) {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT preimage, preimage_ciphertext FROM {table} WHERE id = ?"
-        ))
+        )))
         .bind(id.to_string())
         .fetch_one(&store.pool)
         .await

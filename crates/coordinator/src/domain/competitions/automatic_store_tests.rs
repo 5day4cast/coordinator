@@ -104,7 +104,7 @@ impl Fixture {
             "payout_jobs" | "payouts" | "payout_payment_hashes"
         ));
         bounded(
-            sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
                 .fetch_one(self.database.read()),
         )
         .await

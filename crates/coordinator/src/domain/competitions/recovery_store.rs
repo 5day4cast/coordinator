@@ -262,7 +262,7 @@ impl CompetitionStore {
         &self,
         competition_id: Uuid,
     ) -> Result<Vec<RecoveryTicketRow>, sqlx::Error> {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT t.id AS ticket_id, t.hash AS ticket_hash, t.encrypted_preimage AS ticket_preimage,
                     t.preimage_ciphertext AS ticket_preimage_ciphertext,
                     unixepoch(t.reserved_at) AS reserved_at, t.reserved_by,
@@ -291,7 +291,7 @@ impl CompetitionStore {
              LEFT JOIN ticket_ark_refunds r ON r.ticket_id = t.id
              WHERE t.event_id = ? AND (e.id IS NOT NULL OR p.ticket_id IS NOT NULL)
              ORDER BY t.id"
-        ))
+        )))
         .bind(competition_id.to_string())
         .fetch_all(self.db_connection.read())
         .await?
@@ -304,13 +304,13 @@ impl CompetitionStore {
         &self,
         competition_id: Uuid,
     ) -> Result<Option<RecoveryCompetitionRow>, sqlx::Error> {
-        let Some(row) = sqlx::query(&format!(
+        let Some(row) = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT c.id, c.event_submission, c.event_announcement, c.contract_parameters,
                     c.signed_contract, c.funding_outpoint, c.funding_transaction, c.attestation,
                     c.expiry_broadcasted_at IS NOT NULL AS expiry_broadcasted,
                     COALESCE({COMPETITION_ACTIVE}, TRUE) AS active
              FROM competitions c WHERE c.id = ?"
-        ))
+        )))
         .bind(competition_id.to_string())
         .fetch_optional(self.db_connection.read())
         .await?
@@ -406,7 +406,7 @@ impl CompetitionStore {
             Some(_) => format!("SELECT {COLUMNS} FROM recovery_outbox WHERE competition_id = ?"),
             None => format!("SELECT {COLUMNS} FROM recovery_outbox WHERE kind = 'wallet'"),
         };
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
         if let Some(id) = competition_id {
             query = query.bind(id.to_string());
         }
@@ -472,13 +472,13 @@ impl CompetitionStore {
         now: i64,
         limit: u32,
     ) -> Result<Vec<RecoveryDueEvent>, sqlx::Error> {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT d_tag, kind, content_sha256, attempts, accepted_relays, deleted_at,
                     CASE WHEN deleted_at IS NULL THEN event_json ELSE deletion_json END AS event_json
              FROM recovery_outbox
              WHERE next_attempt_at <= ? AND {PENDING}
              ORDER BY attempts > 0, next_attempt_at LIMIT ?"
-        ))
+        )))
         .bind(now)
         .bind(limit)
         .fetch_all(self.db_connection.read())
@@ -550,9 +550,9 @@ impl CompetitionStore {
 
     /// Events not yet taken by every relay: records' versions and deletions.
     pub async fn recovery_outbox_depth(&self) -> Result<i64, sqlx::Error> {
-        sqlx::query_scalar(&format!(
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM recovery_outbox WHERE {PENDING}"
-        ))
+        )))
         .fetch_one(self.db_connection.read())
         .await
     }
@@ -563,10 +563,10 @@ impl CompetitionStore {
     pub async fn reset_recovery_backoff(&self, now: i64) -> Result<u64, DatabaseWriteError> {
         self.db_connection
             .execute_write(move |pool| async move {
-                Ok(sqlx::query(&format!(
+                Ok(sqlx::query(sqlx::AssertSqlSafe(format!(
                     "UPDATE recovery_outbox SET next_attempt_at = ?
                      WHERE next_attempt_at > ? AND attempts > 0 AND {PENDING}"
-                ))
+                )))
                 .bind(now)
                 .bind(now)
                 .execute(&pool)
@@ -674,18 +674,18 @@ impl CompetitionStore {
         self.db_connection
             .execute_write(move |pool| async move {
                 let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-                sqlx::query(&format!(
+                sqlx::query(sqlx::AssertSqlSafe(format!(
                     "UPDATE recovery_outbox SET settled_at = ?
                      WHERE kind = 'wallet' AND settled_at IS NULL AND deleted_at IS NULL
                        AND NOT EXISTS ({UNSETTLED_ENTRY})"
-                ))
+                )))
                 .bind(now)
                 .execute(&mut *tx)
                 .await?;
-                sqlx::query(&format!(
+                sqlx::query(sqlx::AssertSqlSafe(format!(
                     "UPDATE recovery_outbox SET settled_at = NULL
                      WHERE kind = 'wallet' AND settled_at IS NOT NULL AND EXISTS ({UNSETTLED_ENTRY})"
-                ))
+                )))
                 .execute(&mut *tx)
                 .await?;
                 tx.commit().await?;

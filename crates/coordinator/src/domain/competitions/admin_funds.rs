@@ -126,16 +126,16 @@ impl CompetitionStore {
         offset: u32,
     ) -> Result<FundsPage, sqlx::Error> {
         let condition = " WHERE t.event_id=?1 AND (?2 IS NULL OR t.id=?2) AND (t.reserved_at IS NOT NULL OR t.paid_at IS NOT NULL OR t.payment_request IS NOT NULL OR a.ticket_id IS NOT NULL OR e.id IS NOT NULL)";
-        let total: i64 = sqlx::query_scalar(&format!(
+        let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM ({TICKET_SELECT}{condition})"
-        ))
+        )))
         .bind(competition.to_string())
         .bind(ticket.map(|id| id.to_string()))
         .fetch_one(self.db_connection.read())
         .await?;
-        let records: Vec<FundsTicketRow> = sqlx::query_as(&format!(
+        let records: Vec<FundsTicketRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "{TICKET_SELECT}{condition} ORDER BY t.id LIMIT 25 OFFSET ?3"
-        ))
+        )))
         .bind(competition.to_string())
         .bind(ticket.map(|id| id.to_string()))
         .bind(offset)
@@ -154,7 +154,7 @@ impl CompetitionStore {
     }
     pub async fn funds_ticket(&self, ticket: Uuid) -> Result<Option<TicketFlow>, sqlx::Error> {
         let record: Option<FundsTicketRow> =
-            sqlx::query_as(&format!("{TICKET_SELECT} WHERE t.id=?"))
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("{TICKET_SELECT} WHERE t.id=?")))
                 .bind(ticket.to_string())
                 .fetch_optional(self.db_connection.read())
                 .await?;
