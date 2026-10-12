@@ -376,9 +376,11 @@ impl SynthDb {
             .await?;
         }
         if version < SCHEMA_VERSION {
-            sqlx::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
-                .execute(&self.pool)
-                .await?;
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "PRAGMA user_version = {SCHEMA_VERSION}"
+            )))
+            .execute(&self.pool)
+            .await?;
         }
 
         Ok(())
@@ -402,9 +404,9 @@ impl SynthDb {
                 .fetch_one(&self.pool)
                 .await?;
         if !exists {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "ALTER TABLE {table} ADD COLUMN {column} {definition}"
-            ))
+            )))
             .execute(&self.pool)
             .await?;
         }
@@ -554,9 +556,9 @@ impl SynthDb {
     }
 
     pub async fn list_runs(&self, limit: i64) -> Result<Vec<TestRun>> {
-        let runs = sqlx::query_as::<_, TestRun>(&format!(
+        let runs = sqlx::query_as::<_, TestRun>(sqlx::AssertSqlSafe(format!(
             "{RUN_COLUMNS} ORDER BY started_at DESC LIMIT ?"
-        ))
+        )))
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -566,10 +568,10 @@ impl SynthDb {
 
     /// The most recently completed run, independent of newer runs still in progress.
     pub async fn last_completed_run(&self) -> Result<Option<TestRun>> {
-        sqlx::query_as::<_, TestRun>(&format!(
+        sqlx::query_as::<_, TestRun>(sqlx::AssertSqlSafe(format!(
             "{RUN_COLUMNS} WHERE completed_at IS NOT NULL \
              ORDER BY completed_at DESC, started_at DESC, test_runs.id DESC LIMIT 1"
-        ))
+        )))
         .fetch_optional(&self.pool)
         .await
         .context("read the last completed run")
@@ -590,35 +592,38 @@ impl SynthDb {
                  WHERE scenario IN {PAYOUT_SCENARIOS} AND status = '{status}'{made_competition}"
             )
         };
-        let last_failed: Option<i64> =
-            sqlx::query_scalar(&finished("failed", " AND competition_id IS NOT NULL"))
+        let last_failed: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(finished(
+            "failed",
+            " AND competition_id IS NOT NULL",
+        )))
+        .fetch_one(&self.pool)
+        .await?;
+        let last_passed: Option<i64> =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(finished("passed", "")))
                 .fetch_one(&self.pool)
                 .await?;
-        let last_passed: Option<i64> = sqlx::query_scalar(&finished("passed", ""))
-            .fetch_one(&self.pool)
-            .await?;
-        let last_paid_out: Option<i64> = sqlx::query_scalar(&format!(
+        let last_paid_out: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT MAX(CAST(strftime('%s', money_trails.verified_at) AS INTEGER)) \
              FROM test_runs JOIN money_trails ON money_trails.run_id = test_runs.id \
              WHERE test_runs.scenario IN {PAYOUT_SCENARIOS} AND test_runs.status = 'passed' \
              AND money_trails.money = 'paid_out'"
-        ))
+        )))
         .fetch_one(&self.pool)
         .await?;
-        let newest_money: Option<String> = sqlx::query_scalar(&format!(
+        let newest_money: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT money_trails.money \
              FROM test_runs JOIN money_trails ON money_trails.run_id = test_runs.id \
              WHERE test_runs.scenario IN {PAYOUT_SCENARIOS} \
              AND money_trails.money IN ('paid_out', 'stuck', 'written_off') \
              ORDER BY test_runs.started_at DESC, test_runs.id DESC LIMIT 1"
-        ))
+        )))
         .fetch_optional(&self.pool)
         .await?;
-        let observed: Option<i64> = sqlx::query_scalar(&format!(
+        let observed: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT MAX(CAST(strftime('%s', money_trails.updated_at) AS INTEGER)) \
              FROM money_trails JOIN test_runs ON test_runs.id = money_trails.run_id \
              WHERE test_runs.scenario IN {PAYOUT_SCENARIOS}"
-        ))
+        )))
         .fetch_one(&self.pool)
         .await?;
         Ok(LifecycleEvidence {
@@ -632,10 +637,10 @@ impl SynthDb {
 
     /// Pending money must stay visible even after newer runs fill the dashboard's page.
     pub async fn runs_to_follow(&self) -> Result<Vec<TestRun>> {
-        sqlx::query_as::<_, TestRun>(&format!(
+        sqlx::query_as::<_, TestRun>(sqlx::AssertSqlSafe(format!(
             "{RUN_COLUMNS} WHERE test_runs.competition_id IS NOT NULL \
              AND (money_trails.run_id IS NULL OR money_trails.follow = 1) ORDER BY started_at"
-        ))
+        )))
         .fetch_all(&self.pool)
         .await
         .context("list runs whose money is still being followed")
@@ -700,19 +705,21 @@ impl SynthDb {
     }
 
     pub async fn get_run(&self, id: &str) -> Result<Option<TestRun>> {
-        let run = sqlx::query_as::<_, TestRun>(&format!("{RUN_COLUMNS} WHERE test_runs.id = ?"))
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let run = sqlx::query_as::<_, TestRun>(sqlx::AssertSqlSafe(format!(
+            "{RUN_COLUMNS} WHERE test_runs.id = ?"
+        )))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
 
         Ok(run)
     }
 
     /// The runs the last shutdown left running, oldest first.
     pub async fn unfinished_runs(&self) -> Result<Vec<TestRun>> {
-        sqlx::query_as::<_, TestRun>(&format!(
+        sqlx::query_as::<_, TestRun>(sqlx::AssertSqlSafe(format!(
             "{RUN_COLUMNS} WHERE test_runs.status = 'running' ORDER BY started_at"
-        ))
+        )))
         .fetch_all(&self.pool)
         .await
         .context("list the runs the last shutdown left running")

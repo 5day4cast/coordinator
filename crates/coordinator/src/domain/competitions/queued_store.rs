@@ -114,9 +114,9 @@ async fn queued_places_taken(
     event_id: &str,
     now: OffsetDateTime,
 ) -> Result<i64, sqlx::Error> {
-    let live: i64 = sqlx::query_scalar(&format!(
+    let live: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM tickets WHERE event_id = ? AND {LIVE_TICKET}"
-    ))
+    )))
     .bind(event_id)
     .fetch_one(&mut *connection)
     .await?;
@@ -301,7 +301,7 @@ impl CompetitionStore {
                     tx.rollback().await?;
                     return Ok(QueuedReservation::Closed);
                 }
-                let existing = sqlx::query(&format!(
+                let existing = sqlx::query(sqlx::AssertSqlSafe(format!(
                     "SELECT tickets.event_id, tickets.reserved_by, tickets.hash,
                             tickets.paid_at IS NOT NULL AS paid,
                             (tickets.payment_request IS NOT NULL
@@ -310,7 +310,7 @@ impl CompetitionStore {
                             {LIVE_TICKET} AS live,
                             EXISTS (SELECT 1 FROM entries WHERE entries.ticket_id = tickets.id) AS used
                      FROM tickets WHERE tickets.id = ?"
-                ))
+                )))
                 .bind(&ticket)
                 .fetch_optional(&mut *tx)
                 .await?;
@@ -407,11 +407,11 @@ impl CompetitionStore {
                             tx.rollback().await?;
                             return Ok(QueuedReservation::Full);
                         }
-                        let unpaid: i64 = sqlx::query_scalar(&format!(
+                        let unpaid: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                             "SELECT COUNT(*) FROM tickets
                              WHERE event_id = ? AND reserved_by = ? AND paid_at IS NULL
                                AND {LIVE_TICKET}"
-                        ))
+                        )))
                         .bind(&competition)
                         .bind(&player)
                         .fetch_one(&mut *tx)
@@ -444,11 +444,11 @@ impl CompetitionStore {
                 .bind(&ticket)
                 .execute(&mut *tx)
                 .await?;
-                let reserved = sqlx::query_as::<_, Ticket>(&format!(
+                let reserved = sqlx::query_as::<_, Ticket>(sqlx::AssertSqlSafe(format!(
                     "SELECT {TICKET_COLUMNS} FROM tickets
                      LEFT JOIN entries ON tickets.id = entries.ticket_id
                      WHERE tickets.id = ?"
-                ))
+                )))
                 .bind(&ticket)
                 .fetch_one(&mut *tx)
                 .await?;
@@ -475,7 +475,7 @@ impl CompetitionStore {
         player: &str,
         competition_id: Option<Uuid>,
     ) -> Result<Vec<Ticket>, sqlx::Error> {
-        sqlx::query_as::<_, Ticket>(&format!(
+        sqlx::query_as::<_, Ticket>(sqlx::AssertSqlSafe(format!(
             "SELECT {TICKET_COLUMNS} FROM tickets
              LEFT JOIN entries ON tickets.id = entries.ticket_id
              WHERE tickets.reserved_by = ?1 AND tickets.paid_at IS NULL AND entries.id IS NULL
@@ -487,7 +487,7 @@ impl CompetitionStore {
                         AND tickets.invoice_cancelled_at IS NULL
                         AND tickets.invoice_expires_at > datetime('now', '+2 minutes')))
              ORDER BY tickets.id"
-        ))
+        )))
         .bind(player)
         .bind(competition_id.map(|id| id.to_string()))
         .fetch_all(self.db_connection.read())

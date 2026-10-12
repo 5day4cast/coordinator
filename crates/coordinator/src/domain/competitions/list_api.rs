@@ -15,7 +15,7 @@ pub struct ListPage {
 }
 
 impl ListPage {
-    fn conditions<'a>(&self, query: &mut QueryBuilder<'a, Sqlite>, id: &str, updated: &str) {
+    fn conditions(&self, query: &mut QueryBuilder<Sqlite>, id: &str, updated: &str) {
         if !self.ids.is_empty() {
             query.push(format!(" AND {id} IN ("));
             let mut values = query.separated(",");

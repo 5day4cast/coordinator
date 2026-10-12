@@ -160,13 +160,13 @@ impl CompetitionStore {
         competition_id: Option<Uuid>,
     ) -> Result<Vec<OwedWinner>, sqlx::Error> {
         let competition = competition_id.map(|id| id.to_string());
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {OWED_WINNER_COLUMNS}
              FROM owed_winners o LEFT JOIN entries e ON e.id = o.entry_id
              WHERE (? OR (o.settled_at IS NULL AND o.claimed_on_chain_at IS NULL))
                AND (? IS NULL OR o.competition_id = ?)
              ORDER BY o.owed_since, o.entry_id"
-        ))
+        )))
         .bind(include_resolved)
         .bind(competition.clone())
         .bind(competition)
@@ -177,11 +177,11 @@ impl CompetitionStore {
 
     /// The owed winner of `entry_id`, resolved or not.
     pub async fn owed_winner(&self, entry_id: Uuid) -> Result<Option<OwedWinner>, sqlx::Error> {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {OWED_WINNER_COLUMNS}
              FROM owed_winners o LEFT JOIN entries e ON e.id = o.entry_id
              WHERE o.entry_id = ?"
-        ))
+        )))
         .bind(entry_id.to_string())
         .fetch_optional(self.db_connection.read())
         .await?
