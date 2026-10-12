@@ -165,9 +165,10 @@ async fn main() -> anyhow::Result<()> {
         tick: TICK,
         lookup_every: LOOKUP_EVERY,
         board_every: BOARD_EVERY,
-        // ark-client gives a boarding or a renewal two sessions, the rest of one and the batch
-        // after, and stops waiting itself. This bounds one that hangs past that.
-        board_timeout: 2 * session + Duration::from_secs(60),
+        // ark-client gives up on a batch only when no event comes for two sessions and half a
+        // minute (see `wallet::ArkWallet::open`); these bound the whole boarding or renewal.
+        board_timeout: worker::board_timeout(session),
+        renew_timeout: worker::renew_timeout(session),
     };
     let worker_task = {
         let stopped = stopped.clone();
