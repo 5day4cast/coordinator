@@ -35,16 +35,41 @@ async fn make_checkpoint(
     state: &ProtocolState,
     format: CheckpointFormat,
 ) -> DurableCheckpoint {
+    make_writer(db, key, session, version, state, format.into()).await
+}
+
+/// As [`make_checkpoint`], writing in `layout`.
+async fn make_writer(
+    db: DBConnection,
+    key: SessionSecret,
+    session: SessionId,
+    version: i64,
+    state: &ProtocolState,
+    layout: Layout,
+) -> DurableCheckpoint {
     let written = Loaded {
         version,
         state: state.clone(),
         parts: BTreeSet::new(),
         entries: EntryCache::default(),
     };
-    DurableCheckpoint::resume(db, key, session, written, format)
+    DurableCheckpoint::resume_in(db, key, session, written, layout)
         .await
         .unwrap()
         .0
+}
+
+/// The writer a new operation resumes from what the store holds, writing in `layout`.
+async fn resume_layout(
+    db: &DBConnection,
+    key: &SessionSecret,
+    session: &SessionId,
+    layout: Layout,
+) -> (DurableCheckpoint, ProtocolState) {
+    let loaded = load(db, key, session).await.unwrap().unwrap();
+    DurableCheckpoint::resume_in(db.clone(), key.clone(), session.clone(), loaded, layout)
+        .await
+        .unwrap()
 }
 
 /// A partitioned writer resumed from what the store holds, as a new operation starts one.
@@ -79,6 +104,40 @@ pub(super) async fn assert_stored_journal(
         serde_json::to_value(&stored.journal).unwrap() == serde_json::to_value(journal).unwrap(),
         "the stored journal differs from the one in memory"
     );
+}
+
+/// Every write in a test build also checks that the table holds exactly the parts and nodes
+/// the writer counts as stored, and none after a format-1 write. A writer deletes what its own
+/// previous write stored without reading the table, which this proves it may.
+pub(super) async fn assert_stored_parts(checkpoint: &DurableCheckpoint, snapshot: &Snapshot) {
+    let stored: Vec<Vec<u8>> = sqlx::query_scalar(
+        "SELECT digest FROM keymeld_protocol_parts WHERE session_id = ? ORDER BY digest",
+    )
+    .bind(checkpoint.session.to_string())
+    .fetch_all(checkpoint.db.read())
+    .await
+    .unwrap();
+    let expected: Vec<Vec<u8>> = match snapshot {
+        Snapshot::Legacy(_) => Vec::new(),
+        Snapshot::Parts { committed, .. } => {
+            committed.iter().map(|digest| digest.to_vec()).collect()
+        }
+    };
+    assert!(
+        stored == expected,
+        "the store holds {} parts and nodes; the writer counts {}",
+        stored.len(),
+        expected.len()
+    );
+}
+
+/// The format a row is stored in.
+async fn row_format(db: &DBConnection, session: &SessionId) -> i64 {
+    sqlx::query_scalar("SELECT format FROM keymeld_protocol_state WHERE session_id = ?")
+        .bind(session.to_string())
+        .fetch_one(db.read())
+        .await
+        .unwrap()
 }
 
 /// As [`assert_stored_journal`], for a write of the whole state.
@@ -210,6 +269,13 @@ async fn replace(db: &DBConnection, session: &SessionId, version: i64, ciphertex
     .unwrap();
 }
 
+/// Every format a writer can write.
+const FORMATS: [CheckpointFormat; 3] = [
+    CheckpointFormat::Monolithic,
+    CheckpointFormat::Parts,
+    CheckpointFormat::Tree,
+];
+
 #[tokio::test]
 async fn checkpoint_aead_roundtrips_large_private_state_without_plaintext_in_database() {
     let (_directory, db) = database().await;
@@ -262,7 +328,7 @@ async fn checkpoint_rejects_wrong_key_session_version_schema_and_ciphertext() {
 #[tokio::test]
 async fn independently_loaded_checkpoints_use_compare_and_swap_without_lost_updates() {
     let (_directory, db) = database().await;
-    for format in [CheckpointFormat::Monolithic, CheckpointFormat::Parts] {
+    for format in FORMATS {
         assert_checkpoint_compare_and_swap(&db, format).await;
     }
     db.close().await.unwrap();
@@ -281,7 +347,7 @@ async fn should_not_send(State(count): State<Arc<AtomicUsize>>) -> StatusCode {
 #[tokio::test]
 async fn sdk_sends_no_enclave_command_after_durable_checkpoint_cas_failure() {
     let (_directory, db) = database().await;
-    for format in [CheckpointFormat::Monolithic, CheckpointFormat::Parts] {
+    for format in FORMATS {
         let server = assert_stale_checkpoint_stops_command(&db, format).await;
         server.abort();
     }
@@ -817,6 +883,12 @@ fn cloned_journal_reuses_entry_encodings_and_a_reloaded_one_reserializes_them() 
 
 #[tokio::test]
 async fn failed_part_insert_leaves_version_and_committed_parts_for_the_retry() {
+    for format in [CheckpointFormat::Parts, CheckpointFormat::Tree] {
+        failed_part_insert_leaves_the_writer_for_the_retry(format).await;
+    }
+}
+
+async fn failed_part_insert_leaves_the_writer_for_the_retry(format: CheckpointFormat) {
     let (_directory, db) = database().await;
     let session = SessionId::new_v7();
     let key = SessionSecret::from_bytes([45; 32]);
@@ -829,7 +901,7 @@ async fn failed_part_insert_leaves_version_and_committed_parts_for_the_retry() {
         session.clone(),
         0,
         &original,
-        CheckpointFormat::Parts,
+        format,
     )
     .await;
     writer.save(&original.journal).await.unwrap();
@@ -1119,7 +1191,7 @@ async fn resumed_writer_reuses_the_journal_entry_encodings_it_loaded() {
 async fn checkpoints_encoded_off_the_runtime_store_and_load_the_same_bytes() {
     let (_directory, db) = database().await;
     let key = SessionSecret::from_bytes([52; 32]);
-    for format in [CheckpointFormat::Monolithic, CheckpointFormat::Parts] {
+    for format in FORMATS {
         let session = SessionId::new_v7();
         let mut original = state(&session);
         original.journal = large_journal(4, 16 * 1024);
@@ -1145,15 +1217,42 @@ async fn checkpoints_encoded_off_the_runtime_store_and_load_the_same_bytes() {
             )
             .unwrap();
         let inline = Parts::encode(&key, &session, &original).unwrap();
-        let (expected, digests): (_, Vec<_>) = match format {
-            CheckpointFormat::Monolithic => (json.clone(), vec![]),
+        let (expected, digests): (_, BTreeSet<_>) = match format {
+            CheckpointFormat::Monolithic => (json.clone(), BTreeSet::new()),
             CheckpointFormat::Parts => (
                 serde_json::to_vec(&inline.manifest).unwrap(),
                 inline.bodies.keys().map(|digest| digest.to_vec()).collect(),
             ),
+            CheckpointFormat::Tree => {
+                let packed = protocol_parts::pack(
+                    &key,
+                    &session,
+                    &inline.manifest,
+                    &BTreeSet::new(),
+                    Shape::writer(),
+                )
+                .unwrap();
+                (
+                    serde_json::to_vec(&packed.root).unwrap(),
+                    inline
+                        .bodies
+                        .keys()
+                        .chain(&packed.nodes)
+                        .map(|digest| digest.to_vec())
+                        .collect(),
+                )
+            }
         };
         assert_eq!(sealed, expected);
-        let stored: Vec<_> = part_rows(&db, &session)
+        assert_eq!(
+            row_format(&db, &session).await,
+            match format {
+                CheckpointFormat::Monolithic => 1,
+                CheckpointFormat::Parts => 2,
+                CheckpointFormat::Tree => 3,
+            }
+        );
+        let stored: BTreeSet<_> = part_rows(&db, &session)
             .await
             .into_iter()
             .map(|(digest, _)| digest)
@@ -1170,6 +1269,12 @@ async fn checkpoints_encoded_off_the_runtime_store_and_load_the_same_bytes() {
 /// so the retry commits.
 #[test]
 fn cancelled_save_leaves_the_writer_and_store_unchanged_for_the_retry() {
+    for format in [CheckpointFormat::Parts, CheckpointFormat::Tree] {
+        cancelled_save_leaves_the_writer_for_the_retry(format);
+    }
+}
+
+fn cancelled_save_leaves_the_writer_for_the_retry(format: CheckpointFormat) {
     // One blocking thread, so the test decides when the save's encoding can run.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1189,7 +1294,7 @@ fn cancelled_save_leaves_the_writer_and_store_unchanged_for_the_retry() {
             session.clone(),
             0,
             &original,
-            CheckpointFormat::Parts,
+            format,
         )
         .await;
         let before = row(&db, &session).await;
@@ -1260,7 +1365,7 @@ async fn metadata_reads_match_legacy_and_parts_without_loading_the_journal() {
     original.journal = large_journal(8, 128 * 1024);
     original.epochs.insert(EnclaveId::new(2), 7);
     create(&db, &key, &session, &original).await.unwrap();
-    for format in [CheckpointFormat::Monolithic, CheckpointFormat::Parts] {
+    for format in FORMATS {
         let version = row(&db, &session).await.0;
         let writer = make_checkpoint(
             db.clone(),
@@ -1338,7 +1443,7 @@ async fn metadata_reads_reject_wrong_identity_and_schema() {
     let key = SessionSecret::from_bytes([63; 32]);
     let mut original = state(&session);
     create(&db, &key, &session, &original).await.unwrap();
-    for format in [CheckpointFormat::Monolithic, CheckpointFormat::Parts] {
+    for format in FORMATS {
         for bad_schema in [false, true] {
             original.schema_version = if bad_schema { 2 } else { 1 };
             original.session.session_id = if bad_schema {
@@ -1449,4 +1554,492 @@ async fn checkpoint_read_memory_benchmark() {
         }
     }
     db.close().await.unwrap();
+}
+
+/// The digests the store holds for a session: its parts and, in format 3, its manifest nodes.
+async fn stored_digests(db: &DBConnection, session: &SessionId) -> BTreeSet<Vec<u8>> {
+    part_rows(db, session)
+        .await
+        .into_iter()
+        .map(|(digest, _)| digest)
+        .collect()
+}
+
+/// A successful outcome for the command a journal records under `name`.
+fn outcome(journal: &serde_json::Value, name: &str) -> serde_json::Value {
+    serde_json::to_value(keymeld_core::protocol::Outcome {
+        command_id: serde_json::from_value(
+            journal["commands"][name]["request"]["request"]["command"]["command_id"].clone(),
+        )
+        .unwrap(),
+        created_at: std::time::UNIX_EPOCH,
+        completed_at: std::time::UNIX_EPOCH,
+        response: keymeld_core::protocol::EnclaveOutcome::Musig(
+            keymeld_core::protocol::MusigOutcome::Keygen(
+                keymeld_core::protocol::KeygenOutcome::Success,
+            ),
+        ),
+    })
+    .unwrap()
+}
+
+/// `journal` with a new command under `name`, as the SDK records one before sending it.
+fn with_command(journal: &ConfidentialJournal, name: &str) -> serde_json::Value {
+    let mut value = serde_json::to_value(journal).unwrap();
+    let fresh = serde_json::to_value(large_journal(1, 512)).unwrap();
+    value["commands"][name] = fresh["commands"]["fixture/0/1"].clone();
+    value
+}
+
+#[tokio::test]
+async fn checkpoints_convert_between_all_three_formats_through_reloads() {
+    let (_directory, db) = database().await;
+    let session = SessionId::new_v7();
+    let key = SessionSecret::from_bytes([91; 32]);
+    let mut original = state(&session);
+    original.session.encrypted_session_secret = "converted private field ".repeat(2048);
+    original.journal = large_journal(24, 2 * 1024);
+    create(&db, &key, &session, &original).await.unwrap();
+    let expected = serde_json::to_vec(&original).unwrap();
+    // Each operation resumes from what the store holds, as the service does, so every format
+    // reads every other, and a shape change rewrites the nodes.
+    for (layout, format) in [
+        (Layout::Parts, 2),
+        (Layout::Tree(Shape::writer()), 3),
+        (Layout::Parts, 2),
+        (Layout::Tree(Shape::WRITER), 3),
+        (Layout::Tree(Shape::writer()), 3),
+        (Layout::Monolithic, 1),
+        (Layout::Tree(Shape::WRITER), 3),
+    ] {
+        let (writer, restored) = resume_layout(&db, &key, &session, layout).await;
+        assert_eq!(serde_json::to_vec(&restored).unwrap(), expected);
+        writer.save(&restored.journal).await.unwrap();
+        let restored = writer.finish(restored).await.unwrap();
+        writer.save(&restored.journal).await.unwrap();
+        assert_eq!(row_format(&db, &session).await, format);
+    }
+    let restored = load(&db, &key, &session).await.unwrap().unwrap();
+    assert_eq!(restored.version, 21);
+    assert_eq!(serde_json::to_vec(&restored.state).unwrap(), expected);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_tree_write_stores_the_changed_path_and_deletes_only_what_it_replaced() {
+    let (_directory, db) = database().await;
+    let key = SessionSecret::from_bytes([92; 32]);
+    let mut rows = Vec::new();
+    for layout in [Layout::Parts, Layout::Tree(Shape::WRITER)] {
+        let session = SessionId::new_v7();
+        let mut original = state(&session);
+        original.journal = large_journal(600, 256);
+        create(&db, &key, &session, &original).await.unwrap();
+        let writer = make_writer(
+            db.clone(),
+            key.clone(),
+            session.clone(),
+            0,
+            &original,
+            layout,
+        )
+        .await;
+        writer.finish(original.clone()).await.unwrap();
+        let before = stored_digests(&db, &session).await;
+
+        // A new command lands between others in key order.
+        let mut value = with_command(&original.journal, "fixture/5000/1");
+        let journal: ConfidentialJournal = serde_json::from_value(value.clone()).unwrap();
+        writer.save(&journal).await.unwrap();
+        let added = stored_digests(&db, &session).await;
+        // Its outcome changes that command.
+        value["commands"]["fixture/5000/1"]["outcome"] = outcome(&value, "fixture/5000/1");
+        let journal: ConfidentialJournal = serde_json::from_value(value).unwrap();
+        writer.save(&journal).await.unwrap();
+        let answered = stored_digests(&db, &session).await;
+        let row_bytes = row(&db, &session).await.1.len();
+        rows.push(row_bytes);
+
+        if let Layout::Tree(_) = layout {
+            for (from, to) in [(&before, &added), (&added, &answered)] {
+                let inserted = to.difference(from).count();
+                let deleted = from.difference(to).count();
+                // The command's part, its chunk, and the nodes above the chunk.
+                assert!((2..=6).contains(&inserted), "{inserted} inserted");
+                assert!(deleted <= 5, "{deleted} deleted");
+            }
+            assert!(
+                answered.difference(&added).count() >= 2,
+                "the answered command and its chunk are new"
+            );
+            assert!(
+                added.difference(&answered).count() >= 2,
+                "the unanswered command and its old chunk are gone"
+            );
+            assert!(row_bytes < 8 * 1024, "the root takes {row_bytes} bytes");
+        } else {
+            assert_eq!(added.len(), before.len() + 1);
+            assert_eq!(answered.len(), added.len());
+        }
+    }
+    // Format 2 seals a manifest that names all 600 commands at every write.
+    assert!(rows[0] > 20 * rows[1], "{rows:?}");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn tree_loads_fail_closed_on_a_missing_altered_or_misread_node() {
+    let (_directory, db) = database().await;
+    let session = SessionId::new_v7();
+    let key = SessionSecret::from_bytes([93; 32]);
+    let mut original = state(&session);
+    original.journal = large_journal(600, 256);
+    create(&db, &key, &session, &original).await.unwrap();
+    let writer = make_writer(
+        db.clone(),
+        key.clone(),
+        session.clone(),
+        0,
+        &original,
+        Layout::Tree(Shape::WRITER),
+    )
+    .await;
+    writer.finish(original.clone()).await.unwrap();
+    assert!(load(&db, &key, &session).await.is_ok());
+
+    // The nodes only the journal reaches: 600 commands make at least three chunks, since a chunk
+    // holds at most 256.
+    let manifest = Parts::encode(&key, &session, &original).unwrap().manifest;
+    let fields = [
+        "schema_version",
+        "session",
+        "epochs",
+        "registrations",
+        "roster",
+    ];
+    let pack = |manifest: &Manifest| {
+        protocol_parts::pack(&key, &session, manifest, &BTreeSet::new(), Shape::WRITER)
+            .unwrap()
+            .nodes
+    };
+    let all = pack(&manifest);
+    let metadata = pack(&manifest.select_fields(&fields));
+    let journal_only: Vec<_> = all.difference(&metadata).copied().collect();
+    assert!(journal_only.len() >= 2, "the journal is kept in nodes");
+    let stored = stored_digests(&db, &session).await;
+    assert!(all.iter().all(|node| stored.contains(node.as_slice())));
+
+    let set_body = |digest: [u8; 32], body: Option<Vec<u8>>| {
+        let (db, id) = (db.clone(), session.to_string());
+        async move {
+            db.execute_write(move |pool| async move {
+                match body {
+                    Some(body) => sqlx::query(
+                        "INSERT INTO keymeld_protocol_parts(session_id, digest, body) VALUES (?, ?, ?) \
+                         ON CONFLICT(session_id, digest) DO UPDATE SET body = excluded.body",
+                    )
+                    .bind(id)
+                    .bind(digest.to_vec())
+                    .bind(body)
+                    .execute(&pool)
+                    .await
+                    .map(|_| ()),
+                    None => sqlx::query(
+                        "DELETE FROM keymeld_protocol_parts WHERE session_id = ? AND digest = ?",
+                    )
+                    .bind(id)
+                    .bind(digest.to_vec())
+                    .execute(&pool)
+                    .await
+                    .map(|_| ()),
+                }
+            })
+            .await
+            .unwrap()
+        }
+    };
+    let bodies: BTreeMap<Vec<u8>, Vec<u8>> = part_rows(&db, &session).await.into_iter().collect();
+    let (node, other) = (journal_only[0], journal_only[1]);
+    let original_body = bodies[node.as_slice()].clone();
+
+    // A missing node fails a full load. A metadata read never fetches it.
+    set_body(node, None).await;
+    assert!(load(&db, &key, &session).await.is_err());
+    assert!(load_metadata(&db, &key, &session).await.unwrap().is_some());
+    // An altered node, and another node's body under its address.
+    let mut altered = original_body.clone();
+    let last = altered.len() - 1;
+    altered[last] ^= 1;
+    set_body(node, Some(altered)).await;
+    assert!(load(&db, &key, &session).await.is_err());
+    set_body(node, Some(bodies[other.as_slice()].clone())).await;
+    assert!(load(&db, &key, &session).await.is_err());
+    set_body(node, Some(original_body)).await;
+    assert!(load(&db, &key, &session).await.is_ok());
+
+    // A root read as a format-2 manifest, or a format-2 reader's view of it, is refused.
+    let set_format = |format: i64| {
+        let (db, id) = (db.clone(), session.to_string());
+        async move {
+            db.execute_write(move |pool| async move {
+                sqlx::query("UPDATE keymeld_protocol_state SET format = ? WHERE session_id = ?")
+                    .bind(format)
+                    .bind(id)
+                    .execute(&pool)
+                    .await
+                    .map(|_| ())
+            })
+            .await
+            .unwrap()
+        }
+    };
+    for format in [1, 2, 4] {
+        set_format(format).await;
+        assert!(load(&db, &key, &session).await.is_err(), "format {format}");
+        assert!(load_metadata(&db, &key, &session).await.is_err());
+    }
+    set_format(3).await;
+    let loaded = load(&db, &key, &session).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_vec(&loaded.state).unwrap(),
+        serde_json::to_vec(&original).unwrap()
+    );
+    // A load counts the nodes it authenticated as stored, beside the parts.
+    let mut expected: BTreeSet<[u8; 32]> = all;
+    manifest.digests(&mut expected);
+    assert_eq!(loaded.parts, expected);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_resumed_tree_writer_reuses_every_node_and_part_it_loaded() {
+    let (_directory, db) = database().await;
+    let session = SessionId::new_v7();
+    let key = SessionSecret::from_bytes([95; 32]);
+    let mut original = state(&session);
+    original.session.encrypted_session_secret = "resumed tree field ".repeat(2048);
+    original.journal = large_journal(40, 1024);
+    create(&db, &key, &session, &original).await.unwrap();
+    let layout = Layout::Tree(Shape::writer());
+    make_writer(
+        db.clone(),
+        key.clone(),
+        session.clone(),
+        0,
+        &original,
+        layout,
+    )
+    .await
+    .finish(original)
+    .await
+    .unwrap();
+    let stored = part_rows(&db, &session).await;
+    let (writer, loaded) = resume_layout(&db, &key, &session, layout).await;
+    // Saving the unchanged journal or state seals and inserts no part and no node.
+    run(&db, "CREATE TRIGGER refuse_part_insert BEFORE INSERT ON keymeld_protocol_parts BEGIN SELECT RAISE(ABORT, 'no part may be inserted'); END").await;
+    writer.save(&loaded.journal).await.unwrap();
+    let loaded = writer.finish(loaded).await.unwrap();
+    writer.save(&loaded.journal).await.unwrap();
+    run(&db, "DROP TRIGGER refuse_part_insert").await;
+    assert_eq!(row(&db, &session).await.0, 4);
+    assert_eq!(part_rows(&db, &session).await, stored);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn tree_writers_resumed_from_one_version_cannot_both_commit() {
+    let (_directory, db) = database().await;
+    let session = SessionId::new_v7();
+    let key = SessionSecret::from_bytes([96; 32]);
+    let mut original = state(&session);
+    original.journal = large_journal(30, 1024);
+    create(&db, &key, &session, &original).await.unwrap();
+    let layout = Layout::Tree(Shape::writer());
+    make_writer(
+        db.clone(),
+        key.clone(),
+        session.clone(),
+        0,
+        &original,
+        layout,
+    )
+    .await
+    .finish(original)
+    .await
+    .unwrap();
+    let (first, loaded) = resume_layout(&db, &key, &session, layout).await;
+    let (second, _) = resume_layout(&db, &key, &session, layout).await;
+    first.save(&loaded.journal).await.unwrap();
+    // `first` drops a command, and with it the command's part and the nodes above it, from
+    // what its own previous write stored. `second` still counts them as stored, but its
+    // swap names version 1, so it fails and changes nothing.
+    let mut shorter = serde_json::to_value(&loaded.journal).unwrap();
+    shorter["commands"]
+        .as_object_mut()
+        .unwrap()
+        .remove("fixture/7/1");
+    let removed: ConfidentialJournal = serde_json::from_value(shorter.clone()).unwrap();
+    first.save(&removed).await.unwrap();
+    let after_removal = part_rows(&db, &session).await;
+    assert!(second.save(&loaded.journal).await.is_err());
+    assert!(second.finish(loaded.clone()).await.is_err());
+    assert_eq!(second.current.lock().await.0, 1);
+    assert_eq!(row(&db, &session).await.0, 3);
+    assert_eq!(part_rows(&db, &session).await, after_removal);
+    // A reload resumes from the version that won and stores the command again.
+    let (third, reloaded) = resume_layout(&db, &key, &session, layout).await;
+    assert_eq!(serde_json::to_value(&reloaded.journal).unwrap(), shorter);
+    third.save(&loaded.journal).await.unwrap();
+    let restored = load(&db, &key, &session).await.unwrap().unwrap();
+    assert_eq!(restored.version, 4);
+    assert_eq!(
+        serde_json::to_value(&restored.state.journal).unwrap(),
+        serde_json::to_value(&loaded.journal).unwrap()
+    );
+    db.close().await.unwrap();
+}
+
+/// `PRAGMA wal_checkpoint` on the write connection: (busy, frames in the log, frames copied).
+async fn wal_checkpoint(db: &DBConnection, mode: &'static str) -> (i64, i64, i64) {
+    db.execute_write(move |pool| async move {
+        let statement = format!("PRAGMA wal_checkpoint({mode})");
+        sqlx::query_as::<_, (i64, i64, i64)>(sqlx::AssertSqlSafe(statement))
+            .fetch_one(&pool)
+            .await
+    })
+    .await
+    .unwrap()
+}
+
+/// Empty the write-ahead log, so the next write's pages are all it holds.
+async fn empty_log(db: &DBConnection) {
+    let (busy, _, _) = wal_checkpoint(db, "TRUNCATE").await;
+    assert_eq!(busy, 0, "no reader holds the log between writes");
+}
+
+/// The 4 KiB pages written to the log since [`empty_log`]: what a checkpoint copies into the
+/// database and replication uploads.
+async fn logged_pages(db: &DBConnection) -> i64 {
+    wal_checkpoint(db, "PASSIVE").await.1
+}
+
+/// Log pages per write, and the sealed row's size, for one format and state size.
+struct Measured {
+    parts: i64,
+    first: i64,
+    saves: Vec<i64>,
+    finishes: Vec<i64>,
+    row_bytes: usize,
+}
+
+/// A state with `outcomes` outcome subsets, each its own part as in a contract with that many
+/// outcomes, and 128 journal commands. Two rounds of what a refund does per entry: record a
+/// command, record its outcome, and update the application state.
+async fn measure_writes(layout: Layout, outcomes: usize) -> Measured {
+    let (_directory, db) = database().await;
+    let session = SessionId::new_v7();
+    let key = SessionSecret::from_bytes([94; 32]);
+    let mut original = state(&session);
+    original.session.outcome_subset_ids =
+        (0..outcomes).map(|index| (index, Uuid::now_v7())).collect();
+    original.journal = large_journal(128, 512);
+    create(&db, &key, &session, &original).await.unwrap();
+    let writer = make_writer(
+        db.clone(),
+        key.clone(),
+        session.clone(),
+        0,
+        &original,
+        layout,
+    )
+    .await;
+    empty_log(&db).await;
+    let mut state = writer.finish(original).await.unwrap();
+    let first = logged_pages(&db).await;
+    let (mut saves, mut finishes) = (Vec::new(), Vec::new());
+    for round in 0..2 {
+        let name = format!("refund/{round}/1");
+        let mut value = with_command(&state.journal, &name);
+        state.journal = serde_json::from_value(value.clone()).unwrap();
+        empty_log(&db).await;
+        writer.save(&state.journal).await.unwrap();
+        saves.push(logged_pages(&db).await);
+
+        value["commands"][&name]["outcome"] = outcome(&value, &name);
+        state.journal = serde_json::from_value(value).unwrap();
+        empty_log(&db).await;
+        writer.save(&state.journal).await.unwrap();
+        saves.push(logged_pages(&db).await);
+
+        state
+            .session
+            .encrypted_registration_authorities
+            .insert(UserId::new_v7(), format!("registration authority {round}"));
+        empty_log(&db).await;
+        state = writer.finish(state).await.unwrap();
+        finishes.push(logged_pages(&db).await);
+    }
+    let parts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM keymeld_protocol_parts WHERE session_id = ?")
+            .bind(session.to_string())
+            .fetch_one(db.read())
+            .await
+            .unwrap();
+    let row_bytes = row(&db, &session).await.1.len();
+    db.close().await.unwrap();
+    Measured {
+        parts,
+        first,
+        saves,
+        finishes,
+        row_bytes,
+    }
+}
+
+/// Measures what each write adds to the write-ahead log in formats 2 and 3, at two state sizes.
+/// The table goes to stderr directly, so the test log shows it even when the test passes.
+#[tokio::test]
+async fn checkpoint_writes_grow_with_the_change_not_the_state() {
+    use std::io::Write as _;
+    let mut table = String::from(
+        "| format | stored rows | first write | journal saves (each) | state updates (each) | sealed row bytes |\n| --- | --- | --- | --- | --- | --- |\n",
+    );
+    let mut results = BTreeMap::new();
+    for outcomes in [1024, 4096] {
+        for (name, layout) in [("2", Layout::Parts), ("3", Layout::Tree(Shape::WRITER))] {
+            let measured = measure_writes(layout, outcomes).await;
+            table += &format!(
+                "| {name} | {} | {} | {:?} | {:?} | {} |\n",
+                measured.parts,
+                measured.first,
+                measured.saves,
+                measured.finishes,
+                measured.row_bytes
+            );
+            results.insert((name, outcomes), measured);
+        }
+    }
+    let _ = writeln!(
+        std::io::stderr(),
+        "\ncheckpoint write-ahead log pages per write (4 KiB each):\n{table}"
+    );
+    let max = |values: &[i64]| *values.iter().max().unwrap();
+    let min = |values: &[i64]| *values.iter().min().unwrap();
+    let (small_2, large_2) = (&results[&("2", 1024)], &results[&("2", 4096)]);
+    let (small_3, large_3) = (&results[&("3", 1024)], &results[&("3", 4096)]);
+    // Format 2 rewrites a manifest of every part at every write.
+    assert!(min(&large_2.saves) >= 2 * min(&small_2.saves), "{table}");
+    // Format 3 writes the same few pages at either size.
+    assert!(max(&large_3.saves) <= max(&small_3.saves) + 6, "{table}");
+    assert!(
+        max(&large_3.finishes) <= max(&small_3.finishes) + 6,
+        "{table}"
+    );
+    assert!(max(&large_3.saves) <= 32, "{table}");
+    assert!(max(&large_3.finishes) <= 32, "{table}");
+    assert!(min(&large_2.saves) >= 8 * max(&large_3.saves), "{table}");
+    assert!(
+        min(&large_2.finishes) >= 8 * max(&large_3.finishes),
+        "{table}"
+    );
 }

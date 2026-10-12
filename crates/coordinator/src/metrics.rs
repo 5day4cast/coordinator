@@ -32,6 +32,7 @@ use crate::{
 mod memory;
 pub(crate) use memory::{
     allocator_trimmed, anonymous_footprint_bytes, checkpoint_bytes, checkpoint_encode_buffer_bytes,
+    checkpoint_written_bytes,
 };
 
 /// How long database-derived gauges are reused between scrapes.

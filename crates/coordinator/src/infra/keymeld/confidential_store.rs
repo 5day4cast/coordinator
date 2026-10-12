@@ -1,13 +1,13 @@
 //! Authorized application storage for private protocol retries. The Keymeld
 //! gateway has no access to these records. Persist before any enclave side effect.
 use super::{
-    protocol_parts::{EntryCache, Manifest, PartLengths, Parts},
+    protocol_parts::{self, EntryCache, Manifest, Nodes, PartLengths, Parts, Shape, Tree},
     KeymeldError, StoredDlcKeygenSession,
 };
 use crate::{
     config::CheckpointFormat,
     infra::db::DBConnection,
-    metrics::{checkpoint_bytes, checkpoint_encode_buffer_bytes},
+    metrics::{checkpoint_bytes, checkpoint_encode_buffer_bytes, checkpoint_written_bytes},
 };
 use keymeld_core::{
     authorization::SignedRoster,
@@ -145,8 +145,8 @@ pub(super) async fn load_metadata(
 pub(super) struct Loaded {
     pub version: i64,
     pub state: ProtocolState,
-    /// The parts this version's manifest references; none in format 1. Loading decrypted each
-    /// one and checked it against its content address.
+    /// The parts this version's manifest references, and in format 3 the manifest nodes; none
+    /// in format 1. Loading decrypted each one and checked it against its content address.
     parts: BTreeSet<[u8; 32]>,
     /// The stored encoding of each journal entry, under the identity this load gave the entry.
     entries: EntryCache,
@@ -165,8 +165,13 @@ pub(super) async fn load(
     validate_identity(state.schema_version, &state.session.session_id, session)?;
     let mut parts = BTreeSet::new();
     let entries = match authenticated {
-        Some(Authenticated { manifest, lengths }) => {
+        Some(Authenticated {
+            manifest,
+            lengths,
+            nodes,
+        }) => {
             manifest.digests(&mut parts);
+            parts.extend(nodes);
             EntryCache::loaded(&manifest, &state.journal, &lengths)
         }
         None => EntryCache::default(),
@@ -189,17 +194,57 @@ fn validate_identity(version: u16, stored: &str, session: &SessionId) -> Result<
 }
 
 /// A row's authenticated plaintext, parsed by its format: format 1 holds the value itself,
-/// format 2 a manifest over parts.
+/// format 2 a manifest over parts, and format 3 the root of a manifest kept in nodes.
 enum Opened<T> {
     State(T),
     Manifest(Manifest),
+    Tree(Tree),
 }
 
-/// What a format-2 read authenticated besides the value: the manifest it decoded, and the
-/// plaintext length of each part.
+/// What a format-2 or format-3 read authenticated besides the value: the manifest it decoded,
+/// the plaintext length of each part, and in format 3 the nodes it rebuilt the manifest from.
 struct Authenticated {
     manifest: Manifest,
     lengths: PartLengths,
+    nodes: BTreeSet<[u8; 32]>,
+}
+
+/// The stored bodies of `digests`, read in `snapshot`, at most 200 to a query. A digest without
+/// a row is left out, and decoding then fails closed.
+async fn fetch_bodies(
+    snapshot: &mut sqlx::SqliteConnection,
+    session: &SessionId,
+    digests: &BTreeSet<[u8; 32]>,
+) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, KeymeldError> {
+    let digests: Vec<_> = digests.iter().collect();
+    let mut bodies = BTreeMap::new();
+    for batch in digests.chunks(200) {
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT digest, body FROM keymeld_protocol_parts WHERE session_id = ",
+        );
+        query
+            .push_bind(session.to_string())
+            .push(" AND digest IN (");
+        let mut list = query.separated(",");
+        for digest in batch {
+            list.push_bind(digest.as_slice());
+        }
+        list.push_unseparated(")");
+        for row in query
+            .build()
+            .fetch_all(&mut *snapshot)
+            .await
+            .map_err(|e| failure(e.to_string()))?
+        {
+            bodies.insert(
+                row.try_get::<Vec<u8>, _>("digest")
+                    .map_err(|e| failure(e.to_string()))?,
+                row.try_get::<Vec<u8>, _>("body")
+                    .map_err(|e| failure(e.to_string()))?,
+            );
+        }
+    }
+    Ok(bodies)
 }
 
 async fn load_record<T: DeserializeOwned + Send + 'static>(
@@ -239,67 +284,77 @@ async fn load_record<T: DeserializeOwned + Send + 'static>(
             2 => serde_json::from_slice::<Manifest>(&plaintext)
                 .map(Opened::Manifest)
                 .map_err(|_| failure("Invalid confidential checkpoint manifest")),
+            3 => serde_json::from_slice::<Tree>(&plaintext)
+                .map(Opened::Tree)
+                .map_err(|_| failure("Invalid confidential checkpoint root")),
             _ => Err(failure("Unsupported confidential checkpoint format")),
         }
     });
-    let (state, authenticated) = match opened.await?? {
-        Opened::State(state) => (state, None),
+    // All queries share the row's read transaction, so they see the nodes and parts of the
+    // version the compare-and-swap names.
+    let (manifest, nodes) = match opened.await?? {
+        Opened::State(state) => return Ok(Some((version, state, None))),
         Opened::Manifest(manifest) => {
             let manifest = match fields {
                 Some(fields) => manifest.select_fields(fields),
                 None => manifest,
             };
-            let mut needed = BTreeSet::new();
-            manifest.digests(&mut needed);
-            let digests: Vec<_> = needed.into_iter().collect();
-            let mut bodies = BTreeMap::new();
-            // Bound each SQL result and fetch only the authenticated projection.
-            // All queries share the manifest's read transaction / CAS version.
-            for batch in digests.chunks(200) {
-                let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-                    "SELECT digest, body FROM keymeld_protocol_parts WHERE session_id = ",
-                );
-                query
-                    .push_bind(session.to_string())
-                    .push(" AND digest IN (");
-                let mut list = query.separated(",");
-                for digest in batch {
-                    list.push_bind(digest.as_slice());
-                }
-                list.push_unseparated(")");
-                for row in query
-                    .build()
-                    .fetch_all(&mut *snapshot)
-                    .await
-                    .map_err(|e| failure(e.to_string()))?
-                {
-                    bodies.insert(
-                        row.try_get::<Vec<u8>, _>("digest")
-                            .map_err(|e| failure(e.to_string()))?,
-                        row.try_get::<Vec<u8>, _>("body")
-                            .map_err(|e| failure(e.to_string()))?,
-                    );
-                }
-            }
-            snapshot
-                .commit()
-                .await
-                .map_err(|e| failure(e.to_string()))?;
-            let operation = if fields.is_some() {
-                "metadata_decode"
-            } else {
-                "decode"
+            (manifest, BTreeSet::new())
+        }
+        Opened::Tree(root) => {
+            // Project before fetching, so a metadata read fetches no journal node.
+            let root = match fields {
+                Some(fields) => root.select_fields(fields),
+                None => root,
             };
-            let (owned_key, id) = (key.clone(), session.clone());
-            let decoded = off_runtime(move || {
-                let (state, lengths) =
-                    manifest.decode_as::<T>(&owned_key, &id, &bodies, operation)?;
-                Ok::<_, KeymeldError>((state, Some(Authenticated { manifest, lengths })))
+            let mut nodes = Nodes::default();
+            let mut wanted = root.wanted();
+            let mut rounds = 0;
+            while !wanted.is_empty() {
+                rounds += 1;
+                if rounds > protocol_parts::MAX_DEPTH {
+                    return Err(failure("Confidential checkpoint nests too deeply"));
+                }
+                let bodies = fetch_bodies(&mut snapshot, session, &wanted).await?;
+                let (owned_key, id) = (key.clone(), session.clone());
+                let added = off_runtime(move || {
+                    let next = nodes.authenticate(&owned_key, &id, &wanted, &bodies)?;
+                    Ok::<_, KeymeldError>((nodes, next))
+                });
+                (nodes, wanted) = added.await??;
+            }
+            let unpacked = off_runtime(move || {
+                let manifest = nodes.unpack(&root)?;
+                Ok::<_, KeymeldError>((manifest, nodes.digests().collect::<BTreeSet<_>>()))
             });
-            decoded.await??
+            unpacked.await??
         }
     };
-    Ok(Some((version, state, authenticated)))
+    let mut needed = BTreeSet::new();
+    manifest.digests(&mut needed);
+    // Bound each SQL result and fetch only the authenticated projection.
+    let bodies = fetch_bodies(&mut snapshot, session, &needed).await?;
+    snapshot
+        .commit()
+        .await
+        .map_err(|e| failure(e.to_string()))?;
+    let operation = if fields.is_some() {
+        "metadata_decode"
+    } else {
+        "decode"
+    };
+    let (owned_key, id) = (key.clone(), session.clone());
+    let decoded = off_runtime(move || {
+        let (state, lengths) = manifest.decode_as::<T>(&owned_key, &id, &bodies, operation)?;
+        let authenticated = Authenticated {
+            manifest,
+            lengths,
+            nodes,
+        };
+        Ok::<_, KeymeldError>((state, authenticated))
+    });
+    let (state, authenticated) = decoded.await??;
+    Ok(Some((version, state, Some(authenticated))))
 }
 
 pub(super) async fn create(
@@ -317,6 +372,27 @@ pub(super) async fn create(
     Ok(count == 1)
 }
 
+/// How a writer stores what it writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Layout {
+    /// Format 1: one sealed document.
+    Monolithic,
+    /// Format 2: a sealed manifest over parts.
+    Parts,
+    /// Format 3: a sealed root over manifest nodes and the same parts, split as the shape says.
+    Tree(Shape),
+}
+
+impl From<CheckpointFormat> for Layout {
+    fn from(format: CheckpointFormat) -> Self {
+        match format {
+            CheckpointFormat::Monolithic => Self::Monolithic,
+            CheckpointFormat::Parts => Self::Parts,
+            CheckpointFormat::Tree => Self::Tree(Shape::writer()),
+        }
+    }
+}
+
 enum Snapshot {
     Legacy(Box<ProtocolState>),
     Parts {
@@ -325,10 +401,16 @@ enum Snapshot {
         /// Base ciphertext that no write has committed yet. Each write shares it rather than
         /// copying it, and a failed or cancelled write leaves it here for the retry.
         pending: Arc<BTreeMap<[u8; 32], Vec<u8>>>,
-        /// Parts stored at the current version: those the writer loaded, then those of its
-        /// last successful CAS. Only these are reusable.
+        /// Parts and manifest nodes stored at the current version: those the writer loaded,
+        /// then those of its last successful CAS. Only these are reusable.
         committed: BTreeSet<[u8; 32]>,
+        /// Whether `committed` comes from this writer's own last commit, and so lists exactly
+        /// what is stored. A writer's first write deletes every stored part its version does
+        /// not reference instead, as every write did before.
+        exact: bool,
         entries: EntryCache,
+        /// Write format 3 split this way; format 2 when `None`.
+        tree: Option<Shape>,
     },
 }
 
@@ -344,11 +426,17 @@ impl Snapshot {
     ) -> Result<(SealedWrite, Self), SdkError> {
         match self {
             Self::Legacy(_) => Ok((
-                CheckpointWrite::Monolithic(state).into_sealed(key, session, next)?,
+                CheckpointWrite::Monolithic(state)
+                    .into_sealed(key, session, next)?
+                    .0,
                 Self::Legacy(Box::new(state.clone())),
             )),
             Self::Parts {
-                committed, entries, ..
+                committed,
+                exact,
+                entries,
+                tree,
+                ..
             } => {
                 let mut base = Parts::base(key, session, state, committed)
                     .map_err(|e| SdkError::Internal(e.to_string()))?;
@@ -357,12 +445,13 @@ impl Snapshot {
                 let mut parts =
                     Parts::journal(key, session, &base, &state.journal, committed, entries)
                         .map_err(|e| SdkError::Internal(e.to_string()))?;
-                let mut digests = BTreeSet::new();
-                parts.manifest.digests(&mut digests);
                 let next_entries = std::mem::take(&mut parts.entries);
-                let write = CheckpointWrite::Parts {
+                let (write, stored) = CheckpointWrite::Parts {
                     parts,
                     base: pending,
+                    tree: *tree,
+                    committed,
+                    exact: *exact,
                 }
                 .into_sealed(key, session, next)?;
                 base.serialized_len = 0;
@@ -372,8 +461,10 @@ impl Snapshot {
                     Self::Parts {
                         base,
                         pending: Arc::default(),
-                        committed: digests,
+                        committed: stored,
+                        exact: true,
                         entries: next_entries,
+                        tree: *tree,
                     },
                 ))
             }
@@ -392,23 +483,27 @@ impl Snapshot {
             Self::Legacy(previous) => {
                 let mut state = (**previous).clone();
                 state.journal = journal;
-                let write = CheckpointWrite::Monolithic(&state).into_sealed(key, session, next)?;
+                let (write, _) =
+                    CheckpointWrite::Monolithic(&state).into_sealed(key, session, next)?;
                 Ok((write, Self::Legacy(Box::new(state))))
             }
             Self::Parts {
                 base,
                 pending,
                 committed,
+                exact,
                 entries,
+                tree,
             } => {
                 let mut parts = Parts::journal(key, session, base, &journal, committed, entries)
                     .map_err(|e| SdkError::Internal(e.to_string()))?;
-                let mut digests = BTreeSet::new();
-                parts.manifest.digests(&mut digests);
                 let next_entries = std::mem::take(&mut parts.entries);
-                let write = CheckpointWrite::Parts {
+                let (write, stored) = CheckpointWrite::Parts {
                     parts,
                     base: Arc::clone(pending),
+                    tree: *tree,
+                    committed,
+                    exact: *exact,
                 }
                 .into_sealed(key, session, next)?;
                 // The base itself is unchanged; only the write that stores it counts its bytes.
@@ -425,8 +520,10 @@ impl Snapshot {
                     Self::Parts {
                         base,
                         pending: Arc::default(),
-                        committed: digests,
+                        committed: stored,
+                        exact: true,
                         entries: next_entries,
+                        tree: *tree,
                     },
                 ))
             }
@@ -435,63 +532,111 @@ impl Snapshot {
 }
 
 /// What one compare-and-swap stores: the whole state as one sealed document, or a sealed
-/// manifest and the parts it references that are not stored yet.
+/// manifest (format 2) or root (format 3) and the parts and nodes it references that are not
+/// stored yet.
 enum CheckpointWrite<'a> {
     Monolithic(&'a ProtocolState),
     Parts {
         parts: Parts,
         /// The base's new ciphertext, shared with the writer's snapshot.
         base: Arc<BTreeMap<[u8; 32], Vec<u8>>>,
+        tree: Option<Shape>,
+        /// What is stored at the version this write replaces.
+        committed: &'a BTreeSet<[u8; 32]>,
+        /// Whether `committed` is exact; see [`Snapshot::Parts`].
+        exact: bool,
     },
+}
+
+/// Which stored parts and nodes a write deletes.
+enum Removal {
+    /// Every one: a format-1 row keeps none.
+    All,
+    /// Every one the new version does not reference, read from the table.
+    Unreferenced(BTreeSet<[u8; 32]>),
+    /// These: stored at the replaced version and not referenced by the new one.
+    Only(Vec<[u8; 32]>),
 }
 
 /// A [`CheckpointWrite`] sealed for its version.
 struct SealedWrite {
     encrypted: String,
     format: i64,
-    /// The parts the new manifest references. The write deletes the session's others.
-    keep: BTreeSet<[u8; 32]>,
     base: Arc<BTreeMap<[u8; 32], Vec<u8>>>,
+    /// New parts besides the base's.
     bodies: BTreeMap<[u8; 32], Vec<u8>>,
+    /// New manifest nodes.
+    nodes: BTreeMap<[u8; 32], Vec<u8>>,
+    remove: Removal,
 }
 
 impl CheckpointWrite<'_> {
+    /// The write that stores this as version `next`, and every part and node stored once it
+    /// commits.
     fn into_sealed(
         self,
         key: &SessionSecret,
         session: &SessionId,
         next: i64,
-    ) -> Result<SealedWrite, SdkError> {
-        // A format-1 row keeps no parts, so its write removes every stored part.
-        let mut keep = BTreeSet::new();
+    ) -> Result<(SealedWrite, BTreeSet<[u8; 32]>), SdkError> {
+        let internal = |error: KeymeldError| SdkError::Internal(error.to_string());
         Ok(match self {
-            Self::Monolithic(state) => SealedWrite {
-                encrypted: seal(key, session, next, state)
-                    .map_err(|e| SdkError::Internal(e.to_string()))?,
-                format: 1,
-                keep,
-                base: Arc::default(),
-                bodies: BTreeMap::new(),
-            },
-            Self::Parts { parts, base } => {
+            Self::Monolithic(state) => (
+                SealedWrite {
+                    encrypted: seal(key, session, next, state).map_err(internal)?,
+                    format: 1,
+                    base: Arc::default(),
+                    bodies: BTreeMap::new(),
+                    nodes: BTreeMap::new(),
+                    remove: Removal::All,
+                },
+                BTreeSet::new(),
+            ),
+            Self::Parts {
+                parts,
+                base,
+                tree,
+                committed,
+                exact,
+            } => {
                 checkpoint_bytes("parts", "encode", parts.serialized_len);
                 checkpoint_encode_buffer_bytes(parts.max_buffer_capacity);
-                let plaintext = Zeroizing::new(
-                    serde_json::to_vec(&parts.manifest)
-                        .map_err(|e| SdkError::Internal(e.to_string()))?,
-                );
+                let mut keep = BTreeSet::new();
+                parts.manifest.digests(&mut keep);
+                let (plaintext, format, nodes) = match tree {
+                    None => (serde_json::to_vec(&parts.manifest), 2, BTreeMap::new()),
+                    Some(shape) => {
+                        // Unchanged subtrees pack to nodes `committed` lists, which this write
+                        // neither seals nor inserts again.
+                        let packed =
+                            protocol_parts::pack(key, session, &parts.manifest, committed, shape)
+                                .map_err(internal)?;
+                        keep.extend(packed.nodes);
+                        (serde_json::to_vec(&packed.root), 3, packed.bodies)
+                    }
+                };
+                let plaintext =
+                    Zeroizing::new(plaintext.map_err(|e| SdkError::Internal(e.to_string()))?);
                 let encrypted = key
                     .encrypt(&plaintext, &context(session, next))
                     .and_then(|value| value.to_hex())
                     .map_err(|_| SdkError::Internal("Cannot seal checkpoint manifest".into()))?;
-                parts.manifest.digests(&mut keep);
-                SealedWrite {
-                    encrypted,
-                    format: 2,
+                let remove = if exact {
+                    Removal::Only(committed.difference(&keep).copied().collect())
+                } else {
+                    Removal::Unreferenced(keep.clone())
+                };
+                (
+                    SealedWrite {
+                        encrypted,
+                        format,
+                        base,
+                        bodies: parts.bodies,
+                        nodes,
+                        remove,
+                    },
                     keep,
-                    base,
-                    bodies: parts.bodies,
-                }
+                )
             }
         })
     }
@@ -519,7 +664,8 @@ impl DurableCheckpoint {
     /// stored, so the writer reuses them instead of encrypting and inserting them again. A
     /// part's ciphertext is bound to the session and its content address, never to a version.
     /// A journal entry that keeps the identity the load gave it also keeps its loaded
-    /// encoding, so the writer does not serialize it again.
+    /// encoding, so the writer does not serialize it again. In format 3 the same holds for
+    /// the manifest nodes the load authenticated.
     pub async fn resume(
         db: DBConnection,
         key: SessionSecret,
@@ -527,14 +673,29 @@ impl DurableCheckpoint {
         loaded: Loaded,
         format: CheckpointFormat,
     ) -> Result<(Self, ProtocolState), KeymeldError> {
+        Self::resume_in(db, key, session, loaded, format.into()).await
+    }
+
+    /// As [`Self::resume`], writing in `layout`.
+    pub(super) async fn resume_in(
+        db: DBConnection,
+        key: SessionSecret,
+        session: SessionId,
+        loaded: Loaded,
+        layout: Layout,
+    ) -> Result<(Self, ProtocolState), KeymeldError> {
         let Loaded {
             version,
             state,
             parts,
             entries,
         } = loaded;
-        let (state, snapshot) = match format {
-            CheckpointFormat::Parts => {
+        let (state, snapshot) = match layout {
+            Layout::Parts | Layout::Tree(_) => {
+                let tree = match layout {
+                    Layout::Tree(shape) => Some(shape),
+                    _ => None,
+                };
                 let (owned_key, id) = (key.clone(), session.clone());
                 let encoded = off_runtime(move || {
                     let mut base = Parts::base(&owned_key, &id, &state, &parts)?;
@@ -542,13 +703,15 @@ impl DurableCheckpoint {
                         pending: Arc::new(std::mem::take(&mut base.bodies)),
                         base,
                         committed: parts,
+                        exact: false,
                         entries,
+                        tree,
                     };
                     Ok::<_, KeymeldError>((state, snapshot))
                 });
                 encoded.await??
             }
-            CheckpointFormat::Monolithic => {
+            Layout::Monolithic => {
                 let snapshot = Snapshot::Legacy(Box::new(state.clone()));
                 (state, snapshot)
             }
@@ -568,26 +731,51 @@ impl DurableCheckpoint {
         let SealedWrite {
             encrypted,
             format,
-            keep,
             base,
             bodies,
+            nodes,
+            remove,
         } = write;
+        let written = [
+            ("row", encrypted.len()),
+            (
+                "part",
+                base.values().chain(bodies.values()).map(Vec::len).sum(),
+            ),
+            ("node", nodes.values().map(Vec::len).sum()),
+        ];
         let id = self.session.to_string();
         let count = self.db.execute_write(move |pool| async move {
             let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
             let count = sqlx::query("UPDATE keymeld_protocol_state SET version=?, encrypted_state=?, format=? WHERE session_id=? AND version=?")
                 .bind(next).bind(encrypted).bind(format).bind(&id).bind(previous).execute(&mut *tx).await?.rows_affected();
             if count != 1 { tx.rollback().await?; return Ok(count); }
-            for (digest, body) in base.iter().chain(&bodies) {
+            for (digest, body) in base.iter().chain(&bodies).chain(&nodes) {
                 sqlx::query("INSERT INTO keymeld_protocol_parts(session_id, digest, body) VALUES (?, ?, ?) ON CONFLICT(session_id,digest) DO NOTHING")
                     .bind(&id).bind(digest.to_vec()).bind(body.as_slice()).execute(&mut *tx).await?;
             }
-            let stored: Vec<Vec<u8>> = sqlx::query_scalar("SELECT digest FROM keymeld_protocol_parts WHERE session_id = ?")
-                .bind(&id).fetch_all(&mut *tx).await?;
-            for digest in stored {
-                if !keep.contains(digest.as_slice()) {
-                    sqlx::query("DELETE FROM keymeld_protocol_parts WHERE session_id = ? AND digest = ?")
-                        .bind(&id).bind(digest).execute(&mut *tx).await?;
+            // The swap proved the row was at `previous`, and every write keeps exactly what its
+            // version references, so a writer that made `previous` itself knows what is stored.
+            match remove {
+                Removal::All => {
+                    sqlx::query("DELETE FROM keymeld_protocol_parts WHERE session_id = ?")
+                        .bind(&id).execute(&mut *tx).await?;
+                }
+                Removal::Unreferenced(keep) => {
+                    let stored: Vec<Vec<u8>> = sqlx::query_scalar("SELECT digest FROM keymeld_protocol_parts WHERE session_id = ?")
+                        .bind(&id).fetch_all(&mut *tx).await?;
+                    for digest in stored {
+                        if !keep.contains(digest.as_slice()) {
+                            sqlx::query("DELETE FROM keymeld_protocol_parts WHERE session_id = ? AND digest = ?")
+                                .bind(&id).bind(digest).execute(&mut *tx).await?;
+                        }
+                    }
+                }
+                Removal::Only(digests) => {
+                    for digest in digests {
+                        sqlx::query("DELETE FROM keymeld_protocol_parts WHERE session_id = ? AND digest = ?")
+                            .bind(&id).bind(digest.to_vec()).execute(&mut *tx).await?;
+                    }
                 }
             }
             tx.commit().await?;
@@ -597,6 +785,9 @@ impl DurableCheckpoint {
             return Err(SdkError::Internal(
                 "Concurrent confidential checkpoint changed; reload before retrying".into(),
             ));
+        }
+        for (kind, bytes) in written {
+            checkpoint_written_bytes(kind, bytes);
         }
         Ok(())
     }
@@ -617,6 +808,7 @@ impl DurableCheckpoint {
         *current = (next, following);
         #[cfg(test)]
         {
+            tests::assert_stored_parts(self, &current.1).await;
             if matches!(current.1, Snapshot::Parts { .. }) {
                 tests::assert_stored_state(self, next, &state).await;
             }
@@ -646,6 +838,7 @@ impl ConfidentialCheckpoint for DurableCheckpoint {
             *current = (next, following);
             #[cfg(test)]
             {
+                tests::assert_stored_parts(self, &current.1).await;
                 if matches!(current.1, Snapshot::Parts { .. }) {
                     tests::assert_stored_journal(self, next, journal).await;
                 }

@@ -1018,7 +1018,7 @@ pub struct KeymeldSettings {
 /// docs/protocol-checkpoints.md.
 pub const PROTOCOL_PARTS_ENV: &str = "COORDINATOR_PROTOCOL_PARTS";
 
-/// How the coordinator writes confidential protocol checkpoints. It reads both formats.
+/// How the coordinator writes confidential protocol checkpoints. It reads every format.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CheckpointFormat {
     /// Format 1: one encrypted JSON document.
@@ -1026,6 +1026,9 @@ pub enum CheckpointFormat {
     Monolithic,
     /// Format 2: an encrypted manifest over compressed, encrypted parts.
     Parts,
+    /// Format 3: the parts of format 2, under a manifest kept in compressed, encrypted nodes
+    /// and an encrypted root, so a write stores what changed instead of the whole manifest.
+    Tree,
 }
 
 fn default_automatic_payout_fee_ceiling() -> u64 {
@@ -1291,16 +1294,17 @@ impl KeymeldSettings {
             .unwrap_or(&self.gateway_url)
     }
 
-    /// Apply `COORDINATOR_PROTOCOL_PARTS`: unset, `0` or `false` writes format 1, and `1` or
-    /// `true` writes format 2. Any other value is refused, so a mistyped value stops startup
-    /// instead of silently choosing a format.
+    /// Apply `COORDINATOR_PROTOCOL_PARTS`: unset, `0` or `false` writes format 1, `1` or
+    /// `true` writes format 2, and `tree` writes format 3. Any other value is refused, so a
+    /// mistyped value stops startup instead of silently choosing a format.
     pub fn apply_protocol_parts_env(&mut self, value: Option<String>) -> Result<(), anyhow::Error> {
         self.checkpoint_format = match value.as_deref() {
             None | Some("0" | "false") => CheckpointFormat::Monolithic,
             Some("1" | "true") => CheckpointFormat::Parts,
+            Some("tree") => CheckpointFormat::Tree,
             Some(other) => {
                 return Err(anyhow!(
-                    "{PROTOCOL_PARTS_ENV} must be unset, 0, false, 1 or true, not {other:?}"
+                    "{PROTOCOL_PARTS_ENV} must be unset, 0, false, 1, true or tree, not {other:?}"
                 ))
             }
         };
@@ -1403,8 +1407,9 @@ mod keymeld_config_tests {
         for value in ["1", "true"] {
             assert_eq!(selected(Some(value)).unwrap(), CheckpointFormat::Parts);
         }
+        assert_eq!(selected(Some("tree")).unwrap(), CheckpointFormat::Tree);
         // These once fell back to format 1 without a word.
-        for value in ["", "yes", "TRUE", " 1", "2"] {
+        for value in ["", "yes", "TRUE", " 1", "2", "3", "Tree", "tree "] {
             let refused = selected(Some(value)).unwrap_err();
             assert!(
                 refused.to_string().contains(PROTOCOL_PARTS_ENV),
