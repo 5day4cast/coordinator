@@ -910,6 +910,8 @@ pub async fn build_app(
     leaderboards.spawn_refresher(&tracker, cancel_token.clone());
     admin_weather.spawn_refresher(&tracker, cancel_token.clone());
     admin_monitoring.spawn_refresher(&tracker, cancel_token.clone(), coordinator.clone());
+    // Kickoffs, payouts and refunds leave glibc holding what they freed; hand it back after.
+    crate::infra::allocator::spawn_trimmer(&tracker, cancel_token.clone());
     if let Some(recovery) = recovery.clone() {
         let publisher = RecoveryPublisher::new(
             recovery,
