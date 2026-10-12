@@ -1,6 +1,7 @@
 pub mod admin_monitoring;
 pub mod admin_signals;
 pub mod admin_weather;
+pub mod allocator;
 pub mod ark_swap;
 pub mod bitcoin;
 pub mod db;

@@ -1,6 +1,7 @@
-//! Read-only process and allocator accounting. RSS includes live allocations and retained
-//! pages; glibc's free arena bytes are reusable, not necessarily resident or reclaimable.
-use prometheus::{Gauge, Histogram, HistogramOpts, HistogramVec, Registry};
+//! Read-only process and allocator accounting, plus counts of the trims
+//! [`crate::infra::allocator`] makes. RSS includes live allocations and retained pages; glibc's
+//! free arena bytes are reusable, not necessarily resident or reclaimable.
+use prometheus::{Gauge, Histogram, HistogramOpts, HistogramVec, IntCounter, Registry};
 use std::{sync::LazyLock, time::Duration};
 use tokio::{sync::Mutex, time::Instant};
 
@@ -53,6 +54,20 @@ static SYSTEM: LazyLock<Gauge> = LazyLock::new(|| {
         "glibc arena space plus separately mapped allocations; not RSS",
     ))
 });
+static TRIMS: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "coordinator_allocator_trims_total",
+        "Times the coordinator returned freed heap memory to the system after its memory grew",
+    )
+    .expect("valid metric")
+});
+static TRIMMED: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "coordinator_allocator_trimmed_bytes_total",
+        "Resident anonymous plus swapped bytes those trims released, measured around each trim",
+    )
+    .expect("valid metric")
+});
 static CHECKPOINT: LazyLock<HistogramVec> = LazyLock::new(|| {
     HistogramVec::new(
     HistogramOpts::new("coordinator_checkpoint_plaintext_bytes", "Confidential checkpoint plaintext bytes per write or authenticated read. Format-1 writes and all reads count the whole document; format-2 writes count only the fields and journal entries serialized for that write")
@@ -97,9 +112,24 @@ pub(super) fn register(registry: &Registry) -> prometheus::Result<()> {
     ] {
         registry.register(Box::new(gauge.clone()))?;
     }
+    registry.register(Box::new(TRIMS.clone()))?;
+    registry.register(Box::new(TRIMMED.clone()))?;
     registry.register(Box::new(CHECKPOINT.clone()))?;
     registry.register(Box::new(CHECKPOINT_BUFFER.clone()))?;
     Ok(())
+}
+
+/// Count one trim, and the drop in [`anonymous_footprint_bytes`] across it.
+pub(crate) fn allocator_trimmed(released: u64) {
+    TRIMS.inc();
+    TRIMMED.inc_by(released);
+}
+
+/// Resident anonymous pages plus swapped ones: what the process holds whether or not the
+/// kernel has moved it to swap. `None` where `/proc/self/status` cannot be read.
+pub(crate) fn anonymous_footprint_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status_bytes(&status, "RssAnon")?.checked_add(status_bytes(&status, "VmSwap")?)
 }
 
 /// Fixed labels only; checkpoint contents and session identifiers never become metrics.
@@ -247,6 +277,31 @@ mod tests {
         assert_eq!(metric.get_label().len(), 2);
         assert!(metric.get_histogram().get_sample_count() >= 1);
         assert!(metric.get_histogram().get_sample_sum() >= 70_000.);
+    }
+
+    #[test]
+    fn trims_are_counted_with_the_bytes_they_released() {
+        let registry = Registry::new();
+        register(&registry).unwrap();
+        allocator_trimmed(3 * 1024 * 1024);
+        let families = registry.gather();
+        let counter = |name: &str| {
+            families
+                .iter()
+                .find(|m| m.get_name() == name)
+                .unwrap()
+                .get_metric()[0]
+                .get_counter()
+                .get_value()
+        };
+        assert!(counter("coordinator_allocator_trims_total") >= 1.);
+        assert!(counter("coordinator_allocator_trimmed_bytes_total") >= 3. * 1024. * 1024.);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_anonymous_footprint_is_readable_on_the_deployment_target() {
+        assert!(anonymous_footprint_bytes().is_some_and(|bytes| bytes > 0));
     }
 
     #[tokio::test(start_paused = true)]
