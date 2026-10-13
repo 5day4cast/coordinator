@@ -433,6 +433,10 @@ pub struct SigningStateSettings {
     /// Delete the signing state of competitions that are fully paid out. Off by default: the
     /// first deployment finds every competition paid out longer ago than the period due at
     /// once, so check `coordinator_checkpoint_retention_competitions` before turning it on.
+    ///
+    /// Keep it off until the state is archived before it is deleted (issue #334): the
+    /// history of finished competitions is needed for accounting, and deleted state is gone
+    /// once the database backups' retention passes.
     pub delete_paid_out: bool,
     /// Days the state stays after the competition is first found fully paid out.
     pub paid_out_retention_days: u32,

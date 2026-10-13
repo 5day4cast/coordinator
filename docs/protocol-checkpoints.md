@@ -138,6 +138,8 @@ Metrics:
 
 Deletion is off by default. Turning it on finds every competition paid out longer ago than the period due at once and deletes it over the following hours, so check the `due` gauge first.
 
+Keep it off until each competition's state is archived to object storage, and the archive verified, before it is deleted ([#334](https://github.com/5day4cast/coordinator/issues/334)). The history of finished competitions is needed for accounting, and nothing restores a deleted state once the database backups' retention has passed.
+
 A deleted checkpoint takes the sealed Keymeld receipts in its journal with it. Payout jobs keep their prepared receipts, entries keep the released key and preimage, and the payout witness keeps claim ownership, but a [witness migration that preserves existing claims](payout-witness.md#migration-that-preserves-existing-claims) can no longer collect execution receipts for deleted competitions. Turn deletion off before such a migration.
 
 Rolling back to a release without retention needs nothing: it never reads a deleted checkpoint, since nothing runs for a paid-out competition, and one that tried would fail closed.

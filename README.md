@@ -187,6 +187,8 @@ Off by default. With `delete_paid_out = true`, the Keymeld signing state of a
 competition (its checkpoint, parts and refund invoice authorizations) is kept until the
 competition is fully paid out, then for the retention period, and is then deleted.
 With deletion off nothing is deleted, but the coordinator still counts what would be.
+Keep it off until the state is archived before deletion
+([#334](https://github.com/5day4cast/coordinator/issues/334)).
 See [Retention](docs/protocol-checkpoints.md#retention).
 
 ```toml
