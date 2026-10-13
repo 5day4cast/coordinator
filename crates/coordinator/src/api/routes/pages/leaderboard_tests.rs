@@ -206,7 +206,8 @@ impl Coordinator {
             ticket_id,
             pubkey,
             ephemeral_pubkey: String::new(),
-            payout_hash: String::new(),
+            // Each entry's own: the store keeps payout hashes unique.
+            payout_hash: hex::encode(hashlock::sha256(id.as_bytes())),
             entry_submission: AddEventEntry {
                 id,
                 event_id: competition.id,
