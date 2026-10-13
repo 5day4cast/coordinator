@@ -4225,6 +4225,22 @@ impl Coordinator {
         Ok(competition)
     }
 
+    /// A competition as the public pages read it: without its signed contract, which no page
+    /// shows. Decoding a signed contract rebuilds every outcome's transactions, which for a
+    /// 20-entry pool paying two places is most of the time its leaderboard takes. One whose
+    /// expiry transaction was broadcast is read whole, since whether its pot went back by expiry
+    /// is told by comparing its outcome transaction with the contract's expiry transaction.
+    pub async fn get_competition_for_page(
+        &self,
+        competition_id: Uuid,
+    ) -> Result<Competition, Error> {
+        let competition = self.get_competition_detail(competition_id, false).await?;
+        if competition.expiry_broadcasted_at.is_none() {
+            return Ok(competition);
+        }
+        self.get_competition(competition_id).await
+    }
+
     /// Delete a competition by ID. Only allowed if no entries have been paid.
     pub async fn delete_competition(&self, competition_id: Uuid) -> Result<(), Error> {
         // First check if competition exists and has no paid entries

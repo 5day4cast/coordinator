@@ -241,7 +241,7 @@ async fn complete(state: &AppState, views: &mut [CompetitionView], shown: &[Stri
         futures::future::join_all(
             scored
                 .into_iter()
-                .map(|id| state.coordinator.get_competition(id))
+                .map(|id| state.coordinator.get_competition_for_page(id))
         )
     );
     for view in views.iter_mut() {
@@ -688,10 +688,11 @@ pub fn not_found(headers: &HeaderMap, state: &AppState, what: &str) -> Response 
     response
 }
 
-/// A competition by id: `Ok(None)` when there is none, `Err` when it could
+/// A competition by id, read as the pages read it, without its signed contract (see
+/// `Coordinator::get_competition_for_page`): `Ok(None)` when there is none, `Err` when it could
 /// not be looked up.
 async fn find_competition(state: &AppState, id: Uuid) -> Result<Option<Competition>, Error> {
-    match state.coordinator.get_competition(id).await {
+    match state.coordinator.get_competition_for_page(id).await {
         Ok(competition) => Ok(Some(competition)),
         Err(Error::NotFound(_) | Error::DbError(sqlx::Error::RowNotFound)) => Ok(None),
         Err(error) => Err(error),
