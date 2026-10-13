@@ -2133,7 +2133,7 @@ async fn deleting_a_session_removes_everything_it_stored_and_nothing_else_in_eve
         let kept_parts = part_rows(&db, &bystander).await;
         let kept_state = load(&db, &key, &bystander).await.unwrap().unwrap().state;
 
-        let deleted = delete(&db, &target, BATCH).await.unwrap();
+        let deleted = delete(&db, &target, BATCH, u64::MAX).await.unwrap();
         assert_eq!(
             deleted,
             DeletedSigningState {
@@ -2142,6 +2142,7 @@ async fn deleting_a_session_removes_everything_it_stored_and_nothing_else_in_eve
                 parts: parts.len() as u64,
                 part_bytes: parts.iter().map(|(_, body)| body.len() as u64).sum(),
                 authorizations: 2,
+                finished: true,
             },
             "{format:?}"
         );
@@ -2160,8 +2161,11 @@ async fn deleting_a_session_removes_everything_it_stored_and_nothing_else_in_eve
         );
 
         assert_eq!(
-            delete(&db, &target, BATCH).await.unwrap(),
-            DeletedSigningState::default(),
+            delete(&db, &target, BATCH, u64::MAX).await.unwrap(),
+            DeletedSigningState {
+                finished: true,
+                ..DeletedSigningState::default()
+            },
             "a second deletion finds nothing"
         );
         db.close().await.unwrap();
@@ -2180,7 +2184,9 @@ async fn a_writer_resumed_before_its_session_was_deleted_stores_nothing_after() 
         let session = kickoff_session(&db, &key, layout, 50).await;
         let (writer, mut state) = resume_layout(&db, &key, &session, layout).await;
 
-        delete(&db, &session, DELETE_BATCH_ROWS).await.unwrap();
+        delete(&db, &session, DELETE_BATCH_ROWS, u64::MAX)
+            .await
+            .unwrap();
 
         state.journal =
             serde_json::from_value(with_command(&state.journal, "payout/late/1")).unwrap();
@@ -2221,9 +2227,50 @@ async fn a_deletion_stopped_part_way_fails_closed_until_the_next_one_finishes_it
             "{format:?}: a checkpoint missing parts fails closed"
         );
 
-        let rest = delete(&db, &session, DELETE_BATCH_ROWS).await.unwrap();
+        let rest = delete(&db, &session, DELETE_BATCH_ROWS, u64::MAX)
+            .await
+            .unwrap();
         assert_eq!(rest.rows, 1);
         assert_eq!(rest.parts, stored - 16, "{format:?}");
+        assert!(rest.finished);
+        assert!(load(&db, &key, &session).await.unwrap().is_none());
+        db.close().await.unwrap();
+    }
+}
+
+/// A deletion deletes at most its budget of parts and nodes, and keeps the row until none is
+/// left, so a large session goes over several calls. One that ends exactly at its budget
+/// leaves the row for the next call, which finds no part left and finishes.
+#[tokio::test]
+async fn a_deletion_stops_at_its_budget_and_the_next_one_goes_on() {
+    const BATCH: i64 = 16;
+    for format in [CheckpointFormat::Parts, CheckpointFormat::Tree] {
+        let (_directory, db) = database().await;
+        let key = SessionSecret::from_bytes([105; 32]);
+        let session = kickoff_session(&db, &key, Layout::from(format), 100).await;
+        authorize_refund(&db, &session, "player").await;
+        let stored = part_rows(&db, &session).await.len() as u64;
+        assert!(stored > 40, "{format:?}: {stored}");
+
+        let first = delete(&db, &session, BATCH, 40).await.unwrap();
+        assert_eq!((first.parts, first.rows, first.finished), (40, 0, false));
+        assert_eq!(part_rows(&db, &session).await.len() as u64, stored - 40);
+        assert_eq!(authorizations(&db, &session).await, 1);
+        assert!(load(&db, &key, &session).await.is_err(), "{format:?}");
+
+        let rest = stored - 40;
+        let second = delete(&db, &session, BATCH, rest).await.unwrap();
+        assert_eq!(
+            (second.parts, second.rows, second.finished),
+            (rest, 0, false),
+            "{format:?}: it ended at its budget"
+        );
+        assert!(part_rows(&db, &session).await.is_empty());
+        let last = delete(&db, &session, BATCH, 1).await.unwrap();
+        assert_eq!(
+            (last.parts, last.rows, last.authorizations, last.finished),
+            (0, 1, 1, true)
+        );
         assert!(load(&db, &key, &session).await.unwrap().is_none());
         db.close().await.unwrap();
     }
@@ -2270,7 +2317,9 @@ async fn deleted_checkpoint_pages_are_reused_before_the_file_grows() {
             pages(&db, "PRAGMA freelist_count").await,
         );
         empty_log(&db).await;
-        delete(&db, &session, DELETE_BATCH_ROWS).await.unwrap();
+        delete(&db, &session, DELETE_BATCH_ROWS, u64::MAX)
+            .await
+            .unwrap();
         let logged = logged_pages(&db).await;
         let freed = pages(&db, "PRAGMA freelist_count").await - free;
         assert_eq!(

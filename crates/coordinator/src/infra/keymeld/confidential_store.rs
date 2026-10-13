@@ -379,23 +379,31 @@ pub(super) async fn create(
 /// sealed bodies, so other writes wait for one batch no longer than for a checkpoint.
 pub(super) const DELETE_BATCH_ROWS: i64 = 256;
 
-/// Delete everything stored for `session`: its parts and manifest nodes, `batch` to a write,
-/// then its row and its refund invoice authorizations in one last write. Other writes run
-/// between the batches. The caller holds the session (`Keymeld::try_hold_session`), so no
-/// operation of this process uses it meanwhile.
+/// Delete what is stored for `session`: its parts and manifest nodes, `batch` to a write and
+/// at most `budget` of them, then, once none is left, its row and its refund invoice
+/// authorizations in one last write. Other writes run between the batches. The caller holds
+/// the session (`Keymeld::try_hold_session`), so no operation of this process uses it
+/// meanwhile.
 ///
 /// Once one batch is gone the checkpoint no longer loads, and once the row is gone a stale
 /// writer's compare-and-swap matches no row, so either fails closed and stores nothing. A
-/// deletion that stops part way leaves the rest for the next call.
+/// deletion that stops part way, at its budget or otherwise, leaves the rest for the next
+/// call.
 pub(super) async fn delete(
     db: &DBConnection,
     session: &SessionId,
     batch: i64,
+    budget: u64,
 ) -> Result<DeletedSigningState, KeymeldError> {
     let batch = batch.max(1);
     let id = session.to_string();
     let mut deleted = DeletedSigningState::default();
     loop {
+        let left = budget.saturating_sub(deleted.parts);
+        if left == 0 {
+            return Ok(deleted);
+        }
+        let limit = batch.min(i64::try_from(left).unwrap_or(i64::MAX));
         let session_id = id.clone();
         let lengths: Vec<i64> = db
             .execute_write(move |pool| async move {
@@ -406,7 +414,7 @@ pub(super) async fn delete(
                 )
                 .bind(&session_id)
                 .bind(&session_id)
-                .bind(batch)
+                .bind(limit)
                 .fetch_all(&pool)
                 .await
             })
@@ -416,7 +424,7 @@ pub(super) async fn delete(
         checkpoint_deleted("part", lengths.len() as u64, bytes);
         deleted.parts += lengths.len() as u64;
         deleted.part_bytes += bytes;
-        if (lengths.len() as i64) < batch {
+        if (lengths.len() as i64) < limit {
             break;
         }
     }
@@ -459,6 +467,7 @@ pub(super) async fn delete(
     deleted.rows = row.len() as u64;
     deleted.row_bytes = row_bytes;
     deleted.authorizations = authorizations;
+    deleted.finished = true;
     Ok(deleted)
 }
 

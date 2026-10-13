@@ -438,15 +438,21 @@ pub trait Keymeld: Send + Sync {
     }
 
     /// Delete the signing state stored for the session `hold` holds: its checkpoint row, the
-    /// row's parts and manifest nodes, and its refund invoice authorizations. Once any of it is
-    /// gone the session's checkpoint no longer loads, and every operation on it fails closed. A
-    /// Keymeld that stores no state has nothing to delete.
+    /// row's parts and manifest nodes, and its refund invoice authorizations. At most `budget`
+    /// parts and nodes go in one call; the row and the authorizations go once none is left,
+    /// and the result says whether that happened. Once any of it is gone the session's
+    /// checkpoint no longer loads, and every operation on it fails closed. A Keymeld that
+    /// stores no state has nothing to delete.
     async fn delete_signing_state(
         &self,
         hold: &SessionHold,
+        budget: u64,
     ) -> Result<DeletedSigningState, KeymeldError> {
-        let _ = hold;
-        Ok(DeletedSigningState::default())
+        let _ = (hold, budget);
+        Ok(DeletedSigningState {
+            finished: true,
+            ..DeletedSigningState::default()
+        })
     }
 }
 
@@ -478,6 +484,8 @@ pub struct DeletedSigningState {
     pub part_bytes: u64,
     /// Refund invoice authorizations.
     pub authorizations: u64,
+    /// Whether nothing of the session is left: the row and the authorizations went too.
+    pub finished: bool,
 }
 
 impl DeletedSigningState {

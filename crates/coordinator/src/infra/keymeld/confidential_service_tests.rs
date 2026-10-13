@@ -236,10 +236,15 @@ async fn signing_state_is_deleted_only_while_no_operation_holds_its_session() {
         "other sessions are not held"
     );
 
-    let deleted = service.delete_signing_state(&hold).await.unwrap();
+    let deleted = service.delete_signing_state(&hold, u64::MAX).await.unwrap();
     assert_eq!(
-        (deleted.rows, deleted.parts, deleted.authorizations),
-        (1, 600, 1)
+        (
+            deleted.rows,
+            deleted.parts,
+            deleted.authorizations,
+            deleted.finished
+        ),
+        (1, 600, 1, true)
     );
     assert_eq!(deleted.part_bytes, 600 * 1000);
     assert_eq!(deleted.row_bytes, "sealed root".len() as u64);
@@ -267,6 +272,9 @@ async fn signing_state_is_never_deleted_without_the_sessions_lock() {
         session: session.clone(),
         guard: None,
     };
-    assert!(service.delete_signing_state(&unheld).await.is_err());
+    assert!(service
+        .delete_signing_state(&unheld, u64::MAX)
+        .await
+        .is_err());
     assert_eq!(stored_rows(&service, &session).await, (1, 3, 1));
 }

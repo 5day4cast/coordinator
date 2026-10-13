@@ -1464,6 +1464,7 @@ impl Keymeld for KeymeldService {
     async fn delete_signing_state(
         &self,
         hold: &SessionHold,
+        budget: u64,
     ) -> Result<DeletedSigningState, KeymeldError> {
         if hold.guard.is_none() {
             return Err(invalid(
@@ -1474,6 +1475,7 @@ impl Keymeld for KeymeldService {
             self.database()?,
             &hold.session,
             confidential_store::DELETE_BATCH_ROWS,
+            budget,
         )
         .await
     }

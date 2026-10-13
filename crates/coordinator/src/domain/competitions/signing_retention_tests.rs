@@ -841,6 +841,30 @@ async fn every_checkpoint_format_is_deleted_whole() {
     assert_eq!(fixture.stored(&running.session).await, (1, 700, 1));
 }
 
+/// A pass deletes at most 4,096 parts and nodes: a larger session goes over several passes,
+/// and the next competition due waits for the budget.
+#[tokio::test]
+async fn a_large_session_is_deleted_over_several_passes() {
+    let fixture = Fixture::new().await;
+    let large = fixture.competition(3, 4096 + 100).await;
+    fixture.completed(&large, -10 * DAY).await;
+    let next = fixture.competition(3, 40).await;
+    fixture.completed(&next, -9 * DAY).await;
+
+    fixture.pass(0).await;
+    assert_eq!(fixture.stored(&large.session).await, (1, 100, 1));
+    assert_eq!(fixture.stored(&next.session).await, KEPT);
+    assert_eq!(
+        fixture.survey(0).await.due_competitions(),
+        BTreeSet::from([large.id, next.id]),
+        "both are still due"
+    );
+
+    fixture.pass(60).await;
+    assert_eq!(fixture.stored(&large.session).await, GONE);
+    assert_eq!(fixture.stored(&next.session).await, GONE);
+}
+
 /// A deletion that stopped part way, here after its first batch, leaves a checkpoint that
 /// no longer loads; the next pass finishes it while the competition is still paid out. If its
 /// money moved again meanwhile, what is left stays until it is paid out again.

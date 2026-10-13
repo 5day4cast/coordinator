@@ -104,9 +104,13 @@ fn unix_seconds(column: &str) -> String {
     )
 }
 
-/// Competitions whose signing state one pass deletes, at most. Each is up to tens of megabytes,
-/// deleted a batch at a time; at two a minute a backlog of hundreds clears in a few hours.
+/// Competitions whose signing state one pass deletes, at most.
 const DELETED_PER_PASS: usize = 2;
+
+/// Parts and manifest nodes one pass deletes, at most. Deleting a part rewrites the page it
+/// was on, so the write-ahead log, and what replication uploads, grows by about as much as is
+/// deleted. A kickoff's thousands of parts go over a few passes, about a minute apart.
+const DELETED_ROWS_PER_PASS: u64 = 4096;
 
 /// Topics of conditions reported once rather than on every pass.
 const SESSION_IN_USE: &str = "signing state in use";
@@ -350,12 +354,19 @@ impl Coordinator {
         if !self.signing_state.delete_paid_out {
             return Ok(());
         }
+        let mut budget = DELETED_ROWS_PER_PASS;
         for (at, state) in survey.due.into_iter().take(DELETED_PER_PASS) {
-            if let Err(error) = self.delete_paid_out_state(&state, at, cutoff).await {
-                warn!(
+            match self.delete_paid_out_state(&state, at, cutoff, budget).await {
+                Ok(Some(deleted)) if !deleted.finished => break,
+                Ok(Some(deleted)) => budget = budget.saturating_sub(deleted.parts),
+                Ok(None) => {}
+                Err(error) => warn!(
                     "Competition {}: its Keymeld signing state is not deleted yet: {error:#}",
                     state.competition_id
-                );
+                ),
+            }
+            if budget == 0 {
+                break;
             }
         }
         Ok(())
@@ -395,15 +406,17 @@ impl Coordinator {
         Ok(survey)
     }
 
-    /// Delete one competition's signing state, holding its session for the whole deletion. A
-    /// session in use is left for a later pass, and so is a competition whose money moved again
-    /// since the pass looked.
+    /// Delete one competition's signing state, at most `budget` parts and nodes of it, holding
+    /// its session for the whole deletion. What it deleted, or `None` for a session in use or a
+    /// competition whose money moved again since the pass looked: those are left for a later
+    /// pass. A deletion that stopped at its budget goes on at the next pass.
     async fn delete_paid_out_state(
         &self,
         state: &StoredSigningState,
         paid_out_since: i64,
         cutoff: i64,
-    ) -> Result<(), anyhow::Error> {
+        budget: u64,
+    ) -> Result<Option<DeletedSigningState>, anyhow::Error> {
         let competition_id = state.competition_id;
         let Some(hold) = self.keymeld.try_hold_session(&state.session).await else {
             if self
@@ -416,7 +429,7 @@ impl Coordinator {
                     state.session
                 );
             }
-            return Ok(());
+            return Ok(None);
         };
         self.reported.clear(SESSION_IN_USE, competition_id);
         // Once held, no operation of this process can use the session; look again in case its
@@ -432,15 +445,23 @@ impl Coordinator {
                 "Competition {competition_id}: its signing state is kept, since its money moved \
                  again"
             );
-            return Ok(());
+            return Ok(None);
         }
-        let deleted = self.keymeld.delete_signing_state(&hold).await?;
+        let deleted = self.keymeld.delete_signing_state(&hold, budget).await?;
         drop(hold);
-        info!(
-            "Competition {competition_id}: deleted its Keymeld signing state: {}",
-            describe_deletion(&state.session, paid_out_since, &deleted)
-        );
-        Ok(())
+        if deleted.finished {
+            info!(
+                "Competition {competition_id}: deleted its Keymeld signing state: {}",
+                describe_deletion(&state.session, paid_out_since, &deleted)
+            );
+        } else {
+            info!(
+                "Competition {competition_id}: deleting its Keymeld signing state, the rest on \
+                 the next pass: {}",
+                describe_deletion(&state.session, paid_out_since, &deleted)
+            );
+        }
+        Ok(Some(deleted))
     }
 }
 
@@ -455,8 +476,8 @@ fn describe_deletion(
         .and_then(|at| at.format(&Rfc3339).ok())
         .unwrap_or_else(|| paid_out_since.to_string());
     format!(
-        "session {session}, paid out since {since}, {} rows and {} sealed bytes (checkpoint rows \
-         {}, parts and manifest nodes {}, refund invoice authorizations {})",
+        "session {session}, paid out since {since}, {} rows and {} sealed bytes this pass \
+         (checkpoint rows {}, parts and manifest nodes {}, refund invoice authorizations {})",
         deleted.total_rows(),
         deleted.total_bytes(),
         deleted.rows,

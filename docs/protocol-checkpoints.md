@@ -120,13 +120,13 @@ The period counts from when the competition was last paid out: the latest of whe
 
 A session belongs to the competition whose id it has (a single competition's and a pool's), or to the one competition whose stored session names it (the refund session of a queued competition, or of a pool that never got its own). A session that no competition, or more than one, owns is kept.
 
-The competition cleanup, which one coordinator runs at a time, about once a minute, deletes the state of up to two competitions a pass, the longest paid out first:
+The competition cleanup, which one coordinator runs at a time, about once a minute, deletes the state of up to two competitions a pass, the longest paid out first, and at most 4,096 parts and nodes a pass. Deleting a part rewrites the page it was on, so the write-ahead log, and what replication uploads, grows by about as much as is deleted; the budget bounds that while a backlog clears. For each competition:
 
 1. It holds the session as every operation on it does, without waiting. A session in use is left for a later pass.
 2. It checks again that the competition is still paid out for longer than the period.
-3. It deletes the parts and nodes 256 rows to a write, then the row and the refund invoice authorizations in one write.
+3. It deletes the parts and nodes 256 rows to a write until none is left or the pass's budget is spent, then the row and the refund invoice authorizations in one write. A session larger than the budget goes over several passes.
 
-Once any of it is gone the checkpoint fails to load, and a writer that loaded it before fails its compare-and-swap and stores nothing, so every operation on the session fails closed. A deletion that stops part way leaves a checkpoint that no longer loads, and the next pass finishes it. Each deletion is logged with its competition and session ids, the time the competition was last paid out, and what it removed.
+Once any of it is gone the checkpoint fails to load, and a writer that loaded it before fails its compare-and-swap and stores nothing, so every operation on the session fails closed. A deletion that stops part way, at the budget or because the process stopped, leaves a checkpoint that no longer loads, and the next pass goes on with it. Each pass's deletion is logged with its competition and session ids, the time the competition was last paid out, and what it removed.
 
 With `delete_paid_out = false` nothing is deleted, but each pass still counts what is waiting and due.
 
