@@ -41,8 +41,6 @@ use crate::swap::unix_now;
 
 /// How many VTXOs the indexer is asked for at a time.
 const VTXO_PAGE_SIZE: i32 = 100;
-/// How long the indexer has to answer with one page.
-const VTXO_PAGE_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long `GET /v1/wallet` answers from the last reading of the wallet.
 const VIEW_TTL: Duration = Duration::from_secs(10);
 /// A reading of the wallet slower than this is logged.
@@ -521,12 +519,12 @@ impl ArkWallet {
         let mut index = 0;
         loop {
             let page = request.clone().with_page(VTXO_PAGE_SIZE, index);
-            let response = tokio::time::timeout(
-                VTXO_PAGE_TIMEOUT,
-                self.server.client().grpc().list_vtxos(page),
-            )
-            .await
-            .context("the indexer took too long to list the wallet's VTXOs")??;
+            // A failed read can be repeated on tonic's reconnecting channel. Keep the same
+            // page until it succeeds; append its coins only once. Never wrap a spend in this.
+            let response = crate::read_retry::read("list the wallet's VTXOs", || {
+                self.server.client().grpc().list_vtxos(page.clone())
+            })
+            .await?;
             vtxos.extend(response.vtxos);
             match response.page {
                 Some(page) if page.next < page.total && page.next > index => index = page.next,
