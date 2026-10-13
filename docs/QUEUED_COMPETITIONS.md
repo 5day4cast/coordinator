@@ -319,11 +319,11 @@ Work after the txid is known must therefore finish in the rest of the session, w
 
 1. Check that the commitment transaction pays the pool's funding output, and that the connector tree spends from it.
    Each forfeit also spends a connector, so it is void unless this commitment transaction confirms.
-2. Run the `before_forfeits` hook, in which Keymeld signs the pool's refund transaction.
+2. Run the `before_forfeits` hook, in which Keymeld signs the pool's whole contract: every outcome and split transaction and the expiry refund. The coordinator verifies it.
 3. Sign one forfeit per escrow, with Keymeld as the player and the coordinator, and submit them.
 
-The refund transaction is signed before any forfeit, so a player's funds never sit in a funding output without a way back.
-The outcome and split signatures do not need to be ready before the commitment transaction confirms, so they can follow the batch.
+The whole contract, refund path included, is signed before any forfeit, so a player's funds never sit in a funding output without a signed way out.
+Signing it inside the batch session is what makes the session's time budget matter: a 20-player, two-place pool signs about 1,200 messages.
 If a check or the hook fails, nothing is forfeited, and every escrow stays spendable.
 The ban on the unsigned escrows still applies, so the hook must be reliable.
 
