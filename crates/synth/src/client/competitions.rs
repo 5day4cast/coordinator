@@ -288,6 +288,10 @@ pub struct CompetitionResponse {
     /// The most entries a queued competition takes.
     #[serde(default)]
     pub max_entries: Option<u32>,
+    /// What counts against a queued competition's `max_entries`: paid tickets and tickets held
+    /// for an unexpired invoice. Not every coordinator says.
+    #[serde(default)]
+    pub held: Option<u64>,
     /// A queued competition's stake per player.
     #[serde(default)]
     pub stake_sats: Option<u64>,
@@ -365,14 +369,14 @@ impl CompetitionResponse {
         OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339).ok()
     }
 
-    /// Anyone can still enter: it is taking entries and has room. A pool's players come from its
-    /// queue, so a pool never is.
+    /// Anyone can still enter: it is taking entries and has room, a queue while what is
+    /// [`Self::taken`] is under its cap. A pool's players come from its queue, so a pool never is.
     pub fn open_to_enter(&self, now: OffsetDateTime) -> bool {
         let room = match self.kind {
             CompetitionKind::Single => self.seats().is_none_or(|seats| self.total_entries < seats),
             CompetitionKind::Queued => self
                 .max_entries
-                .is_none_or(|max| self.paid_entries() < u64::from(max)),
+                .is_none_or(|max| self.taken() < u64::from(max)),
             CompetitionKind::Pool => false,
         };
         room && matches!(self.inferred_status(), "created" | "collecting_entries")
@@ -382,6 +386,13 @@ impl CompetitionResponse {
     /// Everyone's paid entries: a queue's, in it and in its pools, or a single competition's.
     pub fn paid_entries(&self) -> u64 {
         self.entries.unwrap_or(self.total_paid_entries)
+    }
+
+    /// What counts against a queue's cap, as the coordinator counts it before it issues a
+    /// ticket: paid tickets and those held for an unpaid invoice, never fewer than the paid
+    /// entries.
+    pub fn taken(&self) -> u64 {
+        self.held.unwrap_or(0).max(self.paid_entries())
     }
 
     /// Other players paid for every seat of a single competition, so none is left to take.

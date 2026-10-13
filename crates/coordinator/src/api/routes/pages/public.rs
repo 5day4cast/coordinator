@@ -39,9 +39,9 @@ use crate::{
         fragments::{
             entries_paused_banner,
             entry_form::{
-                entry_form, forecast_choices, forecasts_url, paid_notice, payout_line,
-                ticket_status, unpaid_notice, Forecasts, NetworkFee, PaidNotice, PayoutDestination,
-                TicketProgress,
+                entries_closed, entry_form, forecast_choices, forecasts_url, paid_notice,
+                payout_line, ticket_status, unpaid_notice, Forecasts, NetworkFee, PaidNotice,
+                PayoutDestination, TicketProgress,
             },
             leaderboard::{
                 leaderboard, leaderboard_scores, queue_pools, rows_url, LeaderboardRow,
@@ -811,12 +811,13 @@ pub async fn entry_forecasts_fragment(
             return failed("entryForecasts", &url, "forecasts");
         }
     };
-    let content = if CompetitionView::new(&competition, now()).can_enter {
+    let view = CompetitionView::new(&competition, now());
+    let content = if view.can_enter {
         let forecasts = forecasts(&state, &competition, FIRST_READ_WAIT).await;
         forecast_choices(&competition_id.to_string(), &forecasts, again.asked())
     } else {
-        let leaderboard = format!("/competitions/{competition_id}/leaderboard");
-        html! { p class="notice" { "Entries have closed. " a href=(leaderboard) { "View the leaderboard" } } }
+        // A competition that filled while the form loaded says so, not that entries closed.
+        entries_closed(&view)
     };
     fragment(content, Caching::Public)
 }

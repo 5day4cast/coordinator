@@ -20,6 +20,7 @@ use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::client::competitions::CompetitionResponse;
+use crate::client::visitor::EntryForm;
 use crate::client::CoordinatorClient;
 use crate::config::KeepOpenConfig;
 use crate::db::SynthDb;
@@ -321,11 +322,15 @@ impl KeepOpen {
                 Ok(form) => form,
                 Err(error) => {
                     warn!("Cannot load competition {id}'s entry form: {error:#}");
-                    crate::client::visitor::EntryForm::Unavailable(
-                        "the coordinator could not be reached".into(),
-                    )
+                    EntryForm::Unavailable("the coordinator could not be reached".into())
                 }
             };
+            // It filled since the list was read, its last seats perhaps only held for invoices
+            // not yet paid: no longer open for visitors, which is nothing wrong.
+            if form == EntryForm::Full {
+                seen.insert(*id, None);
+                continue;
+            }
             let check = form.check(stations);
             forms.checked += 1;
             forms.missing_forecasts += check.missing;
@@ -349,11 +354,9 @@ impl KeepOpen {
         }
         self.form_seen = seen;
         self.forms_loaded = Some(tokio::time::Instant::now());
-        // With no form loaded, the coordinator did not answer: what was last seen stands.
-        if forms.checked > 0 {
-            self.forms = Some(forms);
-            crate::server::metrics::record_entry_forms(Some(forms));
-        }
+        // Every form checked was full: none is open for visitors.
+        self.forms = (forms.checked > 0).then_some(forms);
+        crate::server::metrics::record_entry_forms(self.forms);
         self.forms
     }
 
@@ -732,6 +735,105 @@ mod tests {
         assert!(ready.all_enterable() && !blocked.all_enterable());
         assert!(!keep.forms_due(), "then only every few minutes");
         server.abort();
+    }
+
+    /// A competition that filled after the list said it had room is no longer open for visitors:
+    /// its form saying so is nothing wrong, however many checks in a row find it full.
+    #[tokio::test]
+    async fn a_competition_that_filled_is_not_a_failed_check() {
+        use axum::{extract::Path, routing::get, Router};
+
+        let (full, open) = (Uuid::now_v7(), Uuid::now_v7());
+        let app = Router::new().route(
+            "/competitions/{id}/entry-forecasts",
+            get(move |Path(id): Path<Uuid>| async move {
+                if id == full {
+                    format!(
+                        "<p class=\"notice\">This competition is full. \
+                         <a href=\"/competitions/{id}/leaderboard\">View the leaderboard</a></p>"
+                    )
+                } else {
+                    "<div id=\"entryForecasts\"><fieldset data-station=\"KSTS\">\
+                     <div class=\"pick-row\"><strong class=\"pick-forecast\">98</strong>\
+                     <input type=\"radio\" name=\"KSTS_temp_high\" value=\"over\"></div>\
+                     </fieldset></div>"
+                        .to_owned()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = CoordinatorClient::new(&url, None);
+        let directory = tempfile::tempdir().unwrap();
+        let db = SynthDb::new(directory.path().join("synth.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let mut keep = KeepOpen::default();
+        let stations = vec!["KSTS".to_string()];
+
+        // Only the full one: none is open for visitors.
+        keep.open_now = vec![(full, stations.clone())];
+        for _ in 0..BLOCKED_CHECKS + 1 {
+            assert_eq!(keep.check_forms(&client, &db).await, None);
+        }
+        assert!(!keep.forms_due(), "loaded again only every few minutes");
+        assert!(db.list_runs(10).await.unwrap().is_empty(), "never recorded");
+
+        // Beside an open one, only the open one is counted.
+        keep.open_now = vec![(full, stations.clone()), (open, stations)];
+        let forms = keep.check_forms(&client, &db).await.unwrap();
+        assert_eq!(
+            forms,
+            Forms {
+                checked: 1,
+                enterable: 1,
+                missing_forecasts: 0,
+            }
+        );
+        assert!(forms.all_enterable());
+        assert!(db.list_runs(10).await.unwrap().is_empty());
+        server.abort();
+    }
+
+    /// A one-pool queue whose last seats are held for invoices not yet paid issues no ticket, so
+    /// it is not open for visitors until a hold lapses, as the coordinator's form says.
+    #[test]
+    fn a_queue_whose_last_seats_are_held_is_not_open() {
+        let now = OffsetDateTime::now_utc();
+        let queue = |entries: u64, held: Option<u64>| {
+            let mut json = serde_json::json!({
+                "kind": "queued",
+                "event_submission": {
+                    "start_observation_date": closing(now + Duration::hours(1)),
+                    "locations": ["KSTS"],
+                },
+                "pool_rules": { "min_players": 3, "max_players": 20 },
+                "entries": entries,
+                "max_entries": 20,
+            });
+            if let Some(held) = held {
+                json["held"] = held.into();
+            }
+            competition(json)
+        };
+        assert!(queue(15, Some(18)).open_to_enter(now), "two seats left");
+        assert!(
+            !queue(19, Some(20)).open_to_enter(now),
+            "the last seat is held"
+        );
+        assert!(
+            queue(19, None).open_to_enter(now),
+            "a coordinator that does not say"
+        );
+        assert!(
+            !queue(20, Some(0)).open_to_enter(now),
+            "never fewer than the paid entries"
+        );
+        assert_eq!(
+            open_competitions(&[queue(19, Some(20))], now, Duration::ZERO),
+            Open::default()
+        );
     }
 
     #[test]

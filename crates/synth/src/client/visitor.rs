@@ -39,6 +39,9 @@ pub enum EntryForm {
     Unavailable(String),
     /// The page says entries have closed.
     Closed,
+    /// The page says the competition is full: every seat is paid for or held for an unpaid
+    /// invoice. Nobody can enter it, as nobody should.
+    Full,
 }
 
 /// Whether a visitor can make every pick on a competition's entry form.
@@ -61,7 +64,9 @@ impl EntryForm {
         let before = parts.next().unwrap_or_default();
         let lines: Vec<&str> = parts.collect();
         if lines.is_empty() {
-            return if before.contains("Entries have closed") {
+            return if before.contains("This competition is full") {
+                EntryForm::Full
+            } else if before.contains("Entries have closed") {
                 EntryForm::Closed
             } else if before.contains("Still loading") {
                 EntryForm::Loading
@@ -136,6 +141,8 @@ impl EntryForm {
                 FormCheck::blocked(&format!("the entry form has no picks to make: {why}"))
             }
             EntryForm::Closed => FormCheck::blocked("the entry form says entries have closed"),
+            // It filled after the list said it had room: no problem for a visitor.
+            EntryForm::Full => FormCheck::default(),
         }
     }
 
@@ -336,6 +343,11 @@ mod tests {
         let closed = "<p class=\"notice\">Entries have closed. <a href=\"/x\">View</a></p>";
         assert_eq!(EntryForm::read(closed), EntryForm::Closed);
         assert!(EntryForm::read(closed).check(&[]).blocked.is_some());
+        // A full competition is not one a visitor is kept out of by mistake.
+        let full = "<p class=\"notice\">This competition is full. <a href=\"/x\">View</a></p>";
+        assert_eq!(EntryForm::read(full), EntryForm::Full);
+        assert!(!EntryForm::read(full).may_recover());
+        assert_eq!(EntryForm::read(full).check(&[]).blocked, None);
         assert!(matches!(EntryForm::read(""), EntryForm::Unavailable(_)));
     }
 
