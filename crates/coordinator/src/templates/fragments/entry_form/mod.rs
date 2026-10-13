@@ -389,6 +389,22 @@ pub fn forecast_choices(competition_id: &str, forecasts: &Forecasts, asked: u8) 
     }
 }
 
+/// What the entry form's forecasts say once nobody can enter: that the competition is full, as
+/// its badge says, or that its entries have closed; and where its leaderboard is.
+pub fn entries_closed(competition: &CompetitionView) -> Markup {
+    let leaderboard = format!("/competitions/{}/leaderboard", competition.id);
+    html! {
+        p class="notice" {
+            @if competition.full_before_start() {
+                "This competition is full. "
+            } @else {
+                "Entries have closed. "
+            }
+            a href=(leaderboard) { "View the leaderboard" }
+        }
+    }
+}
+
 /// Where winnings and refunds go, as one line. Refreshed when the user logs
 /// in or out without touching the picks already made.
 pub fn payout_line(
@@ -959,6 +975,52 @@ mod tests {
         assert!(html.contains("Up to 20 players, all in one pool"));
         // Three players so far: first place takes their whole pot.
         assert!(html.contains("<dd>15,000 sats"));
+    }
+
+    /// A form whose competition filled while it loaded says the competition is full, as its
+    /// badge does; one whose entries closed for any other reason says so.
+    #[test]
+    fn a_full_competition_says_it_is_full_not_that_entries_closed() {
+        use crate::templates::pages::competitions::{
+            phase_badge,
+            tests::{queued, twenty_seats},
+            Queue,
+        };
+        let says = |competition: &CompetitionView| {
+            let html = entries_closed(competition).into_string();
+            let leaderboard = format!(r#"href="/competitions/{}/leaderboard""#, competition.id);
+            assert!(html.contains(&leaderboard), "{html}");
+            let badge = phase_badge(competition).into_string();
+            let full = html.contains("This competition is full.");
+            assert_eq!(full, badge.contains(">Full</span>"), "{html} {badge}");
+            assert_ne!(full, html.contains("Entries have closed."), "{html}");
+            full
+        };
+
+        // Every seat of a single competition taken.
+        let mut single = view("c1", Phase::Upcoming, 60);
+        single.total_entries = single.total_allowed_entries;
+        single.can_enter = false;
+        assert!(says(&single));
+
+        // 19 paid and the last seat held for an unpaid invoice: full until the hold lapses.
+        let mut held = twenty_seats(19);
+        if let Queue::Queued(queue) = &mut held.queue {
+            queue.held = Some(20);
+        }
+        held.can_enter = false;
+        assert!(says(&held));
+
+        // A queue without a seat count that takes no more entries has closed them.
+        let mut capped = queued("q", 200);
+        capped.can_enter = false;
+        assert!(!says(&capped));
+
+        // Once its window opens, no competition is full: its entries have closed.
+        let mut started = view("c1", Phase::Live, -10);
+        started.total_entries = started.total_allowed_entries;
+        started.can_enter = false;
+        assert!(!says(&started));
     }
 
     /// A competition taking fewer picks than it has rows says how many of them, and counts down.

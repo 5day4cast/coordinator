@@ -233,6 +233,16 @@ impl CompetitionView {
         })
     }
 
+    /// Before its start, nobody can enter because every seat is taken: a single competition's,
+    /// a one-pool queue's (paid for or held for an unpaid invoice) or a pool's, whose players
+    /// come from its queue. Its badge says "Full". A queue without a seat count is never full:
+    /// once it takes no more entries, its entries have closed.
+    pub fn full_before_start(&self) -> bool {
+        self.phase == Phase::Upcoming
+            && !self.can_enter
+            && (self.queue.queued().is_none() || self.is_full())
+    }
+
     /// A queue's paid entries, those already moved to its pools included.
     fn entry_count(&self, queue: &QueueView) -> u64 {
         queue.entries.unwrap_or(self.total_entries)
@@ -522,10 +532,8 @@ fn badge(competition: &CompetitionView, split: bool) -> Markup {
     let queue = competition.queue.queued();
     let (class, label) = match competition.phase {
         _ if split => ("badge badge-quiet", "Split into pools"),
-        Phase::Upcoming if !competition.can_enter && queue.is_some() && !competition.is_full() => {
-            ("badge badge-open", "Entries closed")
-        }
-        Phase::Upcoming if !competition.can_enter => ("badge badge-open", "Full"),
+        Phase::Upcoming if competition.full_before_start() => ("badge badge-open", "Full"),
+        Phase::Upcoming if !competition.can_enter => ("badge badge-open", "Entries closed"),
         Phase::Upcoming => ("badge badge-open", "Open"),
         Phase::Live => ("badge badge-live", "Live"),
         Phase::AwaitingResult => ("badge badge-waiting", "Awaiting results"),
