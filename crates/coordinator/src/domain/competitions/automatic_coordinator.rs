@@ -69,9 +69,10 @@ impl Coordinator {
         &self,
         competition_id: Uuid,
     ) -> Result<PayoutTermsQuote, Error> {
+        // Only its terms are read: decoding a signed contract would slow every page that quotes.
         let competition = self
             .competition_store
-            .get_competition(competition_id)
+            .get_competition_detail(competition_id, false)
             .await?;
         Ok(PayoutTermsQuote {
             enabled: self

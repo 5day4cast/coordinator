@@ -1,7 +1,9 @@
 //! The leaderboard pages answer from the weather cache: they neither wait for a slow oracle nor
-//! ask it again while what they have is fresh.
+//! ask it again while what they have is fresh. Nor do they decode a signed contract, which no
+//! page shows.
 
 use std::{
+    str::FromStr,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -15,8 +17,16 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use bitcoin::{Amount, FeeRate, OutPoint, Transaction};
+use dlctix::{
+    hashlock,
+    musig2::{self, CompactSignature},
+    secp::{MaybeScalar, Scalar},
+    AnchorParams, ContractParameters, ContractSignatures, EventLockingConditions, MarketMaker,
+    Outcome, PayoutWeights, Player, SignedContract,
+};
 use serde_json::{json, Value};
-use time::OffsetDateTime;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::sync::watch;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tower::ServiceExt;
@@ -435,6 +445,463 @@ async fn leaderboard_timings() {
         );
     }
     assert_eq!(event_requests.load(Ordering::SeqCst), 1);
+
+    coordinator.stop().await;
+    oracle.abort();
+}
+
+fn scalar(index: u64) -> Scalar {
+    Scalar::from_slice(&hashlock::sha256(&index.to_be_bytes())).unwrap()
+}
+
+/// A pool's contract between `players` players paying `places` places, signed: every ranking of
+/// the paid places is an outcome, one more shares the pot back among every entry, and so does the
+/// expiry. One key makes its signatures, not the players: decoding a contract doesn't check
+/// them. Returns its parameters, the signed contract as stored, and the oracle's attestation
+/// secret for each outcome.
+fn pool_contract(players: usize, places: usize) -> (ContractParameters, Value, Vec<Scalar>) {
+    let outcomes = coordinator_escrow::oracle_statement::ranking_outcomes(players, places);
+    let attestations: Vec<Scalar> = (0..outcomes.len() as u64)
+        .map(|index| scalar(10_000 + index))
+        .collect();
+    let equal: PayoutWeights = (0..players).map(|player| (player, 1)).collect();
+    let weights = crate::domain::get_percentage_weights(places);
+    let params = ContractParameters {
+        market_maker: MarketMaker {
+            pubkey: scalar(5_000).base_point_mul(),
+        },
+        players: (0..players)
+            .map(|index| Player {
+                pubkey: scalar(index as u64).base_point_mul(),
+                ticket_hash: hashlock::sha256(&[index as u8, 1]),
+                payout_hash: hashlock::sha256(&[index as u8, 2]),
+            })
+            .collect(),
+        event: EventLockingConditions {
+            locking_points: attestations
+                .iter()
+                .map(|key| key.base_point_mul().into())
+                .collect(),
+            expiry: Some(1_900_000_000),
+        },
+        outcome_payouts: outcomes
+            .iter()
+            .enumerate()
+            .map(|(index, winners)| {
+                let payout = if winners.len() == players {
+                    equal.clone()
+                } else {
+                    winners
+                        .iter()
+                        .copied()
+                        .zip(weights.iter().copied())
+                        .collect()
+                };
+                (Outcome::Attestation(index), payout)
+            })
+            .chain(std::iter::once((Outcome::Expiry, equal.clone())))
+            .collect(),
+        fee_rate: FeeRate::from_sat_per_vb_u32(1),
+        funding_value: Amount::from_sat(5_000 * players as u64),
+        relative_locktime_block_delta: 2_880,
+        anchor: Some(AnchorParams::default()),
+        // The outcome that shares the pot back shares winners with every other outcome.
+        outcome_bound_splits: true,
+    };
+    let signer = scalar(6_000);
+    let signatures = ContractSignatures {
+        expiry_tx_signature: Some(musig2::deterministic::sign_solo::<CompactSignature>(
+            signer, b"expiry",
+        )),
+        outcome_tx_signatures: params
+            .event
+            .locking_points
+            .iter()
+            .enumerate()
+            .map(|(index, point)| {
+                (
+                    index,
+                    musig2::deterministic::adaptor::sign_solo(signer, index.to_be_bytes(), *point),
+                )
+            })
+            .collect(),
+        split_tx_signatures: params
+            .all_win_conditions()
+            .into_iter()
+            .map(|condition| {
+                (
+                    condition,
+                    musig2::deterministic::sign_solo::<CompactSignature>(
+                        signer,
+                        condition.to_string(),
+                    ),
+                )
+            })
+            .collect(),
+    };
+    let funding = OutPoint::from_str(&format!("{}:0", "07".repeat(32))).unwrap();
+    let signed = json!({
+        "signatures": signatures,
+        "dlc": { "params": params, "funding_outpoint": funding },
+    });
+    (params, signed, attestations)
+}
+
+fn rfc3339(at: OffsetDateTime) -> String {
+    at.format(&Rfc3339).unwrap()
+}
+
+/// Writes `columns` of competition `id` in one statement, so its runner never sees half of
+/// them, including what the store itself would not write.
+async fn set_columns(coordinator: &Coordinator, id: Uuid, columns: Vec<(&'static str, String)>) {
+    let sql = format!(
+        "UPDATE competitions SET {} WHERE id = ?",
+        columns
+            .iter()
+            .map(|(column, _)| format!("{column} = ?"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    coordinator.databases[0]
+        .execute_write(move |pool| async move {
+            let mut query = sqlx::query(&sql);
+            for (_, value) in columns {
+                query = query.bind(value);
+            }
+            query.bind(id.to_string()).execute(&pool).await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+/// `competition` as kicked off with `params` and `signed_contract` (stored as given): seats for
+/// its entries alone, the contract signed and funded, and the window closed an hour ago, so it
+/// waits for the oracle, unless `more` columns move it on. Its entries go in before this, while
+/// it is still upcoming and has seats to spare, so no runner kicks it off itself.
+async fn kicked_off(
+    coordinator: &Coordinator,
+    competition: &mut Competition,
+    params: &ContractParameters,
+    places: usize,
+    signed_contract: String,
+    more: Vec<(&'static str, String)>,
+) {
+    let now = OffsetDateTime::now_utc();
+    let event = &mut competition.event_submission;
+    event.start_observation_date = now - time::Duration::hours(19);
+    event.end_observation_date = now - time::Duration::hours(1);
+    event.signing_date = now + time::Duration::hours(1);
+    event.total_allowed_entries = params.players.len();
+    event.number_of_places_win = places;
+    let at = rfc3339(now - time::Duration::hours(18));
+    let mut columns = vec![
+        ("event_submission", serde_json::to_string(event).unwrap()),
+        (
+            "event_announcement",
+            serde_json::to_string(&params.event).unwrap(),
+        ),
+        (
+            "contract_parameters",
+            serde_json::to_string(params).unwrap(),
+        ),
+        ("signed_contract", signed_contract),
+        ("escrow_funds_confirmed_at", at.clone()),
+        ("event_created_at", at.clone()),
+        ("entries_submitted_at", at.clone()),
+        ("contracted_at", at.clone()),
+        ("keymeld_keygen_completed_at", at.clone()),
+        ("signed_at", at.clone()),
+        ("funding_broadcasted_at", at.clone()),
+        ("funding_confirmed_at", at.clone()),
+        ("funding_settled_at", at.clone()),
+        ("awaiting_attestation_at", at),
+    ];
+    columns.extend(more);
+    set_columns(coordinator, competition.id, columns).await;
+}
+
+/// A started competition's pages are the ones visitors open most, and its signed contract is the
+/// largest thing stored for it: decoding the contract rebuilds every outcome's transactions. No
+/// page shows the contract, so none reads it. With a contract that cannot be decoded, every page
+/// of a competition waiting for its result, then scored, still answers, in full.
+#[tokio::test]
+async fn competition_pages_do_not_decode_the_signed_contract() {
+    let stations = ["KPWM", "KBTV", "KBOS"];
+    let readings: Vec<Value> = stations
+        .iter()
+        .map(|station| json!({"target": station, "metric": "temp_high", "baseline": 66}))
+        .collect();
+    let answers = Answers {
+        event: json!({"readings": readings, "entries": [], "attestation": null}),
+        observations: json!([]),
+        stations: json!([]),
+    };
+    let (_open, gate) = watch::channel(true);
+    let (oracle_url, oracle) = gated_oracle(answers, gate, Arc::new(AtomicUsize::new(0))).await;
+    let coordinator = Coordinator::start(oracle_url).await;
+    let mut competition = coordinator
+        .competition(
+            OffsetDateTime::now_utc() + time::Duration::days(1),
+            &stations,
+            25,
+        )
+        .await;
+    let mut entries = vec![];
+    for _ in 0..3 {
+        entries.push(coordinator.paid_entry(&competition, &stations).await);
+    }
+    let (params, _, attestations) = pool_contract(3, 1);
+    kicked_off(
+        &coordinator,
+        &mut competition,
+        &params,
+        1,
+        "a graph that must not be decoded".into(),
+        vec![],
+    )
+    .await;
+    let id = competition.id;
+    let state = &coordinator.state;
+    assert!(
+        state.coordinator.get_competition(id).await.is_err(),
+        "a full read decodes the contract"
+    );
+    let read = state
+        .coordinator
+        .get_competition_for_page(id)
+        .await
+        .unwrap();
+    assert!(read.signed_contract.is_none());
+    assert_eq!(read.contract_parameters.as_ref(), Some(&params));
+    let weather = state
+        .leaderboards
+        .weather(&competition, Duration::from_secs(30))
+        .await;
+    assert!(weather.value().is_some(), "the oracle answered");
+
+    let rows = coordinator
+        .get(&format!("/competitions/{id}/leaderboard/rows"))
+        .await;
+    for entry in &entries {
+        assert!(rows.contains(&entry.to_string()), "{rows}");
+    }
+    for path in [
+        format!("/competitions/{id}/leaderboard"),
+        format!("/competitions/{id}/entry-form"),
+        format!("/competitions/{id}/entry-forecasts"),
+        format!("/entries/{}/detail", entries[0]),
+        format!("/help?competition={id}"),
+        format!("/api/v1/competitions/{id}/payout-terms"),
+    ] {
+        coordinator.get(&path).await;
+    }
+
+    // Scored with the outcome that shares the pot back, which the lists tell from the contract's
+    // parameters.
+    let shared_back = MaybeScalar::from(*attestations.last().unwrap());
+    set_columns(
+        &coordinator,
+        id,
+        vec![("attestation", serde_json::to_string(&shared_back).unwrap())],
+    )
+    .await;
+    let finished = coordinator.get("/competitions?show=finished").await;
+    assert!(finished.contains("pot shared back"), "{finished}");
+    let leaderboard = coordinator
+        .get(&format!("/competitions/{id}/leaderboard"))
+        .await;
+    assert!(leaderboard.contains("Each entry's share"), "{leaderboard}");
+
+    coordinator.stop().await;
+    oracle.abort();
+}
+
+/// The one contract a page reads: whether an attested competition's pot went back by expiry is
+/// told by comparing its outcome transaction with the contract's expiry transaction.
+#[tokio::test]
+async fn a_page_reads_the_contract_of_a_competition_whose_expiry_was_broadcast() {
+    let coordinator = Coordinator::start("http://127.0.0.1:9".into()).await;
+    let mut competition = coordinator
+        .competition(
+            OffsetDateTime::now_utc() + time::Duration::days(1),
+            &["KPWM"],
+            25,
+        )
+        .await;
+    for _ in 0..3 {
+        coordinator.paid_entry(&competition, &["KPWM"]).await;
+    }
+    let (params, signed, attestations) = pool_contract(3, 1);
+    let contract: SignedContract = serde_json::from_value(signed.clone()).unwrap();
+    let expiry: Transaction = contract.expiry_tx().unwrap();
+    // Attested with the first outcome, which pays the first player alone, after the expiry,
+    // which pays everyone, settled it. Finished, so no runner steps it.
+    let first_wins = MaybeScalar::from(attestations[0]);
+    let at = rfc3339(OffsetDateTime::now_utc());
+    kicked_off(
+        &coordinator,
+        &mut competition,
+        &params,
+        1,
+        signed.to_string(),
+        vec![
+            ("attestation", serde_json::to_string(&first_wins).unwrap()),
+            ("expiry_broadcasted_at", at.clone()),
+            (
+                "outcome_transaction",
+                serde_json::to_string(&expiry).unwrap(),
+            ),
+            ("outcome_broadcasted_at", at.clone()),
+            ("completed_at", at),
+        ],
+    )
+    .await;
+    let coordinator_state = &coordinator.state.coordinator;
+    let read = coordinator_state
+        .get_competition_for_page(competition.id)
+        .await
+        .unwrap();
+    assert!(read.signed_contract.is_some());
+    assert!(read.settled_by_expiry());
+    // Without the contract, the attested outcome would look settled.
+    assert!(!coordinator_state
+        .get_competition_detail(competition.id, false)
+        .await
+        .unwrap()
+        .settled_by_expiry());
+
+    let leaderboard = coordinator
+        .get(&format!("/competitions/{}/leaderboard", competition.id))
+        .await;
+    assert!(leaderboard.contains("Each entry's share"), "{leaderboard}");
+    assert!(!leaderboard.contains("Winner takes all"), "{leaderboard}");
+
+    coordinator.stop().await;
+}
+
+/// Not a check: prints how long a started pool's pages take, and the two ways of reading the
+/// pool, for the PR's timings. A pool as the queues start them: 20 entries of 9 picks over three
+/// stations, paying two places, so its contract has 381 attested outcomes and 800 win
+/// conditions.
+///
+/// `cargo test --release -p coordinator pool_pages_timings -- --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "prints timings; run by hand"]
+async fn pool_pages_timings() {
+    const ENTRIES: usize = 20;
+    const RUNS: usize = 20;
+    let stations = ["KPWM", "KBTV", "KBOS"];
+    let readings: Vec<Value> = stations
+        .iter()
+        .flat_map(|station| {
+            [
+                ("temp_high", 66.0, 64.0),
+                ("temp_low", 42.0, 43.0),
+                ("wind_speed", 9.0, 12.0),
+            ]
+            .map(|(metric, baseline, observed)| {
+                json!({"target": station, "metric": metric, "baseline": baseline, "observed": observed})
+            })
+        })
+        .collect();
+    let answers = Answers {
+        event: json!({"readings": readings, "entries": [], "attestation": null}),
+        observations: json!([]),
+        stations: Value::Array(
+            stations
+                .iter()
+                .map(|station| {
+                    json!({"station_id": station, "station_name": station,
+                           "latitude": 43.6, "longitude": -70.3})
+                })
+                .collect(),
+        ),
+    };
+    let (_open, gate) = watch::channel(true);
+    let (oracle_url, oracle) = gated_oracle(answers, gate, Arc::new(AtomicUsize::new(0))).await;
+    let coordinator = Coordinator::start(oracle_url).await;
+    let mut competition = coordinator
+        .competition(
+            OffsetDateTime::now_utc() + time::Duration::days(1),
+            &stations,
+            ENTRIES + 5,
+        )
+        .await;
+    let mut entries = vec![];
+    for _ in 0..ENTRIES {
+        entries.push(coordinator.paid_entry(&competition, &stations).await);
+    }
+    let (params, signed, _) = pool_contract(ENTRIES, 2);
+    assert_eq!(params.outcome_payouts.len(), 382);
+    assert_eq!(params.all_win_conditions().len(), 800);
+    kicked_off(
+        &coordinator,
+        &mut competition,
+        &params,
+        2,
+        signed.to_string(),
+        vec![],
+    )
+    .await;
+    let id = competition.id;
+    let state = &coordinator.state;
+    let weather = state
+        .leaderboards
+        .weather(&competition, Duration::from_secs(30))
+        .await;
+    assert!(weather.value().is_some(), "the oracle answered");
+
+    fn summary(name: &str, mut times: Vec<Duration>) {
+        times.sort();
+        let runs = times.len();
+        println!(
+            "{name}: median {:?}, p95 {:?}, max {:?} over {runs}",
+            times[runs / 2],
+            times[runs * 95 / 100],
+            times[runs - 1],
+        );
+    }
+    let mut full = vec![];
+    let mut page = vec![];
+    for _ in 0..RUNS {
+        let started = Instant::now();
+        let read = state.coordinator.get_competition(id).await.unwrap();
+        full.push(started.elapsed());
+        assert!(read.signed_contract.is_some());
+        let started = Instant::now();
+        state
+            .coordinator
+            .get_competition_for_page(id)
+            .await
+            .unwrap();
+        page.push(started.elapsed());
+    }
+    summary("full read (before)", full);
+    summary("page read (after)", page);
+
+    let pages = [
+        ("leaderboard", format!("/competitions/{id}/leaderboard")),
+        (
+            "leaderboard rows",
+            format!("/competitions/{id}/leaderboard/rows"),
+        ),
+        ("entry picks", format!("/entries/{}/detail", entries[0])),
+        ("help", format!("/help?competition={id}")),
+        (
+            "payout terms",
+            format!("/api/v1/competitions/{id}/payout-terms"),
+        ),
+    ];
+    for (name, path) in &pages {
+        let mut times = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            let started = Instant::now();
+            coordinator.get(path).await;
+            times.push(started.elapsed());
+        }
+        summary(name, times);
+    }
 
     coordinator.stop().await;
     oracle.abort();
