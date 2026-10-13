@@ -200,14 +200,15 @@ impl Coordinator {
             })
             .collect();
         let pubkey = nostr::Keys::generate().public_key().to_hex();
+        // Each entry's own key and payout hash: the store keeps both unique.
+        let key = Scalar::from_slice(&hashlock::sha256(id.as_bytes())).unwrap();
         let entry = UserEntry {
             id,
             event_id: competition.id,
             ticket_id,
             pubkey,
-            ephemeral_pubkey: String::new(),
-            // Each entry's own: the store keeps payout hashes unique.
-            payout_hash: hex::encode(hashlock::sha256(id.as_bytes())),
+            ephemeral_pubkey: hex::encode(key.base_point_mul().serialize()),
+            payout_hash: hex::encode(hashlock::sha256(&key.serialize())),
             entry_submission: AddEventEntry {
                 id,
                 event_id: competition.id,
