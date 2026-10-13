@@ -12,6 +12,7 @@ mod invoices;
 mod lnd;
 mod onchain_wallet;
 mod preimages;
+mod read_retry;
 mod refund;
 mod request_context;
 mod store;
