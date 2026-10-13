@@ -33,8 +33,13 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// Deletion on, with the default period.
     async fn new() -> Self {
-        Self::with(SigningStateSettings::default()).await
+        Self::with(SigningStateSettings {
+            delete_paid_out: true,
+            ..SigningStateSettings::default()
+        })
+        .await
     }
 
     async fn with(settings: SigningStateSettings) -> Self {

@@ -430,7 +430,9 @@ impl RecoverySettings {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SigningStateSettings {
-    /// Delete the signing state of competitions that are fully paid out. On by default.
+    /// Delete the signing state of competitions that are fully paid out. Off by default: the
+    /// first deployment finds every competition paid out longer ago than the period due at
+    /// once, so check `coordinator_checkpoint_retention_competitions` before turning it on.
     pub delete_paid_out: bool,
     /// Days the state stays after the competition is first found fully paid out.
     pub paid_out_retention_days: u32,
@@ -444,7 +446,7 @@ pub const MAX_PAID_OUT_RETENTION_DAYS: u32 = 3650;
 impl Default for SigningStateSettings {
     fn default() -> Self {
         Self {
-            delete_paid_out: true,
+            delete_paid_out: false,
             paid_out_retention_days: 3,
         }
     }
@@ -2615,9 +2617,9 @@ mod signing_state_settings_tests {
     use super::*;
 
     #[test]
-    fn paid_out_signing_state_is_deleted_after_three_days_by_default() {
+    fn paid_out_signing_state_is_kept_by_default_with_a_three_day_period() {
         let defaults = SigningStateSettings::default();
-        assert!(defaults.delete_paid_out);
+        assert!(!defaults.delete_paid_out);
         assert_eq!(defaults.paid_out_retention_days, 3);
         assert_eq!(defaults.grace_secs(), 3 * 24 * 60 * 60);
 
@@ -2633,10 +2635,10 @@ mod signing_state_settings_tests {
         assert_eq!(parsed.signing_state_settings, defaults);
 
         let configured: Settings = toml::from_str(&format!(
-            "{without}\n[signing_state]\ndelete_paid_out = false\npaid_out_retention_days = 14\n"
+            "{without}\n[signing_state]\ndelete_paid_out = true\npaid_out_retention_days = 14\n"
         ))
         .unwrap();
-        assert!(!configured.signing_state_settings.delete_paid_out);
+        assert!(configured.signing_state_settings.delete_paid_out);
         assert_eq!(
             configured.signing_state_settings.paid_out_retention_days,
             14

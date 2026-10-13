@@ -99,7 +99,7 @@ A competition's signing state is its checkpoint row, the row's parts and manifes
 
 ```toml
 [signing_state]
-# Delete the signing state of paid-out competitions. Set false to keep everything.
+# Delete the signing state of paid-out competitions. Off (false) by default.
 delete_paid_out = true
 # Days the state stays after the competition was last paid out (1 to 3650).
 paid_out_retention_days = 3
@@ -136,7 +136,7 @@ Metrics:
 - `coordinator_checkpoint_retention_competitions{state="waiting|due"}`: fully paid-out competitions whose state is still stored, waiting out the period or due for deletion.
 - `coordinator_competitions_db_free_bytes`: free pages in the database.
 
-The first deployment finds every competition paid out longer ago than the period due at once and deletes it over the following hours. To look first, deploy with `delete_paid_out = false`, check the `due` gauge, and turn deletion on.
+Deletion is off by default. Turning it on finds every competition paid out longer ago than the period due at once and deletes it over the following hours, so check the `due` gauge first.
 
 A deleted checkpoint takes the sealed Keymeld receipts in its journal with it. Payout jobs keep their prepared receipts, entries keep the released key and preimage, and the payout witness keeps claim ownership, but a [witness migration that preserves existing claims](payout-witness.md#migration-that-preserves-existing-claims) can no longer collect execution receipts for deleted competitions. Turn deletion off before such a migration.
 
