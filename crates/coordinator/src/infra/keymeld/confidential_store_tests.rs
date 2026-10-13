@@ -2243,22 +2243,23 @@ async fn a_deletion_stopped_part_way_fails_closed_until_the_next_one_finishes_it
 /// leaves the row for the next call, which finds no part left and finishes.
 #[tokio::test]
 async fn a_deletion_stops_at_its_budget_and_the_next_one_goes_on() {
-    const BATCH: i64 = 16;
+    const BATCH: i64 = 8;
     for format in [CheckpointFormat::Parts, CheckpointFormat::Tree] {
         let (_directory, db) = database().await;
         let key = SessionSecret::from_bytes([105; 32]);
         let session = kickoff_session(&db, &key, Layout::from(format), 100).await;
         authorize_refund(&db, &session, "player").await;
         let stored = part_rows(&db, &session).await.len() as u64;
-        assert!(stored > 40, "{format:?}: {stored}");
+        let half = stored / 2;
+        assert!(half > BATCH as u64, "{format:?}: {stored}");
 
-        let first = delete(&db, &session, BATCH, 40).await.unwrap();
-        assert_eq!((first.parts, first.rows, first.finished), (40, 0, false));
-        assert_eq!(part_rows(&db, &session).await.len() as u64, stored - 40);
+        let first = delete(&db, &session, BATCH, half).await.unwrap();
+        assert_eq!((first.parts, first.rows, first.finished), (half, 0, false));
+        assert_eq!(part_rows(&db, &session).await.len() as u64, stored - half);
         assert_eq!(authorizations(&db, &session).await, 1);
         assert!(load(&db, &key, &session).await.is_err(), "{format:?}");
 
-        let rest = stored - 40;
+        let rest = stored - half;
         let second = delete(&db, &session, BATCH, rest).await.unwrap();
         assert_eq!(
             (second.parts, second.rows, second.finished),
