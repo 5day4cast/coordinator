@@ -564,7 +564,8 @@ async fn set_columns(coordinator: &Coordinator, id: Uuid, columns: Vec<(&'static
     );
     coordinator.databases[0]
         .execute_write(move |pool| async move {
-            let mut query = sqlx::query(&sql);
+            // The column names are this file's literals; the values are bound.
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
             for (_, value) in columns {
                 query = query.bind(value);
             }
@@ -596,7 +597,7 @@ async fn kicked_off(
     event.number_of_places_win = places;
     let at = rfc3339(now - time::Duration::hours(18));
     let mut columns = vec![
-        ("event_submission", serde_json::to_string(event).unwrap()),
+        ("event_submission", serde_json::to_string(&*event).unwrap()),
         (
             "event_announcement",
             serde_json::to_string(&params.event).unwrap(),
