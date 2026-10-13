@@ -181,6 +181,20 @@ settled_retention_days = 7
 
 A relay added later gets the existing records with `coordinator admin recovery republish`.
 
+### Signing-state retention
+
+Off by default. With `delete_paid_out = true`, the Keymeld signing state of a
+competition (its checkpoint, parts and refund invoice authorizations) is kept until the
+competition is fully paid out, then for the retention period, and is then deleted.
+With deletion off nothing is deleted, but the coordinator still counts what would be.
+See [Retention](docs/protocol-checkpoints.md#retention).
+
+```toml
+[signing_state]
+delete_paid_out = true
+paid_out_retention_days = 3
+```
+
 ### Satchel test wallet
 
 Off by default. On a test network, ordinary wallets cannot pay the entry

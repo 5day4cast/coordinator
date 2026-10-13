@@ -2043,3 +2043,307 @@ async fn checkpoint_writes_grow_with_the_change_not_the_state() {
         "{table}"
     );
 }
+
+/// A session a writer in `layout` stored as a kickoff leaves one: `outcomes` outcome subsets,
+/// a journal of 32 commands, written once whole and once for a journal save.
+async fn kickoff_session(
+    db: &DBConnection,
+    key: &SessionSecret,
+    layout: Layout,
+    outcomes: usize,
+) -> SessionId {
+    let session = SessionId::new_v7();
+    let mut original = state(&session);
+    original.session.outcome_subset_ids =
+        (0..outcomes).map(|index| (index, Uuid::now_v7())).collect();
+    original.journal = large_journal(32, 512);
+    create(db, key, &session, &original).await.unwrap();
+    let writer = make_writer(
+        db.clone(),
+        key.clone(),
+        session.clone(),
+        0,
+        &original,
+        layout,
+    )
+    .await;
+    let mut state = writer.finish(original).await.unwrap();
+    state.journal = serde_json::from_value(with_command(&state.journal, "kickoff/sign/1")).unwrap();
+    writer.save(&state.journal).await.unwrap();
+    session
+}
+
+/// A refund invoice authorization stored for `session`, as a refund stores one per player.
+async fn authorize_refund(db: &DBConnection, session: &SessionId, user: &str) {
+    let (session, user) = (session.to_string(), user.to_owned());
+    db.execute_write(move |pool| async move {
+        sqlx::query(
+            "INSERT INTO refund_invoice_authorizations
+                 (keygen_session_id, user_id, invoice, authorization)
+             VALUES (?, ?, 'lnbcrt1refund', 'authenticated receipt')",
+        )
+        .bind(session)
+        .bind(user)
+        .execute(&pool)
+        .await
+        .map(|_| ())
+    })
+    .await
+    .unwrap();
+}
+
+async fn authorizations(db: &DBConnection, session: &SessionId) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM refund_invoice_authorizations WHERE keygen_session_id = ?",
+    )
+    .bind(session.to_string())
+    .fetch_one(db.read())
+    .await
+    .unwrap()
+}
+
+/// A deletion removes the row, every part and manifest node, and every refund invoice
+/// authorization of its session, a batch at a time, in every format, and nothing of another
+/// session, which still loads as it did.
+#[tokio::test]
+async fn deleting_a_session_removes_everything_it_stored_and_nothing_else_in_every_format() {
+    const BATCH: i64 = 16;
+    for format in FORMATS {
+        let (_directory, db) = database().await;
+        let key = SessionSecret::from_bytes([101; 32]);
+        let layout = Layout::from(format);
+        let target = kickoff_session(&db, &key, layout, 100).await;
+        let bystander = kickoff_session(&db, &key, layout, 100).await;
+        authorize_refund(&db, &target, "first player").await;
+        authorize_refund(&db, &target, "second player").await;
+        authorize_refund(&db, &bystander, "first player").await;
+
+        let (_, sealed) = row(&db, &target).await;
+        let parts = part_rows(&db, &target).await;
+        if format == CheckpointFormat::Monolithic {
+            assert!(parts.is_empty());
+        } else {
+            assert!(
+                parts.len() as i64 > 2 * BATCH,
+                "{format:?} stores several batches of parts and nodes: {}",
+                parts.len()
+            );
+        }
+        let kept_row = row(&db, &bystander).await;
+        let kept_parts = part_rows(&db, &bystander).await;
+        let kept_state = load(&db, &key, &bystander).await.unwrap().unwrap().state;
+
+        let deleted = delete(&db, &target, BATCH, u64::MAX).await.unwrap();
+        assert_eq!(
+            deleted,
+            DeletedSigningState {
+                rows: 1,
+                row_bytes: sealed.len() as u64,
+                parts: parts.len() as u64,
+                part_bytes: parts.iter().map(|(_, body)| body.len() as u64).sum(),
+                authorizations: 2,
+                finished: true,
+            },
+            "{format:?}"
+        );
+        assert!(load(&db, &key, &target).await.unwrap().is_none());
+        assert!(load_metadata(&db, &key, &target).await.unwrap().is_none());
+        assert!(part_rows(&db, &target).await.is_empty());
+        assert_eq!(authorizations(&db, &target).await, 0);
+
+        assert_eq!(row(&db, &bystander).await, kept_row, "{format:?}");
+        assert_eq!(part_rows(&db, &bystander).await, kept_parts, "{format:?}");
+        assert_eq!(authorizations(&db, &bystander).await, 1);
+        let reloaded = load(&db, &key, &bystander).await.unwrap().unwrap().state;
+        assert_eq!(
+            serde_json::to_value(&reloaded).unwrap(),
+            serde_json::to_value(&kept_state).unwrap()
+        );
+
+        assert_eq!(
+            delete(&db, &target, BATCH, u64::MAX).await.unwrap(),
+            DeletedSigningState {
+                finished: true,
+                ..DeletedSigningState::default()
+            },
+            "a second deletion finds nothing"
+        );
+        db.close().await.unwrap();
+    }
+}
+
+/// A writer an operation resumed before its session was deleted cannot write after it: its
+/// compare-and-swap matches no row, so it stores no row, part or node, and the session stays
+/// gone rather than coming back without its history.
+#[tokio::test]
+async fn a_writer_resumed_before_its_session_was_deleted_stores_nothing_after() {
+    for format in FORMATS {
+        let (_directory, db) = database().await;
+        let key = SessionSecret::from_bytes([102; 32]);
+        let layout = Layout::from(format);
+        let session = kickoff_session(&db, &key, layout, 50).await;
+        let (writer, mut state) = resume_layout(&db, &key, &session, layout).await;
+
+        delete(&db, &session, DELETE_BATCH_ROWS, u64::MAX)
+            .await
+            .unwrap();
+
+        state.journal =
+            serde_json::from_value(with_command(&state.journal, "payout/late/1")).unwrap();
+        assert!(writer.save(&state.journal).await.is_err(), "{format:?}");
+        assert!(writer.finish(state).await.is_err(), "{format:?}");
+        assert!(load(&db, &key, &session).await.unwrap().is_none());
+        assert!(part_rows(&db, &session).await.is_empty(), "{format:?}");
+        db.close().await.unwrap();
+    }
+}
+
+/// A deletion that stopped after its first batch, as when the process stops, leaves a
+/// checkpoint that fails closed rather than loading without its parts, and the next deletion
+/// removes the rest.
+#[tokio::test]
+async fn a_deletion_stopped_part_way_fails_closed_until_the_next_one_finishes_it() {
+    for format in [CheckpointFormat::Parts, CheckpointFormat::Tree] {
+        let (_directory, db) = database().await;
+        let key = SessionSecret::from_bytes([103; 32]);
+        let session = kickoff_session(&db, &key, Layout::from(format), 50).await;
+        let stored = part_rows(&db, &session).await.len() as u64;
+        let id = session.to_string();
+        db.execute_write(move |pool| async move {
+            sqlx::query(
+                "DELETE FROM keymeld_protocol_parts WHERE session_id = ? AND digest IN (
+                     SELECT digest FROM keymeld_protocol_parts WHERE session_id = ? LIMIT 16)",
+            )
+            .bind(&id)
+            .bind(&id)
+            .execute(&pool)
+            .await
+            .map(|_| ())
+        })
+        .await
+        .unwrap();
+        assert!(
+            load(&db, &key, &session).await.is_err(),
+            "{format:?}: a checkpoint missing parts fails closed"
+        );
+
+        let rest = delete(&db, &session, DELETE_BATCH_ROWS, u64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(rest.rows, 1);
+        assert_eq!(rest.parts, stored - 16, "{format:?}");
+        assert!(rest.finished);
+        assert!(load(&db, &key, &session).await.unwrap().is_none());
+        db.close().await.unwrap();
+    }
+}
+
+/// A deletion deletes at most its budget of parts and nodes, and keeps the row until none is
+/// left, so a large session goes over several calls. One that ends exactly at its budget
+/// leaves the row for the next call, which finds no part left and finishes.
+#[tokio::test]
+async fn a_deletion_stops_at_its_budget_and_the_next_one_goes_on() {
+    const BATCH: i64 = 8;
+    for format in [CheckpointFormat::Parts, CheckpointFormat::Tree] {
+        let (_directory, db) = database().await;
+        let key = SessionSecret::from_bytes([105; 32]);
+        let session = kickoff_session(&db, &key, Layout::from(format), 100).await;
+        authorize_refund(&db, &session, "player").await;
+        let stored = part_rows(&db, &session).await.len() as u64;
+        let half = stored / 2;
+        assert!(half > BATCH as u64, "{format:?}: {stored}");
+
+        let first = delete(&db, &session, BATCH, half).await.unwrap();
+        assert_eq!((first.parts, first.rows, first.finished), (half, 0, false));
+        assert_eq!(part_rows(&db, &session).await.len() as u64, stored - half);
+        assert_eq!(authorizations(&db, &session).await, 1);
+        assert!(load(&db, &key, &session).await.is_err(), "{format:?}");
+
+        let rest = stored - half;
+        let second = delete(&db, &session, BATCH, rest).await.unwrap();
+        assert_eq!(
+            (second.parts, second.rows, second.finished),
+            (rest, 0, false),
+            "{format:?}: it ended at its budget"
+        );
+        assert!(part_rows(&db, &session).await.is_empty());
+        let last = delete(&db, &session, BATCH, 1).await.unwrap();
+        assert_eq!(
+            (last.parts, last.rows, last.authorizations, last.finished),
+            (0, 1, 1, true)
+        );
+        assert!(load(&db, &key, &session).await.unwrap().is_none());
+        db.close().await.unwrap();
+    }
+}
+
+/// `PRAGMA page_count`, or `freelist_count`, as the connections see the database now.
+async fn pages(db: &DBConnection, pragma: &'static str) -> i64 {
+    sqlx::query_scalar(pragma)
+        .fetch_one(db.read())
+        .await
+        .unwrap()
+}
+
+/// What deleting a kickoff's state costs and frees. The database does not use auto_vacuum, so
+/// the freed pages go to SQLite's free list (`PRAGMA incremental_vacuum` would do nothing) and
+/// the next checkpoints reuse them before the file grows. The table goes to stderr.
+#[tokio::test]
+async fn deleted_checkpoint_pages_are_reused_before_the_file_grows() {
+    use std::io::Write as _;
+    let mut table = String::from(
+        "| format | outcomes | pages stored | pages freed | log pages to delete | growth for the next session |\n| --- | --- | --- | --- | --- | --- |\n",
+    );
+    for (name, layout) in [
+        ("1", Layout::Monolithic),
+        ("2", Layout::Parts),
+        ("3", Layout::Tree(Shape::WRITER)),
+    ] {
+        let (_directory, db) = database().await;
+        assert_eq!(
+            pages(&db, "PRAGMA auto_vacuum").await,
+            0,
+            "the database keeps freed pages on its free list"
+        );
+        let key = SessionSecret::from_bytes([104; 32]);
+        let (size, free) = (
+            pages(&db, "PRAGMA page_count").await,
+            pages(&db, "PRAGMA freelist_count").await,
+        );
+        let session = kickoff_session(&db, &key, layout, 1024).await;
+        let stored = (pages(&db, "PRAGMA page_count").await - size)
+            - (pages(&db, "PRAGMA freelist_count").await - free);
+        let (size, free) = (
+            pages(&db, "PRAGMA page_count").await,
+            pages(&db, "PRAGMA freelist_count").await,
+        );
+        empty_log(&db).await;
+        delete(&db, &session, DELETE_BATCH_ROWS, u64::MAX)
+            .await
+            .unwrap();
+        let logged = logged_pages(&db).await;
+        let freed = pages(&db, "PRAGMA freelist_count").await - free;
+        assert_eq!(
+            pages(&db, "PRAGMA page_count").await,
+            size,
+            "the file keeps its size"
+        );
+
+        kickoff_session(&db, &key, layout, 1024).await;
+        let growth = pages(&db, "PRAGMA page_count").await - size;
+        table += &format!("| {name} | 1024 | {stored} | {freed} | {logged} | {growth} |\n");
+        assert!(
+            freed * 4 >= stored * 3,
+            "{name}: most pages are freed\n{table}"
+        );
+        assert!(
+            growth * 2 <= stored,
+            "{name}: the next session reuses them\n{table}"
+        );
+        db.close().await.unwrap();
+    }
+    let _ = writeln!(
+        std::io::stderr(),
+        "\npages (4 KiB) per kickoff session, its deletion, and the next one:\n{table}"
+    );
+}

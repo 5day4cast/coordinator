@@ -79,9 +79,9 @@ An old binary requires conversion of **every** format-2 row, including inactive 
 
 The down migration refuses to proceed while any row uses another format. Prefer rollback to a compatible release without reversing migrations.
 
-## Retention and expected savings
+## Expected savings
 
-Only parts outside the current manifest are deleted. The current journal remains available even after settlement. No signing or payment evidence expires automatically.
+Each write deletes only the parts outside the new manifest; whole checkpoints are deleted as [Retention](#retention) describes.
 
 On the measured backup, 90 checkpoint rows contained 476,018,100 encrypted bytes. Their mean size was 5,289,090 bytes; the largest was 24,613,478 bytes.
 
@@ -93,6 +93,57 @@ The regression fixture checks compression, stable ciphertext, binary arrays, rou
 
 Existing rows convert only when written. Therefore, deployment alone does not shrink historical data or establish a daily growth rate.
 
-SQLite can reuse freed pages. Do not run a live `VACUUM` during active signing or payouts to reclaim file space.
+## Retention
 
-Terminal-journal retention needs a separate policy that preserves retry and audit evidence. This release does not delete complete terminal checkpoints.
+A competition's signing state is its checkpoint row, the row's parts and manifest nodes, and its refund invoice authorizations. The coordinator keeps it until the competition is fully paid out, keeps it for a retention period after that, and then deletes it.
+
+```toml
+[signing_state]
+# Delete the signing state of paid-out competitions. Off (false) by default.
+delete_paid_out = true
+# Days the state stays after the competition was last paid out (1 to 3650).
+paid_out_retention_days = 3
+```
+
+A competition is fully paid out when nothing it holds can still need a Keymeld signature and none of its money can still move:
+
+- Its lifecycle is over. It completed, which happens only once every winner's output is settled: closed after a Lightning payout, swept, left as dust, or spent by the winner. Or it was cancelled before its contract's funding was ever broadcast. Or it is a queued competition whose pools all finished.
+- No contract holds its pot unless it completed. A cancelled competition whose funding was broadcast, or that an Arkade batch funded, can still be resumed, and resuming a funded pool's kickoff has Keymeld sign its contract again.
+- No ticket holds money. No Lightning payment is still held, no on-chain escrow is left unreclaimed, and every funded Arkade escrow was spent into a funded pool or returned by a settled refund. A written-off refund counts as not returned. Any refund that has not settled keeps the whole session, since a refund registers every paid player again.
+- No entry has a payout job or Lightning payout under way, a payout held for an operator, or a winner still owed. A paid payout job releases the winner's key through Keymeld, even after the competition completed.
+
+This is stricter than the lifecycle, the cleanup queue and the recovery records' notion of money held: a competition any of them still steps or holds money for is never paid out.
+
+Nothing reads the state after that. The contract's transactions, expiry included, were signed and are stored with the competition. The coordinator signs its own closes and sweeps with its own key, and the payout key and preimage it needs are stored with each entry once released. The recovery tool needs only the published records, the player's wallet, and the chain. The admin funds trace, the recovery records, and restart reconciliation never read checkpoints, and reconciliation only holds payouts of competitions that have not completed. The competition's stored session record (`competitions.keymeld_session`) is kept: it is small, the contract API reads it, and while it names the session no refund makes a new one.
+
+The period counts from when the competition was last paid out: the latest of when it completed, was cancelled or finished its pools, and when each of its tickets settled, was cancelled or reclaimed, each refund last changed, each owed winner was settled or claimed, each payout job and payout ended, and each payout hold was released. All of these are already recorded, so retention stores nothing of its own and needs no migration. Money that moves again, as when a restore holds a payout for an operator, makes the competition not paid out, and the period starts over from when it is paid out again. A time the database cannot read keeps the state.
+
+A session belongs to the competition whose id it has (a single competition's and a pool's), or to the one competition whose stored session names it (the refund session of a queued competition, or of a pool that never got its own). A session that no competition, or more than one, owns is kept.
+
+The competition cleanup, which one coordinator runs at a time, about once a minute, deletes the state of up to two competitions a pass, the longest paid out first, and at most 4,096 parts and nodes a pass. Deleting a part rewrites the page it was on, so the write-ahead log, and what replication uploads, grows by about as much as is deleted; the budget bounds that while a backlog clears. For each competition:
+
+1. It holds the session as every operation on it does, without waiting. A session in use is left for a later pass.
+2. It checks again that the competition is still paid out for longer than the period.
+3. It deletes the parts and nodes 256 rows to a write until none is left or the pass's budget is spent, then the row and the refund invoice authorizations in one write. A session larger than the budget goes over several passes.
+
+Once any of it is gone the checkpoint fails to load, and a writer that loaded it before fails its compare-and-swap and stores nothing, so every operation on the session fails closed. A deletion that stops part way, at the budget or because the process stopped, leaves a checkpoint that no longer loads, and the next pass goes on with it. Each pass's deletion is logged with its competition and session ids, the time the competition was last paid out, and what it removed.
+
+With `delete_paid_out = false` nothing is deleted, but each pass still counts what is waiting and due.
+
+Metrics:
+
+- `coordinator_checkpoint_deleted_rows_total{kind="row|part"}` and `coordinator_checkpoint_deleted_bytes_total{kind="row|part"}`: what retention deleted. `part` counts parts and manifest nodes.
+- `coordinator_checkpoint_retention_competitions{state="waiting|due"}`: fully paid-out competitions whose state is still stored, waiting out the period or due for deletion.
+- `coordinator_competitions_db_free_bytes`: free pages in the database.
+
+Deletion is off by default. Turning it on finds every competition paid out longer ago than the period due at once and deletes it over the following hours, so check the `due` gauge first.
+
+A deleted checkpoint takes the sealed Keymeld receipts in its journal with it. Payout jobs keep their prepared receipts, entries keep the released key and preimage, and the payout witness keeps claim ownership, but a [witness migration that preserves existing claims](payout-witness.md#migration-that-preserves-existing-claims) can no longer collect execution receipts for deleted competitions. Turn deletion off before such a migration.
+
+Rolling back to a release without retention needs nothing: it never reads a deleted checkpoint, since nothing runs for a paid-out competition, and one that tried would fail closed.
+
+### Space
+
+Deleted pages go to SQLite's free list, and later writes reuse them before the file grows. The database does not use `auto_vacuum`, so `PRAGMA incremental_vacuum` would do nothing, and enabling it needs a full `VACUUM`. Neither is needed: once deletions keep pace with new kickoffs the file stops growing, and `coordinator_competitions_db_free_bytes` shows the reusable space. Do not run a live `VACUUM` during active signing or payouts to reclaim file space; a smaller file needs an offline `VACUUM` and a new replica snapshot.
+
+Freed pages keep their old bytes until reused. Those bytes are sealed under the coordinator's checkpoint key.

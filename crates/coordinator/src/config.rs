@@ -61,6 +61,8 @@ pub struct Settings {
     pub kickoff_check_settings: KickoffCheckSettings,
     #[serde(default, rename = "recovery")]
     pub recovery_settings: RecoverySettings,
+    #[serde(default, rename = "signing_state")]
+    pub signing_state_settings: SigningStateSettings,
     #[serde(default, rename = "pow")]
     pub pow_settings: PowSettings,
     #[serde(default)]
@@ -416,6 +418,56 @@ impl RecoverySettings {
             delete_settled: self.delete_settled,
             grace_secs: i64::from(self.settled_retention_days) * 24 * 60 * 60,
         }
+    }
+}
+
+/// Retention of the Keymeld signing state the coordinator keeps for each competition: its
+/// checkpoint row, the row's parts and manifest nodes, and its refund invoice authorizations.
+/// See docs/protocol-checkpoints.md, "Retention".
+///
+/// Once a competition is fully paid out, its state stays for `paid_out_retention_days` and is
+/// then deleted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SigningStateSettings {
+    /// Delete the signing state of competitions that are fully paid out. Off by default: the
+    /// first deployment finds every competition paid out longer ago than the period due at
+    /// once, so check `coordinator_checkpoint_retention_competitions` before turning it on.
+    pub delete_paid_out: bool,
+    /// Days the state stays after the competition is first found fully paid out.
+    pub paid_out_retention_days: u32,
+}
+
+/// The shortest `paid_out_retention_days` allowed: a day.
+pub const MIN_PAID_OUT_RETENTION_DAYS: u32 = 1;
+/// The longest `paid_out_retention_days` allowed: ten years.
+pub const MAX_PAID_OUT_RETENTION_DAYS: u32 = 3650;
+
+impl Default for SigningStateSettings {
+    fn default() -> Self {
+        Self {
+            delete_paid_out: false,
+            paid_out_retention_days: 3,
+        }
+    }
+}
+
+impl SigningStateSettings {
+    pub fn validate(&self) -> Result<(), anyhow::Error> {
+        if !(MIN_PAID_OUT_RETENTION_DAYS..=MAX_PAID_OUT_RETENTION_DAYS)
+            .contains(&self.paid_out_retention_days)
+        {
+            return Err(anyhow!(
+                "signing_state.paid_out_retention_days must be from \
+                 {MIN_PAID_OUT_RETENTION_DAYS} to {MAX_PAID_OUT_RETENTION_DAYS}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// How long the state stays after its competition is found paid out, in seconds.
+    pub fn grace_secs(&self) -> i64 {
+        i64::from(self.paid_out_retention_days) * 24 * 60 * 60
     }
 }
 
@@ -1071,6 +1123,7 @@ impl Settings {
         self.kickoff_check_settings.validate()?;
         self.recovery_settings
             .validate(&self.coordinator_settings)?;
+        self.signing_state_settings.validate()?;
         self.pow_settings.validate()?;
         self.http_context.validate()?;
         self.feedback_settings.validate()?;
@@ -2556,5 +2609,71 @@ mod feedback_settings_tests {
         assert!(logs.validate().is_ok());
         logs.query_path = "/x?y=1".into();
         assert!(logs.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod signing_state_settings_tests {
+    use super::*;
+
+    #[test]
+    fn paid_out_signing_state_is_kept_by_default_with_a_three_day_period() {
+        let defaults = SigningStateSettings::default();
+        assert!(!defaults.delete_paid_out);
+        assert_eq!(defaults.paid_out_retention_days, 3);
+        assert_eq!(defaults.grace_secs(), 3 * 24 * 60 * 60);
+
+        // A config written before the section existed loads with the defaults.
+        let text = toml::to_string(&Settings::default()).unwrap();
+        let without: String = text
+            .split("\n[")
+            .filter(|section| !section.starts_with("signing_state]"))
+            .collect::<Vec<_>>()
+            .join("\n[");
+        assert!(!without.contains("paid_out_retention_days"));
+        let parsed: Settings = toml::from_str(&without).unwrap();
+        assert_eq!(parsed.signing_state_settings, defaults);
+
+        let configured: Settings = toml::from_str(&format!(
+            "{without}\n[signing_state]\ndelete_paid_out = true\npaid_out_retention_days = 14\n"
+        ))
+        .unwrap();
+        assert!(configured.signing_state_settings.delete_paid_out);
+        assert_eq!(
+            configured.signing_state_settings.paid_out_retention_days,
+            14
+        );
+    }
+
+    #[test]
+    fn retention_must_be_between_a_day_and_ten_years() {
+        for days in [1, 3, MAX_PAID_OUT_RETENTION_DAYS] {
+            let settings = SigningStateSettings {
+                paid_out_retention_days: days,
+                ..SigningStateSettings::default()
+            };
+            assert!(settings.validate().is_ok(), "{days}");
+        }
+        for days in [0, MAX_PAID_OUT_RETENTION_DAYS + 1] {
+            let settings = SigningStateSettings {
+                paid_out_retention_days: days,
+                ..SigningStateSettings::default()
+            };
+            let refused = settings.validate().unwrap_err();
+            assert!(
+                refused.to_string().contains("paid_out_retention_days"),
+                "{refused}"
+            );
+            let whole = Settings {
+                signing_state_settings: settings,
+                ..Settings::default()
+            };
+            let refused = whole.validate().unwrap_err();
+            assert!(
+                refused.to_string().contains("paid_out_retention_days"),
+                "{refused}"
+            );
+        }
+        Settings::default().validate().unwrap();
     }
 }

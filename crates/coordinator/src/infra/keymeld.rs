@@ -426,6 +426,78 @@ pub trait Keymeld: Send + Sync {
             "Queued competitions' pools are not supported".into(),
         ))
     }
+
+    /// Hold `session` as each operation on it does while it runs, unless one holds it now.
+    /// Its signing state is deleted only under a hold, so never while an operation of this
+    /// process uses it, and no operation on it starts until the hold is dropped.
+    async fn try_hold_session(&self, session: &SessionId) -> Option<SessionHold> {
+        Some(SessionHold {
+            session: session.clone(),
+            guard: None,
+        })
+    }
+
+    /// Delete the signing state stored for the session `hold` holds: its checkpoint row, the
+    /// row's parts and manifest nodes, and its refund invoice authorizations. At most `budget`
+    /// parts and nodes go in one call; the row and the authorizations go once none is left,
+    /// and the result says whether that happened. Once any of it is gone the session's
+    /// checkpoint no longer loads, and every operation on it fails closed. A Keymeld that
+    /// stores no state has nothing to delete.
+    async fn delete_signing_state(
+        &self,
+        hold: &SessionHold,
+        budget: u64,
+    ) -> Result<DeletedSigningState, KeymeldError> {
+        let _ = (hold, budget);
+        Ok(DeletedSigningState {
+            finished: true,
+            ..DeletedSigningState::default()
+        })
+    }
+}
+
+/// A session held for one task: see [`Keymeld::try_hold_session`]. Dropping it lets the
+/// session's operations run again.
+pub struct SessionHold {
+    session: SessionId,
+    /// The session's operation lock, held. `None` from a Keymeld that keeps no state.
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl SessionHold {
+    pub fn session(&self) -> &SessionId {
+        &self.session
+    }
+}
+
+/// What deleting a session's signing state removed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeletedSigningState {
+    /// The checkpoint row: 1, or 0 when none was stored.
+    pub rows: u64,
+    /// The sealed row's bytes: the whole state in format 1, its manifest in format 2 and its
+    /// root in format 3.
+    pub row_bytes: u64,
+    /// Parts and format-3 manifest nodes.
+    pub parts: u64,
+    /// Their sealed bytes.
+    pub part_bytes: u64,
+    /// Refund invoice authorizations.
+    pub authorizations: u64,
+    /// Whether nothing of the session is left: the row and the authorizations went too.
+    pub finished: bool,
+}
+
+impl DeletedSigningState {
+    /// Every row deleted, of every kind.
+    pub fn total_rows(&self) -> u64 {
+        self.rows + self.parts + self.authorizations
+    }
+
+    /// The sealed bytes of the checkpoint row and its parts and nodes.
+    pub fn total_bytes(&self) -> u64 {
+        self.row_bytes + self.part_bytes
+    }
 }
 
 /// Holds private authority credentials; never format or serialize the live session.

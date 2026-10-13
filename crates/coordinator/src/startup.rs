@@ -582,6 +582,7 @@ pub async fn build_app(
     .with_network_fee(config.network_fee_settings.clone())?
     .with_kickoff_check(config.kickoff_check_settings.clone())?
     .with_cpfp(config.cpfp_settings.clone())?
+    .with_signing_state(config.signing_state_settings.clone())?
     .with_settle_only(
         config.coordinator_settings.settle_only,
         config.coordinator_settings.settle_only_unstarted,
@@ -598,6 +599,14 @@ pub async fn build_app(
         info!("Escrow transactions enabled");
     } else {
         info!("Escrow transactions disabled (using HODL invoices only)");
+    }
+    if config.signing_state_settings.delete_paid_out {
+        info!(
+            "Keymeld signing state is deleted {} days after its competition is paid out",
+            config.signing_state_settings.paid_out_retention_days
+        );
+    } else {
+        info!("Keymeld signing state is kept after its competition is paid out");
     }
 
     info!("Coordinator service configured");

@@ -1451,6 +1451,34 @@ impl Keymeld for KeymeldService {
             .await
             .map(|(signed, _)| signed)
     }
+
+    async fn try_hold_session(&self, session: &SessionId) -> Option<SessionHold> {
+        // Never wait for an operation: a session in use is left for a later pass.
+        let guard = self.session_lock(session).await.try_lock_owned().ok()?;
+        Some(SessionHold {
+            session: session.clone(),
+            guard: Some(guard),
+        })
+    }
+
+    async fn delete_signing_state(
+        &self,
+        hold: &SessionHold,
+        budget: u64,
+    ) -> Result<DeletedSigningState, KeymeldError> {
+        if hold.guard.is_none() {
+            return Err(invalid(
+                "Signing state is deleted only while its session is held",
+            ));
+        }
+        confidential_store::delete(
+            self.database()?,
+            &hold.session,
+            confidential_store::DELETE_BATCH_ROWS,
+            budget,
+        )
+        .await
+    }
 }
 
 impl KeymeldService {

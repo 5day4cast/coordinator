@@ -2,7 +2,8 @@
 //! [`crate::infra::allocator`] makes. RSS includes live allocations and retained pages; glibc's
 //! free arena bytes are reusable, not necessarily resident or reclaimable.
 use prometheus::{
-    Gauge, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, Opts, Registry,
+    Gauge, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Opts, Registry,
 };
 use std::{sync::LazyLock, time::Duration};
 use tokio::{sync::Mutex, time::Instant};
@@ -124,6 +125,80 @@ pub(crate) fn checkpoint_written_bytes(kind: &'static str, bytes: usize) {
         .inc_by(bytes as u64);
 }
 
+/// What signing-state retention deletes, by kind: `row` is a checkpoint row, `part` a part or
+/// format-3 manifest node.
+const CHECKPOINT_DELETE_KINDS: [&str; 2] = ["row", "part"];
+
+static CHECKPOINT_DELETED_ROWS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "coordinator_checkpoint_deleted_rows_total",
+            "Checkpoint rows, and their parts and manifest nodes, deleted once their competition was paid out",
+        ),
+        &["kind"],
+    )
+    .expect("valid metric")
+});
+
+static CHECKPOINT_DELETED_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "coordinator_checkpoint_deleted_bytes_total",
+            "Sealed bytes of the checkpoint rows, parts and manifest nodes deleted once their competition was paid out",
+        ),
+        &["kind"],
+    )
+    .expect("valid metric")
+});
+
+/// Paid-out competitions whose signing state is still stored, by `state`: `waiting` out the
+/// retention period, or `due` for deletion.
+const CHECKPOINT_RETENTION_STATES: [&str; 2] = ["waiting", "due"];
+
+static CHECKPOINT_RETENTION: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "coordinator_checkpoint_retention_competitions",
+            "Fully paid-out competitions whose signing state is still stored: waiting out the retention period, or due for deletion",
+        ),
+        &["state"],
+    )
+    .expect("valid metric")
+});
+
+static DATABASE_FREE: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "coordinator_competitions_db_free_bytes",
+        "Bytes of free pages in the competitions database, which new writes reuse before the file grows",
+    )
+    .expect("valid metric")
+});
+
+/// Count `rows` of one kind, with their sealed `bytes`, that signing-state retention deleted.
+pub(crate) fn checkpoint_deleted(kind: &'static str, rows: u64, bytes: u64) {
+    CHECKPOINT_DELETED_ROWS
+        .with_label_values(&[kind])
+        .inc_by(rows);
+    CHECKPOINT_DELETED_BYTES
+        .with_label_values(&[kind])
+        .inc_by(bytes);
+}
+
+/// Record how many paid-out competitions' signing state waits out its retention period, and
+/// how many are due for deletion.
+pub(crate) fn checkpoint_retention(waiting: usize, due: usize) {
+    for (state, competitions) in CHECKPOINT_RETENTION_STATES.into_iter().zip([waiting, due]) {
+        CHECKPOINT_RETENTION
+            .with_label_values(&[state])
+            .set(i64::try_from(competitions).unwrap_or(i64::MAX));
+    }
+}
+
+/// Record the bytes of the competitions database's free pages.
+pub(crate) fn competitions_db_free_bytes(bytes: i64) {
+    DATABASE_FREE.set(bytes);
+}
+
 pub(super) fn register(registry: &Registry) -> prometheus::Result<()> {
     for gauge in [
         &*RESIDENT,
@@ -144,6 +219,17 @@ pub(super) fn register(registry: &Registry) -> prometheus::Result<()> {
         CHECKPOINT_WRITTEN.with_label_values(&[kind]);
     }
     registry.register(Box::new(CHECKPOINT_WRITTEN.clone()))?;
+    for kind in CHECKPOINT_DELETE_KINDS {
+        CHECKPOINT_DELETED_ROWS.with_label_values(&[kind]);
+        CHECKPOINT_DELETED_BYTES.with_label_values(&[kind]);
+    }
+    registry.register(Box::new(CHECKPOINT_DELETED_ROWS.clone()))?;
+    registry.register(Box::new(CHECKPOINT_DELETED_BYTES.clone()))?;
+    for state in CHECKPOINT_RETENTION_STATES {
+        CHECKPOINT_RETENTION.with_label_values(&[state]);
+    }
+    registry.register(Box::new(CHECKPOINT_RETENTION.clone()))?;
+    registry.register(Box::new(DATABASE_FREE.clone()))?;
     Ok(())
 }
 
@@ -331,6 +417,69 @@ mod tests {
         let before = written("node").unwrap();
         checkpoint_written_bytes("node", 4096);
         assert!(written("node").unwrap() >= before + 4096.);
+    }
+
+    #[test]
+    fn checkpoint_deletions_count_rows_and_bytes_by_kind_from_startup() {
+        let registry = Registry::new();
+        register(&registry).unwrap();
+        let counted = |name: &str, kind: &str| {
+            registry
+                .gather()
+                .iter()
+                .find(|m| m.get_name() == name)
+                .unwrap()
+                .get_metric()
+                .iter()
+                .find(|m| m.get_label()[0].get_value() == kind)
+                .map(|m| m.get_counter().get_value())
+        };
+        for kind in CHECKPOINT_DELETE_KINDS {
+            for name in [
+                "coordinator_checkpoint_deleted_rows_total",
+                "coordinator_checkpoint_deleted_bytes_total",
+            ] {
+                assert!(
+                    counted(name, kind).is_some(),
+                    "{name}{{kind={kind}}} is exported before any deletion"
+                );
+            }
+        }
+        let rows = counted("coordinator_checkpoint_deleted_rows_total", "part").unwrap();
+        let bytes = counted("coordinator_checkpoint_deleted_bytes_total", "part").unwrap();
+        checkpoint_deleted("part", 3, 12_000);
+        assert!(counted("coordinator_checkpoint_deleted_rows_total", "part").unwrap() >= rows + 3.);
+        assert!(
+            counted("coordinator_checkpoint_deleted_bytes_total", "part").unwrap()
+                >= bytes + 12_000.
+        );
+
+        let gauge = |name: &str, state: Option<&str>| {
+            registry
+                .gather()
+                .iter()
+                .find(|m| m.get_name() == name)
+                .and_then(|m| {
+                    m.get_metric()
+                        .iter()
+                        .find(|m| state.is_none_or(|state| m.get_label()[0].get_value() == state))
+                        .map(|m| m.get_gauge().get_value())
+                })
+        };
+        for state in CHECKPOINT_RETENTION_STATES {
+            assert!(
+                gauge("coordinator_checkpoint_retention_competitions", Some(state)).is_some(),
+                "{state} is exported before any pass"
+            );
+        }
+        checkpoint_retention(4, 1);
+        competitions_db_free_bytes(8192);
+        let waiting = gauge(
+            "coordinator_checkpoint_retention_competitions",
+            Some("waiting"),
+        );
+        assert!(waiting.is_some());
+        assert!(gauge("coordinator_competitions_db_free_bytes", None).is_some());
     }
 
     #[test]
