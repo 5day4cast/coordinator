@@ -24,6 +24,8 @@ mod restore_reconcile;
 mod settle_only;
 #[path = "settled_outputs.rs"]
 mod settled_outputs;
+#[path = "signing_retention.rs"]
+mod signing_retention;
 pub use ark_coordinator::{ARK_SWAP_BOARDS_EVERY, SWAPS_UNAVAILABLE};
 pub use automatic::{InvoiceFallbackRequest, PayoutAuthorizationInfo, PayoutTermsQuote};
 pub use kickoff_check::{KickoffCheck, KickoffPool};
@@ -382,6 +384,9 @@ pub struct Coordinator {
     reconciled: Reconciled,
     /// The most winning places a new competition may pay; 1 until `with_max_winning_places`.
     max_winning_places: usize,
+    /// When the Keymeld signing state of paid-out competitions is deleted; kept until
+    /// `with_signing_state`.
+    signing_state: crate::config::SigningStateSettings,
 }
 
 type TicketRequestLocks =
@@ -455,6 +460,10 @@ impl Coordinator {
             settle_only: SettleOnly::default(),
             reconciled: Reconciled::default(),
             max_winning_places: 1,
+            signing_state: crate::config::SigningStateSettings {
+                delete_paid_out: false,
+                ..Default::default()
+            },
         };
         coordinator.validate_coordinator_metadata().await?;
         Ok(coordinator)

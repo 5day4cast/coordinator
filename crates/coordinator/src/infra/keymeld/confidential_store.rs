@@ -2,12 +2,15 @@
 //! gateway has no access to these records. Persist before any enclave side effect.
 use super::{
     protocol_parts::{self, EntryCache, Manifest, Nodes, PartLengths, Parts, Shape, Tree},
-    KeymeldError, StoredDlcKeygenSession,
+    DeletedSigningState, KeymeldError, StoredDlcKeygenSession,
 };
 use crate::{
     config::CheckpointFormat,
     infra::db::DBConnection,
-    metrics::{checkpoint_bytes, checkpoint_encode_buffer_bytes, checkpoint_written_bytes},
+    metrics::{
+        checkpoint_bytes, checkpoint_deleted, checkpoint_encode_buffer_bytes,
+        checkpoint_written_bytes,
+    },
 };
 use keymeld_core::{
     authorization::SignedRoster,
@@ -370,6 +373,93 @@ pub(super) async fn create(
             .bind(id).bind(encrypted).execute(&pool).await.map(|result|result.rows_affected())
     }).await.map_err(|e|failure(e.to_string()))?;
     Ok(count == 1)
+}
+
+/// How many parts and manifest nodes one write of [`delete`] removes, about a megabyte of
+/// sealed bodies, so other writes wait for one batch no longer than for a checkpoint.
+pub(super) const DELETE_BATCH_ROWS: i64 = 256;
+
+/// Delete everything stored for `session`: its parts and manifest nodes, `batch` to a write,
+/// then its row and its refund invoice authorizations in one last write. Other writes run
+/// between the batches. The caller holds the session (`Keymeld::try_hold_session`), so no
+/// operation of this process uses it meanwhile.
+///
+/// Once one batch is gone the checkpoint no longer loads, and once the row is gone a stale
+/// writer's compare-and-swap matches no row, so either fails closed and stores nothing. A
+/// deletion that stops part way leaves the rest for the next call.
+pub(super) async fn delete(
+    db: &DBConnection,
+    session: &SessionId,
+    batch: i64,
+) -> Result<DeletedSigningState, KeymeldError> {
+    let batch = batch.max(1);
+    let id = session.to_string();
+    let mut deleted = DeletedSigningState::default();
+    loop {
+        let session_id = id.clone();
+        let lengths: Vec<i64> = db
+            .execute_write(move |pool| async move {
+                sqlx::query_scalar(
+                    "DELETE FROM keymeld_protocol_parts WHERE session_id = ? AND digest IN (
+                         SELECT digest FROM keymeld_protocol_parts WHERE session_id = ? LIMIT ?)
+                     RETURNING length(body)",
+                )
+                .bind(&session_id)
+                .bind(&session_id)
+                .bind(batch)
+                .fetch_all(&pool)
+                .await
+            })
+            .await
+            .map_err(|e| failure(format!("Cannot delete checkpoint parts: {e}")))?;
+        let bytes = lengths.iter().map(|length| *length as u64).sum::<u64>();
+        checkpoint_deleted("part", lengths.len() as u64, bytes);
+        deleted.parts += lengths.len() as u64;
+        deleted.part_bytes += bytes;
+        if (lengths.len() as i64) < batch {
+            break;
+        }
+    }
+    let (parts, row, authorizations) = db
+        .execute_write(move |pool| async move {
+            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+            // Nothing should be left. The row's cascade would delete a part another process
+            // stored between the batches; it is counted here instead.
+            let parts: Vec<i64> = sqlx::query_scalar(
+                "DELETE FROM keymeld_protocol_parts WHERE session_id = ? RETURNING length(body)",
+            )
+            .bind(&id)
+            .fetch_all(&mut *tx)
+            .await?;
+            let row: Vec<i64> = sqlx::query_scalar(
+                "DELETE FROM keymeld_protocol_state WHERE session_id = ?
+                 RETURNING length(encrypted_state)",
+            )
+            .bind(&id)
+            .fetch_all(&mut *tx)
+            .await?;
+            let authorizations = sqlx::query(
+                "DELETE FROM refund_invoice_authorizations WHERE keygen_session_id = ?",
+            )
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            tx.commit().await?;
+            Ok((parts, row, authorizations))
+        })
+        .await
+        .map_err(|e| failure(format!("Cannot delete the checkpoint: {e}")))?;
+    let part_bytes = parts.iter().map(|length| *length as u64).sum::<u64>();
+    checkpoint_deleted("part", parts.len() as u64, part_bytes);
+    deleted.parts += parts.len() as u64;
+    deleted.part_bytes += part_bytes;
+    let row_bytes = row.iter().map(|length| *length as u64).sum::<u64>();
+    checkpoint_deleted("row", row.len() as u64, row_bytes);
+    deleted.rows = row.len() as u64;
+    deleted.row_bytes = row_bytes;
+    deleted.authorizations = authorizations;
+    Ok(deleted)
 }
 
 /// How a writer stores what it writes.

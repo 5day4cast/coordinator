@@ -245,6 +245,9 @@ impl Coordinator {
     /// Then the Keymeld registrations players sent before paying are deleted once nothing will
     /// use them: those of released reservations, and those of competitions that ended with no
     /// refund left to sign.
+    ///
+    /// Last, the Keymeld signing state of competitions paid out for longer than the retention
+    /// period is deleted (`signing_retention.rs`), after this pass's refunds, which use it.
     pub async fn clean_up_competitions(&self) -> Result<(), anyhow::Error> {
         for competition_id in self
             .competition_store
@@ -262,6 +265,9 @@ impl Coordinator {
         let purged = self.competition_store.purge_ticket_registrations().await?;
         if purged > 0 {
             debug!("Deleted {purged} Keymeld registrations that nothing will use");
+        }
+        if let Err(error) = self.retire_signing_state().await {
+            warn!("Keymeld signing-state retention: {error:#}");
         }
         Ok(())
     }
