@@ -597,6 +597,10 @@ impl ScenarioConfig {
             (fewest..=100).contains(&self.users),
             "users must be between {fewest} and 100"
         );
+        anyhow::ensure!(
+            scenario != super::fill::FILL_COMPETITION || self.competition_id.is_some(),
+            "{scenario} fills a competition someone else made; name it"
+        );
         let seed = self.seed.unwrap_or_else(rand::random);
         let mut config = self.clone();
         config.competition_id.get_or_insert_with(uuid::Uuid::now_v7);
@@ -669,9 +673,9 @@ impl ScenarioConfig {
         );
         let behavior = match scenario {
             "full_lifecycle" | "escrow_refund" => EntryBehavior::Complete,
-            super::stress::STRESS_FULL_POOL | super::manual::MANUAL_COMPETITION => {
-                EntryBehavior::Complete
-            }
+            super::stress::STRESS_FULL_POOL
+            | super::manual::MANUAL_COMPETITION
+            | super::fill::FILL_COMPETITION => EntryBehavior::Complete,
             super::queued::QUEUED_SPLIT
             | super::queued::QUEUED_ONE_POOL
             | super::queued::QUEUED_TOO_FEW => EntryBehavior::Complete,

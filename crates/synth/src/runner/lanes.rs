@@ -119,7 +119,7 @@ impl LaneConfig {
                 && self
                     .scenarios
                     .iter()
-                    .all(|scenario| super::SCENARIOS.contains(&scenario.as_str())),
+                    .all(|scenario| super::schedulable(scenario)),
             "lane {name}: scenarios must name supported scenarios"
         );
         let windows = self.windows(base);

@@ -88,6 +88,10 @@ pub struct SchedulerConfig {
     /// Keep a competition open for visitors: when none is, start a lane's next run at once.
     #[serde(default)]
     pub keep_open: Option<KeepOpenConfig>,
+    /// Fill the competitions synth did not make before their entries close, so the people in
+    /// them get to play. Runs whether or not `enabled` starts synth's own competitions.
+    #[serde(default)]
+    pub fill: Option<FillConfig>,
 }
 
 fn default_scenario() -> String {
@@ -158,6 +162,64 @@ impl KeepOpenConfig {
     }
 }
 
+/// Fill other people's competitions. Every check, synth lists the competitions still taking
+/// entries that it did not make. Once one is within `before_close_secs` of its entries closing,
+/// synth's players take its empty seats, less `leave_open`, arriving over the time left as people
+/// do. A queue that is not full starts only if it has its smallest pool, and a single competition
+/// that is not full when entries close is cancelled, so without this the people who entered may
+/// not get to play.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FillConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// How long before entries close synth starts filling a competition.
+    #[serde(default = "default_fill_before_close_secs")]
+    pub before_close_secs: u64,
+    #[serde(default = "default_check_interval_secs")]
+    pub check_interval_secs: u64,
+    /// Seats synth leaves empty for people who enter at the last minute.
+    #[serde(default)]
+    pub leave_open: u64,
+    /// Fill only competitions with at least this many paid entries from other players.
+    #[serde(default)]
+    pub min_entries: u64,
+    /// Fill only competitions whose entry fee is at most this, in sats.
+    #[serde(default = "default_fill_max_entry_fee_sats")]
+    pub max_entry_fee_sats: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_fill_before_close_secs() -> u64 {
+    30 * 60
+}
+
+fn default_fill_max_entry_fee_sats() -> u64 {
+    10_000
+}
+
+impl FillConfig {
+    /// Check synth's players can arrive, pay and submit within `before_close_secs`.
+    pub fn validate(&self, timing: &crate::scenarios::EntryTiming) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.check_interval_secs > 0,
+            "scheduler.fill.check_interval_secs must be positive"
+        );
+        anyhow::ensure!(
+            self.check_interval_secs < self.before_close_secs,
+            "scheduler.fill.check_interval_secs must be shorter than before_close_secs"
+        );
+        timing.validate(self.before_close_secs).map_err(|error| {
+            anyhow::anyhow!(
+                "scheduler.fill.before_close_secs leaves synth's players too little time: {error:#}"
+            )
+        })
+    }
+}
+
 impl SchedulerConfig {
     pub fn scenario_names(&self) -> Vec<&str> {
         self.scenarios.as_ref().map_or_else(
@@ -176,7 +238,7 @@ impl SchedulerConfig {
             !scenarios.is_empty()
                 && scenarios
                     .iter()
-                    .all(|name| crate::runner::SCENARIOS.contains(name)),
+                    .all(|name| crate::runner::schedulable(name)),
             "scheduler.scenarios must contain supported scenario names"
         );
         validate_windows(windows)
@@ -316,6 +378,7 @@ impl Default for SynthConfig {
                 scenarios: None,
                 lanes: Vec::new(),
                 keep_open: None,
+                fill: None,
             },
             trail: Default::default(),
             defaults: DefaultsConfig {

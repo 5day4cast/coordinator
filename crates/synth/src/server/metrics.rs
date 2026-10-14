@@ -78,6 +78,11 @@ lazy_static::lazy_static! {
         "Players synth entered late so a competition reaches its minimum"
     ).unwrap();
 
+    pub static ref FILL_PLAYERS: prometheus::Counter = register_counter!(
+        "synth_fill_players_total",
+        "Players synth planned to fill other people's competitions with before entries close"
+    ).unwrap();
+
     pub static ref ARK_REFILLS: prometheus::Counter = register_counter!(
         "synth_ark_refill_total",
         "On-chain refills of ark-swapd's Ark wallet the payer sent"
@@ -163,6 +168,7 @@ fn initialize() {
     }
     lazy_static::initialize(&KEEP_OPEN_STARTS);
     lazy_static::initialize(&BACKFILL_PLAYERS);
+    lazy_static::initialize(&FILL_PLAYERS);
     lazy_static::initialize(&ARK_REFILLS);
     lazy_static::initialize(&ARK_REFILL_SATS);
     lazy_static::initialize(&ARK_REFILL_FAILURES);
@@ -355,6 +361,11 @@ pub fn record_ark_refill_last_success(at: i64) {
 /// Record a refill that was refused, dropped, or never reached ark-swapd.
 pub fn record_ark_refill_failure() {
     ARK_REFILL_FAILURES.inc();
+}
+
+/// Record players planned to fill another person's competition.
+pub fn record_fill(players: usize) {
+    FILL_PLAYERS.inc_by(players as f64);
 }
 
 /// Record players entered by a backfill.

@@ -537,6 +537,20 @@ impl SynthDb {
         Ok(id)
     }
 
+    /// Whether any run made, planned or took up `competition_id`.
+    pub async fn has_run_for(&self, competition_id: &Uuid) -> Result<bool> {
+        let id = competition_id.to_string();
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM test_runs WHERE competition_id = ? \
+             OR json_extract(config_json, '$.competition_id') = ?)",
+        )
+        .bind(&id)
+        .bind(&id)
+        .fetch_one(&self.pool)
+        .await
+        .context("look for a run of the competition")
+    }
+
     pub async fn complete_run(&self, id: &str, error: Option<&str>) -> Result<()> {
         let now =
             OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
