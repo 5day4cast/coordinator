@@ -466,6 +466,10 @@ pub struct ScenarioConfig {
     /// The lane run this is; None for a run an operator started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane: Option<LaneCycle>,
+    /// A fill run's last call, for the seats still empty minutes before entries close. Its
+    /// players are others than the earlier runs', which may have entered the competition.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub last_call: bool,
 }
 
 /// What an observation window can score, as the oracle attests it: a window of 24 hours or more
@@ -554,6 +558,7 @@ impl Default for ScenarioConfig {
             backfill: None,
             picks_per_entry: None,
             lane: None,
+            last_call: false,
         }
     }
 }

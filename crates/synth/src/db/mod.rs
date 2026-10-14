@@ -551,6 +551,26 @@ impl SynthDb {
         .context("look for a run of the competition")
     }
 
+    /// The scenario of every run that made, planned or took up `competition_id`, and whether it
+    /// was a fill run's last call.
+    pub async fn runs_for(&self, competition_id: &Uuid) -> Result<Vec<(String, bool)>> {
+        let id = competition_id.to_string();
+        let rows = sqlx::query_as::<_, (String, i64)>(
+            "SELECT scenario, CAST(COALESCE(json_extract(config_json, '$.last_call'), 0) AS INTEGER) \
+             FROM test_runs WHERE competition_id = ? \
+             OR json_extract(config_json, '$.competition_id') = ?",
+        )
+        .bind(&id)
+        .bind(&id)
+        .fetch_all(&self.pool)
+        .await
+        .context("list the runs of the competition")?;
+        Ok(rows
+            .into_iter()
+            .map(|(scenario, last_call)| (scenario, last_call != 0))
+            .collect())
+    }
+
     pub async fn complete_run(&self, id: &str, error: Option<&str>) -> Result<()> {
         let now =
             OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;

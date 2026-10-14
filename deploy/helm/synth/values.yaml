@@ -3,7 +3,7 @@ replicaCount: 1
 
 image:
   repository: ghcr.io/5day4cast/synth
-  tag: "2.27.21"
+  tag: "2.27.22"
   pullPolicy: IfNotPresent
 
 serviceAccount:

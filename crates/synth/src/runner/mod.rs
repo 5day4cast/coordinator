@@ -90,8 +90,9 @@ pub struct Runner {
     schedules: Arc<HashMap<String, Vec<String>>>,
 }
 
-/// Runs in progress, by competition id.
-type Live = Arc<DashMap<Uuid, LiveRun>>;
+/// Runs in progress, by run id. A competition can have more than one: its own run and the runs
+/// that fill it.
+type Live = Arc<DashMap<String, LiveRun>>;
 
 tokio::task_local! {
     /// The run a scenario is recording into, for the steps it records.
@@ -124,7 +125,7 @@ enum Record {
 /// Announce that the running scenario has begun `step`. Does nothing outside a run.
 pub(crate) fn step_started(step: &str) {
     let _ = RECORDER.try_with(|recorder| {
-        if let Some(mut live) = recorder.live.get_mut(&recorder.competition_id) {
+        if let Some(mut live) = recorder.live.get_mut(&recorder.run_id) {
             live.current_step = Some(step.to_string());
         }
         recorder.events.send(Event::StepStarted {
@@ -555,7 +556,7 @@ impl Runner {
     ) -> Result<ScenarioResult> {
         info!("Starting scenario '{scenario}' (run: {run_id}, competition: {competition_id})");
         self.live.insert(
-            competition_id,
+            run_id.clone(),
             LiveRun {
                 run_id: run_id.clone(),
                 competition_id,
@@ -651,7 +652,7 @@ impl Runner {
                 .map(|step| (step.name.clone(), step.duration_ms))
                 .collect::<Vec<_>>(),
         );
-        self.live.remove(&competition_id);
+        self.live.remove(&run_id);
         *self.last_result.lock().await = Some(result.clone());
         self.events.send(Event::RunFinished {
             run_id: run_id.clone(),
@@ -688,10 +689,14 @@ impl Runner {
 
     /// The run `run_id`, if it is in progress.
     pub fn live_run(&self, run_id: &str) -> Option<LiveRun> {
+        self.live.get(run_id).map(|run| run.value().clone())
+    }
+
+    /// Whether a run in progress plays `competition_id`.
+    fn playing(&self, competition_id: &Uuid) -> bool {
         self.live
             .iter()
-            .find(|run| run.run_id == run_id)
-            .map(|run| run.value().clone())
+            .any(|run| run.competition_id == *competition_id)
     }
 
     pub fn events(&self) -> &Events {
@@ -1770,7 +1775,7 @@ mod tests {
         let competition_id = Uuid::now_v7();
         let live: Live = Arc::new(DashMap::new());
         live.insert(
-            competition_id,
+            run_id.clone(),
             LiveRun {
                 run_id: run_id.clone(),
                 competition_id,
@@ -1800,7 +1805,7 @@ mod tests {
             .scope(recorder, async {
                 step_started("create_competition");
                 assert_eq!(
-                    live.get(&competition_id).unwrap().current_step.as_deref(),
+                    live.get(&run_id).unwrap().current_step.as_deref(),
                     Some("create_competition")
                 );
                 step_finished(&StepResult {

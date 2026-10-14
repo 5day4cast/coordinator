@@ -13,11 +13,32 @@ use crate::client::competitions::CompetitionResponse;
 use crate::config::FillConfig;
 use crate::scenarios::{
     fill::{empty_seats, FILL_COMPETITION},
-    ScenarioConfig, WindowShape,
+    manual::MANUAL_COMPETITION,
+    queued::{QUEUED_ONE_POOL, QUEUED_SPLIT},
+    ArrivalPattern, DelayRange, EntryTiming, ScenarioConfig, WindowShape,
 };
 
 /// Most players a run enters, as any run.
 const MAX_PLAYERS: u64 = 100;
+
+/// How a last call's players enter: at once, as someone does who sees a competition about to
+/// close. An entry takes about ten seconds of work besides these waits.
+pub const LAST_CALL_TIMING: EntryTiming = EntryTiming {
+    arrival: DelayRange {
+        min_secs: 0,
+        max_secs: 30,
+    },
+    arrival_pattern: ArrivalPattern::Range,
+    before_payment: DelayRange {
+        min_secs: 0,
+        max_secs: 10,
+    },
+    before_submit: DelayRange {
+        min_secs: 0,
+        max_secs: 20,
+    },
+    deadline_margin_secs: 60,
+};
 
 /// The competitions in `listed` to fill at `now`, each with the players it needs: still taking
 /// entries, closing within `fill.before_close_secs` yet late enough for synth's players to pay
@@ -29,18 +50,67 @@ pub fn wanted<'a>(
     fill: &FillConfig,
     base: &ScenarioConfig,
 ) -> Vec<(&'a CompetitionResponse, usize)> {
+    due(
+        listed,
+        now,
+        fill,
+        fill.before_close_secs,
+        &base.entry_timing,
+    )
+}
+
+/// The competitions in `listed` due their last call at `now`, as [`wanted`] but within
+/// `fill.last_call_before_close_secs` of closing, for players who enter at once. Whether a
+/// competition's runs let it be filled is for the caller to check, with [`meant_to_play`].
+pub fn last_call<'a>(
+    listed: &'a [CompetitionResponse],
+    now: OffsetDateTime,
+    fill: &FillConfig,
+) -> Vec<(&'a CompetitionResponse, usize)> {
+    if fill.last_call_before_close_secs == 0 {
+        return Vec::new();
+    }
+    due(
+        listed,
+        now,
+        fill,
+        fill.last_call_before_close_secs,
+        &LAST_CALL_TIMING,
+    )
+}
+
+/// Whether a competition with a run of `scenario` is meant to play, so a last call may fill it.
+/// The other scenarios test refunds, abandoned seats and cancellations, which a filled
+/// competition would spoil.
+pub fn meant_to_play(scenario: &str) -> bool {
+    [
+        "full_lifecycle",
+        QUEUED_ONE_POOL,
+        QUEUED_SPLIT,
+        FILL_COMPETITION,
+        MANUAL_COMPETITION,
+    ]
+    .contains(&scenario)
+}
+
+/// The competitions in `listed` that close within `lead` seconds of `now`, late enough for
+/// players entering with `timing`, with the players each needs.
+fn due<'a>(
+    listed: &'a [CompetitionResponse],
+    now: OffsetDateTime,
+    fill: &FillConfig,
+    lead: u64,
+    timing: &EntryTiming,
+) -> Vec<(&'a CompetitionResponse, usize)> {
     listed
         .iter()
         .filter(|competition| competition.open_to_enter(now))
         .filter(|competition| {
             competition.entries_close().is_some_and(|close| {
                 let left = close - now;
-                left <= Duration::seconds(fill.before_close_secs as i64)
+                left <= Duration::seconds(lead as i64)
                     && left.is_positive()
-                    && base
-                        .entry_timing
-                        .validate(left.whole_seconds() as u64)
-                        .is_ok()
+                    && timing.validate(left.whole_seconds() as u64).is_ok()
             })
         })
         .filter(|competition| {
@@ -138,13 +208,30 @@ pub fn plan(
         backfill: None,
         picks_per_entry: Some(picks as usize),
         lane: None,
+        last_call: false,
         ..base.clone()
+    })
+}
+
+/// The plan of a last call that fills `competition` with `players` of synth's, who enter at once.
+pub fn last_call_plan(
+    base: &ScenarioConfig,
+    competition: &CompetitionResponse,
+    players: usize,
+    now: OffsetDateTime,
+) -> Result<ScenarioConfig> {
+    Ok(ScenarioConfig {
+        last_call: true,
+        entry_timing: LAST_CALL_TIMING,
+        ..plan(base, competition, players, now)?
     })
 }
 
 impl super::Runner {
     /// Every `fill.check_interval_secs`, start a fill run for each competition [`wanted`] that
-    /// no run of synth's made or took up. While the fill scenario is paused, none starts.
+    /// no run of synth's made or took up, and a last call for each competition due one
+    /// ([`last_call`]) whose runs are all [`meant_to_play`]. While the fill scenario is paused,
+    /// none starts.
     pub async fn run_fill(&self, fill: FillConfig, base: ScenarioConfig) -> Result<()> {
         fill.validate(&base.entry_timing)?;
         info!(
@@ -153,6 +240,8 @@ impl super::Runner {
         );
         // Competitions already filled, or found not to be fillable.
         let mut seen: HashSet<Uuid> = HashSet::new();
+        // Competitions given their last call, or found not to take one.
+        let mut called: HashSet<Uuid> = HashSet::new();
         let mut checks =
             tokio::time::interval(std::time::Duration::from_secs(fill.check_interval_secs));
         checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -177,7 +266,7 @@ impl super::Runner {
             let now = OffsetDateTime::now_utc();
             for (competition, players) in wanted(&listed, now, &fill, &base) {
                 let id = competition.id;
-                if seen.contains(&id) || self.live.contains_key(&id) {
+                if seen.contains(&id) || self.playing(&id) {
                     continue;
                 }
                 match self.db.has_run_for(&id).await {
@@ -205,22 +294,63 @@ impl super::Runner {
                         .entries_close()
                         .map_or_else(|| "entries close".into(), |close| close.to_string())
                 );
-                crate::server::metrics::record_fill(players);
-                let runner = self.clone();
-                tokio::spawn(async move {
-                    if let Err(why) = runner.attempt(FILL_COMPETITION, config).await {
-                        warn!("Filling competition {id} failed: {why}");
+                self.start_fill(id, players, config);
+            }
+            for (competition, players) in last_call(&listed, now, &fill) {
+                let id = competition.id;
+                if called.contains(&id) {
+                    continue;
+                }
+                let runs = match self.db.runs_for(&id).await {
+                    Ok(runs) => runs,
+                    Err(error) => {
+                        warn!("Cannot list the runs of competition {id}: {error:#}");
+                        continue;
                     }
-                });
+                };
+                called.insert(id);
+                if runs.iter().any(|(_, last_call)| *last_call) {
+                    continue;
+                }
+                if let Some((scenario, _)) =
+                    runs.iter().find(|(scenario, _)| !meant_to_play(scenario))
+                {
+                    info!(
+                        "No last call for competition {id}: synth's {scenario} run tests it as it is"
+                    );
+                    continue;
+                }
+                let config = match last_call_plan(&base, competition, players, now) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        warn!("Competition {id} cannot be filled: {error:#}");
+                        continue;
+                    }
+                };
+                info!(
+                    "Last call for competition {id}: {players} of synth's players take the seats \
+                     still empty"
+                );
+                self.start_fill(id, players, config);
             }
         }
+    }
+
+    /// Record and run a fill run of `competition_id` in its own task.
+    fn start_fill(&self, competition_id: Uuid, players: usize, config: ScenarioConfig) {
+        crate::server::metrics::record_fill(players);
+        let runner = self.clone();
+        tokio::spawn(async move {
+            if let Err(why) = runner.attempt(FILL_COMPETITION, config).await {
+                warn!("Filling competition {competition_id} failed: {why}");
+            }
+        });
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scenarios::{ArrivalPattern, DelayRange, EntryTiming};
 
     fn at(text: &str) -> OffsetDateTime {
         OffsetDateTime::parse(text, &Rfc3339).unwrap()
@@ -314,6 +444,104 @@ mod tests {
         let cheap: FillConfig =
             serde_json::from_value(serde_json::json!({ "max_entry_fee_sats": 4999 })).unwrap();
         assert!(wanted(&listed, now, &cheap, &base).is_empty());
+    }
+
+    #[test]
+    fn a_last_call_takes_the_seats_still_empty_minutes_before_close() {
+        let close = "2026-10-15T00:00:00Z";
+        let listed = vec![
+            queue(19, 19, close),
+            queue(20, 20, close),
+            queue(3, 3, "2026-10-15T06:00:00Z"),
+        ];
+        let (fill, base) = (fill(), base());
+        // Four and a half minutes ahead: too late for spread arrivals, in time for a last call.
+        let now = at("2026-10-14T23:55:30Z");
+        assert!(wanted(&listed, now, &fill, &base).is_empty());
+        let found: Vec<_> = last_call(&listed, now, &fill)
+            .into_iter()
+            .map(|(competition, players)| (competition.id, players))
+            .collect();
+        assert_eq!(found, [(listed[0].id, 1)]);
+        // Not yet ten minutes ahead, and too late a minute ahead.
+        assert!(last_call(&listed, at("2026-10-14T23:50:00Z"), &fill).is_empty());
+        assert!(last_call(&listed, at("2026-10-14T23:59:00Z"), &fill).is_empty());
+        let off: FillConfig =
+            serde_json::from_value(serde_json::json!({ "last_call_before_close_secs": 0 }))
+                .unwrap();
+        assert!(last_call(&listed, now, &off).is_empty());
+
+        let config = last_call_plan(&base, &listed[0], 1, now).unwrap();
+        let resolved = config.resolve_plan(FILL_COMPETITION).unwrap();
+        assert!(resolved.last_call);
+        assert!(resolved
+            .entry_plan
+            .iter()
+            .all(|entry| entry.arrival_secs <= 30));
+        let saved: ScenarioConfig =
+            serde_json::from_str(&serde_json::to_string(&resolved).unwrap()).unwrap();
+        assert!(saved.last_call);
+        assert!(!plan(&base, &listed[0], 1, now).unwrap().last_call);
+    }
+
+    #[test]
+    fn only_competitions_meant_to_play_get_a_last_call() {
+        for scenario in [QUEUED_ONE_POOL, FILL_COMPETITION, MANUAL_COMPETITION] {
+            assert!(meant_to_play(scenario), "{scenario}");
+        }
+        for scenario in ["queued_too_few", "escrow_refund", "paid_abandonment"] {
+            assert!(!meant_to_play(scenario), "{scenario}");
+        }
+    }
+
+    #[test]
+    fn a_last_call_must_leave_its_players_time() {
+        let timing = base().entry_timing;
+        fill().validate(&timing).unwrap();
+        let config = |last_call: u64| -> FillConfig {
+            serde_json::from_value(serde_json::json!({ "last_call_before_close_secs": last_call }))
+                .unwrap()
+        };
+        config(0).validate(&timing).unwrap();
+        assert!(config(1800).validate(&timing).is_err());
+        // A check a minute late leaves one minute: invoices close a minute before entries.
+        assert!(config(120).validate(&timing).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_competitions_runs_say_whether_it_had_its_last_call() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = crate::db::SynthDb::new(directory.path().join("synth.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let id = Uuid::now_v7();
+        assert!(db.runs_for(&id).await.unwrap().is_empty());
+        assert!(!db.has_run_for(&id).await.unwrap());
+        for (scenario, config) in [
+            (QUEUED_ONE_POOL, serde_json::json!({ "competition_id": id })),
+            (
+                FILL_COMPETITION,
+                serde_json::json!({ "competition_id": id, "last_call": true }),
+            ),
+            (
+                QUEUED_ONE_POOL,
+                serde_json::json!({ "competition_id": Uuid::now_v7() }),
+            ),
+        ] {
+            db.create_run(scenario, Some(&config.to_string()))
+                .await
+                .unwrap();
+        }
+        let mut runs = db.runs_for(&id).await.unwrap();
+        runs.sort();
+        assert_eq!(
+            runs,
+            [
+                (FILL_COMPETITION.to_string(), true),
+                (QUEUED_ONE_POOL.to_string(), false)
+            ]
+        );
+        assert!(db.has_run_for(&id).await.unwrap());
     }
 
     #[test]
