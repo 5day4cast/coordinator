@@ -1,5 +1,6 @@
 mod common;
 pub mod escrow_refund;
+pub mod fill;
 pub mod full_lifecycle;
 pub mod manual;
 pub mod queued;
@@ -8,6 +9,7 @@ pub mod types;
 pub mod user_behavior;
 
 pub use escrow_refund::run_escrow_refund;
+pub use fill::run_fill_competition;
 pub use full_lifecycle::run_full_lifecycle;
 pub use manual::run_manual_competition;
 pub use stress::run_stress_full_pool;

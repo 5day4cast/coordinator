@@ -186,6 +186,17 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Filling other people's competitions does not depend on synth starting its own.
+    if let Some(fill) = config.scheduler.fill.clone().filter(|fill| fill.enabled) {
+        let filler = runner.clone();
+        let base = config.scenario_config();
+        tokio::spawn(async move {
+            if let Err(error) = filler.run_fill(fill, base).await {
+                error!("Filling other people's competitions stopped: {error:#}");
+            }
+        });
+    }
+
     if let Some(rebalancer) = rebalancer.clone().filter(|r| r.config().enabled) {
         tokio::spawn(async move { rebalancer.run_scheduled().await });
     }

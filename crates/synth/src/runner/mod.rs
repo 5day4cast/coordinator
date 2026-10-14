@@ -1,3 +1,4 @@
+pub mod fill;
 pub mod keep_open;
 pub mod lanes;
 pub mod resume;
@@ -31,7 +32,15 @@ pub const SCENARIOS: &[&str] = &[
     scenarios::queued::QUEUED_TOO_FEW,
     scenarios::queued::QUEUED_LEFTOVER_REFUND,
     scenarios::stress::STRESS_FULL_POOL,
+    scenarios::fill::FILL_COMPETITION,
 ];
+
+/// Whether a schedule can start runs of `scenario`: one of [`SCENARIOS`] that makes its own
+/// competition. A fill run takes up a competition someone else made, which only the fill loop
+/// finds.
+pub fn schedulable(scenario: &str) -> bool {
+    SCENARIOS.contains(&scenario) && scenario != scenarios::fill::FILL_COMPETITION
+}
 
 /// Whether a run of `scenario` can be recorded: one of [`SCENARIOS`], or a competition an
 /// operator asked for, which no schedule runs.
@@ -327,6 +336,13 @@ impl Runner {
                 }
             }
         }
+        // The fill loop runs whether or not the scheduler starts synth's own competitions.
+        if scheduler.fill.as_ref().is_some_and(|fill| fill.enabled) {
+            schedules
+                .entry(scenarios::fill::FILL_COMPETITION.into())
+                .or_default()
+                .push("Fill".into());
+        }
         self.schedules = Arc::new(schedules);
         self
     }
@@ -401,10 +417,14 @@ impl Runner {
             Some(id) => crate::picker::store::pick_for(&self.db, id).await.is_some(),
             None => false,
         };
-        if scenario != scenarios::manual::MANUAL_COMPETITION && !selected {
+        // A competition synth fills is someone else's, with its own stations.
+        let filling = scenario == scenarios::fill::FILL_COMPETITION;
+        if scenario != scenarios::manual::MANUAL_COMPETITION && !selected && !filling {
             picker.choose_default(&mut config).await?;
         }
-        picker.validate_stations(&config).await?;
+        if !filling {
+            picker.validate_stations(&config).await?;
+        }
         let config_json = serde_json::to_string(&config)?;
         self.db.create_run(scenario, Some(&config_json)).await
     }
@@ -605,6 +625,9 @@ impl Runner {
                     }
                     scenarios::manual::MANUAL_COMPETITION => {
                         scenarios::run_manual_competition(&self.client, &self.db, &config).await
+                    }
+                    scenarios::fill::FILL_COMPETITION => {
+                        scenarios::run_fill_competition(&self.client, &self.db, &config).await
                     }
                     _ => unreachable!("record_run validates scenario names"),
                 }
@@ -1224,6 +1247,7 @@ mod tests {
             scenarios: None,
             lanes: Vec::new(),
             keep_open: None,
+            fill: None,
         };
         assert!(runner
             .run_scheduled(&scheduler, ScenarioConfig::default(), vec![7200, 0])

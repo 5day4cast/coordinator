@@ -567,7 +567,7 @@ async fn run_steps(
 /// from the start, as one that never began or never reached its payment does. One that finished
 /// stands as saved. One that reached its payment is never paid again. A normal paid entry
 /// can submit its saved body while entries remain open; older traces wait for their refund.
-async fn resume_entry(
+pub(super) async fn resume_entry(
     client: &CoordinatorClient,
     user: &SynthUser,
     competition_id: &Uuid,
