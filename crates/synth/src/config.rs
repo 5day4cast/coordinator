@@ -187,6 +187,12 @@ pub struct FillConfig {
     /// Fill only competitions whose entry fee is at most this, in sats.
     #[serde(default = "default_fill_max_entry_fee_sats")]
     pub max_entry_fee_sats: u64,
+    /// A last call this long before entries close: any seat still empty then, in a competition
+    /// meant to play, synth's own included, is taken by a player who enters at once. By then
+    /// every earlier run's players have asked for their seats, so an empty seat is one a
+    /// player failed to pay for or never took. 0 turns it off.
+    #[serde(default = "default_fill_last_call_before_close_secs")]
+    pub last_call_before_close_secs: u64,
 }
 
 fn default_true() -> bool {
@@ -199,6 +205,10 @@ fn default_fill_before_close_secs() -> u64 {
 
 fn default_fill_max_entry_fee_sats() -> u64 {
     10_000
+}
+
+fn default_fill_last_call_before_close_secs() -> u64 {
+    5 * 60
 }
 
 impl FillConfig {
@@ -216,7 +226,26 @@ impl FillConfig {
             anyhow::anyhow!(
                 "scheduler.fill.before_close_secs leaves synth's players too little time: {error:#}"
             )
-        })
+        })?;
+        if self.last_call_before_close_secs > 0 {
+            anyhow::ensure!(
+                self.last_call_before_close_secs < self.before_close_secs,
+                "scheduler.fill.last_call_before_close_secs must be shorter than before_close_secs"
+            );
+            // The check that finds the last call due may come a whole interval late.
+            let left = self
+                .last_call_before_close_secs
+                .saturating_sub(self.check_interval_secs);
+            crate::runner::fill::LAST_CALL_TIMING
+                .validate(left)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "scheduler.fill.last_call_before_close_secs, less check_interval_secs, \
+                         leaves a last call's players too little time: {error:#}"
+                    )
+                })?;
+        }
+        Ok(())
     }
 }
 

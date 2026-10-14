@@ -15,12 +15,21 @@ use crate::db::SynthDb;
 
 /// Load or create `count` synthetic users, by name.
 pub(super) async fn load_users(db: &SynthDb, count: usize) -> Result<Vec<SynthUser>> {
+    load_users_from(db, 0, count).await
+}
+
+/// Load or create `count` synthetic users, by name, from the `first`.
+pub(super) async fn load_users_from(
+    db: &SynthDb,
+    first: usize,
+    count: usize,
+) -> Result<Vec<SynthUser>> {
     let names = [
         "alice", "bob", "charlie", "dave", "eve", "frank", "grace", "heidi",
     ];
     let mut users = Vec::new();
 
-    for i in 0..count {
+    for i in first..first + count {
         let name = if i < names.len() {
             names[i].to_string()
         } else {

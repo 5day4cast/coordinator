@@ -5,13 +5,18 @@
 //! the empty seats again, and that many of synth's players arrive over the time left, as people
 //! do. A seat someone else takes meanwhile is theirs: synth's player stands down. Synth's players
 //! then follow the competition, or the queue's pools, to its attestation as any run's do.
+//!
+//! A last call ([`ScenarioConfig::last_call`]) fills the seats still empty minutes before entries
+//! close, in any competition whose runs are meant to play, synth's own included: a player of an
+//! earlier run may have failed to pay. Its players are others than any earlier run's, since a
+//! player enters a competition once.
 
 use std::time::Instant;
 
 use futures::{stream::FuturesUnordered, StreamExt};
 use time::OffsetDateTime;
 
-use super::common::{finish_result, load_users, run_step, Steps};
+use super::common::{finish_result, load_users_from, run_step, Steps};
 use super::full_lifecycle::Payer;
 use super::types::*;
 use super::{queued, user_behavior};
@@ -23,6 +28,10 @@ pub const FILL_COMPETITION: &str = "fill_competition";
 
 /// The step that takes up the competition. It names the competition, so the run is known by it.
 const JOIN_STEP: &str = "join_competition";
+
+/// Where a last call's players start among synth's: past those of any other run, which enters
+/// at most 100.
+pub const LAST_CALL_FIRST_PLAYER: usize = 100;
 
 /// The seats of `competition` still empty: what a queue's cap or a single competition's seats
 /// leave once paid tickets and tickets held for an unpaid invoice are counted. None for a pool,
@@ -109,6 +118,7 @@ async fn run_steps(
     .await?;
     joined.details = Some(serde_json::json!({
         "competition_id": competition_id,
+        "last_call": config.last_call,
         "kind": competition.kind,
         "paid_entries": competition.paid_entries(),
         "planned": config.users,
@@ -132,7 +142,13 @@ async fn run_steps(
             )),
         }));
     };
-    let (loaded, users) = run_step("load_users", || load_users(db, config.users)).await?;
+    let first = if config.last_call {
+        LAST_CALL_FIRST_PLAYER
+    } else {
+        0
+    };
+    let (loaded, users) =
+        run_step("load_users", || load_users_from(db, first, config.users)).await?;
     steps.push(loaded);
 
     let players = &users;
