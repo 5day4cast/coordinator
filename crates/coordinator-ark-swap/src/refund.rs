@@ -174,11 +174,19 @@ impl Swapper {
             *refund = current;
         }
         if refund.claim_txid.is_some() {
+            self.store.clear_indexer_lookup("refund", refund.id).await?;
             return Ok(());
         }
         let Some(preimage) = refund.preimage.as_deref() else {
             return Ok(());
         };
+        if !self
+            .store
+            .reserve_indexer_lookup("refund", refund.id, unix_now())
+            .await?
+        {
+            return Ok(());
+        }
         let preimage = bytes32(preimage)?;
         let swap = self.refund_swap_of(refund)?;
         let amount = Amount::from_sat(refund.amount_sat);
@@ -203,6 +211,7 @@ impl Swapper {
         refund.claim_txid = Some(txid.to_string());
         self.transition_refund(refund, RefundState::Claimed, None)
             .await?;
+        self.store.clear_indexer_lookup("refund", refund.id).await?;
         log::info!("refund {} claimed its swap in {txid}", refund.id);
         Ok(())
     }

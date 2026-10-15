@@ -10,6 +10,7 @@
 //! | `POST /v1/refunds/{id}/paid` | `{ "preimage" }` → records the payment, answering 202 with the refund. The worker claims the swap. |
 //! | `GET /v1/refunds/{id}` | A refund's state. |
 //! | `GET /v1/wallet` | The Ark wallet's addresses and balance: what is spendable, what of it may pay an escrow (`payable_sat`) or is too close to expiry (`expiring_sat`), what must be recovered in a batch (`recoverable_sat`), when the first spendable VTXO expires (`earliest_expiry`, UNIX seconds), and what has confirmed at the boarding address but no batch has taken yet (`boarding_sat`). Read at most once every 10 seconds. Also how boards and renewals went since the service started: the last one the Arkade server failed (`last_board_failure`, `{ "at", "message" }` with `at` in UNIX seconds), and when a batch last took one (`last_board_success_at`, UNIX seconds). The coordinator pauses Arkade entries on a failure newer than the last success. |
+//! | `GET /v1/indexer/stats` | GetVtxos RPC attempts dispatched by this process, including SDK-internal calls and retries. Reading this counter makes no Arkade request. |
 //! | `POST /v1/wallet/board` | Move confirmed boarding coins, and recoverable VTXOs, into VTXOs in the next batch. |
 
 use std::sync::Arc;
@@ -47,6 +48,7 @@ pub fn router(swapper: Arc<Swapper>, token: String, holder: String) -> Router {
         .route("/v1/refunds/{id}/paid", post(refund_paid))
         .route("/v1/refunds/{id}", get(get_refund))
         .route("/v1/wallet", get(wallet))
+        .route("/v1/indexer/stats", get(indexer_stats))
         .route("/v1/wallet/board", post(board))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
     Router::new()
@@ -54,6 +56,13 @@ pub fn router(swapper: Arc<Swapper>, token: String, holder: String) -> Router {
         .merge(authenticated)
         .with_state(state)
         .layer(middleware::from_fn(crate::request_context::request_context))
+}
+
+async fn indexer_stats(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(json!({
+        "process": state.holder.as_str(),
+        "grpc_get_vtxos_started_total": ark_grpc::vtxo_requests_started(),
+    }))
 }
 
 async fn authenticate(State(state): State<AppState>, request: Request, next: Next) -> Response {

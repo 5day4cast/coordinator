@@ -17,6 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use bitcoin::{Amount, OutPoint};
+use rand08::Rng;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -39,7 +40,7 @@ const PAY_ATTEMPTS: u32 = 3;
 
 /// The first wait before looking a settled swap's escrow VTXO up again. Each miss doubles it,
 /// up to `VTXO_LOOKUP_MAX_WAIT_SECS`.
-const VTXO_LOOKUP_FIRST_WAIT_SECS: i64 = 5;
+const VTXO_LOOKUP_FIRST_WAIT_SECS: i64 = 20;
 const VTXO_LOOKUP_MAX_WAIT_SECS: i64 = 10 * 60;
 
 /// Lookups of a settled swap's escrow VTXO before the service gives up, about two hours in all.
@@ -439,11 +440,19 @@ impl Swapper {
     /// `PAY_ATTEMPTS` such payments does the swap fail and cancel the payer's invoice.
     async fn pay_escrow(&self, swap: &mut Swap) -> anyhow::Result<()> {
         let now = unix_now();
+        if !self
+            .store
+            .reserve_indexer_lookup("payment", swap.id, now)
+            .await?
+        {
+            return Ok(());
+        }
         let listed = self.already_paid(swap).await?;
         match payment_step(swap, listed.is_some(), now) {
             PaymentStep::Record => {
                 swap.escrow_vtxo = listed;
                 self.transition(swap, SwapState::EscrowPaid, None).await?;
+                self.store.clear_indexer_lookup("payment", swap.id).await?;
                 self.settle(swap).await
             }
             PaymentStep::Wait => {
@@ -463,6 +472,7 @@ impl Swapper {
                 );
                 self.transition(swap, SwapState::Failed, Some(error.clone()))
                     .await?;
+                self.store.clear_indexer_lookup("payment", swap.id).await?;
                 log::error!("swap {} failed and was cancelled: {error}", swap.id);
                 Ok(())
             }
@@ -498,6 +508,7 @@ impl Swapper {
                             }
                         };
                         self.transition(swap, SwapState::EscrowPaid, None).await?;
+                        self.store.clear_indexer_lookup("payment", swap.id).await?;
                         log::info!(
                             "swap {} paid escrow {} in {txid}",
                             swap.id,
@@ -649,9 +660,10 @@ fn life_days(expiry: i64, now: i64) -> f64 {
 
 /// How long to wait after the `lookups`th missed lookup of a settled swap's escrow VTXO.
 fn vtxo_lookup_wait(lookups: u32) -> i64 {
-    VTXO_LOOKUP_FIRST_WAIT_SECS
+    let ceiling = VTXO_LOOKUP_FIRST_WAIT_SECS
         .saturating_mul(1i64 << lookups.saturating_sub(1).min(16))
-        .min(VTXO_LOOKUP_MAX_WAIT_SECS)
+        .min(VTXO_LOOKUP_MAX_WAIT_SECS);
+    rand08::thread_rng().gen_range(ceiling / 2..=ceiling)
 }
 
 fn bytes32(hex_value: &str) -> anyhow::Result<[u8; 32]> {
@@ -868,11 +880,15 @@ mod tests {
 
     #[test]
     fn escrow_vtxo_lookups_back_off_and_give_up_within_hours() {
-        assert_eq!(vtxo_lookup_wait(1), 5);
-        assert_eq!(vtxo_lookup_wait(2), 10);
-        assert_eq!(vtxo_lookup_wait(3), 20);
-        assert_eq!(vtxo_lookup_wait(8), 600, "capped");
-        assert_eq!(vtxo_lookup_wait(40), 600);
+        for (attempt, low, high) in [
+            (1, 10, 20),
+            (2, 20, 40),
+            (3, 40, 80),
+            (8, 300, 600),
+            (40, 300, 600),
+        ] {
+            assert!((low..=high).contains(&vtxo_lookup_wait(attempt)));
+        }
         let total: i64 = (1..VTXO_LOOKUPS).map(vtxo_lookup_wait).sum();
         assert!(
             (3_600..4 * 3_600).contains(&total),
