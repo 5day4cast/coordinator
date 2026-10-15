@@ -23,7 +23,7 @@ default-members = [
 resolver = "2"
 
 [workspace.package]
-version = "2.27.22"
+version = "2.27.23"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/5day4cast/coordinator"
@@ -191,9 +191,10 @@ opt-level = 3
 # inputs found"). The fork branch listens on the boarding outpoints, ignores other batches' events
 # and refuses to submit an unsigned commitment TX. Remove this once upstream releases the fix.
 # Every ark crate comes from the fork, so ark-client and our own ark-core/ark-grpc share one ark-core.
+# The pinned transport also counts GetVtxos attempts and shares a bounded, jittered request budget.
 [patch.crates-io]
-ark-client = { git = "https://github.com/tee8z/rust-sdk", branch = "fix/batch-events-by-id" }
-ark-core = { git = "https://github.com/tee8z/rust-sdk", branch = "fix/batch-events-by-id" }
-ark-delegator = { git = "https://github.com/tee8z/rust-sdk", branch = "fix/batch-events-by-id" }
-ark-fees = { git = "https://github.com/tee8z/rust-sdk", branch = "fix/batch-events-by-id" }
-ark-grpc = { git = "https://github.com/tee8z/rust-sdk", branch = "fix/batch-events-by-id" }
+ark-client = { git = "https://github.com/tee8z/rust-sdk", rev = "d9a58985b2eab2547d565b8a325fa652479e379d" }
+ark-core = { git = "https://github.com/tee8z/rust-sdk", rev = "d9a58985b2eab2547d565b8a325fa652479e379d" }
+ark-delegator = { git = "https://github.com/tee8z/rust-sdk", rev = "d9a58985b2eab2547d565b8a325fa652479e379d" }
+ark-fees = { git = "https://github.com/tee8z/rust-sdk", rev = "d9a58985b2eab2547d565b8a325fa652479e379d" }
+ark-grpc = { git = "https://github.com/tee8z/rust-sdk", rev = "d9a58985b2eab2547d565b8a325fa652479e379d" }

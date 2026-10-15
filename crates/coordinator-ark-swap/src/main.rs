@@ -8,6 +8,9 @@ mod api;
 mod coins;
 mod config;
 mod electrum;
+#[cfg(test)]
+mod indexer_accounting_tests;
+mod indexer_backoff;
 mod invoices;
 mod lnd;
 mod onchain_wallet;

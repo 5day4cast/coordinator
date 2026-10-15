@@ -362,6 +362,7 @@ fn setup_logging() {
         })
         .level(log::LevelFilter::Warn)
         .level_for("coordinator_synth", log::LevelFilter::Info)
+        .level_for("ark_indexer", log::LevelFilter::Info)
         .chain(std::io::stderr())
         .apply()
         .expect("Failed to initialize logging");

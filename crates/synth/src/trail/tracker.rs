@@ -1703,6 +1703,13 @@ async fn indexed_vtxos(
     let mut found = HashMap::new();
     let mut index = 0;
     loop {
+        let permit =
+            tokio::time::timeout(Duration::from_secs(10), ark_grpc::vtxo_request_permit(arkd))
+                .await
+                .context("the Arkade indexer is backing off; defer this lookup")?;
+        // Count attempts at the outbound boundary, including every page. Do not
+        // log the URL query: it contains players' outpoints.
+        log::info!(target: "ark_indexer", "ark_indexer_request protocol=rest method=GetVtxos page={index} outpoints={}", outpoints.len());
         let response = http
             .get(&url)
             .query(&query)
@@ -1712,6 +1719,7 @@ async fn indexed_vtxos(
             .context("ask the Arkade indexer")?;
         anyhow::ensure!(response.status().is_success(), "{}", response.status());
         let page: Found = response.json().await.context("read the Arkade indexer")?;
+        permit.succeeded();
         found.extend(page.vtxos.into_iter().map(|vtxo| {
             (
                 format!("{}:{}", vtxo.outpoint.txid, vtxo.outpoint.vout),
@@ -3565,6 +3573,44 @@ mod tests {
         assert!(outpoints
             .iter()
             .all(|outpoint| vtxos[outpoint].as_ref().unwrap().amount_sat == 1100));
+    }
+
+    #[tokio::test]
+    async fn concurrent_rest_lookups_cannot_burst_after_an_indexer_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let received = Arc::new(AtomicUsize::new(0));
+        let counted = received.clone();
+        let router = Router::new().route(
+            "/v1/indexer/vtxos",
+            get(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                async { axum::http::StatusCode::BAD_GATEWAY }
+            }),
+        );
+        let fixture = fixture(router, false, false).await;
+        let http = reqwest::Client::new();
+        let outpoints = vec![format!("{}:0", "ab".repeat(32))];
+        assert!(indexed_vtxos(&http, &fixture.url, &outpoints)
+            .await
+            .is_err());
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..100 {
+            let http = http.clone();
+            let url = fixture.url.clone();
+            let outpoints = outpoints.clone();
+            tasks.spawn(async move {
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    indexed_vtxos(&http, &url, &outpoints),
+                )
+                .await
+                .is_err()
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            assert!(result.unwrap(), "backoff must expire requests locally");
+        }
+        assert_eq!(received.load(Ordering::SeqCst), 1);
     }
 
     /// Two runs whose competitions were cancelled hold their players' escrows. One request asks

@@ -105,6 +105,57 @@ pub struct Store {
 }
 
 impl Store {
+    /// Claim a due lookup and persist its next earliest start before contacting Arkade.
+    /// The conditional update also excludes concurrent callers sharing this database.
+    pub async fn reserve_indexer_lookup(
+        &self,
+        purpose: &str,
+        id: Uuid,
+        now: i64,
+    ) -> anyhow::Result<bool> {
+        let key = id.to_string();
+        let previous = sqlx::query(
+            "SELECT attempts, retry_after FROM indexer_backoff WHERE purpose = ? AND id = ?",
+        )
+        .bind(purpose)
+        .bind(&key)
+        .fetch_optional(&self.pool)
+        .await?;
+        if previous
+            .as_ref()
+            .is_some_and(|row| row.get::<i64, _>("retry_after") > now)
+        {
+            return Ok(false);
+        }
+        let attempts = previous.map(|row| row.get::<i64, _>("attempts"));
+        let next_attempt = attempts
+            .unwrap_or(0)
+            .saturating_add(1)
+            .min(i64::from(u32::MAX));
+        let wait =
+            crate::indexer_backoff::delay_secs(next_attempt as u32, &mut rand08::thread_rng());
+        let changed = sqlx::query(
+            "INSERT INTO indexer_backoff (purpose, id, attempts, retry_after) VALUES (?, ?, ?, ?)
+             ON CONFLICT (purpose, id) DO UPDATE SET attempts = excluded.attempts, retry_after = excluded.retry_after
+             WHERE indexer_backoff.retry_after <= ? AND indexer_backoff.attempts = ?",
+        )
+        .bind(purpose).bind(&key).bind(next_attempt).bind(now.saturating_add(wait))
+        .bind(now).bind(attempts.unwrap_or(0)).execute(&self.pool).await?.rows_affected();
+        if changed == 1 {
+            log::info!("ark_indexer_lookup purpose={purpose} id={id} attempt={next_attempt} next_in_secs={wait}");
+        }
+        Ok(changed == 1)
+    }
+
+    pub async fn clear_indexer_lookup(&self, purpose: &str, id: Uuid) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM indexer_backoff WHERE purpose = ? AND id = ?")
+            .bind(purpose)
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn open(path: &Path, preimages: PreimageKey) -> anyhow::Result<Self> {
         let options = SqliteConnectOptions::new()
             .filename(path)
@@ -681,6 +732,82 @@ mod tests {
 
     async fn open(path: &Path) -> Store {
         Store::open(path, test_key()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn indexer_backoff_survives_restart_and_gates_every_worker_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swaps.sqlite");
+        let store = open(&path).await;
+        let id = Uuid::now_v7();
+        let mut now = 1_800_000_000;
+        for attempt in 1..=6 {
+            assert!(store
+                .reserve_indexer_lookup("payment", id, now)
+                .await
+                .unwrap());
+            let row = sqlx::query("SELECT attempts, retry_after FROM indexer_backoff WHERE purpose = 'payment' AND id = ?")
+                .bind(id.to_string()).fetch_one(&store.pool).await.unwrap();
+            assert_eq!(row.get::<i64, _>("attempts"), attempt);
+            let next = row.get::<i64, _>("retry_after");
+            let ceiling = (20_i64 << (attempt - 1).min(4)).min(300);
+            assert!((ceiling / 2..=ceiling).contains(&(next - now)));
+            // Reopen the same DB, as another slot or restarted process would.
+            let reopened = open(&path).await;
+            for tick in now..next {
+                assert!(
+                    !reopened
+                        .reserve_indexer_lookup("payment", id, tick)
+                        .await
+                        .unwrap(),
+                    "an empty result or failure cannot allow the next worker tick to poll"
+                );
+            }
+            now = next;
+        }
+        assert!(
+            store
+                .reserve_indexer_lookup("refund", id, now)
+                .await
+                .unwrap(),
+            "separate operations have separate backoffs"
+        );
+        store.clear_indexer_lookup("payment", id).await.unwrap();
+        assert!(store
+            .reserve_indexer_lookup("payment", id, now)
+            .await
+            .unwrap());
+        assert!(!store
+            .reserve_indexer_lookup("refund", id, now)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn concurrent_indexer_lookups_reserve_only_one_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swaps.sqlite");
+        let first = open(&path).await;
+        let second = open(&path).await;
+        let id = Uuid::now_v7();
+        let now = 1_800_000_000;
+        let (a, b) = tokio::join!(
+            first.reserve_indexer_lookup("refund", id, now),
+            second.reserve_indexer_lookup("refund", id, now)
+        );
+        assert_ne!(a.unwrap(), b.unwrap());
+        let next: i64 = sqlx::query_scalar(
+            "SELECT retry_after FROM indexer_backoff WHERE purpose = 'refund' AND id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_one(&first.pool)
+        .await
+        .unwrap();
+        let (a, b) = tokio::join!(
+            first.reserve_indexer_lookup("refund", id, next),
+            second.reserve_indexer_lookup("refund", id, next)
+        );
+        assert_ne!(a.unwrap(), b.unwrap());
     }
 
     /// The preimage `byte` repeated, and its payment hash, both hex.
