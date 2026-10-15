@@ -1717,9 +1717,17 @@ async fn indexed_vtxos(
             .send()
             .await
             .context("ask the Arkade indexer")?;
-        anyhow::ensure!(response.status().is_success(), "{}", response.status());
-        let page: Found = response.json().await.context("read the Arkade indexer")?;
+        // Trouble at the indexer, or a refusal of us, backs every lookup off. A
+        // refusal of this lookup, or a page that fails to decode, is an answer.
+        let status = response.status();
+        anyhow::ensure!(
+            !ark_grpc::http_status_backs_off(status.as_u16()),
+            "{status}"
+        );
+        let body = response.bytes().await.context("read the Arkade indexer")?;
         permit.succeeded();
+        anyhow::ensure!(status.is_success(), "{status}");
+        let page: Found = serde_json::from_slice(&body).context("read the Arkade indexer")?;
         found.extend(page.vtxos.into_iter().map(|vtxo| {
             (
                 format!("{}:{}", vtxo.outpoint.txid, vtxo.outpoint.vout),
@@ -3611,6 +3619,42 @@ mod tests {
             assert!(result.unwrap(), "backoff must expire requests locally");
         }
         assert_eq!(received.load(Ordering::SeqCst), 1);
+    }
+
+    /// A refusal of one lookup, or a page that fails to decode, is still an answer: the next
+    /// lookup waits the usual spacing, not a backoff.
+    #[tokio::test]
+    async fn rest_refusals_and_undecodable_pages_do_not_back_off() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let received = Arc::new(AtomicUsize::new(0));
+        let counted = received.clone();
+        let router = Router::new().route(
+            "/v1/indexer/vtxos",
+            get(move || {
+                let n = counted.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        (axum::http::StatusCode::NOT_FOUND, "no such outpoint")
+                    } else {
+                        (axum::http::StatusCode::OK, "not json")
+                    }
+                }
+            }),
+        );
+        let fixture = fixture(router, false, false).await;
+        let http = reqwest::Client::new();
+        let outpoints = vec![format!("{}:0", "ab".repeat(32))];
+        for expected in 1..=3 {
+            let started = std::time::Instant::now();
+            assert!(indexed_vtxos(&http, &fixture.url, &outpoints)
+                .await
+                .is_err());
+            assert_eq!(received.load(Ordering::SeqCst), expected);
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "an answer must not start a backoff"
+            );
+        }
     }
 
     /// Two runs whose competitions were cancelled hold their players' escrows. One request asks

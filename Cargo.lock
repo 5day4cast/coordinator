@@ -189,7 +189,7 @@ dependencies = [
 [[package]]
 name = "ark-client"
 version = "0.11.0"
-source = "git+https://github.com/tee8z/rust-sdk?rev=d9a58985b2eab2547d565b8a325fa652479e379d#d9a58985b2eab2547d565b8a325fa652479e379d"
+source = "git+https://github.com/tee8z/rust-sdk?rev=1650c6b1d4666866d8b093930a0e54b03688ab44#1650c6b1d4666866d8b093930a0e54b03688ab44"
 dependencies = [
  "ark-core",
  "ark-delegator",
@@ -227,7 +227,7 @@ dependencies = [
 [[package]]
 name = "ark-core"
 version = "0.11.0"
-source = "git+https://github.com/tee8z/rust-sdk?rev=d9a58985b2eab2547d565b8a325fa652479e379d#d9a58985b2eab2547d565b8a325fa652479e379d"
+source = "git+https://github.com/tee8z/rust-sdk?rev=1650c6b1d4666866d8b093930a0e54b03688ab44#1650c6b1d4666866d8b093930a0e54b03688ab44"
 dependencies = [
  "bech32",
  "bitcoin",
@@ -248,7 +248,7 @@ dependencies = [
 [[package]]
 name = "ark-delegator"
 version = "0.11.0"
-source = "git+https://github.com/tee8z/rust-sdk?rev=d9a58985b2eab2547d565b8a325fa652479e379d#d9a58985b2eab2547d565b8a325fa652479e379d"
+source = "git+https://github.com/tee8z/rust-sdk?rev=1650c6b1d4666866d8b093930a0e54b03688ab44#1650c6b1d4666866d8b093930a0e54b03688ab44"
 dependencies = [
  "ark-core",
  "bitcoin",
@@ -261,7 +261,7 @@ dependencies = [
 [[package]]
 name = "ark-fees"
 version = "0.11.0"
-source = "git+https://github.com/tee8z/rust-sdk?rev=d9a58985b2eab2547d565b8a325fa652479e379d#d9a58985b2eab2547d565b8a325fa652479e379d"
+source = "git+https://github.com/tee8z/rust-sdk?rev=1650c6b1d4666866d8b093930a0e54b03688ab44#1650c6b1d4666866d8b093930a0e54b03688ab44"
 dependencies = [
  "cel",
 ]
@@ -269,7 +269,7 @@ dependencies = [
 [[package]]
 name = "ark-grpc"
 version = "0.11.0"
-source = "git+https://github.com/tee8z/rust-sdk?rev=d9a58985b2eab2547d565b8a325fa652479e379d#d9a58985b2eab2547d565b8a325fa652479e379d"
+source = "git+https://github.com/tee8z/rust-sdk?rev=1650c6b1d4666866d8b093930a0e54b03688ab44#1650c6b1d4666866d8b093930a0e54b03688ab44"
 dependencies = [
  "ark-core",
  "async-stream",
