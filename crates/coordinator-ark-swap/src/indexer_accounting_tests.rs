@@ -8,8 +8,14 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+/// The SDK's dispatch counter is process-wide, so the tests that send GetVtxos
+/// run one at a time.
+static SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(Default::default);
+
 #[tokio::test]
 async fn actual_rpc_traffic_is_counted_paced_and_blocked_after_failure() {
+    let _serial = SERIAL.lock().await;
     let _ = rustls::crypto::ring::default_provider().install_default();
     let received = Arc::new(AtomicUsize::new(0));
     let arrivals = Arc::new(Mutex::new(Vec::new()));
@@ -135,5 +141,60 @@ async fn actual_rpc_traffic_is_counted_paced_and_blocked_after_failure() {
     }
     assert_eq!(received.load(Ordering::SeqCst), 4);
     assert_eq!(ark_grpc::vtxo_requests_started(), before + 4);
+    server.abort();
+}
+
+/// A refusal of the request, or an answer that fails to decode, keeps the usual
+/// spacing. Only trouble at the server (here Unavailable) starts the backoff.
+#[tokio::test]
+async fn only_trouble_at_the_server_starts_the_backoff() {
+    let _serial = SERIAL.lock().await;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let received = Arc::new(AtomicUsize::new(0));
+    let counted = received.clone();
+    let app = Router::new().route(
+        "/ark.v1.IndexerService/GetVtxos",
+        post(move || {
+            let n = counted.fetch_add(1, Ordering::SeqCst);
+            async move {
+                // InvalidArgument; then one VTXO without an outpoint, which
+                // fails to decode; then Unavailable.
+                let (status, body) = match n {
+                    0 => ("3", vec![0u8; 5]),
+                    1 => ("0", vec![0, 0, 0, 0, 2, 0x0a, 0x00]),
+                    _ => ("14", vec![0u8; 5]),
+                };
+                (
+                    [
+                        ("content-type", "application/grpc"),
+                        ("grpc-status", status),
+                    ],
+                    body,
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut client = ark_grpc::Client::new(format!("http://{address}"));
+    client.connect().await.unwrap();
+    let request = || GetVtxosRequest::new_for_outpoints(&[bitcoin::OutPoint::null()]);
+    for expected in 1..=3 {
+        let started = Instant::now();
+        assert!(client.list_vtxos(request()).await.is_err());
+        assert_eq!(received.load(Ordering::SeqCst), expected);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "an answer must not start a backoff"
+        );
+    }
+    // The Unavailable answer did: the next call expires locally.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), client.list_vtxos(request()))
+            .await
+            .is_err()
+    );
+    assert_eq!(received.load(Ordering::SeqCst), 3);
     server.abort();
 }
