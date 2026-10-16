@@ -11,6 +11,7 @@ mod electrum;
 #[cfg(test)]
 mod indexer_accounting_tests;
 mod indexer_backoff;
+mod indexer_budget;
 mod invoices;
 mod lnd;
 mod onchain_wallet;
@@ -53,7 +54,7 @@ struct Cli {
 const TICK: Duration = Duration::from_secs(1);
 /// How often the wallet's holder boards what has confirmed at its boarding address, and renews
 /// the VTXOs that are recoverable or close to expiry.
-const BOARD_EVERY: Duration = Duration::from_secs(60);
+const BOARD_EVERY: Duration = Duration::from_secs(240);
 /// How often settled swaps whose escrow VTXO is unknown are checked for lookups that are due.
 /// Each swap waits out its own backoff; see `Swapper::lookup_tick`.
 const LOOKUP_EVERY: Duration = Duration::from_secs(10);
@@ -105,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
         &wallet::load_or_create_key(&config.data_dir.join("wallet.key"))?.secret_bytes(),
     );
     let store = Store::open(&config.data_dir.join("swaps.sqlite"), preimages).await?;
+    ark_grpc::set_vtxo_request_budget(&config.ark_server_url, Arc::new(store.clone())).await;
     {
         let store = store.clone();
         tokio::spawn(async move {
@@ -130,8 +132,10 @@ async fn main() -> anyhow::Result<()> {
         refund_turn: Default::default(),
         renewed: Default::default(),
     });
-    let view = swapper.wallet.view().await?;
-    log::info!(
+    // A restart must not reset an exhausted quota or crash-loop until it refills.
+    // Coin selection still requires a fresh successful read before spending.
+    match swapper.wallet.view().await {
+        Ok(view) => log::info!(
         "Ark wallet {} holds {} sat confirmed and {} sat preconfirmed, {} sat of it too close to \
          expiry to pay an escrow, and {} sat recoverable; {} sat await boarding at {}",
         view.ark_address,
@@ -141,7 +145,9 @@ async fn main() -> anyhow::Result<()> {
         view.recoverable_sat,
         view.boarding_sat,
         view.boarding_address
-    );
+        ),
+        Err(error) => log::warn!("initial wallet reading deferred: {error:#}"),
+    }
 
     // Two instances can share the database during a blue/green deploy. Only the lease holder
     // advances swaps and moves the wallet's coins; both serve the API.

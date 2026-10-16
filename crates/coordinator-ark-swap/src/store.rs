@@ -105,6 +105,44 @@ pub struct Store {
 }
 
 impl Store {
+    /// Reserve before network access. One conditional INSERT serializes all
+    /// callers, including independent pools and processes sharing this database.
+    /// Failed/cancelled requests retain their reservation; a restart cannot refill it.
+    pub async fn reserve_indexer_request(
+        &self,
+        now_ms: i64,
+    ) -> anyhow::Result<Option<std::time::Duration>> {
+        use crate::indexer_budget::{REQUESTS, WINDOW_MS};
+        let cutoff = now_ms.saturating_sub(WINDOW_MS);
+        sqlx::query("DELETE FROM indexer_request_budget WHERE requested_at_ms <= ?")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await?;
+        let inserted = sqlx::query(
+            "INSERT INTO indexer_request_budget (requested_at_ms)
+             SELECT ? WHERE (SELECT COUNT(*) FROM indexer_request_budget) < ?",
+        )
+        .bind(now_ms)
+        .bind(REQUESTS)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if inserted == 1 {
+            return Ok(None);
+        }
+        let oldest: Option<i64> =
+            sqlx::query_scalar("SELECT MIN(requested_at_ms) FROM indexer_request_budget")
+                .fetch_one(&self.pool)
+                .await?;
+        // A concurrent caller may have just expired the rows. Retry locally;
+        // never grant without successfully recording the INSERT above.
+        let wait_ms = oldest
+            .map(|oldest| oldest.saturating_add(WINDOW_MS).saturating_sub(now_ms))
+            .unwrap_or(1)
+            .max(1) as u64;
+        Ok(Some(std::time::Duration::from_millis(wait_ms)))
+    }
+
     /// Claim a due lookup and persist its next earliest start before contacting Arkade.
     /// The conditional update also excludes concurrent callers sharing this database.
     pub async fn reserve_indexer_lookup(

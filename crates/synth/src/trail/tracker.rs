@@ -1706,7 +1706,7 @@ async fn indexed_vtxos(
         let permit =
             tokio::time::timeout(Duration::from_secs(10), ark_grpc::vtxo_request_permit(arkd))
                 .await
-                .context("the Arkade indexer is backing off; defer this lookup")?;
+                .context("the Arkade indexer is backing off; defer this lookup")??;
         // Count attempts at the outbound boundary, including every page. Do not
         // log the URL query: it contains players' outpoints.
         log::info!(target: "ark_indexer", "ark_indexer_request protocol=rest method=GetVtxos page={index} outpoints={}", outpoints.len());
@@ -3573,6 +3573,33 @@ mod tests {
         assert!(outpoints
             .iter()
             .all(|outpoint| vtxos[outpoint].as_ref().unwrap().amount_sat == 1100));
+    }
+
+    #[tokio::test]
+    async fn exhausted_shared_quota_prevents_rest_requests() {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let app = indexer(asked.clone()).route(
+            "/v1/indexer/permit",
+            axum::routing::post(|| async {
+                (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({ "retry_after_ms": 240_000 })),
+                )
+            }),
+        );
+        let fixture = fixture(app, false, false).await;
+        coordinator_ark::indexer_budget::configure(&fixture.url, &fixture.url, "test-token")
+            .await
+            .unwrap();
+        let http = reqwest::Client::new();
+        let outpoints = vec![format!("{}:0", "ab".repeat(32))];
+        assert!(indexed_vtxos(&http, &fixture.url, &outpoints)
+            .await
+            .is_err());
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "a denied permit must never reach the indexer"
+        );
     }
 
     #[tokio::test]

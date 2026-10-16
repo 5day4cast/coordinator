@@ -42,7 +42,7 @@ use crate::swap::unix_now;
 /// How many VTXOs the indexer is asked for at a time.
 const VTXO_PAGE_SIZE: i32 = 100;
 /// How long `GET /v1/wallet` answers from the last reading of the wallet.
-const VIEW_TTL: Duration = Duration::from_secs(10);
+const VIEW_TTL: Duration = Duration::from_secs(120);
 /// A reading of the wallet slower than this is logged.
 const SLOW_VIEW: Duration = Duration::from_secs(5);
 

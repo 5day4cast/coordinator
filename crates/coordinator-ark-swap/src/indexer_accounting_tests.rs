@@ -136,4 +136,100 @@ async fn actual_rpc_traffic_is_counted_paced_and_blocked_after_failure() {
     assert_eq!(received.load(Ordering::SeqCst), 4);
     assert_eq!(ark_grpc::vtxo_requests_started(), before + 4);
     server.abort();
+
+    shared_quota_bounds_actual_requests().await;
+}
+
+/// Three distinct transport limiters represent the three production processes.
+/// One reserves directly in SQLite; the others use the production HTTP client.
+async fn shared_quota_bounds_actual_requests() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = crate::store::Store::open(
+        &directory.path().join("quota.sqlite"),
+        crate::preimages::PreimageKey::from_wallet_secret(&[1; 32]),
+    )
+    .await
+    .unwrap();
+    let shared = store.clone();
+    let received = Arc::new(AtomicUsize::new(0));
+    let counted = received.clone();
+    let app = Router::new()
+        .route(
+            "/v1/indexer/permit",
+            post(move || {
+                let store = shared.clone();
+                async move { crate::api::reserve_indexer(&store).await }
+            }),
+        )
+        .route(
+            "/ark.v1.IndexerService/GetVtxos",
+            post(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                async {
+                    (
+                        [("content-type", "application/grpc"), ("grpc-status", "0")],
+                        vec![0u8; 5],
+                    )
+                }
+            }),
+        );
+    let mut servers = Vec::new();
+    let mut urls = Vec::new();
+    for _ in 0..3 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        urls.push(format!("http://{}", listener.local_addr().unwrap()));
+        let app = app.clone();
+        servers.push(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap()
+        }));
+    }
+    ark_grpc::set_vtxo_request_budget(&urls[0], Arc::new(store)).await;
+    let mut clients = Vec::new();
+    for (index, url) in urls.iter().enumerate() {
+        if index > 0 {
+            coordinator_ark::indexer_budget::configure(url, &urls[0], "test-token")
+                .await
+                .unwrap();
+        }
+        let mut client = ark_grpc::Client::new(url.clone());
+        client.connect().await.unwrap();
+        clients.push(client);
+    }
+    let before = ark_grpc::vtxo_requests_started();
+    for index in 0..10 {
+        clients[index % clients.len()]
+            .list_vtxos(GetVtxosRequest::new_for_outpoints(&[
+                bitcoin::OutPoint::null(),
+            ]))
+            .await
+            .unwrap();
+    }
+    assert_eq!(received.load(Ordering::SeqCst), 10);
+    let mut burst = tokio::task::JoinSet::new();
+    for index in 0..100 {
+        let client = clients[index % clients.len()].clone();
+        burst.spawn(async move {
+            !matches!(
+                tokio::time::timeout(
+                    Duration::from_secs(3),
+                    client.list_vtxos(GetVtxosRequest::new_for_outpoints(&[
+                        bitcoin::OutPoint::null()
+                    ]),)
+                )
+                .await,
+                Ok(Ok(_))
+            )
+        });
+    }
+    while let Some(result) = burst.join_next().await {
+        assert!(
+            result.unwrap(),
+            "exhausted shared quota must block every caller"
+        );
+    }
+    assert_eq!(received.load(Ordering::SeqCst), 10);
+    assert_eq!(ark_grpc::vtxo_requests_started(), before + 10);
+    for server in servers {
+        server.abort();
+    }
 }
