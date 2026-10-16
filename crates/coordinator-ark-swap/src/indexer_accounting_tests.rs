@@ -8,8 +8,14 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+/// The SDK's dispatch counter is process-wide, so the tests that send GetVtxos
+/// run one at a time.
+static SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(Default::default);
+
 #[tokio::test]
 async fn actual_rpc_traffic_is_counted_paced_and_blocked_after_failure() {
+    let _serial = SERIAL.lock().await;
     let _ = rustls::crypto::ring::default_provider().install_default();
     let received = Arc::new(AtomicUsize::new(0));
     let arrivals = Arc::new(Mutex::new(Vec::new()));
@@ -142,6 +148,7 @@ async fn actual_rpc_traffic_is_counted_paced_and_blocked_after_failure() {
 /// spacing. Only trouble at the server (here Unavailable) starts the backoff.
 #[tokio::test]
 async fn only_trouble_at_the_server_starts_the_backoff() {
+    let _serial = SERIAL.lock().await;
     let _ = rustls::crypto::ring::default_provider().install_default();
     let received = Arc::new(AtomicUsize::new(0));
     let counted = received.clone();
