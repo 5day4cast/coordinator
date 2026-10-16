@@ -38,6 +38,7 @@ use crate::config::Config;
 use crate::electrum::Electrum;
 use crate::onchain_wallet::BoardingOnlyWallet;
 use crate::swap::unix_now;
+use crate::vtxo_sync::{self, Listing, VtxoSync};
 
 /// How many VTXOs the indexer is asked for at a time.
 const VTXO_PAGE_SIZE: i32 = 100;
@@ -88,6 +89,8 @@ pub struct ArkWallet {
     view: Cached<WalletView>,
     /// How the last boards and renewals went, for `view`.
     boards: BoardOutcomes,
+    /// The unspent VTXOs as of the last listing, for `coins`. Readings take turns.
+    vtxo_sync: tokio::sync::Mutex<Option<VtxoSync>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -285,6 +288,7 @@ impl ArkWallet {
             margins: Margins::from_days(config.renew_margin_days, config.pay_margin_days),
             view: Cached::new(VIEW_TTL),
             boards: BoardOutcomes::default(),
+            vtxo_sync: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -478,8 +482,9 @@ impl ArkWallet {
         Ok(ark_txid)
     }
 
-    /// The wallet's unspent VTXOs, from the indexer's listings of spendable and of recoverable
-    /// ones. Neither lists the spent VTXOs, which are most of what the address has held.
+    /// The wallet's unspent VTXOs. One listing a reading: what changed since the last one, or
+    /// every unspent VTXO when a full listing is due (see `vtxo_sync`). Neither lists the spent
+    /// VTXOs that are most of what the addresses have held.
     pub async fn coins(&self) -> anyhow::Result<Coins> {
         let info = self
             .client
@@ -499,19 +504,34 @@ impl ArkWallet {
             .filter(|(_, vtxo)| info.signer_requires_recovery_at(vtxo.server_pk(), now))
             .map(|(address, _)| address.to_p2tr_script_pubkey())
             .collect();
-        let request =
-            || GetVtxosRequest::new_for_addresses(addresses.iter().map(|(address, _)| *address));
-        let filter = |error| anyhow::anyhow!("filter the VTXO listing: {error}");
-        // The transport serializes these reads. Await them in order so a
-        // background deferral cannot cancel an in-flight sibling and impose
-        // failure backoff on a payment waiting behind it.
-        let mut vtxos = self
-            .list_vtxos(request().spendable_only().map_err(filter)?)
-            .await?;
-        let recoverable = self
-            .list_vtxos(request().recoverable_only().map_err(filter)?)
-            .await?;
-        vtxos.extend(recoverable);
+        let mut scripts: Vec<bitcoin::ScriptBuf> = addresses
+            .iter()
+            .map(|(address, _)| address.to_p2tr_script_pubkey())
+            .collect();
+        scripts.sort();
+        let mut sync = self.vtxo_sync.lock().await;
+        let started_ms = vtxo_sync::now_ms();
+        let listing = Listing::next(sync.as_ref(), &scripts, std::time::Instant::now());
+        let request = listing
+            .narrow(GetVtxosRequest::new_for_addresses(
+                addresses.iter().map(|(address, _)| *address),
+            ))
+            .map_err(|error| anyhow::anyhow!("narrow the VTXO listing: {error}"))?;
+        let listed = self.list_vtxos(request).await?;
+        let changes = matches!(listing, Listing::Changes { .. });
+        match sync.as_mut() {
+            Some(current) if changes => current.apply(listed, started_ms),
+            _ => {
+                *sync = Some(VtxoSync::full(
+                    scripts,
+                    listed,
+                    started_ms,
+                    std::time::Instant::now(),
+                ))
+            }
+        }
+        let mut vtxos = sync.as_ref().map(VtxoSync::vtxos).unwrap_or_default();
+        drop(sync);
         vtxos.retain(|vtxo| {
             !unsigned.contains(&vtxo.script) || coins::recoverable_at(vtxo, info.dust, now)
         });
