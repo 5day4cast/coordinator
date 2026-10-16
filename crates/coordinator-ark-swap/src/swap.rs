@@ -185,6 +185,9 @@ impl Swapper {
                     amount_sat,
                 )?;
             }
+            // Do not issue an invoice when the fresh payment check is deferred:
+            // the payer would otherwise hold an HTLC while no reads are allowed.
+            Err(error) if crate::indexer_budget::deferred(&error).is_some() => return Err(error),
             Err(error) => log::warn!("check the wallet can fund a new swap: {error:#}"),
         }
 

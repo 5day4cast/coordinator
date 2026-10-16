@@ -96,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
         ),
         Some(_) => {}
     }
-    let ark_swap = match config
+    let ark_swap_config = config
         .rebalance
         .as_ref()
         .and_then(|rebalance| rebalance.arkade.as_ref())
@@ -105,8 +105,15 @@ async fn main() -> anyhow::Result<()> {
             .ark_refill
             .as_ref()
             .filter(|refill| refill.enabled)
-            .map(|refill| &refill.ark_swap))
-    {
+            .map(|refill| &refill.ark_swap));
+    if let Some(indexer_url) = &config.trail.arkd_url {
+        let budget = ark_swap_config.ok_or_else(|| {
+            anyhow::anyhow!("trail.arkd_url requires ark-swapd for the shared GetVtxos budget")
+        })?;
+        let token = zeroize::Zeroizing::new(std::fs::read_to_string(&budget.token_file)?);
+        coordinator_ark::indexer_budget::configure(indexer_url, &budget.url, token.trim()).await?;
+    }
+    let ark_swap = match ark_swap_config {
         Some(ark_swap) => Some(ArkSwap::new(ark_swap)?),
         None => None,
     };

@@ -23,7 +23,7 @@ default-members = [
 resolver = "2"
 
 [workspace.package]
-version = "2.27.24"
+version = "2.27.25"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/5day4cast/coordinator"
@@ -193,8 +193,8 @@ opt-level = 3
 # Every ark crate comes from the fork, so ark-client and our own ark-core/ark-grpc share one ark-core.
 # The pinned transport also counts GetVtxos attempts and shares a bounded, jittered request budget.
 [patch.crates-io]
-ark-client = { git = "https://github.com/tee8z/rust-sdk", rev = "1650c6b1d4666866d8b093930a0e54b03688ab44" }
-ark-core = { git = "https://github.com/tee8z/rust-sdk", rev = "1650c6b1d4666866d8b093930a0e54b03688ab44" }
-ark-delegator = { git = "https://github.com/tee8z/rust-sdk", rev = "1650c6b1d4666866d8b093930a0e54b03688ab44" }
-ark-fees = { git = "https://github.com/tee8z/rust-sdk", rev = "1650c6b1d4666866d8b093930a0e54b03688ab44" }
-ark-grpc = { git = "https://github.com/tee8z/rust-sdk", rev = "1650c6b1d4666866d8b093930a0e54b03688ab44" }
+ark-client = { git = "https://github.com/tee8z/rust-sdk", rev = "8580894d7f394a89dbd7c41368079254a1723daf" }
+ark-core = { git = "https://github.com/tee8z/rust-sdk", rev = "8580894d7f394a89dbd7c41368079254a1723daf" }
+ark-delegator = { git = "https://github.com/tee8z/rust-sdk", rev = "8580894d7f394a89dbd7c41368079254a1723daf" }
+ark-fees = { git = "https://github.com/tee8z/rust-sdk", rev = "8580894d7f394a89dbd7c41368079254a1723daf" }
+ark-grpc = { git = "https://github.com/tee8z/rust-sdk", rev = "8580894d7f394a89dbd7c41368079254a1723daf" }

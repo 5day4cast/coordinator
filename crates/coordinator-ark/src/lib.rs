@@ -17,6 +17,7 @@
 
 mod dlc;
 mod error;
+pub mod indexer_budget;
 mod kickoff;
 mod recover;
 mod refund;

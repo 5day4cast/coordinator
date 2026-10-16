@@ -3295,9 +3295,15 @@ async fn arkade(
     if !settings.enabled {
         return Ok(None);
     }
+    let swap_token = settings.swap_token()?;
+    coordinator_ark::indexer_budget::configure(
+        &settings.server_url,
+        &settings.swap_url,
+        &swap_token,
+    )
+    .await?;
     let server = coordinator_ark::ArkServer::connect(settings.server_url.clone()).await?;
-    let swaps =
-        crate::infra::ark_swap::SwapClient::new(&settings.swap_url, settings.swap_token()?)?;
+    let swaps = crate::infra::ark_swap::SwapClient::new(&settings.swap_url, swap_token)?;
     info!(
         "Arkade funding enabled: server {} (signer {}), swaps at {}",
         settings.server_url,

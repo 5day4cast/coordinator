@@ -312,15 +312,16 @@ impl Coordinator {
             .iter()
             .map(|(pending, _)| pending.escrow_address.clone())
             .collect();
-        let listed = match ark.transport.vtxos(addresses).await {
-            Ok(listed) => listed,
-            Err(e) => {
-                for (pending, _) in &unverified {
-                    self.report_swap(pending, format!("cannot list its escrow on Arkade: {e}"));
+        let listed =
+            match coordinator_ark::indexer_budget::payment(ark.transport.vtxos(addresses)).await {
+                Ok(listed) => listed,
+                Err(e) => {
+                    for (pending, _) in &unverified {
+                        self.report_swap(pending, format!("cannot list its escrow on Arkade: {e}"));
+                    }
+                    return Ok(());
                 }
-                return Ok(());
-            }
-        };
+            };
         for (pending, swap) in &unverified {
             self.settle_paid_swap(ark, pending, swap, &listed).await?;
         }

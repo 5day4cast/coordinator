@@ -19,11 +19,11 @@ pub trait Steps: Send + Sync + 'static {
 
 impl Steps for Swapper {
     fn tick(&self) -> impl Future<Output = ()> + Send {
-        Swapper::tick(self)
+        coordinator_ark::indexer_budget::payment(Swapper::tick(self))
     }
 
     fn refund_tick(&self) -> impl Future<Output = ()> + Send {
-        Swapper::refund_tick(self)
+        coordinator_ark::indexer_budget::payment(Swapper::refund_tick(self))
     }
 
     fn lookup_tick(&self) -> impl Future<Output = ()> + Send {

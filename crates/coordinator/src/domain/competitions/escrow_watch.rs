@@ -485,10 +485,10 @@ impl Coordinator {
             // An event that names the script but carries no VTXO there says only where to look.
             let mut vtxos = self.escrow_watch.seen(&pending.escrow_address);
             if vtxos.is_empty() {
-                vtxos = match ark
-                    .transport
-                    .vtxos(vec![pending.escrow_address.clone()])
-                    .await
+                vtxos = match coordinator_ark::indexer_budget::payment(
+                    ark.transport.vtxos(vec![pending.escrow_address.clone()]),
+                )
+                .await
                 {
                     Ok(vtxos) => vtxos,
                     Err(e) => {

@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+anyhow = { workspace = true }
 ark-core = { workspace = true }
 ark-grpc = { workspace = true }
 async-trait = { workspace = true }
@@ -17,6 +18,8 @@ futures = { workspace = true }
 log = { workspace = true }
 prost = { workspace = true }
 rand = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
 rustls = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
@@ -28,6 +31,7 @@ tonic-prost = { workspace = true }
 test-utils = []
 
 [dev-dependencies]
+axum.workspace = true
 electrum-client.workspace = true
 coordinator-ark = { path = ".", features = ["test-utils"] }
 # Proves the transactions this crate builds are the ones the verifier authorizes.
