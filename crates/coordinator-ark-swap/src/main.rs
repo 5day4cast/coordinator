@@ -21,6 +21,7 @@ mod refund;
 mod request_context;
 mod store;
 mod swap;
+mod vtxo_sync;
 mod wallet;
 mod worker;
 
