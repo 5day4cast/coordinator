@@ -156,10 +156,14 @@ async fn shared_quota_bounds_actual_requests() {
     let app = Router::new()
         .route(
             "/v1/indexer/permit",
-            post(move || {
-                let store = shared.clone();
-                async move { crate::api::reserve_indexer(&store).await }
-            }),
+            post(
+                move |axum::extract::Query(request): axum::extract::Query<
+                    crate::api::IndexerPermit,
+                >| {
+                    let store = shared.clone();
+                    async move { crate::api::reserve_indexer(&store, request).await }
+                },
+            ),
         )
         .route(
             "/ark.v1.IndexerService/GetVtxos",
@@ -196,7 +200,7 @@ async fn shared_quota_bounds_actual_requests() {
         clients.push(client);
     }
     let before = ark_grpc::vtxo_requests_started();
-    for index in 0..10 {
+    for index in 0..4 {
         clients[index % clients.len()]
             .list_vtxos(GetVtxosRequest::new_for_outpoints(&[
                 bitcoin::OutPoint::null(),
@@ -204,11 +208,29 @@ async fn shared_quota_bounds_actual_requests() {
             .await
             .unwrap();
     }
+    assert!(clients[1]
+        .list_vtxos(GetVtxosRequest::new_for_outpoints(&[
+            bitcoin::OutPoint::null(),
+        ]))
+        .await
+        .is_err());
+    assert_eq!(
+        received.load(Ordering::SeqCst),
+        4,
+        "background work must leave the payment reserve untouched"
+    );
+    for index in 0..6 {
+        coordinator_ark::indexer_budget::payment(clients[index % clients.len()].list_vtxos(
+            GetVtxosRequest::new_for_outpoints(&[bitcoin::OutPoint::null()]),
+        ))
+        .await
+        .unwrap();
+    }
     assert_eq!(received.load(Ordering::SeqCst), 10);
     let mut burst = tokio::task::JoinSet::new();
     for index in 0..100 {
         let client = clients[index % clients.len()].clone();
-        burst.spawn(async move {
+        burst.spawn(coordinator_ark::indexer_budget::payment(async move {
             !matches!(
                 tokio::time::timeout(
                     Duration::from_secs(3),
@@ -219,7 +241,7 @@ async fn shared_quota_bounds_actual_requests() {
                 .await,
                 Ok(Ok(_))
             )
-        });
+        }));
     }
     while let Some(result) = burst.join_next().await {
         assert!(

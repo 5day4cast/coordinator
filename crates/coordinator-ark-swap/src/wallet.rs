@@ -502,10 +502,15 @@ impl ArkWallet {
         let request =
             || GetVtxosRequest::new_for_addresses(addresses.iter().map(|(address, _)| *address));
         let filter = |error| anyhow::anyhow!("filter the VTXO listing: {error}");
-        let (mut vtxos, recoverable) = tokio::try_join!(
-            self.list_vtxos(request().spendable_only().map_err(filter)?),
-            self.list_vtxos(request().recoverable_only().map_err(filter)?),
-        )?;
+        // The transport serializes these reads. Await them in order so a
+        // background deferral cannot cancel an in-flight sibling and impose
+        // failure backoff on a payment waiting behind it.
+        let mut vtxos = self
+            .list_vtxos(request().spendable_only().map_err(filter)?)
+            .await?;
+        let recoverable = self
+            .list_vtxos(request().recoverable_only().map_err(filter)?)
+            .await?;
         vtxos.extend(recoverable);
         vtxos.retain(|vtxo| {
             !unsigned.contains(&vtxo.script) || coins::recoverable_at(vtxo, info.dust, now)

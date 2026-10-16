@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ark_grpc::{VtxoBudgetError, VtxoRequestBudget};
+use ark_grpc::{VtxoBudgetError, VtxoRequestBudget, VtxoRequestPriority};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::Deserialize;
 
@@ -31,8 +31,13 @@ impl RemoteIndexerBudget {
         })
     }
 
-    async fn request(&self) -> anyhow::Result<Option<Duration>> {
-        let response = self.client.post(&self.url).send().await?;
+    async fn request(&self, priority: VtxoRequestPriority) -> anyhow::Result<Option<Duration>> {
+        let response = self
+            .client
+            .post(&self.url)
+            .query(&[("priority", priority.as_str())])
+            .send()
+            .await?;
         if response.status() == reqwest::StatusCode::NO_CONTENT {
             return Ok(None);
         }
@@ -52,13 +57,16 @@ impl RemoteIndexerBudget {
 }
 
 impl VtxoRequestBudget for RemoteIndexerBudget {
-    fn reserve(&self) -> Pin<Box<dyn Future<Output = Result<(), VtxoBudgetError>> + Send + '_>> {
+    fn reserve(
+        &self,
+        priority: VtxoRequestPriority,
+    ) -> Pin<Box<dyn Future<Output = Result<(), VtxoBudgetError>> + Send + '_>> {
         Box::pin(async move {
-            match self.request().await {
+            match self.request(priority).await {
                 Ok(None) => Ok(()),
                 Ok(Some(retry_after)) => Err(VtxoBudgetError {
                     retry_after,
-                    message: "shared GetVtxos budget exhausted: 10 requests per rolling 4 minutes"
+                    message: "shared GetVtxos budget exhausted or capacity reserved for payments"
                         .into(),
                 }),
                 Err(error) => Err(VtxoBudgetError {
@@ -70,6 +78,12 @@ impl VtxoRequestBudget for RemoteIndexerBudget {
             }
         })
     }
+}
+
+/// Payment confirmation, spending, and refund checks can use the payment reserve.
+/// Ordinary monitoring and maintenance remain background work by default.
+pub async fn payment<F: Future>(future: F) -> F::Output {
+    ark_grpc::with_vtxo_request_priority(VtxoRequestPriority::Payment, future).await
 }
 
 pub async fn configure(indexer_url: &str, swap_url: &str, token: &str) -> anyhow::Result<()> {
@@ -137,23 +151,41 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let budget =
             |path: &str| RemoteIndexerBudget::new(&format!("{url}/{path}"), "test-token").unwrap();
-        budget("grant").reserve().await.unwrap();
+        budget("grant")
+            .reserve(VtxoRequestPriority::Payment)
+            .await
+            .unwrap();
         assert_eq!(
-            budget("exhausted").reserve().await.unwrap_err().retry_after,
+            budget("exhausted")
+                .reserve(VtxoRequestPriority::Payment)
+                .await
+                .unwrap_err()
+                .retry_after,
             Duration::from_secs(239)
         );
         assert_eq!(
-            budget("zero").reserve().await.unwrap_err().retry_after,
+            budget("zero")
+                .reserve(VtxoRequestPriority::Payment)
+                .await
+                .unwrap_err()
+                .retry_after,
             Duration::from_secs(1)
         );
         for path in ["broken", "unavailable", "redirect", "missing"] {
             assert_eq!(
-                budget(path).reserve().await.unwrap_err().retry_after,
+                budget(path)
+                    .reserve(VtxoRequestPriority::Payment)
+                    .await
+                    .unwrap_err()
+                    .retry_after,
                 Duration::from_secs(60)
             );
         }
         server.abort();
         let _ = server.await;
-        assert!(budget("grant").reserve().await.is_err());
+        assert!(budget("grant")
+            .reserve(VtxoRequestPriority::Payment)
+            .await
+            .is_err());
     }
 }

@@ -1390,9 +1390,7 @@ impl Coordinator {
             .address(ark.server.hrp())
             .map_err(|e| anyhow!("The swap has no Ark address: {e}"))?
             .encode();
-        let paid = ark
-            .transport
-            .vtxos(vec![address])
+        let paid = coordinator_ark::indexer_budget::payment(ark.transport.vtxos(vec![address]))
             .await
             .map_err(|e| anyhow!("Arkade will not list the swap's VTXOs: {e}"))?
             .into_iter()
@@ -1453,13 +1451,14 @@ impl Coordinator {
         escrow: &TicketArkEscrow,
         outpoint: OutPoint,
     ) -> Result<coordinator_ark::VirtualTxOutPoint, Error> {
-        ark.transport
-            .vtxos(vec![escrow.escrow_address.clone()])
-            .await
-            .map_err(|e| anyhow!("Arkade will not list the escrow's VTXOs: {e}"))?
-            .into_iter()
-            .find(|vtxo| vtxo.outpoint == outpoint)
-            .ok_or_else(|| anyhow!("Arkade does not list its escrow {outpoint}").into())
+        coordinator_ark::indexer_budget::payment(
+            ark.transport.vtxos(vec![escrow.escrow_address.clone()]),
+        )
+        .await
+        .map_err(|e| anyhow!("Arkade will not list the escrow's VTXOs: {e}"))?
+        .into_iter()
+        .find(|vtxo| vtxo.outpoint == outpoint)
+        .ok_or_else(|| anyhow!("Arkade does not list its escrow {outpoint}").into())
     }
 
     /// Pay the player, and give `ark-swapd` the preimage that claims the swap.

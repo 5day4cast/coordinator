@@ -111,8 +111,13 @@ impl Store {
     pub async fn reserve_indexer_request(
         &self,
         now_ms: i64,
+        priority: ark_grpc::VtxoRequestPriority,
     ) -> anyhow::Result<Option<std::time::Duration>> {
-        use crate::indexer_budget::{REQUESTS, WINDOW_MS};
+        use crate::indexer_budget::{BACKGROUND_REQUESTS, REQUESTS, WINDOW_MS};
+        let ceiling = match priority {
+            ark_grpc::VtxoRequestPriority::Payment => REQUESTS,
+            ark_grpc::VtxoRequestPriority::Background => BACKGROUND_REQUESTS,
+        };
         let cutoff = now_ms.saturating_sub(WINDOW_MS);
         sqlx::query("DELETE FROM indexer_request_budget WHERE requested_at_ms <= ?")
             .bind(cutoff)
@@ -123,7 +128,7 @@ impl Store {
              SELECT ? WHERE (SELECT COUNT(*) FROM indexer_request_budget) < ?",
         )
         .bind(now_ms)
-        .bind(REQUESTS)
+        .bind(ceiling)
         .execute(&self.pool)
         .await?
         .rows_affected();

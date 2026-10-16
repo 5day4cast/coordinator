@@ -193,8 +193,8 @@ opt-level = 3
 # Every ark crate comes from the fork, so ark-client and our own ark-core/ark-grpc share one ark-core.
 # The pinned transport also counts GetVtxos attempts and shares a bounded, jittered request budget.
 [patch.crates-io]
-ark-client = { git = "https://github.com/tee8z/rust-sdk", rev = "d9db466f577c45879156fe1dbac7e29804ad2cab" }
-ark-core = { git = "https://github.com/tee8z/rust-sdk", rev = "d9db466f577c45879156fe1dbac7e29804ad2cab" }
-ark-delegator = { git = "https://github.com/tee8z/rust-sdk", rev = "d9db466f577c45879156fe1dbac7e29804ad2cab" }
-ark-fees = { git = "https://github.com/tee8z/rust-sdk", rev = "d9db466f577c45879156fe1dbac7e29804ad2cab" }
-ark-grpc = { git = "https://github.com/tee8z/rust-sdk", rev = "d9db466f577c45879156fe1dbac7e29804ad2cab" }
+ark-client = { git = "https://github.com/tee8z/rust-sdk", rev = "8b27cb7975ea1e3b86b100b5f8eeaa7a38333085" }
+ark-core = { git = "https://github.com/tee8z/rust-sdk", rev = "8b27cb7975ea1e3b86b100b5f8eeaa7a38333085" }
+ark-delegator = { git = "https://github.com/tee8z/rust-sdk", rev = "8b27cb7975ea1e3b86b100b5f8eeaa7a38333085" }
+ark-fees = { git = "https://github.com/tee8z/rust-sdk", rev = "8b27cb7975ea1e3b86b100b5f8eeaa7a38333085" }
+ark-grpc = { git = "https://github.com/tee8z/rust-sdk", rev = "8b27cb7975ea1e3b86b100b5f8eeaa7a38333085" }
