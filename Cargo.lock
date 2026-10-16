@@ -189,7 +189,7 @@ dependencies = [
 [[package]]
 name = "ark-client"
 version = "0.11.0"
-source = "git+https://github.com/tee8z/rust-sdk?rev=8b27cb7975ea1e3b86b100b5f8eeaa7a38333085#8b27cb7975ea1e3b86b100b5f8eeaa7a38333085"
+source = "git+https://github.com/tee8z/rust-sdk?rev=8580894d7f394a89dbd7c41368079254a1723daf#8580894d7f394a89dbd7c41368079254a1723daf"
 dependencies = [
  "ark-core",
  "ark-delegator",
@@ -227,7 +227,7 @@ dependencies = [
 [[package]]
 name = "ark-core"
 version = "0.11.0"
-source = "git+https://github.com/tee8z/rust-sdk?rev=8b27cb7975ea1e3b86b100b5f8eeaa7a38333085#8b27cb7975ea1e3b86b100b5f8eeaa7a38333085"
+source = "git+https://github.com/tee8z/rust-sdk?rev=8580894d7f394a89dbd7c41368079254a1723daf#8580894d7f394a89dbd7c41368079254a1723daf"
 dependencies = [
  "bech32",
  "bitcoin",
@@ -248,7 +248,7 @@ dependencies = [
 [[package]]
 name = "ark-delegator"
 version = "0.11.0"
-source = "git+https://github.com/tee8z/rust-sdk?rev=8b27cb7975ea1e3b86b100b5f8eeaa7a38333085#8b27cb7975ea1e3b86b100b5f8eeaa7a38333085"
+source = "git+https://github.com/tee8z/rust-sdk?rev=8580894d7f394a89dbd7c41368079254a1723daf#8580894d7f394a89dbd7c41368079254a1723daf"
 dependencies = [
  "ark-core",
  "bitcoin",
@@ -261,7 +261,7 @@ dependencies = [
 [[package]]
 name = "ark-fees"
 version = "0.11.0"
-source = "git+https://github.com/tee8z/rust-sdk?rev=8b27cb7975ea1e3b86b100b5f8eeaa7a38333085#8b27cb7975ea1e3b86b100b5f8eeaa7a38333085"
+source = "git+https://github.com/tee8z/rust-sdk?rev=8580894d7f394a89dbd7c41368079254a1723daf#8580894d7f394a89dbd7c41368079254a1723daf"
 dependencies = [
  "cel",
 ]
@@ -269,7 +269,7 @@ dependencies = [
 [[package]]
 name = "ark-grpc"
 version = "0.11.0"
-source = "git+https://github.com/tee8z/rust-sdk?rev=8b27cb7975ea1e3b86b100b5f8eeaa7a38333085#8b27cb7975ea1e3b86b100b5f8eeaa7a38333085"
+source = "git+https://github.com/tee8z/rust-sdk?rev=8580894d7f394a89dbd7c41368079254a1723daf#8580894d7f394a89dbd7c41368079254a1723daf"
 dependencies = [
  "ark-core",
  "async-stream",
@@ -1568,7 +1568,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator"
-version = "2.27.24"
+version = "2.27.25"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1644,7 +1644,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-ark"
-version = "2.27.24"
+version = "2.27.25"
 dependencies = [
  "anyhow",
  "ark-core",
@@ -1674,7 +1674,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-ark-escrow"
-version = "2.27.24"
+version = "2.27.25"
 dependencies = [
  "bitcoin",
  "hex",
@@ -1685,7 +1685,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-ark-swap"
-version = "2.27.24"
+version = "2.27.25"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1720,7 +1720,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-core"
-version = "2.27.24"
+version = "2.27.25"
 dependencies = [
  "axum",
  "coordinator-escrow",
@@ -1736,7 +1736,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-escrow"
-version = "2.27.24"
+version = "2.27.25"
 dependencies = [
  "anyhow",
  "coordinator-ark-escrow",
@@ -1757,7 +1757,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-escrow-verifier"
-version = "2.27.24"
+version = "2.27.25"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1790,7 +1790,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-lnurl-relay"
-version = "2.27.24"
+version = "2.27.25"
 dependencies = [
  "anyhow",
  "coordinator-escrow",
@@ -1802,7 +1802,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-payout-witness"
-version = "2.27.24"
+version = "2.27.25"
 dependencies = [
  "anyhow",
  "axum",
@@ -1818,7 +1818,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-recover"
-version = "2.27.24"
+version = "2.27.25"
 dependencies = [
  "ark-core",
  "base64 0.22.1",
@@ -1847,7 +1847,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-synth"
-version = "2.27.24"
+version = "2.27.25"
 dependencies = [
  "anyhow",
  "ark-grpc",
@@ -1895,7 +1895,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-verifier-enclave"
-version = "2.27.24"
+version = "2.27.25"
 dependencies = [
  "anyhow",
  "coordinator-escrow-verifier",
@@ -1906,7 +1906,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-wasm"
-version = "2.27.24"
+version = "2.27.25"
 dependencies = [
  "base64 0.22.1",
  "bitcoin",
