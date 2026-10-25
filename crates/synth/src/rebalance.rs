@@ -386,13 +386,13 @@ impl Rebalancer {
         let last_top_up = self.db.last_rebalance_at(ARKADE).await?;
         let since =
             last_top_up.map(|at| (OffsetDateTime::now_utc() - at).whole_seconds().max(0) as u64);
-        if !needs_top_up(wallet.spendable_sat(), wallet.boarding_sat, since, config) {
+        if !needs_top_up(&wallet, since, config) {
             return Ok(None);
         }
         let amount = config.top_up_sats;
         info!(
             "Topping up ark-swapd, which can fund {} sats, with {amount} sats on-chain",
-            wallet.spendable_sat()
+            wallet.payable()
         );
         let sent = self
             .payer
@@ -404,7 +404,7 @@ impl Rebalancer {
                 kind: ARKADE,
                 channel_id: "ark-swapd".to_string(),
                 amount_sats: amount,
-                local_before_sats: wallet.spendable_sat(),
+                local_before_sats: wallet.payable(),
                 capacity_sats: 0,
                 txid: sent.as_ref().ok().cloned(),
                 error: sent.as_ref().err().map(|e| format!("{e:#}")),
@@ -517,20 +517,19 @@ fn channel_intent(
     })
 }
 
-/// Whether ark-swapd needs coins: it can fund less than the low mark, less than the low mark
+/// Whether ark-swapd needs coins: its payable balance is below the low mark, less than the low mark
 /// waits at its boarding address, and no top-up has been sent recently enough to still be
 /// confirming or boarding.
 ///
 /// Coins at the boarding address are already on their way in: when the Arkade server cannot
 /// board them, sending more only leaves more waiting there.
 fn needs_top_up(
-    spendable_sat: u64,
-    boarding_sat: u64,
+    wallet: &ArkWallet,
     since_last_top_up_secs: Option<u64>,
     config: &ArkadeTopUpConfig,
 ) -> bool {
-    spendable_sat < config.low_sats
-        && boarding_sat < config.low_sats
+    wallet.payable() < config.low_sats
+        && wallet.boarding_sat < config.low_sats
         && since_last_top_up_secs.is_none_or(|since| since >= config.settle_secs)
 }
 
@@ -607,19 +606,47 @@ mod tests {
         }
     }
 
+    fn wallet(payable: u64, boarding_sat: u64) -> ArkWallet {
+        ArkWallet {
+            confirmed_sat: payable,
+            payable_sat: Some(payable),
+            boarding_sat,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn expiring_coins_do_not_hide_a_wallet_that_cannot_pay_entries() {
+        let mut wallet = wallet(1_393, 0);
+        wallet.confirmed_sat = 401_393;
+        wallet.expiring_sat = Some(400_000);
+        assert!(needs_top_up(&wallet, None, &arkade()));
+        wallet.boarding_sat = 200_000;
+        assert!(!needs_top_up(&wallet, None, &arkade()));
+        wallet.boarding_sat = 0;
+        wallet.payable_sat = None;
+        assert!(
+            !needs_top_up(&wallet, None, &arkade()),
+            "legacy servers report only spendable coins"
+        );
+    }
+
     #[test]
     fn ark_swapd_is_topped_up_only_when_low_and_no_top_up_is_on_its_way() {
-        assert!(!needs_top_up(60_000, 0, None, &arkade()), "not low yet");
         assert!(
-            needs_top_up(200, 0, None, &arkade()),
+            !needs_top_up(&wallet(60_000, 0), None, &arkade()),
+            "not low yet"
+        );
+        assert!(
+            needs_top_up(&wallet(200, 0), None, &arkade()),
             "drained, and never topped up"
         );
         assert!(
-            !needs_top_up(200, 0, Some(600), &arkade()),
+            !needs_top_up(&wallet(200, 0), Some(600), &arkade()),
             "the last top-up may still be confirming or boarding"
         );
         assert!(
-            needs_top_up(200, 0, Some(3600), &arkade()),
+            needs_top_up(&wallet(200, 0), Some(3600), &arkade()),
             "a top-up that never arrived is tried again"
         );
     }
@@ -627,19 +654,19 @@ mod tests {
     #[test]
     fn ark_swapd_is_not_topped_up_while_enough_waits_to_be_boarded() {
         assert!(
-            !needs_top_up(200, 400_000, Some(7200), &arkade()),
+            !needs_top_up(&wallet(200, 400_000), Some(7200), &arkade()),
             "two top-ups the server has not boarded yet"
         );
         assert!(
-            !needs_top_up(200, 50_000, None, &arkade()),
+            !needs_top_up(&wallet(200, 50_000), None, &arkade()),
             "exactly the low mark waits"
         );
         assert!(
-            needs_top_up(200, 49_999, Some(7200), &arkade()),
+            needs_top_up(&wallet(200, 49_999), Some(7200), &arkade()),
             "less than the low mark waits"
         );
         assert!(
-            !needs_top_up(200, 1_000, Some(600), &arkade()),
+            !needs_top_up(&wallet(200, 1_000), Some(600), &arkade()),
             "the settle window still holds with little waiting"
         );
     }

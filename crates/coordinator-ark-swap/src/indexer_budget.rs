@@ -63,7 +63,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_bursts_preserve_six_payment_slots_even_across_restart() {
+    async fn background_bursts_preserve_payment_capacity_even_across_restart() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("reserved.sqlite");
         let now = 1_800_000_000_000;
@@ -117,7 +117,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_hundred_callers_across_independent_pools_share_ten_slots_and_restart_keeps_them() {
+    async fn a_hundred_callers_across_independent_pools_share_the_budget_and_restart_keeps_it() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("budget.sqlite");
         let mut stores = Vec::new();
