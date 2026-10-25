@@ -480,6 +480,23 @@ impl Swapper {
                 Ok(())
             }
             PaymentStep::Pay => {
+                // Pay only against a payer's HTLC that is still held. LND cancels it as its CLTV
+                // deadline nears, and an escrow paid after that cannot be settled for: on
+                // 2026-10-21 a payment delayed past it cost the wallet 5,382 sats.
+                let held = self
+                    .lnd
+                    .invoice_state(&bytes32(&swap.payment_hash)?)
+                    .await?;
+                if !may_pay_against(held) {
+                    let error = format!(
+                        "the payer's HTLC is no longer held ({held:?}), so the escrow was not paid"
+                    );
+                    self.transition(swap, SwapState::Failed, Some(error.clone()))
+                        .await?;
+                    self.store.clear_indexer_lookup("payment", swap.id).await?;
+                    log::warn!("swap {}: {error}", swap.id);
+                    return Ok(());
+                }
                 if let Some(attempted) = swap.pay_attempted_at {
                     log::warn!(
                         "swap {}: the escrow payment sent at {attempted} never reached Arkade; \
@@ -610,6 +627,12 @@ enum PaymentStep {
 }
 
 /// What a swap paying its escrow does next at `now`, given whether Arkade lists its payment.
+/// Whether an escrow may be paid while the payer's invoice is in `state`: only while LND holds
+/// the payer's HTLC, so the swap can settle for what it pays.
+fn may_pay_against(state: InvoiceState) -> bool {
+    state == InvoiceState::Accepted
+}
+
 fn payment_step(swap: &Swap, listed: bool, now: i64) -> PaymentStep {
     if listed {
         return PaymentStep::Record;
@@ -879,6 +902,18 @@ mod tests {
         assert!(renewed.waits(&[coin(1)], session));
         assert!(!renewed.waits(&[coin(1), coin(2)], session));
         assert!(!renewed.waits(&[coin(1)], Duration::ZERO));
+    }
+
+    #[test]
+    fn escrows_are_paid_only_against_a_held_htlc() {
+        assert!(may_pay_against(InvoiceState::Accepted));
+        for state in [
+            InvoiceState::Open,
+            InvoiceState::Canceled,
+            InvoiceState::Settled,
+        ] {
+            assert!(!may_pay_against(state), "{state:?}");
+        }
     }
 
     #[test]
