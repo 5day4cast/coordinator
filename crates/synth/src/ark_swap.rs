@@ -171,7 +171,7 @@ impl ArkSwap {
             let body = response.text().await.unwrap_or_default();
             if attempt < 2 && matches!(status.as_u16(), 429 | 503) {
                 if let Some(seconds) = retry_after.filter(|seconds| *seconds <= 240) {
-                    let jitter = rand::thread_rng().gen_range(250..=1000);
+                    let jitter = rand::rng().random_range(250..=1000);
                     let delay = Duration::from_secs(seconds.max(1)) + Duration::from_millis(jitter);
                     // Leave the client's full request timeout inside the overall budget.
                     if tokio::time::Instant::now() + delay + Duration::from_secs(30) <= deadline {
