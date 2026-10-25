@@ -153,6 +153,9 @@ async fn actual_rpc_traffic_is_counted_paced_and_blocked_after_failure() {
 /// Three distinct transport limiters represent the three production processes.
 /// One reserves directly in SQLite; the others use the production HTTP client.
 async fn shared_quota_bounds_actual_requests() {
+    use crate::indexer_budget::{BACKGROUND_REQUESTS, REQUESTS};
+    let background = BACKGROUND_REQUESTS as usize;
+    let total = REQUESTS as usize;
     let directory = tempfile::tempdir().unwrap();
     let store = crate::store::Store::open(
         &directory.path().join("quota.sqlite"),
@@ -210,7 +213,7 @@ async fn shared_quota_bounds_actual_requests() {
         clients.push(client);
     }
     let before = ark_grpc::vtxo_requests_started();
-    for index in 0..4 {
+    for index in 0..background {
         clients[index % clients.len()]
             .list_vtxos(GetVtxosRequest::new_for_outpoints(&[
                 bitcoin::OutPoint::null(),
@@ -226,17 +229,17 @@ async fn shared_quota_bounds_actual_requests() {
         .is_err());
     assert_eq!(
         received.load(Ordering::SeqCst),
-        4,
+        background,
         "background work must leave the payment reserve untouched"
     );
-    for index in 0..6 {
+    for index in 0..total - background {
         coordinator_ark::indexer_budget::payment(clients[index % clients.len()].list_vtxos(
             GetVtxosRequest::new_for_outpoints(&[bitcoin::OutPoint::null()]),
         ))
         .await
         .unwrap();
     }
-    assert_eq!(received.load(Ordering::SeqCst), 10);
+    assert_eq!(received.load(Ordering::SeqCst), total);
     let mut burst = tokio::task::JoinSet::new();
     for index in 0..100 {
         let client = clients[index % clients.len()].clone();
@@ -259,8 +262,8 @@ async fn shared_quota_bounds_actual_requests() {
             "exhausted shared quota must block every caller"
         );
     }
-    assert_eq!(received.load(Ordering::SeqCst), 10);
-    assert_eq!(ark_grpc::vtxo_requests_started(), before + 10);
+    assert_eq!(received.load(Ordering::SeqCst), total);
+    assert_eq!(ark_grpc::vtxo_requests_started(), before + total as u64);
     for server in servers {
         server.abort();
     }
