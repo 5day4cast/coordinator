@@ -8,9 +8,12 @@ use ark_grpc::{VtxoBudgetError, VtxoRequestBudget, VtxoRequestPriority};
 
 use crate::store::Store;
 
-pub const REQUESTS: i64 = 10;
-// Background reads stop when four slots are used; six remain reserved for payments.
-pub const BACKGROUND_REQUESTS: i64 = 4;
+// About 7.5 a minute across swapd, Coordinator and Synth: enough for a 20-seat competition to
+// fill, still far below the polling that drew Arkade's complaint (about 60 a minute from one
+// process). Ten a window refused entry payments until 20-seat competitions went unfilled.
+pub const REQUESTS: i64 = 30;
+// Background reads stop when ten slots are used; twenty remain reserved for payments.
+pub const BACKGROUND_REQUESTS: i64 = 10;
 pub const WINDOW_MS: i64 = 240_000;
 
 pub fn deferred(error: &anyhow::Error) -> Option<&VtxoBudgetError> {
