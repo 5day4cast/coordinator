@@ -20,9 +20,11 @@ env:
   SQLITE_DIR: ${{ github.workspace }}/.sqlite
 
 jobs:
+  # Playwright 1.57 supports Ubuntu 24.04. Build native artifacts on that same
+  # image so E2E does not receive binaries linked against a newer glibc.
   release-metadata:
     name: Release Metadata and Packaging
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -37,7 +39,7 @@ jobs:
   # Format check (fast, runs first)
   fmt:
     name: Format
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -48,7 +50,7 @@ jobs:
   # Clippy lint check
   clippy:
     name: Clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -61,7 +63,7 @@ jobs:
         id: sqlite-cache
         uses: actions/cache@v4
         with:
-          key: sqlite-3500400-v2-${{ runner.os }}
+          key: sqlite-3500400-v2-ubuntu-24.04-${{ runner.arch }}
           path: ${{ env.SQLITE_DIR }}
 
       - name: Install SQLite with sqlx features
@@ -102,13 +104,15 @@ jobs:
           components: clippy
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-24.04-${{ runner.arch }}
 
       - run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::double_must_use
 
   # Unit tests
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -121,7 +125,7 @@ jobs:
         id: sqlite-cache
         uses: actions/cache@v4
         with:
-          key: sqlite-3500400-v2-${{ runner.os }}
+          key: sqlite-3500400-v2-ubuntu-24.04-${{ runner.arch }}
           path: ${{ env.SQLITE_DIR }}
 
       - name: Install SQLite with sqlx features
@@ -160,13 +164,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-24.04-${{ runner.arch }}
 
       - run: cargo test --workspace --locked
 
   # Build check
   build:
     name: Build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -179,7 +185,7 @@ jobs:
         id: sqlite-cache
         uses: actions/cache@v4
         with:
-          key: sqlite-3500400-v2-${{ runner.os }}
+          key: sqlite-3500400-v2-ubuntu-24.04-${{ runner.arch }}
           path: ${{ env.SQLITE_DIR }}
 
       - name: Install SQLite with sqlx features
@@ -218,6 +224,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-24.04-${{ runner.arch }}
 
       - name: Build with e2e-testing feature
         run: cargo build --workspace --release --features e2e-testing --locked
@@ -234,13 +242,15 @@ jobs:
   # Browser assets and native binaries compile independently.
   build-wasm:
     name: Build WASM
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-24.04-${{ runner.arch }}
 
       - name: Install wasm-pack
         uses: taiki-e/install-action@v2
@@ -265,7 +275,7 @@ jobs:
   # E2E tests using Playwright with mock services
   e2e:
     name: E2E Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [build, build-wasm]
     timeout-minutes: 15
     steps:
@@ -312,7 +322,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ steps.playwright-version.outputs.version }}
+          key: playwright-ubuntu-24.04-${{ runner.arch }}-${{ steps.playwright-version.outputs.version }}
 
       - name: Run browser unit tests
         working-directory: e2e

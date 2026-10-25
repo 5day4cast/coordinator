@@ -100,6 +100,15 @@ A reconciliation pass does not also start a replacement on that leg. Subsequent 
 Keep LND payment history available until pending intents resolve. Do not delete pending database rows to retry an uncertain payment.
 This recovery protocol covers Lightning channel rebalances. On-chain top-ups retain their existing confirmation handling.
 
+Wallet reads for automatic top-ups respect ark-swapd's `Retry-After` response on HTTP 429 or 503.
+Synth adds jitter and makes at most three attempts within four minutes, including request timeouts.
+These reads remain background work under the shared GetVtxos budget.
+Other failures return immediately for investigation.
+
+The legacy `rebalance.arkade` top-up uses the wallet's payable balance.
+Coins too close to expiry cannot hide a shortfall that blocks new entries.
+Confirmed boarding coins and the settlement interval still prevent duplicate top-ups.
+
 ## Refill the Ark swap wallet
 
 ark-swapd pays each Arkade escrow from its own Ark wallet, so the wallet only drains. `[ark_refill]` sends it coins on-chain from an LND payer. It is off by default:
