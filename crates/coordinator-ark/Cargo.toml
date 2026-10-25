@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 ark-core = { workspace = true }
+ark-fees = { workspace = true }
 ark-grpc = { workspace = true }
 async-trait = { workspace = true }
 bitcoin = { workspace = true }

@@ -18,6 +18,7 @@
 mod dlc;
 mod error;
 pub mod indexer_budget;
+mod intent_fee;
 mod kickoff;
 mod recover;
 mod refund;
@@ -29,6 +30,7 @@ mod transport;
 
 pub use dlc::{ContractSigner, DlcKickoff, LocalContractSigner};
 pub use error::{BoxError, Error};
+pub use intent_fee::intent_fee;
 pub use kickoff::{
     delete_escrow_intent, delete_pool_intent, fund_pool, EscrowInput, Kickoff, KickoffConfig,
     KickoffHooks, PoolFunding,
