@@ -104,6 +104,8 @@ jobs:
           components: clippy
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-24.04-${{ runner.arch }}
 
       - run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::double_must_use
 
@@ -162,6 +164,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-24.04-${{ runner.arch }}
 
       - run: cargo test --workspace --locked
 
@@ -220,6 +224,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-24.04-${{ runner.arch }}
 
       - name: Build with e2e-testing feature
         run: cargo build --workspace --release --features e2e-testing --locked
@@ -243,6 +249,8 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-24.04-${{ runner.arch }}
 
       - name: Install wasm-pack
         uses: taiki-e/install-action@v2
