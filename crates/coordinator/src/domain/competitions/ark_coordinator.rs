@@ -615,16 +615,35 @@ impl Coordinator {
         let hooks = DlcKickoff::new(params.clone(), keymeld_pool.clone())?;
         let info = ark.server.info();
         let escrowed: Amount = inputs.iter().map(|input| input.amount).sum();
-        let fee = escrowed
+        let surplus = escrowed
             .checked_sub(hooks.funding_output().value)
             .ok_or_else(|| anyhow!("The escrows hold less than the pool"))?;
+        // The Arkade server takes what the batch leaves over its outputs, and refuses an intent
+        // that leaves less than its intent fee (INTENT_INSUFFICIENT_FEE). Its fee programs can
+        // change while this process runs: on 2026-10-21 they began charging 0.2% of every VTXO
+        // younger than a day, and every escrow is that young at kickoff. So they are read
+        // fresh, and the fee comes off the surplus before the coordinator's own.
+        let current = ark.server.client().grpc().get_info().await?;
+        let arkade_fee = coordinator_ark::intent_fee(
+            &current,
+            inputs.iter().map(|input| input.amount),
+            OffsetDateTime::now_utc().unix_timestamp(),
+            [hooks.funding_output().value],
+        )?;
+        let fee = surplus.checked_sub(arkade_fee).ok_or_else(|| {
+            anyhow!(
+                "The escrows hold {surplus} beyond the pool, less than the Arkade server's \
+                 intent fee of {arkade_fee}"
+            )
+        })?;
         // Each escrow's signer takes a fee output of at most its own cap per escrow, and tickets
         // issued at different fee rates have different caps, so the lowest binds them all.
         let cap = self.pool_fee_cap(&entries).await?;
         let fee = if fee > cap {
             warn!(
-                "Competition {}: the escrows hold {fee} beyond the pool, but their lowest fee cap \
-                 allows {cap}; the rest goes to the Arkade server",
+                "Competition {}: the escrows hold {fee} beyond the pool and the Arkade server's \
+                 {arkade_fee} intent fee, but their lowest fee cap allows {cap}; the rest goes \
+                 to the Arkade server",
                 competition.id
             );
             cap
