@@ -23,7 +23,7 @@ default-members = [
 resolver = "2"
 
 [workspace.package]
-version = "2.27.26"
+version = "2.27.27"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/5day4cast/coordinator"
@@ -42,6 +42,8 @@ coordinator-recover = { path = "crates/coordinator-recover", default-features = 
 # Arkade: arkd's Rust SDK. The generated gRPC code is checked in, so no protoc is needed.
 ark-core = "0.11"
 ark-grpc = { version = "0.11", default-features = false, features = ["tls-webpki-roots"] }
+# arkd's intent fee programs (CEL), evaluated as the server does.
+ark-fees = "0.11"
 # The same gRPC stack ark-grpc uses, for the one arkd call it does not expose (DeleteIntent).
 prost = { version = "0.14", default-features = false, features = ["std", "derive"] }
 tonic = { version = "0.14", default-features = false, features = ["transport", "codegen", "tls-webpki-roots"] }
@@ -193,8 +195,8 @@ opt-level = 3
 # Every ark crate comes from the fork, so ark-client and our own ark-core/ark-grpc share one ark-core.
 # The pinned transport also counts GetVtxos attempts and shares a bounded, jittered request budget.
 [patch.crates-io]
-ark-client = { git = "https://github.com/tee8z/rust-sdk", rev = "8137819e8c96be6f974ef580e8eb33f5ab20175b" }
-ark-core = { git = "https://github.com/tee8z/rust-sdk", rev = "8137819e8c96be6f974ef580e8eb33f5ab20175b" }
-ark-delegator = { git = "https://github.com/tee8z/rust-sdk", rev = "8137819e8c96be6f974ef580e8eb33f5ab20175b" }
-ark-fees = { git = "https://github.com/tee8z/rust-sdk", rev = "8137819e8c96be6f974ef580e8eb33f5ab20175b" }
-ark-grpc = { git = "https://github.com/tee8z/rust-sdk", rev = "8137819e8c96be6f974ef580e8eb33f5ab20175b" }
+ark-client = { git = "https://github.com/tee8z/rust-sdk", rev = "a734f91eddf559ce436e4e516d7d6360e5b3339d" }
+ark-core = { git = "https://github.com/tee8z/rust-sdk", rev = "a734f91eddf559ce436e4e516d7d6360e5b3339d" }
+ark-delegator = { git = "https://github.com/tee8z/rust-sdk", rev = "a734f91eddf559ce436e4e516d7d6360e5b3339d" }
+ark-fees = { git = "https://github.com/tee8z/rust-sdk", rev = "a734f91eddf559ce436e4e516d7d6360e5b3339d" }
+ark-grpc = { git = "https://github.com/tee8z/rust-sdk", rev = "a734f91eddf559ce436e4e516d7d6360e5b3339d" }
