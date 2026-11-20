@@ -49,10 +49,10 @@ test.describe("Public vs Authenticated Views", () => {
     });
   });
 
-  test("unauthenticated user can see competitions table", async ({ page }) => {
+  test("unauthenticated user can see the lobby", async ({ page }) => {
     await page.goto("/");
 
-    await expect(page.locator(".navbar-brand strong")).toContainText(
+    await expect(page.locator(".site-brand .wordmark")).toContainText(
       "5day4cast",
     );
     await expect(page.locator("#competitions-page")).toBeVisible();

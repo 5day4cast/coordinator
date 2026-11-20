@@ -21,7 +21,7 @@ use coordinator::{
         },
         layouts::base::{base, PageConfig},
         pages::{
-            competitions::{competitions_page, CompetitionView, ListOptions, Queue, QueueView},
+            competitions::{lobby_page, CompetitionView, ListOptions, Lobby, Queue, QueueView},
             help_page,
         },
         shared_map::{lat_lon_to_svg, StationPin},
@@ -64,25 +64,29 @@ fn main() -> Result<(), Box<dyn Error>> {
     ];
     // The pins sit beside the stations' picks; a queued competition's form adds a "?" to
     // its Win and Entries.
-    let forecasts = Forecasts::Ready {
-        stations,
-        pins: vec![
-            pin(
-                "KORD",
-                "ORD",
-                "Chicago/O'Hare International, IL",
-                41.98,
-                -87.90,
-            ),
-            pin(
-                "KJFK",
-                "JFK",
-                "New York/JF Kennedy International, NY",
-                40.64,
-                -73.78,
-            ),
-        ],
+    let pins = vec![
+        pin(
+            "KORD",
+            "ORD",
+            "Chicago/O'Hare International, IL",
+            41.98,
+            -87.90,
+        ),
+        pin(
+            "KJFK",
+            "JFK",
+            "New York/JF Kennedy International, NY",
+            40.64,
+            -73.78,
+        ),
+    ];
+    let lobby = Lobby {
+        cities: [("KORD", "Chicago, IL"), ("KJFK", "New York, NY")]
+            .map(|(id, city)| (id.to_owned(), city.to_owned()))
+            .into(),
+        weather: Some((stations.clone(), pins.clone())),
     };
+    let forecasts = Forecasts::Ready { stations, pins };
     let payout = PayoutDestination::Address("player@lightning.example".into());
     let entry = entry_form(
         &open,
@@ -207,9 +211,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let pages: [(&str, Markup); 6] = [
         (
             "home",
-            competitions_page(
+            lobby_page(
                 &[open.clone(), queued.clone(), live.clone(), finished],
                 &ListOptions::default(),
+                &lobby,
                 now,
             ),
         ),

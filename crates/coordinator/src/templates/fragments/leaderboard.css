@@ -12,25 +12,22 @@
 
 .leaderboard-window {
   margin: 0.25rem 0 1rem;
-  color: var(--competition-muted);
+  color: var(--dim);
 }
 
-.leaderboard-facts,
-.entry-facts {
+.leaderboard-facts {
   display: flex;
   flex-wrap: wrap;
   gap: 0.75rem 2rem;
   margin-bottom: 1.25rem;
 }
 
-.leaderboard-facts dt,
-.entry-facts dt {
+.leaderboard-facts dt {
   font-size: 0.75rem;
-  color: var(--competition-muted);
+  color: var(--dim);
 }
 
-.leaderboard-facts dd,
-.entry-facts dd {
+.leaderboard-facts dd {
   font-weight: 600;
 }
 
@@ -43,7 +40,7 @@
   display: block;
   font-size: 0.75rem;
   font-weight: 400;
-  color: var(--competition-muted);
+  color: var(--dim);
 }
 
 .refund-share {
@@ -53,7 +50,7 @@
 /* A pool's link back to its queued competition, and a queue's pools. */
 .pool-of {
   margin-top: 0.25rem;
-  color: var(--competition-muted);
+  color: var(--dim);
 }
 
 .queue-pools {
@@ -65,7 +62,7 @@
 }
 
 .leaderboard .help {
-  color: var(--competition-muted);
+  color: var(--dim);
 }
 
 .leaderboard-facts .refund-fact {
@@ -78,7 +75,7 @@
 
 /* Shown until the rows arrive. */
 .rows-loading td {
-  color: var(--competition-muted);
+  color: var(--dim);
 }
 
 .spinner {

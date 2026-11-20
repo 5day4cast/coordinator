@@ -35,7 +35,7 @@ use crate::{
     startup::AppState,
     templates::{
         components::RecoveryHelp,
-        format::{short_npub, Explorers},
+        format::{city_name, short_npub, Explorers},
         fragments::{
             entries_paused_banner,
             entry_form::{
@@ -52,7 +52,9 @@ use crate::{
         },
         layouts::base::{base, PageConfig},
         pages::{
-            competitions::{competitions_page, shown_ids, CompetitionView, ListOptions, Tab},
+            competitions::{
+                featured_id, lobby_page, shown_ids, CompetitionView, ListOptions, Lobby, Tab,
+            },
             entries::{
                 entries_page, older_entries, sign_in_required, EntryRow, PaidRow, UnpaidRow,
                 PAGE_SIZE,
@@ -379,8 +381,12 @@ pub async fn competitions_fragment(
     let (mut competitions, named) = tokio::join!(competition_views(&state, now), named);
     options.stations = named;
     let shown = shown_ids(&competitions, &options);
-    complete(&state, &mut competitions, &shown).await;
-    let content = competitions_page(&competitions, &options, now);
+    let featured = featured_id(&competitions, &options);
+    let (_, lobby) = tokio::join!(
+        complete(&state, &mut competitions, &shown),
+        lobby(&state, featured),
+    );
+    let content = lobby_page(&competitions, &options, &lobby, now);
     let content = if state.coordinator.settle_only() {
         html! { (entries_paused_banner()) (content) }
     } else {
@@ -393,6 +399,26 @@ pub async fn competitions_fragment(
         content,
         Caching::Public,
     )
+}
+
+/// The lobby's cities, from the oracle's stations, and the featured competition's forecasts
+/// for its map, when the caches have them in time.
+async fn lobby(state: &AppState, featured: Option<String>) -> Lobby {
+    let featured = async {
+        let id = Uuid::parse_str(&featured?).ok()?;
+        let competition = find_competition(state, id).await.ok().flatten()?;
+        match forecasts(state, &competition, FIRST_READ_WAIT).await {
+            Forecasts::Ready { stations, pins } => Some((stations, pins)),
+            Forecasts::Pending(_) => None,
+        }
+    };
+    let (stations, weather) = tokio::join!(state.leaderboards.stations(FIRST_READ_WAIT), featured);
+    let stations = stations_by_id(stations.value().map(Vec::as_slice).unwrap_or_default());
+    let cities = stations
+        .keys()
+        .filter_map(|id| Some((id.clone(), city_name(&station_name(&stations, id)?))))
+        .collect();
+    Lobby { cities, weather }
 }
 
 /// Only the signed-in player's submitted entry counts. Never stored by a shared cache.

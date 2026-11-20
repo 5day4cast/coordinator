@@ -15,7 +15,7 @@ use crate::templates::{
     fragments::entries_paused_banner,
     fragments::loading::{placeholder, Pending},
     pages::competitions::CompetitionView,
-    shared_map::{station_map, StationPin},
+    shared_map::{station_map, MapMark, StationPin},
 };
 
 /// One station's forecasts, the values its picks are judged against.
@@ -108,6 +108,9 @@ impl<'a> PaidNotice<'a> {
 
 /// Entry form for a competition. `unpaid` is the logged-in player's oldest unpaid ticket in it,
 /// which Pay resumes, and `paid` what to say of their paid tickets whose entry never went in.
+///
+/// The picks run down the page; beside them on a wide screen, and pinned along the bottom on a
+/// phone, the entry panel counts them and holds Pay.
 pub fn entry_form(
     competition: &CompetitionView,
     forecasts: &Forecasts,
@@ -132,131 +135,195 @@ pub fn entry_form(
     // A row is one metric at one station; a competition may take fewer picks than it has rows.
     let rows = (competition.locations.len() * competition.metrics.len()).max(picks_allowed);
     let queue = competition.queue.queued();
+    let cities: Vec<String> = match forecasts {
+        Forecasts::Ready { stations, .. } => stations
+            .iter()
+            .filter_map(|station| station.station_name.as_deref().map(city_name))
+            .collect(),
+        Forecasts::Pending(_) => vec![],
+    };
     html! {
         div id="entryContainer" class="entry-form" {
             a class="back-link" href="/competitions" hx-get="/competitions"
-              hx-target="#main-content" hx-push-url="true" { "← All competitions" }
-            h1 class="title is-4" { "Enter this competition" }
+              hx-target="#main-content" hx-push-url="true" { "← Lobby" }
             @if banner { (entries_paused_banner()) }
 
-            dl class="entry-facts" {
-                div {
-                    dt { "Entries close" (tip_start("Picks lock then, and the readings count from that moment on.")) }
-                    dd { (format::zoned_time(competition.start, TimeStyle::Weekday)) }
+            header class="entry-head" {
+                p class="entry-kicker" { span class="badge badge-open" { "Open" } " Make your picks" }
+                h1 class="title entry-title" { (format::zoned_time(competition.start, TimeStyle::Weekday)) }
+                @if !cities.is_empty() {
+                    p class="entry-cities" { (cities.join(" · ")) }
                 }
-                div {
-                    dt { "Entry fee" }
-                    dd { (price(competition, network_fee)) }
-                }
-                div {
-                    dt {
-                        "Prizes"
-                        @if queue.is_some() {
-                            (tip("What a pool's winner takes; it grows as more players enter."))
+                dl class="entry-facts" {
+                    div class="fact-lock" {
+                        dt { "Locks in" (tip_start("Picks lock when the observation window starts, and the readings count from then on.")) }
+                        dd {
+                            span class="pixel lock-clock" data-countdown=(competition.start.unix_timestamp()) {
+                                (format::duration(competition.start - time::OffsetDateTime::now_utc()))
+                            }
                         }
                     }
-                    dd {
-                        (competition.win())
-                        @if let Some(split) = competition.prize_split() {
-                            span class="fact-note prize-note" { (split) }
-                        }
-                        @if let Some(rule) = competition.prize_rule() {
-                            span class="fact-note prize-note" { (rule) }
-                        }
-                        span class="fact-note prize-note" { "Ties go to the earliest entry" }
-                    }
-                }
-                div {
-                    dt {
-                        "Entries"
-                        @if let Some(queue) = queue {
-                            (tip(&format!("{}.", queue.pool_note())))
-                        }
-                    }
-                    dd { (competition.entries()) }
-                }
-                div {
-                    dt { "Picks required" }
-                    dd {
-                        (picks_allowed)
-                        @if picks_allowed < rows { " of " (rows) }
-                    }
-                }
-                // One entry per player needs no line; only a competition allowing more says so.
-                @if competition.max_entries_per_player > 1 {
                     div {
-                        dt { "Per player" }
-                        dd { "up to " (competition.max_entries_per_player) " entries" }
+                        dt { "Entry fee" }
+                        dd { (price(competition, network_fee)) }
+                    }
+                    div {
+                        dt {
+                            "1st wins"
+                            @if queue.is_some() {
+                                (tip("What a pool's winner takes; it grows as more players enter."))
+                            }
+                        }
+                        dd {
+                            (competition.win())
+                            @if let Some(split) = competition.prize_split() {
+                                span class="fact-note prize-note" { (split) }
+                            }
+                            @if let Some(rule) = competition.prize_rule() {
+                                span class="fact-note prize-note" { (rule) }
+                            }
+                            span class="fact-note prize-note" { "Ties go to the earliest entry" }
+                        }
+                    }
+                    div {
+                        dt {
+                            "Seats"
+                            @if let Some(queue) = queue {
+                                (tip(&format!("{}.", queue.pool_note())))
+                            }
+                        }
+                        dd { (seats(competition)) }
+                    }
+                    @if competition.max_entries_per_player > 1 {
+                        div {
+                            dt { "Per player" }
+                            dd { "up to " (competition.max_entries_per_player) " entries" }
+                        }
+                    }
+                }
+                p class="entry-rules" {
+                    (scoring_line(competition))
+                    " "
+                    a href="/help#scoring" target="_blank" rel="noopener" { "How scoring works" }
+                }
+            }
+
+            div class="entry-layout" {
+                div class="entry-main" {
+                    // What the wallet checks the entry's terms against: what this form shows.
+                    form id="entryForm" data-competition-id=(competition.id)
+                         data-entry-fee=(competition.entry_fee)
+                         data-ticket-price=(competition.ticket_price)
+                         data-network-fee=[network_fee.sats()]
+                         data-total-pool=(competition.total_pool)
+                         data-winner-count=(competition.paid_places)
+                         data-max-values=(picks_allowed)
+                         data-pick-rows=(rows)
+                         data-kind=[queue.map(|_| "queued")]
+                         data-pool-min-players=[queue.and_then(|queue| queue.min_players)]
+                         data-pool-max-players=[queue.map(|queue| queue.max_players)] {
+                        (forecast_choices(&competition.id, forecasts, 0))
+                    }
+                    p class="how-to-pick" {
+                        a href=(format!("/help?open=advanced&competition={}#advanced", competition.id))
+                          target="_blank" rel="noopener" { "How your entry is held and paid" }
+                    }
+                }
+
+                aside class="entry-panel" aria-label="Your entry" {
+                    div class="entry-panel-head" {
+                        h2 { "Your entry" }
+                        span class="pick-count" id="pickCount" { "0 of " (picks_allowed) }
+                    }
+                    div class="pick-meter" id="pickMeter" aria-hidden="true" {
+                        @for _ in 0..picks_allowed { i {} }
+                    }
+                    // The picks made so far, one line each (`entry_form.js`).
+                    ul class="pick-summary" id="pickSummary" {}
+
+                    (payout_line(&competition.id, terms, destination))
+
+                    div class="entry-submit" {
+                        (unpaid_notice(&competition.id, unpaid, time::OffsetDateTime::now_utc()))
+                        (paid_notice(&competition.id, paid, time::OffsetDateTime::now_utc()))
+                        // How many picks are still to make; `entry_form.js` counts as the player picks.
+                        p id="picksLeft" class="picks-left" role="status" aria-live="polite" {
+                            (picks_to_make(picks_allowed, rows))
+                        }
+                        @if let (Some(reason), false) = (&paused, banner) {
+                            div id="entriesPaused" class="notification is-warning" { (reason) }
+                        }
+                        @let pay_label = match network_fee.sats() {
+                            Some(fee) => pay_label(picks_allowed, competition.ticket_price + fee),
+                            None => "Lock in picks".to_string(),
+                        };
+                        @let pay_class = if paid.hides_pay() {
+                            "button is-primary is-medium is-fullwidth is-hidden"
+                        } else {
+                            "button is-primary is-medium is-fullwidth"
+                        };
+                        // A paid ticket is entered without paying again, paused or not. `entry_form.js`
+                        // relabels the button when the paid notice comes or goes with a log-in, and hides
+                        // it while the notice says no ticket would be issued; while entries are paused
+                        // there is no price to go back to.
+                        button type="button" id="submitEntry" class=(pay_class)
+                               disabled[paused.is_some() && paid.ticket.is_none()]
+                               data-pay-label=[paused.is_none().then_some(&pay_label)] {
+                            @if paid.ticket.is_some() {
+                                (FINISH_LABEL)
+                            } @else if paused.is_some() {
+                                "Entries paused"
+                            } @else {
+                                (pay_label)
+                            }
+                        }
+                        div id="successMessage" class="notification is-success hidden" {
+                            "You're in. "
+                            a href="/entries" hx-get="/entries" hx-target="#main-content" hx-push-url="true" { "See your entries" }
+                        }
+                        div id="errorMessage" class="notification is-danger hidden" {}
                     }
                 }
             }
+        }
+    }
+}
 
-            p class="how-to-pick" {
-                a href="/help#scoring" target="_blank" rel="noopener" { "How scoring works" }
-            }
+/// Pay's label: `Lock in 9 picks · 5,383 sats`. `entry_form.js` builds the same once a ticket
+/// gives the final price.
+fn pay_label(picks: usize, total: u64) -> String {
+    format!(
+        "Lock in {picks} {} · {}",
+        if picks == 1 { "pick" } else { "picks" },
+        sats(total)
+    )
+}
 
-            // What the wallet checks the entry's terms against: what this form shows.
-            form id="entryForm" data-competition-id=(competition.id)
-                 data-entry-fee=(competition.entry_fee)
-                 data-ticket-price=(competition.ticket_price)
-                 data-network-fee=[network_fee.sats()]
-                 data-total-pool=(competition.total_pool)
-                 data-winner-count=(competition.paid_places)
-                 data-max-values=(picks_allowed)
-                 data-pick-rows=(rows)
-                 data-kind=[queue.map(|_| "queued")]
-                 data-pool-min-players=[queue.and_then(|queue| queue.min_players)]
-                 data-pool-max-players=[queue.map(|queue| queue.max_players)] {
-                (forecast_choices(&competition.id, forecasts, 0))
-            }
+/// What a right pick scores, in one line above the picks.
+fn scoring_line(competition: &CompetitionView) -> String {
+    use crate::domain::leaderboard::progress::{LINE_POINTS, OVER_OR_UNDER_POINTS, PAR_POINTS};
+    use crate::infra::oracle::ScoringRules;
+    match competition.scoring_rules {
+        ScoringRules::Lines => format!(
+            "Pick Under, In range or Over in each row. A right pick scores {LINE_POINTS} points; a wrong one scores none."
+        ),
+        ScoringRules::Fixed => format!(
+            "Pick Under, Exactly or Over in each row. A right Under or Over scores {OVER_OR_UNDER_POINTS} points and a right Exactly {PAR_POINTS}; a wrong pick scores none."
+        ),
+    }
+}
 
-            (payout_line(&competition.id, terms, destination))
-
-            p class="how-to-pick" {
-                a href=(format!("/help?open=advanced&competition={}#advanced", competition.id))
-                  target="_blank" rel="noopener" { "How your entry is held and paid" }
-            }
-
-            div class="entry-submit" {
-                (unpaid_notice(&competition.id, unpaid, time::OffsetDateTime::now_utc()))
-                (paid_notice(&competition.id, paid, time::OffsetDateTime::now_utc()))
-                // How many picks are still to make; `entry_form.js` counts as the player picks.
-                p id="picksLeft" class="picks-left" role="status" aria-live="polite" {
-                    (picks_to_make(picks_allowed, rows))
+/// How full the competition is, as a bar: `4 of 20 seats filled · 16 left`.
+pub fn seats(competition: &CompetitionView) -> Markup {
+    html! {
+        @match competition.seat_fill() {
+            Some((filled, seats)) => {
+                span class="seat-meter" {
+                    meter min="0" max=(seats) value=(filled) {}
+                    span class="seat-text" { (competition.entries()) }
                 }
-                @if let (Some(reason), false) = (&paused, banner) {
-                    div id="entriesPaused" class="notification is-warning" { (reason) }
-                }
-                @let pay_label = match network_fee.sats() {
-                    Some(fee) => format!("Pay {} and enter", sats(competition.ticket_price + fee)),
-                    None => "Pay and enter".to_string(),
-                };
-                @let pay_class = if paid.hides_pay() {
-                    "button is-primary is-medium is-hidden"
-                } else {
-                    "button is-primary is-medium"
-                };
-                // A paid ticket is entered without paying again, paused or not. `entry_form.js`
-                // relabels the button when the paid notice comes or goes with a log-in, and hides
-                // it while the notice says no ticket would be issued; while entries are paused
-                // there is no price to go back to.
-                button type="button" id="submitEntry" class=(pay_class)
-                       disabled[paused.is_some() && paid.ticket.is_none()]
-                       data-pay-label=[paused.is_none().then_some(&pay_label)] {
-                    @if paid.ticket.is_some() {
-                        (FINISH_LABEL)
-                    } @else if paused.is_some() {
-                        "Entries paused"
-                    } @else {
-                        (pay_label)
-                    }
-                }
-                div id="successMessage" class="notification is-success hidden" {
-                    "You're in. "
-                    a href="/entries" hx-get="/entries" hx-target="#main-content" hx-push-url="true" { "See your entries" }
-                }
-                div id="errorMessage" class="notification is-danger hidden" {}
             }
+            None => { (competition.entries()) }
         }
     }
 }
@@ -361,21 +428,17 @@ pub fn forecasts_url(competition_id: &str) -> String {
     format!("/competitions/{competition_id}/entry-forecasts")
 }
 
-/// The picks, a map of the stations and Over / Par / Under for each forecast;
-/// or, while the forecasts are not here, a placeholder that loads them (see
-/// `fragments::loading`). `asked`: how many times the placeholder has asked.
+/// The picks: a weather map of the stations, then a forecast panel for each with Under, In
+/// range and Over for each forecast; or, while the forecasts are not here, a placeholder that
+/// loads them (see `fragments::loading`). `asked`: how many times the placeholder has asked.
 pub fn forecast_choices(competition_id: &str, forecasts: &Forecasts, asked: u8) -> Markup {
     match forecasts {
         Forecasts::Ready { stations, pins } => html! {
             div id="entryForecasts" {
-                @if !pins.is_empty() { (station_map(pins)) }
+                @if !pins.is_empty() { (station_map(&map_marks(stations, pins), true)) }
                 // Says so when Pay is clicked with nothing picked (`entry_form.js`), right above
                 // the first pick, which then takes focus.
                 p id="picksMessage" class="notification is-danger hidden" role="alert" {}
-                p class="city-heading" {
-                    strong { "City" }
-                    (tip_start("Weather is measured at each city's named airport station. The forecast is NOAA's; the pick ranges use historical forecast errors."))
-                }
                 @for station in stations { (station_picks(station)) }
             }
         },
@@ -387,6 +450,45 @@ pub fn forecast_choices(competition_id: &str, forecasts: &Forecasts, asked: u8) 
             asked,
         ),
     }
+}
+
+/// Each pin with its station's forecast: its high (or low, at night) tints it, and its
+/// caption reads `37° / 15°`.
+pub fn map_marks<'a>(stations: &[StationForecast], pins: &'a [StationPin]) -> Vec<MapMark<'a>> {
+    pins.iter()
+        .map(|pin| {
+            let forecast = |metric: Metric| {
+                stations
+                    .iter()
+                    .find(|station| station.station_id == pin.station_id)
+                    .and_then(|station| {
+                        station
+                            .forecasts
+                            .iter()
+                            .find(|(of, ..)| *of == metric)
+                            .and_then(|(_, value, _)| *value)
+                    })
+            };
+            let (high, low, wind) = (
+                forecast(Metric::TempHigh),
+                forecast(Metric::TempLow),
+                forecast(Metric::WindSpeed),
+            );
+            let temperature = |value: f64| {
+                html! { tspan class=(format::temperature_band(value)) { (format!("{:.0}°", value.round())) } }
+            };
+            let caption = match (high, low) {
+                (Some(high), Some(low)) => Some(html! { (temperature(high)) " / " (temperature(low)) }),
+                (Some(only), None) | (None, Some(only)) => Some(temperature(only)),
+                (None, None) => wind.map(|wind| html! { (Metric::WindSpeed.short_value(wind)) }),
+            };
+            MapMark {
+                pin,
+                temperature: high.or(low),
+                caption,
+            }
+        })
+        .collect()
 }
 
 /// What the entry form's forecasts say once nobody can enter: that the competition is full, as
@@ -421,7 +523,9 @@ pub fn payout_line(
                 (Some(false), _) => {
                     "Winners of this competition submit a Lightning invoice after the result."
                 }
-                (_, PayoutDestination::LoggedOut) => { "Log in to enter." }
+                (_, PayoutDestination::LoggedOut) => {
+                    "Build your entry, then log in to lock it in. Your picks stay here."
+                }
                 (_, PayoutDestination::Address(address)) => {
                     "Winnings"
                     @if refunds { " and refunds" }
@@ -437,24 +541,29 @@ pub fn payout_line(
     }
 }
 
+/// A station's forecast panel: the city, then a row of picks for each forecast.
 fn station_picks(station: &StationForecast) -> Markup {
     html! {
         fieldset class="station-picks" id=(format!("station-{}", station.station_id)) data-station=(station.station_id) {
-            legend {
-                @if let Some(name) = &station.station_name {
-                    (city_name(name)) " "
+            legend class="station-head" {
+                span class="station-city" {
+                    @match &station.station_name {
+                        Some(name) => (city_name(name)),
+                        None => (station.station_id),
+                    }
                 }
-                span class="station-code" { (station.station_id) }
-                @if let Some(name) = &station.station_name {
-                    (tip(&format!("Weather station: {name} ({})", station.station_id)))
+                span class="station-source" {
+                    "NOAA forecast · "
+                    span class="station-code" { (station.station_id) }
+                    @if let Some(name) = &station.station_name {
+                        (tip(&format!("Measured at {name} ({}). The forecast is NOAA's; the ranges come from how past forecasts missed.", station.station_id)))
+                    }
                 }
             }
-            div class="pick-heading" aria-hidden="true" {
-                span class="pick-metric" { "NOAA forecast" }
-                span { "Your pick" }
-            }
-            @for (metric, forecast, rule) in &station.forecasts {
-                (pick_row(&station.station_id, *metric, *forecast, *rule))
+            div class="station-rows" {
+                @for (metric, forecast, rule) in &station.forecasts {
+                    (pick_row(&station.station_id, *metric, *forecast, *rule))
+                }
             }
         }
     }
@@ -524,36 +633,44 @@ pub fn ticket_status(url: &str, progress: TicketProgress) -> Markup {
 
 /// Thresholds and a range for one forecast, as radio buttons named `KPWM_temp_high`, none
 /// checked at first; choosing the checked one again takes the pick back (`entry_form.js`).
+/// Each button says which side it takes and its bound; its label reads the whole pick.
 pub(crate) fn pick_row(
     station_id: &str,
     metric: Metric,
     forecast: Option<f64>,
     rule: Option<Rule>,
 ) -> Markup {
+    use crate::infra::oracle::ValueOptions;
     let name = format!("{station_id}_{}", metric.id());
-    let options = ["under", "par", "over"].map(|value| {
-        let pick = match value {
-            "under" => crate::infra::oracle::ValueOptions::Under,
-            "over" => crate::infra::oracle::ValueOptions::Over,
-            _ => crate::infra::oracle::ValueOptions::Par,
-        };
-        (value, format::pick_target(metric, forecast, rule, &pick))
-    });
+    let options = [
+        ("under", ValueOptions::Under),
+        ("par", ValueOptions::Par),
+        ("over", ValueOptions::Over),
+    ];
     html! {
         div class="pick-row" {
-            span class="pick-metric" {
-                (metric.label())
+            div class="pick-metric" {
+                span class="pick-label" { (metric.label()) }
                 @match forecast {
-                    Some(value) => { " " strong class="pick-forecast" { (metric.value(value)) } }
-                    None => { " " span class="pick-forecast is-missing" { "no forecast yet" } }
+                    Some(value) => {
+                        strong class=(format!("pick-forecast pixel {}", metric.tint(value).unwrap_or("")))
+                               title=[metric.hint(value)] {
+                            (metric.short_value(value))
+                        }
+                    }
+                    None => { span class="pick-forecast is-missing" { "no forecast yet" } }
                 }
             }
             div class="pick-options" role="radiogroup" aria-label=(format!("{} at {station_id}", metric.label())) {
-                @for (value, text) in &options {
-                    label class="pick-option" {
+                @for (value, pick) in &options {
+                    label class=(format!("pick-option is-{value}"))
+                          title=[format::pick_hint(metric, forecast, rule, pick)] {
                         input type="radio" name=(name) value=(value) disabled[forecast.is_none() || rule.is_none()]
-                              aria-label=(text);
-                        span { (text) }
+                              aria-label=(format::pick_target(metric, forecast, rule, pick));
+                        span class="pick-choice" {
+                            span class="pick-word" { (format::pick_word(pick, rule)) }
+                            span class="pick-value" { (format::pick_value(metric, forecast, rule, pick)) }
+                        }
                     }
                 }
             }
@@ -687,7 +804,7 @@ mod tests {
             "nothing more to pay"
         );
         assert!(
-            html.contains(r#"data-pay-label="Pay "#),
+            html.contains(r#"data-pay-label="Lock in "#),
             "the label to go back to"
         );
         // Paused entries take no new money; a paid ticket is still entered.
@@ -697,7 +814,7 @@ mod tests {
         assert!(paused[button..].contains(">Enter</button>"));
         let unpaid = form(None, NetworkFee::Estimate(50));
         assert!(!unpaid.contains("Paid — make"));
-        assert!(unpaid.contains(" and enter</button>"));
+        assert!(unpaid.contains(" sats</button>"));
     }
 
     /// A player whose paid ticket lapsed is told so once, however many lapsed, beside the usual
@@ -736,7 +853,7 @@ mod tests {
         assert!(notice < button);
         assert_eq!(form.matches(LAPSED_ENTRY).count(), 1);
         assert!(
-            form[button..].contains(" and enter</button>"),
+            form[button..].contains(" sats</button>"),
             "Pay pays for a new entry"
         );
         assert!(!form.contains(r#"type="checkbox""#), "no extra consent");
@@ -783,7 +900,9 @@ mod tests {
         let html = form_with(refused);
         assert_eq!(html.matches(LAPSED_ENTRY).count(), 1);
         assert!(
-            html.contains(r#"id="submitEntry" class="button is-primary is-medium is-hidden""#),
+            html.contains(
+                r#"id="submitEntry" class="button is-primary is-medium is-fullwidth is-hidden""#
+            ),
             "{html}"
         );
         // Where the lapsed ticket does not count, Pay starts a new entry.
@@ -791,7 +910,9 @@ mod tests {
             lapsed: true,
             ..PaidNotice::default()
         });
-        assert!(open.contains(r#"id="submitEntry" class="button is-primary is-medium""#));
+        assert!(
+            open.contains(r#"id="submitEntry" class="button is-primary is-medium is-fullwidth""#)
+        );
         assert!(!open.contains("data-pay-refused"));
 
         let ticket = PaidTicket {
@@ -805,7 +926,9 @@ mod tests {
             ticket: Some(&ticket),
             ..refused
         });
-        assert!(enter.contains(r#"id="submitEntry" class="button is-primary is-medium""#));
+        assert!(
+            enter.contains(r#"id="submitEntry" class="button is-primary is-medium is-fullwidth""#)
+        );
         assert!(enter.contains(">Enter</button>"));
         assert!(!enter.contains("data-pay-refused"));
     }
@@ -899,9 +1022,9 @@ mod tests {
         assert!(html.contains(r#"data-ticket-price="5250""#));
         assert!(html.contains(r#"data-network-fee="50""#));
         assert!(html.contains(r#"<span id="ticketTotal">5,300 sats</span>"#));
-        assert!(html.contains("Pay 5,300 sats and enter"));
+        assert!(html.contains("Lock in 9 picks · 5,300 sats"));
         // At the start of its line, so its bubble grows rightwards and stays on a phone.
-        assert!(html.contains(r#"<dt>Entries close<span class="tip tip-start""#));
+        assert!(html.contains(r#"<dt>Locks in<span class="tip tip-start""#));
     }
 
     #[test]
@@ -921,7 +1044,7 @@ mod tests {
         .into_string();
         assert!(unavailable.contains(r#"<span id="ticketTotal">Unavailable right now</span>"#));
         assert!(!unavailable.contains("data-network-fee"));
-        assert!(unavailable.contains("Pay and enter"));
+        assert!(unavailable.contains("Lock in picks"));
     }
 
     /// What winning pays sits beside the price: first place's prize.
@@ -929,7 +1052,7 @@ mod tests {
     fn entry_form_shows_what_first_place_wins() {
         let html = form(PayoutDestination::LoggedOut);
         assert!(
-            html.contains(r#"<dt>Prizes</dt><dd>15,000 sats<span class="fact-note prize-note">Ties go to the earliest entry</span></dd>"#),
+            html.contains(r#"<dt>1st wins</dt><dd>15,000 sats<span class="fact-note prize-note">Ties go to the earliest entry</span></dd>"#),
             "{html}"
         );
         let mut two = view("c1", Phase::Upcoming, 60);
@@ -968,7 +1091,7 @@ mod tests {
             PaidNotice::default(),
         )
         .into_string();
-        assert!(html.contains("20 seats · 17 left"), "{html}");
+        assert!(html.contains("3 of 20 seats filled · 17 left"), "{html}");
         assert!(html.contains("1st 70% · 2nd 30%"));
         assert!(html.contains("Under 10 players: winner takes all"));
         assert!(html.contains("Ties go to the earliest entry"));
@@ -1040,7 +1163,7 @@ mod tests {
         )
         .into_string();
         assert!(
-            some.contains("<dt>Picks required</dt><dd>3 of 12</dd>"),
+            some.contains(r#"<span class="pick-count" id="pickCount">0 of 3</span>"#),
             "{some}"
         );
         assert!(some.contains(r#"data-max-values="3" data-pick-rows="12""#));
@@ -1057,7 +1180,7 @@ mod tests {
             PaidNotice::default(),
         )
         .into_string();
-        assert!(all.contains("<dt>Picks required</dt><dd>12</dd>"));
+        assert!(all.contains(r#"<span class="pick-count" id="pickCount">0 of 12</span>"#));
         assert!(all.contains("12 picks to make: one in every row."));
         assert_eq!(picks_to_make(1, 3), "1 pick to make: any 1 of the 3 rows.");
     }
@@ -1085,7 +1208,7 @@ mod tests {
     #[test]
     fn entry_form_shows_the_deadline_and_links_the_rules() {
         let html = form(PayoutDestination::LoggedOut);
-        assert!(html.contains("Entries close"));
+        assert!(html.contains("Locks in"));
         // Localized, it names the reader's zone: the one time on the form.
         assert_eq!(html.matches("data-zone").count(), 1);
         assert!(
@@ -1112,7 +1235,9 @@ mod tests {
         )
         .into_string();
         assert!(html.contains(ENTRIES_PAUSED));
-        assert!(html.contains(r#"id="submitEntry" class="button is-primary is-medium" disabled"#));
+        assert!(html.contains(
+            r#"id="submitEntry" class="button is-primary is-medium is-fullwidth" disabled"#
+        ));
         assert!(html.contains("Entries paused"));
         assert!(!html.contains("and enter"));
     }
@@ -1135,7 +1260,9 @@ mod tests {
         assert!(html.contains("Entries are paused."));
         assert!(!html.contains(r#"id="entriesPaused" "#));
         assert!(!html.contains(ENTRIES_PAUSED));
-        assert!(html.contains(r#"id="submitEntry" class="button is-primary is-medium" disabled"#));
+        assert!(html.contains(
+            r#"id="submitEntry" class="button is-primary is-medium is-fullwidth" disabled"#
+        ));
         assert!(!html.contains("and enter"));
     }
 
@@ -1157,7 +1284,9 @@ mod tests {
             "Entries are paused while the Arkade network recovers; try again in a little while."
         ));
         assert!(!html.contains(ENTRIES_PAUSED));
-        assert!(html.contains(r#"id="submitEntry" class="button is-primary is-medium" disabled"#));
+        assert!(html.contains(
+            r#"id="submitEntry" class="button is-primary is-medium is-fullwidth" disabled"#
+        ));
         assert!(html.contains("Entries paused"));
         assert!(!html.contains("and enter"));
     }
@@ -1227,7 +1356,7 @@ mod tests {
     fn a_logged_out_visitor_is_asked_to_log_in_and_nothing_more() {
         let line =
             payout_line("c1", Some(&terms(false)), &PayoutDestination::LoggedOut).into_string();
-        assert!(line.contains("Log in to enter."));
+        assert!(line.contains("log in to lock it in"));
         assert!(!line.contains("returns to your wallet"));
     }
 
@@ -1279,14 +1408,21 @@ mod tests {
             PaidNotice::default(),
         )
         .into_string();
-        let under = html.find("&lt; 67.4°F").expect("under button");
-        let par = html.find("67.4–70.2°F").expect("par button");
-        let over = html.find("&gt; 70.2°F").expect("over button");
+        let under = html
+            .find(r#"aria-label="Under 67.4°F""#)
+            .expect("under button");
+        let par = html
+            .find(r#"aria-label="67.4–70.2°F""#)
+            .expect("par button");
+        let over = html
+            .find(r#"aria-label="Over 70.2°F""#)
+            .expect("over button");
         assert!(under < par && par < over);
-        assert!(html.contains(r#"aria-label="67.4–70.2°F""#));
+        // The button reads the range with its tenths set smaller.
+        assert!(html.contains(r#"<span class="pick-value">67<span class="tenths">.4</span>–70<span class="tenths">.2</span>°</span>"#));
         assert!(!html.contains("pick-par") && !html.contains("lately"));
         // No forecast threshold is invented while the scoring range is unknown.
-        assert!(html.contains(r#"value="over" disabled aria-label="&gt; —""#));
+        assert!(html.contains(r#"value="over" disabled aria-label="Over —""#));
     }
 
     #[test]
@@ -1359,32 +1495,20 @@ mod tests {
     const CSS: &str = include_str!("entry_form.css");
 
     /// Map pins are neither blue nor grey, stand apart from the hover colour, and show on the
-    /// map's land (3:1, WCAG's bar for graphics) in both themes.
+    /// map's land (3:1, WCAG's bar for graphics).
     #[test]
     fn the_map_pins_are_not_blue_or_grey() {
         use crate::templates::css_check::{contrast, hsl, rgba, rule, value};
         let hover = value(rule(CSS, ".station-pins a:focus .station-pin"), "fill");
-        for (theme, pin, map) in [
-            ("light", ".station-pin", ".station-map"),
-            (
-                "dark",
-                r#"[data-theme="dark"] .station-pin"#,
-                r#"[data-theme="dark"] .station-map"#,
-            ),
-        ] {
-            let fill = value(rule(CSS, pin), "fill");
-            let (hue, saturation, _, _) = hsl(fill);
-            assert!(!(170.0..=260.0).contains(&hue), "{theme}: {fill} is blue");
-            assert!(saturation >= 0.5, "{theme}: {fill} is grey");
-            let apart = (hue - hsl(hover).0).abs();
-            assert!(
-                apart.min(360.0 - apart) >= 30.0,
-                "{theme}: {fill} is like {hover}"
-            );
-            let land = value(rule(CSS, map), "--station-map-land");
-            let ratio = contrast(rgba(fill).0, rgba(land).0);
-            assert!(ratio >= 3.0, "{theme}: {fill} on {land} is {ratio:.2}:1");
-        }
+        let fill = value(rule(CSS, ".station-pin"), "fill");
+        let (hue, saturation, _, _) = hsl(fill);
+        assert!(!(170.0..=260.0).contains(&hue), "{fill} is blue");
+        assert!(saturation >= 0.5, "{fill} is grey");
+        let apart = (hue - hsl(hover).0).abs();
+        assert!(apart.min(360.0 - apart) >= 30.0, "{fill} is like {hover}");
+        let land = value(rule(CSS, ".station-map"), "--station-map-land");
+        let ratio = contrast(rgba(fill).0, rgba(land).0);
+        assert!(ratio >= 3.0, "{fill} on {land} is {ratio:.2}:1");
     }
 
     /// On a phone the facts wrap, so a "?" can sit anywhere on the line; its bubble hangs from
@@ -1426,14 +1550,22 @@ mod tests {
     #[test]
     fn a_pin_takes_a_46_px_tap_on_a_touch_screen() {
         use crate::templates::css_check::{rule, value};
-        use crate::templates::shared_map::{station_map, StationPin};
-        let map = station_map(&[StationPin {
+        use crate::templates::shared_map::{station_map, MapMark, StationPin};
+        let pin = StationPin {
             station_id: "KORD".into(),
             label: "ORD".into(),
             name: "Chicago/O'Hare International, IL".into(),
             svg_x: 382.5,
             svg_y: 110.0,
-        }])
+        };
+        let map = station_map(
+            &[MapMark {
+                pin: &pin,
+                temperature: None,
+                caption: None,
+            }],
+            true,
+        )
         .into_string();
         let link = &map[map.find("<a ").unwrap()..map.find("</a>").unwrap()];
         assert!(link.contains(

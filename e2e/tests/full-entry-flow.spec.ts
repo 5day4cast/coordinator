@@ -75,12 +75,12 @@ test.describe("Full Entry Submission Flow", () => {
   }) => {
     await registerAndLogin(page);
 
-    await page.waitForSelector("#competitions-page a.competition-row", {
+    await page.waitForSelector("#competitions-page :is(a.competition-row, .featured-card)", {
       timeout: 15000,
     });
 
     let rowCount = await page
-      .locator("#competitions-page a.competition-row")
+      .locator("#competitions-page :is(a.competition-row, .featured-card)")
       .count();
 
     if (rowCount === 0) {
@@ -92,7 +92,7 @@ test.describe("Full Entry Submission Flow", () => {
     }
 
     const enterButton = page
-      .locator("#competitions-page a.competition-row[href$='/entry-form']")
+      .locator("#competitions-page a[href$='/entry-form']")
       .first();
 
     const canEnter = (await enterButton.count()) > 0;
@@ -171,12 +171,12 @@ test.describe("Full Entry Submission Flow", () => {
   }) => {
     await registerAndLogin(page);
 
-    await page.waitForSelector("#competitions-page a.competition-row", {
+    await page.waitForSelector("#competitions-page :is(a.competition-row, .featured-card)", {
       timeout: 15000,
     });
 
     const enterButton = page
-      .locator("#competitions-page a.competition-row[href$='/entry-form']")
+      .locator("#competitions-page a[href$='/entry-form']")
       .first();
 
     await enterButton.click();
@@ -212,7 +212,7 @@ test.describe("Full Entry Submission Flow", () => {
       } });
     });
     await page
-      .locator("#competitions-page a.competition-row[href$='/entry-form']")
+      .locator("#competitions-page a[href$='/entry-form']")
       .first().click();
     // Winnings go to the profile's address; the entry form asks nothing more.
     await expect(page.locator("#entryContainer input[type=checkbox]")).toHaveCount(0);
@@ -238,12 +238,12 @@ test.describe("Full Entry Submission Flow", () => {
   }) => {
     await registerAndLogin(page);
 
-    await page.waitForSelector("#competitions-page a.competition-row", {
+    await page.waitForSelector("#competitions-page :is(a.competition-row, .featured-card)", {
       timeout: 15000,
     });
 
     const enterButton = page
-      .locator("#competitions-page a.competition-row[href$='/entry-form']")
+      .locator("#competitions-page a[href$='/entry-form']")
       .first();
 
     await enterButton.click();
@@ -263,12 +263,12 @@ test.describe("Full Entry Submission Flow", () => {
   test("a pick is taken back by choosing it again", async ({ page }) => {
     await registerAndLogin(page);
 
-    await page.waitForSelector("#competitions-page a.competition-row", {
+    await page.waitForSelector("#competitions-page :is(a.competition-row, .featured-card)", {
       timeout: 15000,
     });
 
     const enterButton = page
-      .locator("#competitions-page a.competition-row[href$='/entry-form']")
+      .locator("#competitions-page a[href$='/entry-form']")
       .first();
 
     await enterButton.click();
@@ -307,14 +307,14 @@ test.describe("Competition Status Display", () => {
     await page.goto("/");
 
     await page.waitForSelector("#competitions-page", { timeout: 10000 });
-    await expect(page.locator("#competitions-page .intro")).toContainText("Daily Fantasy Weather");
+    await expect(page.locator("#competitions-page .intro")).toContainText("Daily fantasy weather");
 
     const rows = page.locator("#competitions-page a.competition-row");
     const count = await rows.count();
     for (let i = 0; i < count; i++) {
       const status = await rows.nth(i).locator(".cell-status").textContent();
       expect(
-        ["Open", "Full", "Entries closed", "Live", "Awaiting results", "Finished", "Didn't run", "Cancelled"].some((s) =>
+        ["Open", "Full", "Entries closed", "Live", "Awaiting results", "Final", "Didn't run", "Cancelled"].some((s) =>
           status?.includes(s),
         ),
       ).toBe(true);
@@ -337,20 +337,20 @@ test.describe("Competition Status Display", () => {
 
   test("the finished tab lists every finished competition with a search", async ({ page }) => {
     await page.goto("/competitions?show=finished");
-    await expect(page.locator("#competitions-page .competition-tabs [aria-current='page']")).toContainText("Finished");
+    await expect(page.locator("#competitions-page .competition-tabs [aria-current='page']")).toContainText("Final");
     const search = page.locator("#competitions-page form.competition-search input[name='q']");
     await search.fill("no-such-competition");
     await search.press("Enter");
     await expect(page.locator("#competitions-page .empty-state")).toContainText("Nothing matches");
     await expect(page).toHaveURL(/show=finished.*q=no-such-competition/);
     await page.locator("#competitions-page .competition-tabs a", { hasText: "Open & recent" }).click();
-    await expect(page.locator("#competitions-page .intro")).toContainText("Daily Fantasy Weather");
+    await expect(page.locator("#competitions-page .intro")).toContainText("Daily fantasy weather");
   });
 
   test("an account page opened by its address offers the log-in dialog", async ({ page }) => {
     await page.goto("/entries");
     await expect(page.locator(".sign-in-required")).toContainText("You're signed out");
     await expect(page.locator("#loginModal")).toHaveClass(/is-active/);
-    await expect(page.locator("nav.navbar")).toBeVisible();
+    await expect(page.locator("header.site-header")).toBeVisible();
   });
 });

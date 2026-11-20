@@ -44,6 +44,24 @@ async function setOwnerTag(npub) {
   markOwnRows(document);
 }
 
+// "7 h 52 min" for `seconds` from now, as `format::duration` writes it.
+function untilText(seconds) {
+  const minutes = Math.max(0, Math.floor(seconds / 60));
+  const [days, hours, mins] = [Math.floor(minutes / 1440), Math.floor(minutes / 60) % 24, minutes % 60];
+  if (days === 0 && hours === 0) return mins === 0 ? "under a minute" : `${mins} min`;
+  if (days === 0) return mins === 0 ? `${hours} h` : `${hours} h ${mins} min`;
+  if (days === 1) return hours === 0 ? "1 day" : `1 day ${hours} h`;
+  return `${days} days`;
+}
+
+// Countdowns marked data-countdown (a unix time) stay current while the page is open.
+function tickCountdowns() {
+  const now = Date.now() / 1000;
+  for (const element of document.querySelectorAll("[data-countdown]")) {
+    element.textContent = untilText(Number(element.dataset.countdown) - now);
+  }
+}
+
 // The header link for the section the reader is in. A competition's own pages belong to the
 // Lobby, as does the home page.
 function markCurrentNav(path = location.pathname) {
@@ -57,6 +75,7 @@ function markCurrentNav(path = location.pathname) {
 function setupPage() {
   localizeTimes(document);
   markCurrentNav();
+  setInterval(tickCountdowns, 30_000);
   // A navigation changes the address after its click, and Back without one.
   document.addEventListener("click", (event) => {
     const link = event.target.closest?.("a[hx-push-url][href]");

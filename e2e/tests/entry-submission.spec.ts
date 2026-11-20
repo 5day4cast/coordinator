@@ -38,10 +38,10 @@ async function registerWithUsername(
 }
 
 test.describe("Basic UI", () => {
-  test("homepage loads and shows competitions table", async ({ page }) => {
+  test("homepage loads and shows the lobby", async ({ page }) => {
     await page.goto("/");
 
-    await expect(page.locator(".navbar-brand strong")).toContainText(
+    await expect(page.locator(".site-brand .wordmark")).toContainText(
       "5day4cast",
     );
 
@@ -138,22 +138,16 @@ test.describe("Competitions", () => {
     await registerWithUsername(page, username, password);
   });
 
-  test("competitions table shows headers", async ({ page }) => {
-    const headers = page.locator("#competitions-page .competition-header").first().locator(":scope > span, :scope > button");
-    await expect(headers.nth(0)).toContainText("Status");
-    await expect(headers.nth(1)).toContainText("Starts");
+  test("the featured contest shows what it costs, what first place wins and its seats", async ({ page }) => {
+    const facts = page.locator("#competitions-page .featured-facts");
     // What it costs, all in, and what first place wins; nothing else about fees or places.
-    await expect(headers.nth(2)).toContainText("Duration");
-    await expect(headers.nth(3)).toContainText("Entry fee");
-    await expect(headers.nth(4)).toContainText("Prizes");
-    await expect(headers.nth(5)).toContainText("Entries");
+    await expect(facts).toContainText("1st wins");
+    await expect(facts).toContainText("Entry");
+    await expect(facts).toContainText("Seats");
   });
 
   test("a competition paying two places shows how they share the pot", async ({ page }) => {
-    const row = page
-      .locator("#competitions-page a.competition-row[href$='/entry-form']")
-      .first();
-    await expect(row.locator(".cell-win")).toContainText("1st 70% · 2nd 30%", {
+    await expect(page.locator("#competitions-page .prize-note").first()).toContainText("1st 70% · 2nd 30%", {
       timeout: 15000,
     });
   });
@@ -186,12 +180,12 @@ test.describe("Entry Form", () => {
   test("entry container shows when clicking enter on a competition", async ({
     page,
   }) => {
-    await page.waitForSelector("#competitions-page a.competition-row", {
+    await page.waitForSelector("#competitions-page :is(a.competition-row, .featured-card)", {
       timeout: 10000,
     });
 
     const enterButton = page
-      .locator("#competitions-page a.competition-row[href$='/entry-form']")
+      .locator("#competitions-page a[href$='/entry-form']")
       .first();
 
     const canEnter = (await enterButton.count()) > 0;
@@ -213,12 +207,12 @@ test.describe("Entry Form", () => {
   });
 
   test("can go back from entry form", async ({ page }) => {
-    await page.waitForSelector("#competitions-page a.competition-row", {
+    await page.waitForSelector("#competitions-page :is(a.competition-row, .featured-card)", {
       timeout: 10000,
     });
 
     const enterButton = page
-      .locator("#competitions-page a.competition-row[href$='/entry-form']")
+      .locator("#competitions-page a[href$='/entry-form']")
       .first();
 
     const canEnter = (await enterButton.count()) > 0;
@@ -243,12 +237,12 @@ test.describe("Entry Form", () => {
   });
 
   test("entry form shows weather prediction options", async ({ page }) => {
-    await page.waitForSelector("#competitions-page a.competition-row", {
+    await page.waitForSelector("#competitions-page :is(a.competition-row, .featured-card)", {
       timeout: 10000,
     });
 
     const enterButton = page
-      .locator("#competitions-page a.competition-row[href$='/entry-form']")
+      .locator("#competitions-page a[href$='/entry-form']")
       .first();
 
     const canEnter = (await enterButton.count()) > 0;
@@ -280,12 +274,12 @@ test.describe("Entry Form", () => {
   });
 
   test("can select predictions before submitting", async ({ page }) => {
-    await page.waitForSelector("#competitions-page a.competition-row", {
+    await page.waitForSelector("#competitions-page :is(a.competition-row, .featured-card)", {
       timeout: 10000,
     });
 
     const enterButton = page
-      .locator("#competitions-page a.competition-row[href$='/entry-form']")
+      .locator("#competitions-page a[href$='/entry-form']")
       .first();
 
     const canEnter = (await enterButton.count()) > 0;

@@ -1,7 +1,7 @@
 //! The home page: what the game is, the competition to enter now, and every
 //! competition grouped by where it stands.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use maud::{html, Markup};
 use time::OffsetDateTime;
@@ -12,7 +12,11 @@ use crate::domain::{
     winner_payout_sats, Competition, RefundProgress, WindowShape,
 };
 use crate::infra::oracle::ScoringRules;
-use crate::templates::format::{self, sats, TimeStyle};
+use crate::templates::{
+    format::{self, sats, TimeStyle},
+    fragments::entry_form::{map_marks, seats, StationForecast},
+    shared_map::{station_map, StationPin},
+};
 
 mod queue;
 pub use queue::{PoolLink, PoolOf, Queue, QueueView};
@@ -178,17 +182,18 @@ impl CompetitionView {
     }
 
     /// `3 of 25`, or `40 entered` for a queue, which has no seat count. A queue that plays as
-    /// one pool has seats: `20 seats · 17 left` until it starts, `3 of 20` after. Seats left
-    /// count what the entry cap counts, paid tickets and unexpired invoice holds, so a queue
-    /// whose last seats are held shows `0 left` until a hold lapses. Otherwise it counts the
-    /// entries the page lists; a fee paid for an entry that never arrived is in the refund note.
+    /// one pool has seats: `3 of 20 seats filled · 17 left` until it starts, `3 of 20` after.
+    /// Seats filled count what the entry cap counts, paid tickets and unexpired invoice holds,
+    /// so a queue whose last seats are held shows `0 left` until a hold lapses. Otherwise it
+    /// counts the entries the page lists; a fee paid for an entry that never arrived is in the
+    /// refund note.
     pub fn entries(&self) -> String {
         match &self.queue {
             Queue::Queued(queue) => match queue.seats() {
-                Some(seats) if self.phase == Phase::Upcoming && queue.pools.is_empty() => format!(
-                    "{seats} seats · {} left",
-                    seats.saturating_sub(queue.taken(self.total_entries))
-                ),
+                Some(seats) if self.phase == Phase::Upcoming && queue.pools.is_empty() => {
+                    let filled = queue.taken(self.total_entries).min(seats);
+                    format!("{filled} of {seats} seats filled · {} left", seats - filled)
+                }
                 Some(seats) => format!("{} of {seats}", self.entry_count(queue)),
                 None => format!("{} entered", self.entry_count(queue)),
             },
@@ -196,20 +201,22 @@ impl CompetitionView {
         }
     }
 
-    /// Compact capacity for the competition list; the full wording labels it accessibly.
-    pub fn entries_compact(&self) -> String {
+    /// Seats filled and seats in all, for the bar under [`Self::entries`]; `None` for a queue
+    /// with no seat count.
+    pub fn seat_fill(&self) -> Option<(u64, u64)> {
         match &self.queue {
-            Queue::Queued(queue) => match queue.seats() {
-                Some(seats) if self.phase == Phase::Upcoming && queue.pools.is_empty() => {
-                    format!(
-                        "{}/{seats}",
-                        seats.saturating_sub(queue.taken(self.total_entries))
-                    )
-                }
-                Some(seats) => format!("{}/{seats}", self.entry_count(queue)),
-                None => self.entries(),
-            },
-            _ => format!("{}/{}", self.total_entries, self.total_allowed_entries),
+            Queue::Queued(queue) => queue.seats().map(|seats| {
+                let filled = if self.phase == Phase::Upcoming && queue.pools.is_empty() {
+                    queue.taken(self.total_entries)
+                } else {
+                    self.entry_count(queue)
+                };
+                (filled.min(seats), seats)
+            }),
+            _ => Some((
+                self.total_entries.min(self.total_allowed_entries),
+                self.total_allowed_entries,
+            )),
         }
     }
 
@@ -537,7 +544,7 @@ fn badge(competition: &CompetitionView, split: bool) -> Markup {
         Phase::Upcoming => ("badge badge-open", "Open"),
         Phase::Live => ("badge badge-live", "Live"),
         Phase::AwaitingResult => ("badge badge-waiting", "Awaiting results"),
-        Phase::Scored | Phase::Expired => ("badge badge-quiet", "Finished"),
+        Phase::Scored | Phase::Expired => ("badge badge-quiet", "Final"),
         // Cancelled by the operator, not for want of entries.
         Phase::Cancelled if !competition.did_not_fill() => ("badge badge-quiet", "Cancelled"),
         Phase::Unfilled | Phase::Cancelled | Phase::Failed => ("badge badge-quiet", "Didn't run"),
@@ -836,6 +843,14 @@ impl<'a> Sections<'a> {
     }
 }
 
+/// The competition the overview features, which the handler fetches weather for.
+pub fn featured_id(competitions: &[CompetitionView], options: &ListOptions) -> Option<String> {
+    let competitions = listed(competitions);
+    Sections::of(&competitions, options)
+        .featured
+        .map(|competition| competition.id.clone())
+}
+
 /// The ids of the competitions the list shows for `options`: the ones a page needs refunds and
 /// contracts for. A queue split into pools is shown by its own id.
 pub fn shown_ids(competitions: &[CompetitionView], options: &ListOptions) -> Vec<String> {
@@ -854,6 +869,37 @@ pub fn competitions_page(
     options: &ListOptions,
     now: OffsetDateTime,
 ) -> Markup {
+    lobby_page(competitions, options, &Lobby::default(), now)
+}
+
+/// What the lobby shows beyond the competitions themselves.
+#[derive(Debug, Default)]
+pub struct Lobby {
+    /// Station id to its city, `Afton, WY`, from the oracle's stations when the handler has
+    /// them.
+    pub cities: HashMap<String, String>,
+    /// The featured competition's forecasts and map pins, when they are ready.
+    pub weather: Option<(Vec<StationForecast>, Vec<StationPin>)>,
+}
+
+impl Lobby {
+    /// `competition`'s cities in its stations' order, leaving out any the oracle hasn't named.
+    fn cities(&self, competition: &CompetitionView) -> Vec<&str> {
+        competition
+            .locations
+            .iter()
+            .filter_map(|station| self.cities.get(station).map(String::as_str))
+            .collect()
+    }
+}
+
+/// [`competitions_page`] with the cities and the featured competition's weather.
+pub fn lobby_page(
+    competitions: &[CompetitionView],
+    options: &ListOptions,
+    lobby: &Lobby,
+    now: OffsetDateTime,
+) -> Markup {
     let competitions = &listed(competitions);
     let sections = Sections::of(competitions, options);
 
@@ -864,14 +910,19 @@ pub fn competitions_page(
             hx-select="#competitions-page"
             hx-swap="outerHTML" {
             @match options.tab {
-                Tab::Overview => { (overview(&sections, options, now)) }
-                Tab::Live | Tab::Finished => { (full_list(&sections, options, now)) }
+                Tab::Overview => { (overview(&sections, options, lobby, now)) }
+                Tab::Live | Tab::Finished => { (full_list(&sections, options, lobby, now)) }
             }
         }
     }
 }
 
-fn overview(sections: &Sections, options: &ListOptions, now: OffsetDateTime) -> Markup {
+fn overview(
+    sections: &Sections,
+    options: &ListOptions,
+    lobby: &Lobby,
+    now: OffsetDateTime,
+) -> Markup {
     let Sections {
         open,
         live,
@@ -882,50 +933,70 @@ fn overview(sections: &Sections, options: &ListOptions, now: OffsetDateTime) -> 
         featured,
         ..
     } = sections;
+    // The featured competition leads the page, so its list doesn't repeat it.
+    let (open, live) = (without(open, *featured), without(live, *featured));
     html! {
-        (intro(*featured, now))
+        (intro(*featured, lobby, now))
+        (tabs(sections, options))
 
         @if !open.is_empty() {
-            (group("Open", open, None, now))
+            (group("Open", &open, None, lobby, now))
         }
         @if !live.is_empty() {
             (group(
                 "Live",
-                live,
-                (*live_count > live.len()).then(|| {
-                    list_link(options.tab_url(Tab::Live), html! { "Show all live (" (live_count) ") →" })
+                &live,
+                (*live_count > live.len() + usize::from(featured.is_some_and(|featured| featured.phase == Phase::Live))).then(|| {
+                    list_link(options.tab_url(Tab::Live), html! { "All live (" (live_count) ") →" })
                 }),
+                lobby,
                 now,
             ))
         }
         @if !waiting.is_empty() {
-            (group("Awaiting results", waiting, None, now))
+            (group("Awaiting results", waiting, None, lobby, now))
         }
         section class="competition-group" {
             div class="group-heading" {
-                h2 class="title is-5" { "Finished" }
+                h2 class="title is-5" { "Final" }
                 @if *finished_count > 0 {
                     span class="group-more" {
-                        (list_link(options.tab_url(Tab::Finished), html! { "All finished (" (finished_count) ") →" }))
+                        (list_link(options.tab_url(Tab::Finished), html! { "All results (" (finished_count) ") →" }))
                     }
                 }
                 (cancelled_toggle(sections, options))
             }
             @if finished.is_empty() {
-                p class="empty-state" { "No finished competitions yet." }
+                p class="empty-state" { "No final results yet." }
             } @else {
-                (list(finished, now))
+                (list(finished, lobby, now))
             }
         }
     }
 }
 
+/// `list` less the `featured` competition.
+fn without<'a>(
+    list: &[&'a CompetitionView],
+    featured: Option<&CompetitionView>,
+) -> Vec<&'a CompetitionView> {
+    list.iter()
+        .copied()
+        .filter(|competition| featured.is_none_or(|featured| featured.id != competition.id))
+        .collect()
+}
+
 /// The Live or the Finished tab: every one of them, found by a search, the finished a page at
 /// a time.
-fn full_list(sections: &Sections, options: &ListOptions, now: OffsetDateTime) -> Markup {
+fn full_list(
+    sections: &Sections,
+    options: &ListOptions,
+    lobby: &Lobby,
+    now: OffsetDateTime,
+) -> Markup {
     let (title, shown) = match options.tab {
         Tab::Live => ("Live", &sections.live),
-        _ => ("Finished", &sections.finished),
+        _ => ("Final", &sections.finished),
     };
     html! {
         (tabs(sections, options))
@@ -942,11 +1013,11 @@ fn full_list(sections: &Sections, options: &ListOptions, now: OffsetDateTime) ->
                     @match (&options.search, options.tab) {
                         (Some(search), _) => { "Nothing matches “" (search) "”." }
                         (None, Tab::Live) => { "Nothing is live right now." }
-                        _ => { "No finished competitions yet." }
+                        _ => { "No final results yet." }
                     }
                 }
             } @else {
-                (list(shown, now))
+                (list(shown, lobby, now))
             }
             @if options.tab == Tab::Finished && sections.pages > 1 {
                 nav class="pager" aria-label="Finished competitions pages" {
@@ -977,8 +1048,8 @@ fn tabs(sections: &Sections, options: &ListOptions) -> Markup {
         nav class="tabs competition-tabs" aria-label="Competition lists" {
             ul {
                 (tab(Tab::Overview, html! { "Open & recent" }))
-                (tab(Tab::Live, html! { "Live (" (sections.live_count) ")" }))
-                (tab(Tab::Finished, html! { "Finished (" (sections.finished_count) ")" }))
+                (tab(Tab::Live, html! { "Live " span class="tab-count" { (sections.live_count) } }))
+                (tab(Tab::Finished, html! { "Final " span class="tab-count" { (sections.finished_count) } }))
             }
         }
     }
@@ -1092,68 +1163,89 @@ fn by_phase<'a>(competitions: &'a [CompetitionView], phases: &[Phase]) -> Vec<&'
 }
 
 /// How to play, and the competition to act on now.
-fn intro(featured: Option<&CompetitionView>, now: OffsetDateTime) -> Markup {
+fn intro(featured: Option<&CompetitionView>, lobby: &Lobby, now: OffsetDateTime) -> Markup {
     html! {
         section class="intro" {
             div class="intro-text" {
-                h1 class="title is-4" { "Daily Fantasy Weather" }
-                p {
-                    span class="intro-line" { "Choose a city, score points on correctly forecasted weather readings." }
-                    " "
-                    span class="intro-line" { "Pay and win with sats, all via the Lightning Network." }
+                p class="intro-eyebrow" { "Daily fantasy weather" }
+                h1 class="title intro-title" { "Call the weather. Win the pot." }
+                p class="intro-copy" {
+                    "Pick Under, In range or Over on NOAA's forecast for every city in a contest. "
+                    "Right calls score points, and the top of each pool splits the prize in sats over Lightning."
                 }
                 p class="intro-link" {
-                    a href="/help" hx-get="/help" hx-target="#main-content" hx-push-url="true" { "How it works →" }
+                    a href="/help" hx-get="/help" hx-target="#main-content" hx-push-url="true" { "How to play →" }
                 }
             }
             @if let Some(competition) = featured {
-                (featured_card(competition, now))
+                (featured_card(competition, lobby, now))
             }
         }
     }
 }
 
-fn featured_card(competition: &CompetitionView, now: OffsetDateTime) -> Markup {
+/// The competition to act on now, as a forecast panel: the next to lock, or with none open the
+/// next live one to end.
+fn featured_card(competition: &CompetitionView, lobby: &Lobby, now: OffsetDateTime) -> Markup {
+    let live = competition.phase == Phase::Live;
+    let cities = lobby.cities(competition);
     html! {
-        div class="featured-card" {
-            div class="featured-status" {
-                (list_badge(competition))
-                span class="countdown" {
-                    @if competition.phase == Phase::Live {
-                        "Observations end in " (format::duration(competition.end - now))
-                    } @else {
-                        "Entries close in " (format::duration(competition.start - now))
+        article class="featured-card" data-featured-id=(competition.id) {
+            div class="wx-bar" {
+                span { @if live { "Live now" } @else { "Next to lock" } }
+                span class="wx-clock" {
+                    @if live { "Ends in " } @else { "Locks in " }
+                    span class="pixel" data-countdown=(if live { competition.end } else { competition.start }.unix_timestamp()) {
+                        (format::duration(if live { competition.end - now } else { competition.start - now }))
                     }
                 }
             }
-            p class="featured-window" {
-                (format::zoned_time(competition.start, format::TimeStyle::Weekday))
-                " · " (format::competition_duration(competition.start, competition.end))
-            }
-            dl class="featured-facts" {
-                @if competition.can_enter {
-                    div { dt { "Entry fee" } dd { (sats(competition.price())) } }
-                }
-                div {
-                    dt { "Prizes" }
-                    dd {
-                        (competition.win())
-                        @if let Some(split) = competition.prize_split() { span class="cell-note prize-note" { (split) } }
-                        @if let Some(rule) = competition.prize_rule() { span class="cell-note prize-note" { (rule) } }
+            div class="featured-body" {
+                div class="featured-main" {
+                    div class="featured-heading" {
+                        (list_badge(competition))
+                        h2 class="featured-title" { (format::zoned_time(competition.start, TimeStyle::Weekday)) }
+                    }
+                    p class="featured-window" {
+                        (competition.number_of_values_per_entry) " picks · scored over "
+                        (format::competition_duration(competition.start, competition.end))
+                        @if let Some(queue) = competition.queue.queued().filter(|queue| queue.pools.len() > 1) {
+                            " · " (queue.pools.len()) " pools"
+                        }
+                    }
+                    @if !cities.is_empty() {
+                        p class="featured-cities" { (cities.join(" · ")) }
+                    }
+                    @if let Some((stations, pins)) = &lobby.weather {
+                        @if !pins.is_empty() { (station_map(&map_marks(stations, pins), false)) }
                     }
                 }
-                div {
-                    dt { "Entries" }
-                    dd title=(competition.entries()) {
-                        span aria-hidden="true" { (competition.entries_compact()) }
-                        span class="is-sr-only" { (competition.entries()) }
+                div class="featured-side" {
+                    dl class="featured-facts" {
+                        @if competition.top_prize().is_some() {
+                            div {
+                                dt { "1st wins" }
+                                dd {
+                                    (competition.win())
+                                    @if let Some(split) = competition.prize_split() { span class="cell-note prize-note" { (split) } }
+                                    @if let Some(rule) = competition.prize_rule() { span class="cell-note prize-note" { (rule) } }
+                                    @if competition.can_enter && competition.queue.queued().is_some() {
+                                        span class="cell-note prize-note" { "Grows as seats fill" }
+                                    }
+                                }
+                            }
+                        }
+                        @if competition.can_enter {
+                            div { dt { "Entry" } dd { (sats(competition.price())) } }
+                        }
+                        div { dt { "Seats" } dd class="featured-seats" { (seats(competition)) } }
+                    }
+                    a class="button is-primary is-fullwidth is-medium"
+                      href=(competition.url()) hx-get=(competition.url())
+                      hx-target="#main-content" hx-push-url="true" {
+                        @if competition.can_enter { "Make picks" } @else { "Watch live" }
                     }
                 }
-            }
-            a class=(if competition.can_enter { "button is-primary is-fullwidth" } else { "button is-fullwidth" })
-              href=(competition.url()) hx-get=(competition.url())
-              hx-target="#main-content" hx-push-url="true" {
-                @if competition.can_enter { "Enter" } @else { "Watch the leaderboard" }
             }
         }
     }
@@ -1165,6 +1257,7 @@ fn group(
     title: &str,
     competitions: &[&CompetitionView],
     more: Option<Markup>,
+    lobby: &Lobby,
     now: OffsetDateTime,
 ) -> Markup {
     html! {
@@ -1175,63 +1268,69 @@ fn group(
                     span class="group-more" { (more) }
                 }
             }
-            (list(competitions, now))
+            (list(competitions, lobby, now))
         }
     }
 }
 
-fn list(competitions: &[&CompetitionView], now: OffsetDateTime) -> Markup {
+/// The competitions as cards; open ones can be sorted.
+fn list(competitions: &[&CompetitionView], lobby: &Lobby, now: OffsetDateTime) -> Markup {
     let sortable = competitions
         .iter()
         .any(|competition| competition.phase == Phase::Upcoming);
     html! {
         div class="competition-list" data-sortable[sortable] {
-            div class=(if sortable { "competition-header is-sortable" } else { "competition-header" }) {
-                span { "Status" }
-                (sort_heading("Starts", "start", sortable))
-                span { "Duration" }
-                (sort_heading("Entry fee", "fee", sortable))
-                (sort_heading("Prizes", "prize", sortable))
-                span { "Entries" }
-                span {}
+            @if sortable && competitions.len() > 1 {
+                div class="competition-sorts" role="group" aria-label="Sort these contests" {
+                    span class="competition-sorts-label" { "Sort" }
+                    (sort_heading("Starts", "start"))
+                    (sort_heading("Entry fee", "fee"))
+                    (sort_heading("1st prize", "prize"))
+                }
             }
             @for competition in competitions {
-                (competition_row(competition, now))
+                (contest_card(competition, &lobby.cities(competition), now))
             }
         }
     }
 }
 
-fn sort_heading(label: &str, key: &str, sortable: bool) -> Markup {
+fn sort_heading(label: &str, key: &str) -> Markup {
     html! {
-        @if sortable {
-            button type="button" class="competition-sort" data-sort=(key)
-                aria-label=(format!("Sort by {label}")) {
-                (label) " " span class="sort-direction" aria-hidden="true" { "↕" }
-            }
-        } @else { span { (label) } }
+        button type="button" class="competition-sort" data-sort=(key)
+            aria-label=(format!("Sort by {label}")) {
+            (label) " " span class="sort-direction" aria-hidden="true" { "↕" }
+        }
     }
 }
 
-/// One competition; the whole row links to its entry form or leaderboard.
+/// One competition as a card, without its cities; the whole card links to its entry form or
+/// leaderboard.
 pub fn competition_row(competition: &CompetitionView, now: OffsetDateTime) -> Markup {
+    contest_card(competition, &[], now)
+}
+
+/// One competition as a card: when it starts, its cities, and the figures that decide whether
+/// to enter. The whole card links to its entry form or leaderboard.
+fn contest_card(competition: &CompetitionView, cities: &[&str], now: OffsetDateTime) -> Markup {
     let action = if competition.can_enter {
-        "Enter"
+        "Make picks"
     } else if competition.phase == Phase::Cancelled {
         "Details"
+    } else if competition.phase == Phase::Live {
+        "Watch live"
     } else {
         "Leaderboard"
     };
-    // Phones show these facts below the window. Only a competition taking entries has an
-    // entry fee, the all-in price; one that didn't run wins nothing.
+    // A screen reader's summary of the facts the card lays out.
     let mut facts = Vec::new();
     if competition.can_enter {
         facts.push(format!("Entry fee {}", sats(competition.price())));
     }
     if competition.top_prize().is_some() {
         facts.push(match competition.prize_split() {
-            Some(split) => format!("Prizes {} ({split})", competition.win()),
-            None => format!("Prizes {}", competition.win()),
+            Some(split) => format!("1st wins {} ({split})", competition.win()),
+            None => format!("1st wins {}", competition.win()),
         });
     }
     facts.push(format::competition_duration(
@@ -1244,61 +1343,85 @@ pub fn competition_row(competition: &CompetitionView, now: OffsetDateTime) -> Ma
     });
     let facts = facts.join(" · ");
     html! {
-        a class="competition-row" data-competition-id=(competition.id) data-facts=(facts)
+        a class=(format!("competition-row contest-card is-{}", phase_class(competition.phase)))
+          data-competition-id=(competition.id) data-facts=(facts)
           data-start=(competition.start.unix_timestamp()) data-fee=(competition.price())
           data-prize=[competition.top_prize()]
           href=(competition.url()) hx-get=(competition.url())
           hx-target="#main-content" hx-push-url="true" {
-            span class="cell-status" { (list_badge(competition)) }
-            span class="cell-window" {
-                (format::zoned_time(competition.start, format::TimeStyle::Weekday))
-                @match competition.phase {
-                    Phase::Upcoming => { span class="cell-note" { "starts in " (format::duration(competition.start - now)) } }
-                    Phase::Live => { span class="cell-note" { "observations end in " (format::duration(competition.end - now)) } }
-                    Phase::AwaitingResult if competition.result_is_late(now) => { span class="cell-note" { "results are late" } }
-                    Phase::Expired => { span class="cell-note" { "no result · pot shared back" } }
-                    Phase::Scored if competition.pot_refunded => { span class="cell-note" { "no winner · pot shared back" } }
-                    _ => {}
-                }
-                @if let Some(refunds) = refund_line(competition, now) {
-                    span class="cell-note refund-line" { (refunds) }
-                }
-                @match &competition.queue {
-                    Queue::Queued(queue) if queue.pools.is_empty() && queue.seats().is_none() => {
-                        span class="cell-note" { "pools of up to " (queue.max_players) }
+            span class="card-head" {
+                span class="cell-status" { (list_badge(competition)) }
+                span class="cell-window" {
+                    span class="card-title" { (format::zoned_time(competition.start, format::TimeStyle::Weekday)) }
+                    @match competition.phase {
+                        Phase::Upcoming => {
+                            span class="cell-note" { "locks in " span data-countdown=(competition.start.unix_timestamp()) { (format::duration(competition.start - now)) } }
+                        }
+                        Phase::Live => {
+                            span class="cell-note" { "observations end in " span data-countdown=(competition.end.unix_timestamp()) { (format::duration(competition.end - now)) } }
+                        }
+                        Phase::AwaitingResult if competition.result_is_late(now) => { span class="cell-note" { "results are late" } }
+                        Phase::Expired => { span class="cell-note" { "no result · pot shared back" } }
+                        Phase::Scored if competition.pot_refunded => { span class="cell-note" { "no winner · pot shared back" } }
+                        _ => {}
                     }
-                    Queue::Queued(queue) if queue.pools.is_empty() => {}
-                    Queue::Queued(queue) if queue.pools.len() == 1 => { span class="cell-note" { "1 pool" } }
-                    Queue::Queued(queue) => { span class="cell-note" { (queue.pools.len()) " pools" } }
-                    Queue::Pool(pool) => { span class="cell-note" { (pool.label()) } }
-                    Queue::Single => {}
-                }
-            }
-            span class="cell-duration" data-label="Duration" {
-                (format::competition_duration(competition.start, competition.end))
-            }
-            span class="cell-fee" data-label="Entry fee" {
-                @if competition.can_enter { (sats(competition.price())) } @else { "—" }
-            }
-            span class="cell-win" data-label="Prizes" {
-                (competition.win())
-                @if let Some(split) = competition.prize_split() { span class="cell-note prize-note" { (split) } }
-                @if let Some(rule) = competition.prize_rule() { span class="cell-note prize-note" { (rule) } }
-            }
-            span class="cell-entries" data-label="Entries" {
-                span class="entry-count" title=(competition.entries()) {
-                    span aria-hidden="true" { (competition.entries_compact()) }
-                    span class="is-sr-only" { (competition.entries()) }
-                }
-                @if competition.phase == Phase::Upcoming {
-                    span class="cell-note player-entries" data-player-entries=(competition.id)
-                      data-entry-limit=(competition.max_entries_per_player) {
-                        (competition.max_entries_per_player) " max per player"
+                    @if let Some(refunds) = refund_line(competition, now) {
+                        span class="cell-note refund-line" { (refunds) }
                     }
+                    @match &competition.queue {
+                        Queue::Queued(queue) if queue.pools.is_empty() && queue.seats().is_none() => {
+                            span class="cell-note" { "pools of up to " (queue.max_players) }
+                        }
+                        Queue::Queued(queue) if queue.pools.is_empty() => {}
+                        Queue::Queued(queue) if queue.pools.len() == 1 => { span class="cell-note" { "1 pool" } }
+                        Queue::Queued(queue) => { span class="cell-note" { (queue.pools.len()) " pools" } }
+                        Queue::Pool(pool) => { span class="cell-note" { (pool.label()) } }
+                        Queue::Single => {}
+                    }
+                }
+            }
+            @if !cities.is_empty() {
+                span class="card-cities" { (cities.join(" · ")) }
+            }
+            span class="card-figures" {
+                @if competition.can_enter {
+                    span class="card-figure cell-fee" { small { "Entry" } b { (sats(competition.price())) } }
+                }
+                @if competition.top_prize().is_some() {
+                    span class="card-figure cell-win" {
+                        small { "1st wins" }
+                        b { (competition.win()) }
+                        @if let Some(split) = competition.prize_split() { span class="cell-note prize-note" { (split) } }
+                        @if let Some(rule) = competition.prize_rule() { span class="cell-note prize-note" { (rule) } }
+                    }
+                }
+                span class="card-figure cell-entries" {
+                    small { @if competition.phase == Phase::Upcoming { "Seats" } @else { "Players" } }
+                    (seats(competition))
+                    @if competition.phase == Phase::Upcoming {
+                        span class="cell-note player-entries" data-player-entries=(competition.id)
+                          data-entry-limit=(competition.max_entries_per_player) {
+                            (competition.max_entries_per_player) " max per player"
+                        }
+                    }
+                }
+                span class="card-figure cell-duration" {
+                    small { "Window" }
+                    b { (format::competition_duration(competition.start, competition.end)) }
                 }
             }
             span class="cell-action" { (action) " →" }
         }
+    }
+}
+
+/// The class a card takes for its phase, which sets its accent.
+fn phase_class(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Upcoming => "open",
+        Phase::Live => "live",
+        Phase::AwaitingResult => "waiting",
+        _ => "done",
     }
 }
 
@@ -1385,9 +1508,14 @@ pub(crate) mod tests {
             view("live", Phase::Live, -5),
         ];
         let html = competitions_page(&competitions, &ListOptions::default(), NOW).into_string();
+        // The open one leads the page as the featured competition, and isn't listed again.
         assert_eq!(
             row_ids(&html),
-            ["open", "live", "waiting", "finished-new", "finished-old"]
+            ["live", "waiting", "finished-new", "finished-old"]
+        );
+        assert!(
+            position(&html, r#"href="/competitions/open/entry-form""#)
+                < position(&html, ">Live</h2>")
         );
     }
 
@@ -1413,7 +1541,6 @@ pub(crate) mod tests {
             row_ids(&html),
             [
                 "full",
-                "open-soon",
                 "open-middle",
                 "open-later",
                 "live-early",
@@ -1422,10 +1549,12 @@ pub(crate) mod tests {
                 "waiting-late"
             ]
         );
+        // The soonest to enter is featured above the list instead of in it.
         assert_eq!(
             html.matches(r#"data-competition-id="open-soon""#).count(),
-            1
+            0
         );
+        assert!(html.contains(r#"href="/competitions/open-soon/entry-form""#));
         assert!(html.contains(r#"<h2 class="title is-5">Open</h2>"#));
         let open = position(&html, ">Open</h2>");
         assert!(open < position(&html, ">Live</h2>"));
@@ -1442,15 +1571,15 @@ pub(crate) mod tests {
             (0..5).map(|index| view(&format!("done-{index}"), Phase::Scored, -1000 + index * 20)),
         );
         let html = competitions_page(&competitions, &ListOptions::default(), NOW).into_string();
-        // Nothing is open, so the first live one is featured as well.
-        assert!(html.contains("Observations end in"));
+        // Nothing is open, so the first live one is featured instead of listed.
+        assert!(html.contains("Ends in"));
         assert_eq!(
             row_ids(&html),
-            ["live-0", "live-1", "live-2", "live-3", "done-4", "done-3"]
+            ["live-1", "live-2", "live-3", "done-4", "done-3"]
         );
-        assert!(html.contains("Show all live (6) →"));
+        assert!(html.contains("All live (6) →"));
         assert!(html.contains(r#"href="/competitions?show=live""#));
-        assert!(html.contains("All finished (5) →"));
+        assert!(html.contains("All results (5) →"));
         assert!(html.contains(r#"href="/competitions?show=finished""#));
         assert!(!html.contains("Page 1 of"));
         // The tabs list them all.
@@ -1530,21 +1659,23 @@ pub(crate) mod tests {
             NOW,
         )
         .into_string();
-        assert!(html.contains("Entries close in 2 h 13 min"));
+        assert!(html.contains(">2 h 13 min</span>") && html.contains("Locks in "));
         assert!(html.contains(r#"href="/competitions/open/entry-form""#));
-        assert!(html.contains("Daily Fantasy Weather"));
+        assert!(html.contains("Daily fantasy weather"));
         assert!(html.contains(r#"href="/help""#));
         // What it costs, all in, and what first place wins; the network fee is in the entry fee
         // once known.
-        assert!(html.contains("<dt>Entry fee</dt><dd>5,250 sats</dd>"));
+        assert!(html.contains("<dt>Entry</dt><dd>5,250 sats</dd>"));
         assert!(!html.contains(">Price<"));
-        assert!(html.contains("<dt>Prizes</dt><dd>15,000 sats</dd>"));
+        assert!(html.contains("<dt>1st wins</dt><dd>15,000 sats</dd>"));
         assert!(!html.contains("Paid places") && !html.contains(">Pot<"));
         let mut priced = view("open", Phase::Upcoming, 133);
         priced.network_fee = Some(437);
         let row = competition_row(&priced, NOW).into_string();
-        assert!(row.contains(r#"data-label="Entry fee">5,687 sats</span>"#));
-        assert!(row.contains("Entry fee 5,687 sats · Prizes 15,000 sats · 10 min · 1 of 3 entries"));
+        assert!(row.contains(r#"<small>Entry</small><b>5,687 sats</b>"#));
+        assert!(
+            row.contains("Entry fee 5,687 sats · 1st wins 15,000 sats · 10 min · 1 of 3 entries")
+        );
     }
 
     #[test]
@@ -1711,7 +1842,7 @@ pub(crate) mod tests {
             view("expired", Phase::Expired, -60),
         ] {
             assert!(
-                badge(&finished).contains(">Finished</span>"),
+                badge(&finished).contains(">Final</span>"),
                 "{}",
                 finished.id
             );
@@ -1814,7 +1945,7 @@ pub(crate) mod tests {
         let html = competitions_page(&competitions, &ListOptions::default(), NOW).into_string();
         assert!(!html.contains("hidden-open") && !html.contains("hidden-done"));
         assert!(html.contains(r#"href="/competitions/listed-open/entry-form""#));
-        assert!(html.contains("No finished competitions yet."));
+        assert!(html.contains("No final results yet."));
         assert_eq!(
             shown_ids(&competitions, &ListOptions::default()),
             vec!["listed-open".to_owned()]
@@ -1846,7 +1977,14 @@ pub(crate) mod tests {
                         ..Default::default()
                     };
                     let html = competitions_page(&competitions, &options, NOW).into_string();
+                    // The featured competition leads the page instead of being a row.
                     let mut rendered = row_ids(&html);
+                    rendered.extend(html.match_indices(r#"data-featured-id=""#).map(
+                        |(at, found)| {
+                            let rest = &html[at + found.len()..];
+                            rest[..rest.find('"').unwrap()].to_owned()
+                        },
+                    ));
                     let mut shown = shown_ids(&competitions, &options);
                     rendered.sort();
                     shown.sort();
@@ -1875,7 +2013,7 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let first = competitions_page(&competitions, &finished, NOW).into_string();
-        assert_eq!(first.matches("class=\"competition-row\"").count(), 10);
+        assert_eq!(first.matches("class=\"competition-row ").count(), 10);
         assert!(first.contains("done-24") && !first.contains("done-14"));
         assert!(first.contains("Page 1 of 3"));
         assert!(first.contains(r#"href="/competitions?show=finished&amp;page=1""#));
@@ -1889,7 +2027,7 @@ pub(crate) mod tests {
             NOW,
         )
         .into_string();
-        assert_eq!(last.matches("class=\"competition-row\"").count(), 5);
+        assert_eq!(last.matches("class=\"competition-row ").count(), 5);
         assert!(last.contains("done-00"));
         assert!(last.contains("← Newer"));
     }
@@ -1897,9 +2035,9 @@ pub(crate) mod tests {
     #[test]
     fn rows_are_links_so_the_whole_row_is_clickable() {
         let html = competition_row(&view("live", Phase::Live, -5), NOW).into_string();
-        assert!(html.starts_with("<a class=\"competition-row\""));
+        assert!(html.starts_with("<a class=\"competition-row "));
         assert!(html.contains(r#"href="/competitions/live/leaderboard""#));
-        assert!(html.contains(r#"data-label="Duration">10 min</span>"#));
+        assert!(html.contains(r#"<small>Window</small><b>10 min</b>"#));
         assert!(!html.contains("ends in"));
     }
 
@@ -1909,10 +2047,9 @@ pub(crate) mod tests {
         refunded.pot_refunded = true;
         for competition in [refunded, view("cancelled", Phase::Cancelled, -60)] {
             let html = competition_row(&competition, NOW).into_string();
-            assert!(html.contains(r#"data-label="Prizes">—</span>"#));
-            assert!(!html.contains("Prizes 15,000"));
+            assert!(!html.contains("1st wins"));
             // Nothing to buy either.
-            assert!(html.contains(r#"data-label="Entry fee">—</span>"#));
+            assert!(!html.contains("cell-fee"));
         }
     }
 
@@ -1922,13 +2059,10 @@ pub(crate) mod tests {
     fn a_queue_shows_how_many_entered_and_its_pool_size() {
         let queue = queued("q", 40);
         let row = competition_row(&queue, NOW).into_string();
-        assert!(
-            row.contains(r#"title="40 entered"><span aria-hidden="true">40 entered</span>"#),
-            "{row}"
-        );
+        assert!(row.contains("<small>Seats</small>40 entered"), "{row}");
         assert!(row.contains("pools of up to 25"));
         // Forty entries make two pools of twenty.
-        assert!(row.contains("Entry fee 5,250 sats · Prizes 100,000 sats · 10 min · 40 entered"));
+        assert!(row.contains("Entry fee 5,250 sats · 1st wins 100,000 sats · 10 min · 40 entered"));
         assert_eq!(queue.pot(), "100,000 sats per pool");
         let six = queued("q", 6);
         assert_eq!(six.win(), "30,000 sats");
@@ -1958,7 +2092,7 @@ pub(crate) mod tests {
         assert_eq!(queue.win(), "65,000–70,000 sats");
         assert_eq!(queue.top_prize(), Some(65_000));
         let row = competition_row(&queue, NOW).into_string();
-        assert!(row.contains(r#"data-label="Prizes">65,000–70,000 sats</span>"#));
+        assert!(row.contains(r#"<small>1st wins</small><b>65,000–70,000 sats</b>"#));
 
         // Once formed, the pools' own sizes decide, whatever the entry count says.
         let mut split = queued("q", 30);
@@ -2055,7 +2189,9 @@ pub(crate) mod tests {
         };
         let row = competition_row(&pool(OTHER_POOL, 1, Phase::Live), NOW).into_string();
         assert!(row.contains(r#"<span class="cell-note">Pool 2</span>"#));
-        assert!(row.contains(r#"title="1 of 3"><span aria-hidden="true">1/3</span>"#));
+        assert!(row.contains(
+            r#"<meter min="0" max="3" value="1"></meter><span class="seat-text">1 of 3</span>"#
+        ));
 
         // The list shows the queue once, with its least advanced pool, and not its pools.
         let all = [
@@ -2222,7 +2358,7 @@ pub(crate) mod tests {
         assert_eq!(expired.refund_shares, Some(vec![1_000; 3]));
         assert!(phase_badge(&expired)
             .into_string()
-            .contains(">Finished</span>"));
+            .contains(">Final</span>"));
     }
 
     /// The default competition: a queue of 20 seats that plays as one pool and pays 70% and 30%
@@ -2240,8 +2376,8 @@ pub(crate) mod tests {
     #[test]
     fn a_one_pool_queue_shows_its_seats_and_how_its_prizes_split() {
         let open = twenty_seats(3);
-        assert_eq!(open.entries(), "20 seats · 17 left");
-        assert_eq!(twenty_seats(13).entries_compact(), "7/20");
+        assert_eq!(open.entries(), "3 of 20 seats filled · 17 left");
+        assert_eq!(twenty_seats(13).seat_fill(), Some((13, 20)));
         assert_eq!(open.prize_split().as_deref(), Some("1st 70% · 2nd 30%"));
         assert_eq!(
             open.prize_rule().as_deref(),
@@ -2251,19 +2387,19 @@ pub(crate) mod tests {
         assert_eq!(open.win(), "15,000 sats");
         let row = competition_row(&open, NOW).into_string();
         assert!(
-            row.contains(r#"title="20 seats · 17 left"><span aria-hidden="true">17/20</span>"#),
+            row.contains(r#"<meter min="0" max="20" value="3"></meter><span class="seat-text">3 of 20 seats filled · 17 left</span>"#),
             "{row}"
         );
         assert!(row.contains("1st 70% · 2nd 30%"));
         assert!(row.contains("Under 10 players: winner takes all"));
-        assert!(row.contains("Prizes 15,000 sats (1st 70% · 2nd 30%)"));
+        assert!(row.contains("1st wins 15,000 sats (1st 70% · 2nd 30%)"));
         // One pool: no pool size to explain.
         assert!(!row.contains("pools of up to"));
 
         // From ten players first place takes 70% of the pot.
         assert_eq!(twenty_seats(10).win(), "35,000 sats");
         assert_eq!(twenty_seats(20).win(), "70,000 sats");
-        assert_eq!(twenty_seats(20).entries(), "20 seats · 0 left");
+        assert_eq!(twenty_seats(20).entries(), "20 of 20 seats filled · 0 left");
         let mut started = twenty_seats(12);
         started.phase = Phase::Live;
         started.can_enter = false;
@@ -2298,13 +2434,13 @@ pub(crate) mod tests {
             competition
         };
         let some_held = with_held(15, 18);
-        assert_eq!(some_held.entries(), "20 seats · 2 left");
+        assert_eq!(some_held.entries(), "18 of 20 seats filled · 2 left");
         assert!(some_held.can_enter && !some_held.is_full());
 
         // 19 paid and the last seat held for an unpaid invoice: full, never "1 left".
         let last_held = with_held(19, 20);
-        assert_eq!(last_held.entries(), "20 seats · 0 left");
-        assert_eq!(last_held.entries_compact(), "0/20");
+        assert_eq!(last_held.entries(), "20 of 20 seats filled · 0 left");
+        assert_eq!(last_held.seat_fill(), Some((20, 20)));
         assert!(last_held.is_full() && !last_held.can_enter);
         let badge = phase_badge(&last_held).into_string();
         assert!(badge.contains(">Full</span>"), "{badge}");
@@ -2316,7 +2452,7 @@ pub(crate) mod tests {
         if let Queue::Queued(queue) = &mut paid_only.queue {
             queue.held = None;
         }
-        assert_eq!(paid_only.entries(), "20 seats · 1 left");
+        assert_eq!(paid_only.entries(), "19 of 20 seats filled · 1 left");
     }
 
     /// The API's `held` field reaches the page, and a full queue cannot be entered.

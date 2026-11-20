@@ -322,14 +322,6 @@ html.site .button.is-ghost-line:hover {
     color: var(--gold);
 }
 
-html.site a:not(.button):not(.tag):not(.site-nav-link):not(.competition-row) {
-    color: var(--bulma-link-text);
-}
-
-html.site a:not(.button):not(.tag):not(.site-nav-link):not(.competition-row):hover {
-    color: var(--gold);
-}
-
 /* Forecast and reading numerals: the WeatherStar's pixel type. */
 .pixel {
     font-family: var(--font-pixel);

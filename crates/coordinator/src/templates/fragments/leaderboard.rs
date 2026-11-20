@@ -576,7 +576,7 @@ mod tests {
         .into_string();
         assert!(html.contains("1st 70% · 2nd 30%"), "{html}");
         assert!(html.contains("Under 10 players: winner takes all"));
-        assert!(html.contains("20 seats · 16 left"));
+        assert!(html.contains("4 of 20 seats filled · 16 left"));
         assert!(html.contains(r#"data-tip="Up to 20 players, all in one pool.""#));
 
         let mut one = crate::templates::pages::competitions::tests::twenty_seats(4);
@@ -1020,7 +1020,7 @@ mod tests {
         assert!(!html.contains("0 pts"), "{html}");
         assert_eq!(html.matches("not scored").count(), 3);
         let badge = phase_badge(&competition).into_string();
-        assert!(badge.contains(">Finished</span>"));
+        assert!(badge.contains(">Final</span>"));
         assert!(badge.contains("the pot is shared back"));
 
         board.any_readings = true;
@@ -1039,7 +1039,7 @@ mod tests {
         assert!(html.contains("0 pts"));
         assert!(phase_badge(&competition)
             .into_string()
-            .contains(">Finished</span>"));
+            .contains(">Final</span>"));
 
         board.any_readings = true;
         assert!(!leaderboard_scores(&competition, &board, NOW)
@@ -1101,7 +1101,7 @@ mod tests {
         competition.ticket_price = 1_000;
         competition.refund_shares = Some(vec![1_000; 3]);
         let html = leaderboard(&competition, NOW).into_string();
-        assert!(html.contains(">Finished</span>"));
+        assert!(html.contains(">Final</span>"));
         assert!(html.contains("Each entry&#39;s share") || html.contains("Each entry's share"));
         assert!(html.contains("1,000 sats per entry"));
         assert!(html.contains("payment may still be pending"));

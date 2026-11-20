@@ -1,19 +1,126 @@
-/* Entry form: terms, compact station map, pick buttons. */
-
-.entry-form {
-  --entry-muted: #5b6170;
-  max-width: 48rem;
-}
-
-[data-theme="dark"] .entry-form {
-  --entry-muted: #afb5c8;
-}
+/* Entry form: the contest's terms, the weather map, a forecast panel per city with its picks,
+   and the entry panel that counts them and holds Pay. */
 
 .entry-form .entry-facts dt,
 .entry-form .fact-note,
 .entry-form .station-code,
 .entry-form .pick-forecast.is-missing {
-  color: var(--entry-muted);
+  color: var(--dim);
+}
+
+.entry-head {
+  display: grid;
+  gap: 0.5rem;
+  margin-bottom: 1.25rem;
+}
+
+.entry-kicker {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--dim);
+  font-size: 0.85rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.entry-form .entry-title {
+  margin: 0;
+  font-size: clamp(2rem, 5vw, 2.75rem);
+  line-height: 1;
+}
+
+.entry-cities {
+  font-family: var(--font-display);
+  font-size: 1.35rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--gold);
+}
+
+.entry-facts {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 2.25rem;
+  margin: 0.5rem 0 0;
+}
+
+.entry-facts dt {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.entry-facts dd {
+  display: grid;
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 1.6rem;
+  font-weight: 700;
+  line-height: 1.15;
+}
+
+.entry-facts .fact-note {
+  font-family: var(--font-body);
+  font-size: 0.78rem;
+  font-weight: 400;
+  line-height: 1.4;
+}
+
+.lock-clock {
+  color: var(--gold);
+  font-size: 2rem;
+  line-height: 1;
+}
+
+.entry-rules {
+  max-width: 46rem;
+  color: var(--dim);
+  font-size: 0.9rem;
+}
+
+/* A bar of seats filled, with the count beside it. */
+.seat-meter {
+  display: grid;
+  gap: 0.3rem;
+}
+
+.seat-meter meter {
+  width: 100%;
+  min-width: 9rem;
+  height: 0.45rem;
+  border: 0;
+  border-radius: 999px;
+  background: var(--raise);
+  appearance: none;
+}
+
+.seat-meter meter::-webkit-meter-bar {
+  border: 0;
+  border-radius: 999px;
+  background: var(--raise);
+}
+
+.seat-meter meter::-webkit-meter-optimum-value,
+.seat-meter meter::-webkit-meter-suboptimum-value,
+.seat-meter meter::-webkit-meter-even-less-good-value {
+  border-radius: 999px;
+  background: var(--gold);
+}
+
+.seat-meter meter::-moz-meter-bar {
+  border-radius: 999px;
+  background: var(--gold);
+}
+
+.seat-text {
+  font-family: var(--font-body);
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--dim);
 }
 
 /* Phones and tablets wrap the facts, so a "?" can sit anywhere across the line and a bubble
@@ -78,82 +185,270 @@
 }
 
 .how-to-pick {
-  margin-bottom: 1rem;
+  margin: 0.5rem 0 1rem;
   font-size: 0.9rem;
 }
 
-/* The map only shows where the stations are; keep it small. */
+/* Picks down the page, the entry panel beside them. */
+.entry-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 21rem;
+  gap: 1.5rem;
+  align-items: start;
+}
+
+.entry-main {
+  min-width: 0;
+}
+
+.entry-panel {
+  position: sticky;
+  top: 6.5rem;
+  display: grid;
+  gap: 0.75rem;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--navy);
+}
+
+.entry-panel-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.entry-panel-head h2 {
+  margin: 0;
+  font-size: 1.5rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.pick-count {
+  color: var(--dim);
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.pick-meter {
+  display: flex;
+  gap: 3px;
+}
+
+.pick-meter i {
+  flex: 1;
+  height: 6px;
+  border-radius: 2px;
+  background: var(--raise);
+}
+
+.pick-meter i.is-made {
+  background: var(--gold);
+}
+
+.pick-summary {
+  display: grid;
+  gap: 0.3rem;
+  font-size: 0.85rem;
+}
+
+.pick-summary:empty {
+  display: none;
+}
+
+.pick-summary li {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.pick-summary span {
+  color: var(--dim);
+}
+
+.pick-summary b {
+  text-align: right;
+  font-weight: 600;
+}
+
+.pick-summary .is-under { color: var(--cold); }
+.pick-summary .is-par { color: var(--gold); }
+.pick-summary .is-over { color: var(--warm); }
+
+.payout-line {
+  margin: 0;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--line);
+  font-size: 0.85rem;
+  color: var(--dim);
+}
+
+.payout-line strong {
+  color: var(--ink);
+}
+
+.entry-submit .notification {
+  margin: 0.5rem 0 0;
+}
+
+/* How many picks are left, right above Pay. */
+.picks-left {
+  margin-bottom: 0.5rem;
+  font-size: 0.85rem;
+  color: var(--dim);
+}
+
+.entry-submit .button {
+  white-space: normal;
+  height: auto;
+  min-height: 3rem;
+}
+
+/* On a narrow screen the panel follows the picks and stays pinned above the tab bar while
+   they scroll by; only the count, Pay and anything that needs saying show. */
+@media screen and (max-width: 1023px) {
+  .entry-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .entry-panel {
+    top: auto;
+    bottom: 0;
+    z-index: 20;
+    gap: 0.5rem;
+    margin: 0 -0.5rem;
+    padding: 0.75rem;
+    border-radius: 12px 12px 0 0;
+    border-bottom: 0;
+    box-shadow: 0 -10px 24px rgb(4 9 26 / 0.6);
+  }
+
+  .pick-summary,
+  .picks-left {
+    display: none;
+  }
+
+  .entry-panel-head h2 {
+    font-size: 1.15rem;
+  }
+}
+
+@media screen and (max-width: 768px) {
+  .entry-panel {
+    bottom: calc(3.6rem + env(safe-area-inset-bottom, 0px));
+  }
+}
+
+/* The weather map: the country at night, a glow around each city in its temperature's colour.
+   Pins stay gold; the hover is crimson. */
 .station-map {
-  --station-map-land: #d8e3ee;
-  --station-map-border: #74879b;
-  position: relative;
-  max-width: 26rem;
+  --station-map-land: #1d3470;
   margin: 0 0 1.25rem;
-  padding: 0.5rem;
-  border: 1px solid #9aadc0;
-  border-radius: 0.65rem;
-  background: #f2f6fb;
+  overflow: hidden;
+  border: 1px solid var(--wx-edge);
+  border-radius: 12px;
+  background: var(--night);
 }
 
-[data-theme="dark"] .station-map {
-  --station-map-land: #3d5168;
-  --station-map-border: #a5b6c8;
-  border-color: #637b96;
-  background: #162538;
-}
-
-.station-map .usa-map {
+.forecast-map {
   display: block;
   width: 100%;
   height: auto;
-  opacity: 1;
+}
+
+.forecast-map .fm-sea {
+  fill: #0a1638;
+}
+
+.forecast-map .fm-grid line {
+  stroke: #182a5c;
+  stroke-width: 0.4;
+}
+
+.forecast-map .fm-land {
   fill: var(--station-map-land);
-  stroke: var(--station-map-border);
-  stroke-width: 0.75;
+  stroke: #5675d6;
+  stroke-width: 0.5;
 }
 
-[data-theme="dark"] .station-map .usa-map {
-  filter: none;
+.forecast-map .fm-glows {
+  mix-blend-mode: screen;
 }
 
-.station-pins {
-  position: absolute;
-  inset: 0.5rem;
-  width: calc(100% - 1rem);
-  height: calc(100% - 1rem);
-  overflow: visible;
+.fm-glow stop {
+  stop-color: currentColor;
 }
 
-/* Amber pins: not blue or grey, and apart from the crimson hover. On the map's land they are
-   4.6:1 in the light theme and 4.4:1 in the dark. */
+.station-pin-caption tspan,
+.station-pin-ring {
+  fill: currentColor;
+}
+
+.station-pin-ring {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
 .station-pin {
-  fill: hsl(32, 100%, 30%);
+  fill: hsl(43, 100%, 62%);
   stroke: #fff;
   stroke-width: 2;
   vector-effect: non-scaling-stroke;
 }
 
-[data-theme="dark"] .station-pin {
-  fill: hsl(38, 95%, 58%);
-}
-
 .station-pins a:hover .station-pin,
 .station-pins a:focus .station-pin {
-  fill: hsl(348, 70%, 50%);
+  fill: hsl(348, 80%, 60%);
 }
 
+/* Sized by the map, which scales its type as it zooms (shared_map.rs). */
 .station-pin-label {
-  font-size: 20px;
+  font-family: var(--font-display);
   font-weight: 700;
-  fill: var(--bulma-text-strong);
+  letter-spacing: 0.02em;
+  fill: #fff;
   paint-order: stroke;
-  stroke: var(--bulma-scheme-main);
-  stroke-width: 3px;
+  stroke: #0a1638;
+  stroke-width: 4px;
 }
 
-@media screen and (max-width: 480px) {
+.station-pin-caption {
+  font-family: var(--font-pixel);
+  font-size: 1.3em;
+  fill: var(--dim);
+  paint-order: stroke;
+  stroke: #0a1638;
+  stroke-width: 4px;
+}
+
+@media screen and (max-width: 600px) {
   .station-pin-label {
-    font-size: 26px;
+    font-size: 1.4em;
+  }
+
+  .station-pin-caption {
+    font-size: 1.8em;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .station-pin-ring {
+    animation: pin-pulse 2.4s ease-out infinite;
+  }
+
+  @keyframes pin-pulse {
+    0% {
+      transform: scale(0.6);
+      opacity: 0.9;
+    }
+    100% {
+      transform: scale(2.2);
+      opacity: 0;
+    }
   }
 }
 
@@ -193,47 +488,96 @@
   }
 }
 
+/* A city's forecast panel, in the Weather Channel's blue. */
 .station-picks {
-  border: 1px solid var(--bulma-border);
-  border-radius: 0.5rem;
-  padding: 0.75rem 1rem 0.5rem;
-  margin-bottom: 1rem;
-  scroll-margin-top: 4rem;
+  margin: 0 0 1rem;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--wx-edge);
+  border-radius: 12px;
+  background: linear-gradient(180deg, var(--wx-a), var(--wx-b));
+  scroll-margin-top: 7rem;
 }
 
 .station-picks:target {
-  border-color: var(--bulma-link);
+  outline: 2px solid var(--gold);
+  outline-offset: 2px;
 }
 
-.station-picks legend {
-  padding: 0 0.35rem;
-  font-weight: 600;
-}
-
-.entry-form .pick-row,
-.entry-form .pick-heading {
+/* A legend floated across the panel lays out like any block. */
+.station-picks .station-head {
+  float: left;
+  width: 100%;
   display: flex;
   flex-wrap: wrap;
-  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.25rem 0.75rem;
+  padding: 0.65rem 1rem;
+}
+
+.station-city {
+  font-family: var(--font-display);
+  font-size: 1.5rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  color: var(--gold);
+}
+
+.station-source {
+  margin-left: auto;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: #c9d5f5;
+}
+
+.entry-form .station-source .station-code {
+  color: inherit;
+}
+
+.station-rows {
+  clear: both;
+  background: rgb(8 18 48 / 0.55);
+}
+
+.entry-form .pick-row {
+  display: grid;
+  grid-template-columns: 8.5rem minmax(0, 1fr);
   align-items: center;
   gap: 0.5rem 1rem;
-  padding: 0.4rem 0;
+  padding: 0.65rem 1rem;
 }
 
 .entry-form .pick-row + .pick-row {
-  border-top: 1px solid var(--bulma-border-weak);
+  border-top: 1px solid rgb(61 95 214 / 0.35);
 }
 
-.pick-forecast.is-missing {
-  color: var(--bulma-text-weak);
+.entry-form .pick-metric {
+  display: grid;
+}
+
+.entry-form .pick-label {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--dim);
+}
+
+.entry-form .pick-forecast {
+  font-size: 2rem;
+  line-height: 1;
+}
+
+.entry-form .pick-forecast.is-missing {
+  font-family: var(--font-body);
+  font-size: 0.85rem;
   font-style: italic;
 }
 
 .pick-options {
-  display: inline-flex;
-  border: 1px solid var(--bulma-border);
-  border-radius: 6px;
-  overflow: hidden;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.4rem;
 }
 
 .pick-option input {
@@ -242,65 +586,68 @@
   pointer-events: none;
 }
 
-/* 44 px tall: a pick is tapped more than anything else on the page. */
-.pick-option span {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 4.5rem;
-  min-height: 44px;
-  padding: 0.35rem 0.75rem;
+/* 44 px tall at least: a pick is tapped more than anything else on the page. */
+.pick-option .pick-choice {
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  min-height: 52px;
+  padding: 0.35rem 0.4rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--navy);
   text-align: center;
-  white-space: nowrap;
   cursor: pointer;
   user-select: none;
+  transition: background-color 0.12s ease, border-color 0.12s ease;
 }
 
-.pick-option + .pick-option span {
-  border-left: 1px solid var(--bulma-border);
+.pick-option .pick-word {
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
 }
 
-.pick-option input:focus-visible + span {
-  outline: 2px solid var(--bulma-link);
-  outline-offset: -2px;
-}
-
-.pick-option input:checked + span {
-  color: #fff;
+.pick-option .pick-value {
   font-weight: 600;
+  white-space: nowrap;
 }
 
-.pick-option input[value="over"]:checked + span {
-  background: hsl(271, 60%, 52%);
+.tenths {
+  font-size: 0.8em;
+  opacity: 0.8;
 }
 
-.pick-option input[value="par"]:checked + span {
-  background: hsl(171, 70%, 36%);
+.is-under .pick-word { color: var(--cold); }
+.is-par .pick-word { color: var(--gold); }
+.is-over .pick-word { color: var(--warm); }
+
+.pick-option:hover .pick-choice {
+  border-color: var(--dim);
 }
 
-.pick-option input[value="under"]:checked + span {
-  background: hsl(217, 71%, 50%);
+.pick-option input:focus-visible + .pick-choice {
+  outline: 2px solid var(--gold);
+  outline-offset: 2px;
 }
 
-.pick-option input:disabled + span {
+.pick-option input:checked + .pick-choice {
+  border-color: transparent;
+  color: var(--night);
+}
+
+.pick-option input:checked + .pick-choice .pick-word {
+  color: inherit;
+}
+
+.pick-option.is-under input:checked + .pick-choice { background: var(--cold); }
+.pick-option.is-par input:checked + .pick-choice { background: var(--gold); }
+.pick-option.is-over input:checked + .pick-choice { background: var(--warm); }
+
+.pick-option input:disabled + .pick-choice {
   cursor: not-allowed;
   opacity: 0.4;
-}
-
-.payout-line {
-  margin: 1rem 0;
-}
-
-
-
-.entry-submit .notification {
-  margin-top: 1rem;
-}
-
-/* How many picks are left, right above Pay. */
-.picks-left {
-  margin-bottom: 0.5rem;
-  font-size: 0.9rem;
 }
 
 /* The ticket invoice's QR code, drawn by the server. */
@@ -357,14 +704,29 @@
   opacity: 0;
 }
 
-/* Phones: three ranges side by side. */
-@media screen and (max-width: 480px) {
-  .pick-option span {
-    min-width: 0;
-    padding: 0.35rem 0.55rem;
-    font-size: 0.9rem;
+/* Phones: the forecast above its three picks. */
+@media screen and (max-width: 600px) {
+  .entry-form .pick-row {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 0.6rem 0.75rem;
+  }
+
+  .entry-form .pick-metric {
+    grid-template-columns: auto auto;
+    justify-content: start;
+    align-items: baseline;
+    gap: 0.5rem;
+  }
+
+  .entry-form .pick-forecast {
+    font-size: 1.6rem;
+  }
+
+  .pick-option .pick-value {
+    font-size: 0.85rem;
+  }
+
+  .station-source {
+    margin-left: 0;
   }
 }
-
-.city-heading { margin-bottom: 0.75rem; }
-.pick-heading { color: var(--entry-muted); font-size: 0.8rem; }

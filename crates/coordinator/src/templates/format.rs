@@ -115,14 +115,22 @@ pub trait MetricText {
     fn range(self, low: f64, high: f64) -> String;
     /// One end of a Par range, to the tenth: `67.4°F`.
     fn bound(self, value: f64) -> String;
+    /// A value as forecast panels show it, in pixel numerals: `77°`, `7 kt`.
+    fn short_value(self, value: f64) -> String;
+    /// The unit after a pick's bound: `°` or ` kt`.
+    fn short_unit(self) -> &'static str;
+    /// The class colouring a value: a temperature's band, none for wind.
+    fn tint(self, value: f64) -> Option<&'static str>;
+    /// A value's tooltip: wind in miles per hour too.
+    fn hint(self, value: f64) -> Option<String>;
 }
 
 impl MetricText for Metric {
     fn label(self) -> &'static str {
         match self {
-            Metric::TempHigh => "Highest temperature",
-            Metric::TempLow => "Lowest temperature",
-            Metric::WindSpeed => "Highest wind speed",
+            Metric::TempHigh => "High",
+            Metric::TempLow => "Low",
+            Metric::WindSpeed => "Peak wind",
         }
     }
 
@@ -147,6 +155,34 @@ impl MetricText for Metric {
             Metric::WindSpeed => format!("{value:.1} kt"),
         }
     }
+
+    fn short_value(self, value: f64) -> String {
+        match self {
+            Metric::TempHigh | Metric::TempLow => format!("{:.0}°", value.round()),
+            Metric::WindSpeed => format!("{:.0} kt", value.round()),
+        }
+    }
+
+    fn short_unit(self) -> &'static str {
+        match self {
+            Metric::TempHigh | Metric::TempLow => "°",
+            Metric::WindSpeed => " kt",
+        }
+    }
+
+    fn tint(self, value: f64) -> Option<&'static str> {
+        match self {
+            Metric::TempHigh | Metric::TempLow => Some(temperature_band(value)),
+            Metric::WindSpeed => None,
+        }
+    }
+
+    fn hint(self, value: f64) -> Option<String> {
+        match self {
+            Metric::TempHigh | Metric::TempLow => None,
+            Metric::WindSpeed => Some(mph(value)),
+        }
+    }
 }
 
 /// The chosen threshold or inclusive range, shared by the form and saved picks.
@@ -159,26 +195,117 @@ pub fn pick_target(
 ) -> String {
     let (Some(forecast), Some(rule)) = (forecast, rule) else {
         return match pick {
-            ValueOptions::Under => "< —",
+            ValueOptions::Under => "Under —",
             ValueOptions::Par => "—",
-            ValueOptions::Over => "> —",
+            ValueOptions::Over => "Over —",
         }
         .to_owned();
     };
     match (rule, pick) {
         (Rule::Line { lower, .. }, ValueOptions::Under) => {
-            format!("< {}", metric.bound(forecast + lower))
+            format!("Under {}", metric.bound(forecast + lower))
         }
         (Rule::Line { lower, upper }, ValueOptions::Par) => {
             metric.range(forecast + lower, forecast + upper)
         }
         (Rule::Line { upper, .. }, ValueOptions::Over) => {
-            format!("> {}", metric.bound(forecast + upper))
+            format!("Over {}", metric.bound(forecast + upper))
         }
-        (Rule::Fixed, ValueOptions::Under) => format!("< {}", metric.value(forecast)),
+        (Rule::Fixed, ValueOptions::Under) => format!("Under {}", metric.value(forecast)),
         (Rule::Fixed, ValueOptions::Par) => metric.value(forecast),
-        (Rule::Fixed, ValueOptions::Over) => format!("> {}", metric.value(forecast)),
+        (Rule::Fixed, ValueOptions::Over) => format!("Over {}", metric.value(forecast)),
     }
+}
+
+/// A pick's target for its button: the bound or range alone, its tenths smaller, the word
+/// beside it saying which side (`pick_word`). The full text is `pick_target`.
+pub fn pick_value(
+    metric: Metric,
+    forecast: Option<f64>,
+    rule: Option<Rule>,
+    pick: &ValueOptions,
+) -> Markup {
+    let (Some(forecast), Some(rule)) = (forecast, rule) else {
+        return html! { "—" };
+    };
+    let unit = metric.short_unit();
+    match (rule, pick) {
+        (Rule::Line { lower, .. }, ValueOptions::Under) => {
+            html! { (tenths(forecast + lower)) (unit) }
+        }
+        (Rule::Line { lower, upper }, ValueOptions::Par) => {
+            html! { (tenths(forecast + lower)) "–" (tenths(forecast + upper)) (unit) }
+        }
+        (Rule::Line { upper, .. }, ValueOptions::Over) => {
+            html! { (tenths(forecast + upper)) (unit) }
+        }
+        (Rule::Fixed, _) => html! { (format!("{:.0}", forecast.round())) (unit) },
+    }
+}
+
+/// Which side of the forecast a pick takes, as its button says it. Under fixed rules the
+/// middle pick is the forecast itself.
+pub fn pick_word(pick: &ValueOptions, rule: Option<Rule>) -> &'static str {
+    match (pick, rule) {
+        (ValueOptions::Under, _) => "Under",
+        (ValueOptions::Par, Some(Rule::Fixed)) => "Exactly",
+        (ValueOptions::Par, _) => "In range",
+        (ValueOptions::Over, _) => "Over",
+    }
+}
+
+/// `73.4` with its tenth set smaller, so the whole degrees read first.
+fn tenths(value: f64) -> Markup {
+    let text = format!("{value:.1}");
+    let (whole, tenth) = text.split_once('.').unwrap_or((&text, "0"));
+    html! { (whole) span class="tenths" { "." (tenth) } }
+}
+
+/// The colour band of a temperature in °F, as NWS maps band them; its class colours it
+/// (static/styles.css).
+pub fn temperature_band(fahrenheit: f64) -> &'static str {
+    match fahrenheit {
+        t if t < 10.0 => "temp-frigid",
+        t if t < 32.0 => "temp-freezing",
+        t if t < 50.0 => "temp-cool",
+        t if t < 70.0 => "temp-mild",
+        t if t < 85.0 => "temp-warm",
+        t if t < 100.0 => "temp-hot",
+        _ => "temp-scorching",
+    }
+}
+
+/// A wind pick's bound in miles per hour, for its button's tooltip: `≈ 9–11 mph`. Temperatures
+/// need none.
+pub fn pick_hint(
+    metric: Metric,
+    forecast: Option<f64>,
+    rule: Option<Rule>,
+    pick: &ValueOptions,
+) -> Option<String> {
+    let (Metric::WindSpeed, Some(forecast), Some(rule)) = (metric, forecast, rule) else {
+        return None;
+    };
+    let mph = |knots: f64| knots * 1.150_779;
+    Some(match (rule, pick) {
+        (Rule::Line { lower, .. }, ValueOptions::Under) => {
+            format!("Under ≈ {:.0} mph", mph(forecast + lower))
+        }
+        (Rule::Line { lower, upper }, ValueOptions::Par) => format!(
+            "≈ {:.0}–{:.0} mph",
+            mph(forecast + lower),
+            mph(forecast + upper)
+        ),
+        (Rule::Line { upper, .. }, ValueOptions::Over) => {
+            format!("Over ≈ {:.0} mph", mph(forecast + upper))
+        }
+        (Rule::Fixed, _) => format!("≈ {:.0} mph", mph(forecast)),
+    })
+}
+
+/// Knots in miles per hour, for a wind value's tooltip: `≈ 17 mph`.
+pub fn mph(knots: f64) -> String {
+    format!("≈ {:.0} mph", knots * 1.150_779)
 }
 
 /// How long ago something happened, in words, with the exact UTC time on
