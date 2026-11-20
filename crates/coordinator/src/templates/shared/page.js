@@ -54,7 +54,18 @@ function untilText(seconds) {
   return `${days} days`;
 }
 
-// Countdowns marked data-countdown (a unix time) stay current while the page is open. One that
+// "04:59:12", or "1d 04:59:12", as `format::clock` writes it.
+function clockText(seconds) {
+  const left = Math.max(0, Math.floor(seconds));
+  const days = Math.floor(left / 86_400);
+  const rest = left % 86_400;
+  const pad = (value) => String(value).padStart(2, "0");
+  const time = `${pad(Math.floor(rest / 3600))}:${pad(Math.floor(rest / 60) % 60)}:${pad(rest % 60)}`;
+  return days > 0 ? `${days}d ${time}` : time;
+}
+
+// Countdowns marked data-countdown (a unix time) stay current while the page is open, to the
+// second where marked data-clock. One that
 // runs out says so once, with `fw:countdown-ended` from the body: the lobby reloads, and the
 // entry form stops taking picks.
 function tickCountdowns() {
@@ -62,10 +73,10 @@ function tickCountdowns() {
   for (const element of document.querySelectorAll("[data-countdown]")) {
     const left = Number(element.dataset.countdown) - now;
     if (left > 0) {
-      element.textContent = untilText(left);
+      element.textContent = element.hasAttribute("data-clock") ? clockText(left) : untilText(left);
     } else if (!element.dataset.ended) {
       element.dataset.ended = "true";
-      element.textContent = "now";
+      element.textContent = element.hasAttribute("data-clock") ? clockText(0) : "now";
       document.body.dispatchEvent(new CustomEvent("fw:countdown-ended", { detail: { element } }));
     }
   }
@@ -87,7 +98,7 @@ function markCurrentNav(path = location.pathname) {
 function setupPage() {
   localizeTimes(document);
   markCurrentNav();
-  setInterval(tickCountdowns, 10_000);
+  setInterval(tickCountdowns, 1_000);
   // A navigation changes the address after its click, and Back without one.
   document.addEventListener("click", (event) => {
     const link = event.target.closest?.("a[hx-push-url][href]");

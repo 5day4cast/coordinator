@@ -39,6 +39,19 @@ pub fn duration(duration: time::Duration) -> String {
     }
 }
 
+/// A countdown to the second, as the WeatherStar showed the time: `04:59:12`, or `1d 04:59:12`
+/// a day or more out. `shared/page.js` keeps it running (`clockText`).
+pub fn clock(duration: time::Duration) -> String {
+    let seconds = duration.whole_seconds().max(0);
+    let (days, rest) = (seconds / 86_400, seconds % 86_400);
+    let time = format!("{:02}:{:02}:{:02}", rest / 3600, rest / 60 % 60, rest % 60);
+    if days > 0 {
+        format!("{days}d {time}")
+    } else {
+        time
+    }
+}
+
 /// The observation duration, without implying when the final result will arrive.
 pub fn competition_duration(start: OffsetDateTime, end: OffsetDateTime) -> String {
     let length = end - start;
@@ -441,6 +454,17 @@ pub fn ordinal(place: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_clock_counts_down_to_the_second() {
+        use time::Duration;
+        assert_eq!(
+            clock(Duration::seconds(4 * 3600 + 59 * 60 + 12)),
+            "04:59:12"
+        );
+        assert_eq!(clock(Duration::seconds(86_400 + 61)), "1d 00:01:01");
+        assert_eq!(clock(Duration::seconds(-5)), "00:00:00");
+    }
     use time::macros::datetime;
 
     #[test]

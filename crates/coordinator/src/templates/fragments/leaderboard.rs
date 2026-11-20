@@ -10,7 +10,8 @@
 use maud::{html, Markup};
 use time::OffsetDateTime;
 
-use crate::domain::leaderboard::{Metric, Phase, PickState};
+use crate::domain::leaderboard::{Metric, Phase, PickState, Rule};
+use crate::infra::oracle::ValueOptions;
 use crate::templates::{
     components::{tip, tip_start},
     format::{self, ordinal, sats, MetricText, TimeStyle},
@@ -86,6 +87,21 @@ impl PickMark {
     }
 }
 
+/// How the entries split on one row of picks, once picks are public.
+#[derive(Debug, Clone)]
+pub struct Ownership {
+    pub station_id: String,
+    /// `Afton, WY`, when the oracle knows the station.
+    pub city: Option<String>,
+    pub metric: Metric,
+    pub forecast: Option<f64>,
+    pub rule: Option<Rule>,
+    /// Entries on Under, In range and Over.
+    pub counts: [usize; 3],
+    /// The side that is right so far, when the readings say.
+    pub right: Option<usize>,
+}
+
 /// A station's readings over the window so far: the running high, low and peak wind.
 #[derive(Debug, Clone, Default)]
 pub struct StationReadings {
@@ -119,6 +135,9 @@ pub struct LeaderboardView {
     pub readings: Vec<StationReadings>,
     /// The stations on the map.
     pub pins: Vec<StationPin>,
+    /// How the entries split on each row, in the competition's order; none before the window
+    /// opens, while picks are private.
+    pub ownership: Vec<Ownership>,
 }
 
 /// Whether a competition in `phase` ran, so its entries have scores. One that didn't fill, or
@@ -416,6 +435,7 @@ pub fn leaderboard_scores(
                 }
             }
             (conditions(board))
+            @if !board.ownership.is_empty() { (ownership(&board.ownership)) }
             (scores_table(
                 leaderboard_rows(
                     &board.rows,
@@ -528,6 +548,47 @@ fn conditions(board: &LeaderboardView) -> Markup {
                     }
                 }
             }
+            }
+        }
+    }
+}
+
+/// What share of the entries took each side on each row, the side right so far marked.
+fn ownership(rows: &[Ownership]) -> Markup {
+    let sides = [
+        (ValueOptions::Under, "is-under"),
+        (ValueOptions::Par, "is-par"),
+        (ValueOptions::Over, "is-over"),
+    ];
+    html! {
+        section class="ownership" {
+            h2 class="ownership-title" { "Pick ownership" }
+            p class="ownership-note" { "How the entries split on each row. ✓ marks the side that's right so far." }
+            div class="ownership-grid" {
+                @for row in rows {
+                    @let total = row.counts.iter().sum::<usize>().max(1);
+                    div class="ownership-row" {
+                        p class="ownership-what" {
+                            (row.city.as_deref().unwrap_or(&row.station_id)) " "
+                            span class=(row.metric.color()) { (row.metric.label()) }
+                            @if let Some(forecast) = row.forecast {
+                                span class="ownership-forecast" { " · forecast " (row.metric.short_value(forecast)) }
+                            }
+                        }
+                        @for (side, (pick, class)) in sides.iter().enumerate() {
+                            @let share = (row.counts[side] * 100 + total / 2) / total;
+                            @let right = row.right == Some(side);
+                            div class=(if right { format!("ownership-side {class} is-right") } else { format!("ownership-side {class}") }) {
+                                span class="ownership-word" {
+                                    (format::pick_word(pick, row.rule))
+                                    @if right { " ✓" }
+                                }
+                                meter min="0" max="100" value=(share) {}
+                                span class="ownership-share" { (share) "%" }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -983,6 +1044,30 @@ mod tests {
             .contains("money-line"));
     }
 
+    /// Once picks are public, each row's split shows as shares, the side right so far marked.
+    #[test]
+    fn pick_ownership_shows_each_sides_share_and_the_side_right_so_far() {
+        let html = ownership(&[Ownership {
+            station_id: "KORD".into(),
+            city: Some("Chicago, IL".into()),
+            metric: Metric::TempHigh,
+            forecast: Some(77.0),
+            rule: Some(Rule::Line {
+                lower: -1.0,
+                upper: 1.0,
+            }),
+            counts: [1, 2, 0],
+            right: Some(1),
+        }])
+        .into_string();
+        assert!(html.contains("Chicago, IL"));
+        assert!(html.contains(r#"<span class="ownership-share">33%</span>"#));
+        assert!(html.contains(r#"<span class="ownership-share">67%</span>"#));
+        assert!(html.contains(r#"<span class="ownership-share">0%</span>"#));
+        assert_eq!(html.matches("is-right").count(), 1);
+        assert!(html.contains("In range ✓"));
+    }
+
     #[test]
     fn rows_open_the_picks_without_script_filters() {
         let html = leaderboard_rows(&[row("e1", "bob", 0, 1)], true, 0, 0).into_string();
@@ -1011,6 +1096,7 @@ mod tests {
             unverified: false,
             readings: vec![],
             pins: vec![],
+            ownership: vec![],
         };
         let live = leaderboard_scores(&competition, &board, NOW).into_string();
         assert!(live.contains("Updated <time"));
@@ -1058,6 +1144,7 @@ mod tests {
             unverified: false,
             readings: vec![],
             pins: vec![],
+            ownership: vec![],
         };
         let html = leaderboard_scores(&competition, &tied, NOW).into_string();
         assert_eq!(html.matches("paid-badge").count(), 1);
@@ -1085,6 +1172,7 @@ mod tests {
             unverified: false,
             readings: vec![],
             pins: vec![],
+            ownership: vec![],
         };
         let html = leaderboard_scores(&competition, &board, NOW).into_string();
         assert_eq!(
@@ -1111,6 +1199,7 @@ mod tests {
             unverified: false,
             readings: vec![],
             pins: vec![],
+            ownership: vec![],
         };
         assert!(!leaderboard_scores(&competition, &board, NOW)
             .into_string()
@@ -1167,6 +1256,7 @@ mod tests {
             unverified: false,
             readings: vec![],
             pins: vec![],
+            ownership: vec![],
         };
         let scores = leaderboard_scores(&competition, &board, NOW).into_string();
         assert!(!scores.contains("30 pts"), "{scores}");
@@ -1308,6 +1398,7 @@ mod tests {
             unverified: false,
             readings: vec![],
             pins: vec![],
+            ownership: vec![],
         };
         let html = leaderboard_scores(&competition, &board, NOW).into_string();
         assert!(html.contains("No-score outcome."));
@@ -1377,6 +1468,7 @@ mod tests {
             unverified: false,
             readings: vec![],
             pins: vec![],
+            ownership: vec![],
         };
         assert!(leaderboard_scores(&competition, &board, NOW)
             .into_string()
@@ -1418,6 +1510,7 @@ mod tests {
             unverified: false,
             readings: vec![],
             pins: vec![],
+            ownership: vec![],
         };
         let scores = leaderboard_scores(&competition, &board, NOW).into_string();
         assert!(scores.contains("never signed a result in time"));
@@ -1429,6 +1522,7 @@ mod tests {
             unverified: true,
             readings: vec![],
             pins: vec![],
+            ownership: vec![],
             ..board
         };
         let scores = leaderboard_scores(&competition, &unverified, NOW).into_string();

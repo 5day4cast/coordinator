@@ -158,8 +158,8 @@ pub fn entry_form(
                     div class="fact-lock" {
                         dt { "Locks in" (tip_start("Picks lock when the observation window starts, and the readings count from then on.")) }
                         dd {
-                            span class="pixel lock-clock" data-countdown=(competition.start.unix_timestamp()) {
-                                (format::duration(competition.start - time::OffsetDateTime::now_utc()))
+                            span class="pixel lock-clock" data-countdown=(competition.start.unix_timestamp()) data-clock {
+                                (format::clock(competition.start - time::OffsetDateTime::now_utc()))
                             }
                         }
                     }

@@ -17,8 +17,8 @@ use coordinator::{
                 entry_form, Forecasts, NetworkFee, PaidNotice, PayoutDestination, StationForecast,
             },
             leaderboard::{
-                leaderboard, leaderboard_scores, LeaderboardRow, LeaderboardView, PickMark,
-                StationReadings,
+                leaderboard, leaderboard_scores, LeaderboardRow, LeaderboardView, Ownership,
+                PickMark, StationReadings,
             },
             picks::{picks_detail, PickView},
         },
@@ -163,6 +163,26 @@ fn main() -> Result<(), Box<dyn Error>> {
             },
         ],
         pins: pins_for_board,
+        ownership: vec![
+            Ownership {
+                station_id: "KORD".into(),
+                city: Some("Chicago, IL".into()),
+                metric: Metric::TempHigh,
+                forecast: Some(77.0),
+                rule: Some(line(-3.6, -1.0)),
+                counts: [1, 2, 1],
+                right: Some(1),
+            },
+            Ownership {
+                station_id: "KJFK".into(),
+                city: Some("New York, NY".into()),
+                metric: Metric::WindSpeed,
+                forecast: Some(8.0),
+                rule: Some(line(0.5, 2.5)),
+                counts: [3, 0, 1],
+                right: None,
+            },
+        ],
     };
     // Rows arrive after the page loads; here they are put where they land, the last one
     // marked as the viewer's own as page.js would.

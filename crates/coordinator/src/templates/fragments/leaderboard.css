@@ -170,6 +170,114 @@
   color: #c9d5f5;
 }
 
+/* How the entries split on each row, once picks are public. */
+.ownership {
+  margin-bottom: 1.25rem;
+}
+
+html.site .ownership-title {
+  margin: 0 0 0.2rem;
+  font-size: 1.3rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.ownership-note {
+  margin-bottom: 0.6rem;
+  font-size: 0.8rem;
+  color: var(--dim);
+}
+
+.ownership-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 19rem), 1fr));
+  gap: 0.6rem;
+}
+
+.ownership-row {
+  display: grid;
+  gap: 0.3rem;
+  padding: 0.7rem 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--navy);
+}
+
+.ownership-what {
+  font-weight: 600;
+}
+
+.ownership-forecast {
+  font-weight: 400;
+  color: var(--dim);
+}
+
+.ownership-side {
+  display: grid;
+  grid-template-columns: 5.5rem minmax(0, 1fr) 2.75rem;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.8rem;
+}
+
+.ownership-word {
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.ownership-side.is-under .ownership-word { color: var(--cold); }
+.ownership-side.is-par .ownership-word { color: var(--gold); }
+.ownership-side.is-over .ownership-word { color: var(--warm); }
+
+.ownership-share {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.ownership-side meter {
+  width: 100%;
+  height: 0.5rem;
+  border: 0;
+  border-radius: 999px;
+  background: var(--raise);
+  appearance: none;
+}
+
+.ownership-side meter::-webkit-meter-bar {
+  border: 0;
+  border-radius: 999px;
+  background: var(--raise);
+}
+
+.ownership-side meter::-webkit-meter-optimum-value,
+.ownership-side meter::-webkit-meter-suboptimum-value,
+.ownership-side meter::-webkit-meter-even-less-good-value {
+  border-radius: 999px;
+  background: var(--dim);
+}
+
+.ownership-side meter::-moz-meter-bar {
+  border-radius: 999px;
+  background: var(--dim);
+}
+
+/* The side right so far fills green. */
+.ownership-side.is-right meter::-webkit-meter-optimum-value,
+.ownership-side.is-right meter::-webkit-meter-suboptimum-value,
+.ownership-side.is-right meter::-webkit-meter-even-less-good-value {
+  background: var(--win);
+}
+
+.ownership-side.is-right meter::-moz-meter-bar {
+  background: var(--win);
+}
+
+.ownership-side.is-right .ownership-share {
+  color: var(--win);
+  font-weight: 700;
+}
+
 /* Scores. */
 .leaderboard-table td {
   vertical-align: middle;
@@ -215,11 +323,32 @@ html.site .leaderboard-table td {
 
 .pick-squares i,
 .pick-legend i {
-  display: inline-block;
+  display: inline-grid;
+  place-items: center;
   width: 14px;
   height: 14px;
   border-radius: 3px;
   background: var(--open);
+  color: var(--night);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 800;
+  line-height: 1;
+}
+
+/* A mark in each square, so right and wrong read without telling green from red. */
+.pick-squares .is-right::after,
+.pick-legend .is-right::after,
+.pick-squares .is-leaning-right::after,
+.pick-legend .is-leaning-right::after {
+  content: "✓";
+}
+
+.pick-squares .is-wrong::after,
+.pick-legend .is-wrong::after,
+.pick-squares .is-leaning-wrong::after,
+.pick-legend .is-leaning-wrong::after {
+  content: "✕";
 }
 
 .pick-squares .is-right,

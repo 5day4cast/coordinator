@@ -33,7 +33,7 @@ use crate::{
         },
         Competition, Error, LedgerTotals, RefundProgress, Returned, UnenteredTickets, UnpaidTicket,
     },
-    infra::refresh_cache::Cached,
+    infra::{oracle::ValueOptions, refresh_cache::Cached},
     startup::AppState,
     templates::{
         components::RecoveryHelp,
@@ -47,7 +47,7 @@ use crate::{
             },
             leaderboard::{
                 leaderboard, leaderboard_scores, queue_pools, rows_url, LeaderboardRow,
-                LeaderboardView, PickMark, StationReadings,
+                LeaderboardView, Ownership, PickMark, StationReadings,
             },
             loading::{placeholder, Pending, MAX_ASKS},
             picks::{detail_url, own_picks_detail, picks_detail, withheld_picks_detail, PickView},
@@ -1135,6 +1135,7 @@ fn leaderboard_view(
             })
             .collect(),
         pins: station_pins(locations, stations),
+        ownership: ownership(board, stations),
         rows: board
             .rows
             .iter()
@@ -1186,6 +1187,42 @@ fn leaderboard_view(
             .any(|row| row.picks.iter().any(|pick| pick.observed.is_some())),
         unverified: board.settlement_blocked,
     }
+}
+
+/// How the entries split on each row of picks, in the order the picks come. A side is right so
+/// far when any entry on it is.
+fn ownership(board: &Leaderboard, stations: &StationsById) -> Vec<Ownership> {
+    let mut rows: Vec<Ownership> = Vec::new();
+    for pick in board.rows.iter().flat_map(|row| &row.picks) {
+        let side = match pick.pick {
+            ValueOptions::Under => 0,
+            ValueOptions::Par => 1,
+            ValueOptions::Over => 2,
+        };
+        let index = rows
+            .iter()
+            .position(|row| row.station_id == pick.station_id && row.metric == pick.metric)
+            .unwrap_or_else(|| {
+                rows.push(Ownership {
+                    station_id: pick.station_id.clone(),
+                    city: station_name(stations, &pick.station_id).map(|name| city_name(&name)),
+                    metric: pick.metric,
+                    forecast: pick.forecast,
+                    rule: pick.rule,
+                    counts: [0; 3],
+                    right: None,
+                });
+                rows.len() - 1
+            });
+        rows[index].counts[side] += 1;
+        if matches!(
+            PickMark::of(pick.state, pick.points),
+            PickMark::Right | PickMark::LeaningRight
+        ) {
+            rows[index].right = Some(side);
+        }
+    }
+    rows
 }
 
 /// Public, like the leaderboard; ownership is highlighted locally without a signature.
