@@ -142,6 +142,16 @@ pub fn points(
     }
 }
 
+/// The most a pick can score: what it scores when right. A lines event's band may not be
+/// known yet; any right pick on one scores the same.
+pub fn best_points(pick: &ValueOptions, rule: Option<Rule>) -> u64 {
+    match (rule, pick) {
+        (Some(Rule::Fixed), ValueOptions::Par) => PAR_POINTS,
+        (Some(Rule::Fixed), _) => OVER_OR_UNDER_POINTS,
+        _ => LINE_POINTS,
+    }
+}
+
 /// Where a pick stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PickState {
@@ -243,6 +253,28 @@ mod tests {
     use ValueOptions::{Over, Par, Under};
 
     /// The oracle's own cases (noaa-oracle `scoring.rs`), for the rules the coordinator's metrics use.
+    #[test]
+    fn best_points_are_what_a_right_pick_scores() {
+        let line = Some(Rule::Line {
+            lower: -1.0,
+            upper: 1.0,
+        });
+        for (rule, pick, observed) in [
+            (line, ValueOptions::Under, 60.0),
+            (line, ValueOptions::Par, 70.0),
+            (line, ValueOptions::Over, 80.0),
+            (Some(Rule::Fixed), ValueOptions::Under, 60.0),
+            (Some(Rule::Fixed), ValueOptions::Par, 70.0),
+            (Some(Rule::Fixed), ValueOptions::Over, 80.0),
+        ] {
+            assert_eq!(
+                best_points(&pick, rule),
+                points(&pick, Metric::TempHigh, rule, Some(70.0), Some(observed)),
+                "{rule:?} {pick:?}"
+            );
+        }
+    }
+
     #[test]
     fn points_match_the_oracle() {
         assert_eq!(

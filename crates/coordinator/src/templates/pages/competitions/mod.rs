@@ -467,11 +467,15 @@ impl CompetitionView {
         self.refunds.paid() == 0 && self.total_entries == 0
     }
 
+    /// Its entry form while it takes entries, otherwise its leaderboard. A queue that became
+    /// one pool goes straight to that pool's, which has the scores.
     pub fn url(&self) -> String {
         if self.can_enter {
-            format!("/competitions/{}/entry-form", self.id)
-        } else {
-            format!("/competitions/{}/leaderboard", self.id)
+            return format!("/competitions/{}/entry-form", self.id);
+        }
+        match self.queue.queued().map(|queue| queue.pools.as_slice()) {
+            Some([pool]) => pool.url(),
+            _ => format!("/competitions/{}/leaderboard", self.id),
         }
     }
 }

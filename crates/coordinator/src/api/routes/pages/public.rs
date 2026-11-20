@@ -23,12 +23,14 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::oracle_view::{
-    station_forecasts, station_name, station_pins, stations_by_id, stations_named,
+    station_forecasts, station_name, station_pins, stations_by_id, stations_named, StationsById,
 };
 use crate::{
     api::extractors::NostrAuth,
     domain::{
-        leaderboard::{Leaderboard, Phase, FIRST_READ_WAIT},
+        leaderboard::{
+            progress::best_points, Leaderboard, Metric, Phase, PickState, FIRST_READ_WAIT,
+        },
         Competition, Error, LedgerTotals, RefundProgress, Returned, UnenteredTickets, UnpaidTicket,
     },
     infra::refresh_cache::Cached,
@@ -45,7 +47,7 @@ use crate::{
             },
             leaderboard::{
                 leaderboard, leaderboard_scores, queue_pools, rows_url, LeaderboardRow,
-                LeaderboardView,
+                LeaderboardView, PickMark, StationReadings,
             },
             loading::{placeholder, Pending, MAX_ASKS},
             picks::{detail_url, own_picks_detail, picks_detail, withheld_picks_detail, PickView},
@@ -1088,17 +1090,44 @@ pub async fn leaderboard_rows_fragment(
         );
     }
     let now = now();
-    let view = competition_view(&state, &competition, now).await;
-    fragment(
-        leaderboard_scores(&view, &leaderboard_view(&board), now),
-        Caching::Public,
-    )
+    let (view, stations) = tokio::join!(
+        competition_view(&state, &competition, now),
+        state.leaderboards.stations(FIRST_READ_WAIT),
+    );
+    let stations = stations_by_id(stations.value().map(Vec::as_slice).unwrap_or_default());
+    let board = leaderboard_view(&board, &competition.event_submission.locations, &stations);
+    fragment(leaderboard_scores(&view, &board, now), Caching::Public)
 }
 
 /// The domain's leaderboard as the page shows it: shared ranks, player names,
 /// and a tag the browser matches to mark the viewer's own rows.
-fn leaderboard_view(board: &Leaderboard) -> LeaderboardView {
+fn leaderboard_view(
+    board: &Leaderboard,
+    locations: &[String],
+    stations: &StationsById,
+) -> LeaderboardView {
+    let live = board.phase == Phase::Live;
+    // Every entry's picks at a station see the same observations: the first found will do.
+    let reading = |station_id: &str, metric: Metric| {
+        board
+            .rows
+            .iter()
+            .flat_map(|row| &row.picks)
+            .find(|pick| pick.station_id == station_id && pick.metric == metric)
+            .and_then(|pick| pick.observed)
+    };
     LeaderboardView {
+        readings: locations
+            .iter()
+            .map(|station_id| StationReadings {
+                station_id: station_id.clone(),
+                city: station_name(stations, station_id).map(|name| city_name(&name)),
+                high: reading(station_id, Metric::TempHigh),
+                low: reading(station_id, Metric::TempLow),
+                wind: reading(station_id, Metric::WindSpeed),
+            })
+            .collect(),
+        pins: station_pins(locations, stations),
         rows: board
             .rows
             .iter()
@@ -1121,6 +1150,24 @@ fn leaderboard_view(board: &Leaderboard) -> LeaderboardView {
                     },
                     owner: npub.as_deref().map(owner_tag).unwrap_or_default(),
                     score: i32::try_from(row.standing.score).unwrap_or(i32::MAX),
+                    picks: row
+                        .picks
+                        .iter()
+                        .map(|pick| PickMark::of(pick.state, pick.points))
+                        .collect(),
+                    // Settled picks count what they scored; the rest what a right pick scores.
+                    max: (live && !row.picks.is_empty()).then(|| {
+                        let max: u64 = row
+                            .picks
+                            .iter()
+                            .map(|pick| match pick.state {
+                                PickState::LockedIn | PickState::Final => pick.points,
+                                PickState::Out => 0,
+                                _ => best_points(&pick.pick, pick.rule),
+                            })
+                            .sum();
+                        i32::try_from(max).unwrap_or(i32::MAX)
+                    }),
                 }
             })
             .collect(),

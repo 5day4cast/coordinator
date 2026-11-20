@@ -16,7 +16,10 @@ use coordinator::{
             entry_form::{
                 entry_form, Forecasts, NetworkFee, PaidNotice, PayoutDestination, StationForecast,
             },
-            leaderboard::{leaderboard, leaderboard_scores, LeaderboardRow, LeaderboardView},
+            leaderboard::{
+                leaderboard, leaderboard_scores, LeaderboardRow, LeaderboardView, PickMark,
+                StationReadings,
+            },
             picks::{picks_detail, PickView},
         },
         layouts::base::{base, PageConfig},
@@ -49,7 +52,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         held: None,
         pools: vec![],
     });
-    let live = competition("live", Phase::Live, now - Duration::hours(2), 6);
+    let mut live = competition("live", Phase::Live, now - Duration::hours(2), 6);
+    live.paid_places = 2;
     let finished = competition("done", Phase::Scored, now - Duration::days(2), 6);
 
     let stations = vec![
@@ -86,6 +90,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .into(),
         weather: Some((stations.clone(), pins.clone())),
     };
+    let pins_for_board = pins.clone();
     let forecasts = Forecasts::Ready { stations, pins };
     let payout = PayoutDestination::Address("player@lightning.example".into());
     let entry = entry_form(
@@ -116,19 +121,48 @@ fn main() -> Result<(), Box<dyn Error>> {
     .into_iter()
     .enumerate()
     .map(|(index, player)| LeaderboardRow {
-        rank: 1,
+        rank: [1, 2, 2, 4][index],
         entry_id: format!("01a0d0f5-0000-7000-8000-00000000000{index}"),
         player: player.into(),
         owner: format!("owner-{index}"),
-        score: 0,
+        // Ties at 2nd, across the line the prizes pay to.
+        score: [40, 30, 30, 10][index],
+        picks: ["RRRROW", "RRRWLO", "RRRWWO", "RWWLKO"][index]
+            .chars()
+            .map(|mark| match mark {
+                'R' => PickMark::Right,
+                'W' => PickMark::Wrong,
+                'L' => PickMark::LeaningRight,
+                'K' => PickMark::LeaningWrong,
+                _ => PickMark::Open,
+            })
+            .collect(),
+        max: Some([50, 50, 40, 30][index]),
     })
     .collect();
     let board = LeaderboardView {
         rows,
         phase: Phase::Live,
         updated_at: Some(now - Duration::minutes(2)),
-        any_readings: false,
+        any_readings: true,
         unverified: false,
+        readings: vec![
+            StationReadings {
+                station_id: "KORD".into(),
+                city: Some("Chicago, IL".into()),
+                high: Some(74.0),
+                low: Some(57.0),
+                wind: Some(9.0),
+            },
+            StationReadings {
+                station_id: "KJFK".into(),
+                city: Some("New York, NY".into()),
+                high: Some(71.0),
+                low: Some(60.0),
+                wind: Some(12.0),
+            },
+        ],
+        pins: pins_for_board,
     };
     // Rows arrive after the page loads; here they are put where they land, the last one
     // marked as the viewer's own as page.js would.

@@ -1,4 +1,16 @@
-/* Leaderboard page. */
+/* Leaderboard page: the contest, the readings so far over the map, and every entry's score
+   with a square for each pick. */
+
+.leaderboard-kicker {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--dim);
+  font-size: 0.85rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
 
 .leaderboard-heading {
   display: flex;
@@ -6,38 +18,53 @@
   gap: 0.75rem;
 }
 
-.leaderboard-heading .title {
-  margin-bottom: 0;
+.leaderboard .leaderboard-title {
+  margin: 0.25rem 0 0;
+  font-size: clamp(2rem, 5vw, 2.75rem);
+  line-height: 1;
 }
 
 .leaderboard-window {
-  margin: 0.25rem 0 1rem;
+  margin: 0.4rem 0 1rem;
   color: var(--dim);
+}
+
+.leaderboard-clock {
+  color: var(--gold);
+  font-size: 1.35rem;
 }
 
 .leaderboard-facts {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.75rem 2rem;
+  gap: 0.75rem 2.25rem;
   margin-bottom: 1.25rem;
 }
 
 .leaderboard-facts dt {
-  font-size: 0.75rem;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
   color: var(--dim);
 }
 
 .leaderboard-facts dd {
-  font-weight: 600;
+  font-family: var(--font-display);
+  font-size: 1.5rem;
+  font-weight: 700;
+  line-height: 1.15;
 }
 
 .prize + .prize::before {
   content: " · ";
   font-weight: 400;
+  color: var(--dim);
 }
 
 .fact-note {
   display: block;
+  font-family: var(--font-body);
   font-size: 0.75rem;
   font-weight: 400;
   color: var(--dim);
@@ -69,8 +96,248 @@
   max-width: 100%;
 }
 
+/* The readings so far, in the Weather Channel's blue, over the map. */
+.conditions {
+  margin-bottom: 1.25rem;
+  overflow: hidden;
+  border: 1px solid var(--wx-edge);
+  border-radius: 12px;
+  background: linear-gradient(180deg, var(--wx-a), var(--wx-b));
+}
+
+.wx-note {
+  font-family: var(--font-body);
+  font-size: 0.7rem;
+  letter-spacing: 0.08em;
+  color: #c9d5f5;
+}
+
+.conditions .station-map {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+}
+
+/* The map beside the readings on a wide screen, above them on a narrow one. */
+.conditions-body {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(14rem, 1fr);
+}
+
+.conditions-grid {
+  display: grid;
+  align-content: start;
+}
+
+.condition {
+  display: grid;
+  gap: 0.1rem;
+  padding: 0.75rem 1rem;
+  border-left: 1px solid rgb(61 95 214 / 0.5);
+}
+
+.condition + .condition {
+  border-top: 1px solid rgb(61 95 214 / 0.5);
+}
+
+@media screen and (max-width: 900px) {
+  .conditions-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .condition {
+    border-left: 0;
+    border-top: 1px solid rgb(61 95 214 / 0.5);
+  }
+}
+
+.condition-city {
+  font-family: var(--font-display);
+  font-size: 1.15rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  color: var(--gold);
+}
+
+.condition-values {
+  font-size: 1.45rem;
+  line-height: 1.1;
+}
+
+.condition-values em {
+  font-style: normal;
+  font-size: 0.8em;
+  color: #c9d5f5;
+}
+
+/* Scores. */
 .leaderboard-table td {
   vertical-align: middle;
+}
+
+html.site .leaderboard-table {
+  background: transparent;
+  color: var(--ink);
+}
+
+html.site .leaderboard-table th {
+  color: var(--dim);
+  font-size: 0.7rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  border-bottom-color: var(--line);
+}
+
+html.site .leaderboard-table td {
+  border-color: rgb(42 68 130 / 0.6);
+}
+
+.rank-cell,
+.points-cell {
+  font-family: var(--font-display);
+  font-size: 1.25rem;
+  font-weight: 700;
+}
+
+.max-column {
+  color: var(--dim);
+}
+
+/* A square for each pick: green right, red wrong, striped while it can still change, slate
+   while nothing is observed. */
+.pick-squares {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  max-width: 13rem;
+  vertical-align: middle;
+}
+
+.pick-squares i,
+.pick-legend i {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  background: var(--open);
+}
+
+.pick-squares .is-right,
+.pick-legend .is-right {
+  background: var(--win);
+}
+
+.pick-squares .is-wrong,
+.pick-legend .is-wrong {
+  background: var(--out);
+}
+
+.pick-squares .is-leaning-right,
+.pick-legend .is-leaning-right {
+  background: repeating-linear-gradient(-45deg, var(--win) 0 3px, rgb(53 212 154 / 0.45) 3px 6px);
+}
+
+.pick-squares .is-leaning-wrong,
+.pick-legend .is-leaning-wrong {
+  background: repeating-linear-gradient(-45deg, var(--out) 0 3px, rgb(255 94 116 / 0.45) 3px 6px);
+}
+
+.pick-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1.25rem;
+  margin: 0.5rem 0 1rem;
+  font-size: 0.8rem;
+  color: var(--dim);
+}
+
+.pick-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+/* The rows the prizes would pay now, and the line under them. */
+html.site .leaderboard-table tr.is-in-the-money td {
+  background: rgb(255 201 60 / 0.06);
+}
+
+html.site .leaderboard-table tr.is-own td {
+  background: rgb(255 201 60 / 0.16);
+}
+
+.money-line td {
+  padding: 0 !important;
+  border: 0 !important;
+}
+
+.money-line span {
+  display: block;
+  padding: 0.3rem 0.75rem;
+  border-top: 2px dashed var(--gold);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--gold);
+}
+
+.money-badge {
+  margin-left: 0.5rem;
+  padding: 0 0.4rem;
+  border: 1px solid var(--gold);
+  border-radius: 4px;
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--gold);
+}
+
+/* The places the final result pays. */
+.final-note {
+  color: var(--win);
+  font-weight: 600;
+}
+
+.podium {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 1.25rem;
+}
+
+.podium-place {
+  display: grid;
+  gap: 0.1rem;
+  padding: 0.85rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--navy);
+}
+
+.podium-place:first-child {
+  border-color: var(--gold);
+}
+
+.podium-rank {
+  font-family: var(--font-display);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--gold);
+}
+
+.podium-amount {
+  font-family: var(--font-display);
+  font-size: 1.9rem;
+  font-weight: 700;
+  line-height: 1.05;
+}
+
+.podium-player {
+  font-size: 0.85rem;
+  color: var(--dim);
 }
 
 /* Shown until the rows arrive. */
@@ -106,13 +373,49 @@
 .paid-badge {
   padding: 0 0.4rem;
   border-radius: 999px;
+  font-family: var(--font-body);
   font-size: 0.7rem;
   font-weight: 600;
   white-space: nowrap;
-  background: hsla(141, 53%, 42%, 0.18);
-  color: hsl(141, 53%, 30%);
+  background: rgb(53 212 154 / 0.18);
+  color: var(--win);
 }
 
-[data-theme="dark"] .paid-badge {
-  color: hsl(141, 53%, 65%);
+/* Phones: the row opens the picks, so the button and the Max column give way to the names. */
+@media screen and (max-width: 600px) {
+  html.site .leaderboard-table .max-column,
+  html.site .leaderboard-table th:last-child,
+  html.site .leaderboard-table td:last-child:not([colspan]) {
+    display: none;
+  }
+
+  html.site .leaderboard-table td,
+  html.site .leaderboard-table th {
+    padding: 0.5rem 0.4rem;
+  }
+
+  .points-cell {
+    white-space: nowrap;
+  }
+
+  .player-name {
+    display: block;
+    max-width: 8.5rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .money-badge {
+    margin-left: 0;
+  }
+
+  .wx-note {
+    display: none;
+  }
+
+  .pick-squares i {
+    width: 11px;
+    height: 11px;
+  }
 }
