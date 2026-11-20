@@ -3,7 +3,6 @@
 function initApp() {
   setupTelemetry();
   setupModalCloseHandlers();
-  setupThemeToggle();
   setupPage();
   setupCompetitions();
   setupEntryForm();

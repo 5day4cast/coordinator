@@ -50,7 +50,7 @@ impl PublicHeaders {
 /// The recovery page's policy: the public pages' own, but connections to any https or wss
 /// origin, and no Trusted Types policy at all, since its script writes text only.
 const RECOVER_POLICY: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; \
-    style-src 'self'; img-src 'self' data:; connect-src 'self' https: wss:; object-src 'none'; \
+    style-src 'self'; font-src 'self'; img-src 'self' data:; connect-src 'self' https: wss:; object-src 'none'; \
     base-uri 'none'; frame-ancestors 'none'; form-action 'self'; \
     require-trusted-types-for 'script'; trusted-types 'none'";
 
@@ -66,7 +66,7 @@ fn origin(url: &str) -> Option<String> {
 ///   `login-worker`, which admits only the log-in worker's URL (shared/wasm.js),
 ///   and `pow-worker`, which admits only the sign-up proof-of-work worker's
 ///   (components/modals/signup_pow.js); workers fall under `script-src`;
-/// - styles: this site's only (Bulma is vendored); no inline styles;
+/// - styles and fonts: this site's only (Bulma and the fonts are vendored); no inline styles;
 /// - connections: this site, the API, oracle and configured Keymeld gateway;
 /// - forms: this site, and the sites in `forms`.
 pub fn content_security_policy(connect: &[&str], forms: &[&str]) -> String {
@@ -83,6 +83,7 @@ pub fn content_security_policy(connect: &[&str], forms: &[&str]) -> String {
         "default-src 'none'".to_owned(),
         "script-src 'self' 'wasm-unsafe-eval'".to_owned(),
         "style-src 'self'".to_owned(),
+        "font-src 'self'".to_owned(),
         "img-src 'self' data:".to_owned(),
         format!("connect-src {}", sources(connect)),
         "object-src 'none'".to_owned(),
@@ -184,6 +185,7 @@ mod tests {
         assert!(!policy.contains("'unsafe-eval'"));
         assert!(policy.contains("connect-src 'self' https://5day4cast.com https://4casttruth.win https://keymeld.example.net;"));
         assert!(policy.contains("style-src 'self';"));
+        assert!(policy.contains("font-src 'self';"));
         for directive in [
             "require-trusted-types-for 'script'",
             "trusted-types htmx login-worker pow-worker",

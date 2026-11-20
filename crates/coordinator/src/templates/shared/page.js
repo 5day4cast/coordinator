@@ -44,8 +44,25 @@ async function setOwnerTag(npub) {
   markOwnRows(document);
 }
 
+// The header link for the section the reader is in. A competition's own pages belong to the
+// Lobby, as does the home page.
+function markCurrentNav(path = location.pathname) {
+  const section = path === "/" || path.startsWith("/competitions") ? "/competitions" : path;
+  for (const link of document.querySelectorAll(".site-nav-link")) {
+    if (section.startsWith(link.getAttribute("href"))) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
+  }
+}
+
 function setupPage() {
   localizeTimes(document);
+  markCurrentNav();
+  // A navigation changes the address after its click, and Back without one.
+  document.addEventListener("click", (event) => {
+    const link = event.target.closest?.("a[hx-push-url][href]");
+    if (link) markCurrentNav(new URL(link.href, location.href).pathname);
+  });
+  window.addEventListener("popstate", () => markCurrentNav());
   // htmx processes every swapped-in element, and the page itself at start.
   document.addEventListener("htmx:after:process", (event) => {
     localizeTimes(event.target);

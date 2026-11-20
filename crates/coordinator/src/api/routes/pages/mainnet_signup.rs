@@ -26,7 +26,7 @@ use std::{
     sync::Arc,
 };
 use time::OffsetDateTime;
-const TITLE: &str = "Mainnet signup - Fantasy Weather";
+const TITLE: &str = "Mainnet signup · 5day4cast";
 
 #[derive(Default, Deserialize)]
 pub struct MainnetSignupForm {

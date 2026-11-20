@@ -84,8 +84,7 @@ a.competition-row.htmx-request {
     transform: translate(-50%, -50%);
   }
 
-  .picks-button,
-  .navbar-burger {
+  .picks-button {
     min-width: 44px;
     min-height: 44px;
   }
@@ -181,29 +180,192 @@ tr.is-own td {
   }
 }
 
-.nav-backdrop {
+/* The header: wordmark, the four sections and the account buttons. On phones the
+   sections become a tab bar along the bottom of the screen. */
+.network-banner {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: baseline;
+  gap: 0.15rem 0.75rem;
+  padding: 0.3rem 1rem;
+  font-size: 0.8rem;
+  line-height: 1.3;
+  text-align: center;
+  color: var(--gold-ink);
+  background: repeating-linear-gradient(-45deg, var(--gold) 0 16px, #f2b928 16px 32px);
+}
+
+.network-banner strong {
+  color: inherit;
+  font-family: var(--font-display);
+  font-size: 0.95rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.site-header {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  background: var(--navy);
+  border-bottom: 1px solid var(--line);
+}
+
+.site-header-inner {
+  display: flex;
+  align-items: center;
+  gap: 2rem;
+  max-width: 1344px;
+  margin: 0 auto;
+  padding: 0.55rem 1.5rem;
+}
+
+.site-brand {
+  line-height: 1;
+}
+
+.wordmark {
+  font-family: var(--font-display);
+  font-size: 1.85rem;
+  font-style: italic;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  color: #fff;
+  white-space: nowrap;
+}
+
+.wordmark b {
+  color: var(--gold);
+  font-weight: 700;
+}
+
+.site-nav {
+  display: flex;
+  gap: 1.6rem;
+}
+
+.site-nav-link {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.55rem 0;
+  border-bottom: 2px solid transparent;
+  color: var(--dim);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.site-nav-link:hover {
+  color: var(--ink);
+}
+
+.site-nav-link[aria-current="page"] {
+  color: var(--ink);
+  border-bottom-color: var(--gold);
+}
+
+.nav-icon {
   display: none;
 }
 
-/* The brand: name above "Powered by". */
-.navbar-brand-text {
-  flex-direction: column;
-  align-items: flex-start;
+.site-account {
+  margin-left: auto;
 }
 
-.brand-note {
-  color: var(--bulma-text-weak);
+.site-account .buttons {
+  flex-wrap: nowrap;
+  margin-bottom: 0;
+}
+
+.site-account .buttons .button {
+  margin-bottom: 0;
+}
+
+.site-main {
+  padding-top: 1.75rem;
+}
+
+@media (max-width: 768px) {
+  .network-banner {
+    padding: 0.2rem 0.75rem;
+    font-size: 0.72rem;
+  }
+
+  .network-banner strong {
+    font-size: 0.85rem;
+  }
+
+  .network-banner-more {
+    display: none;
+  }
+
+  .site-header-inner {
+    gap: 0.75rem;
+    padding: 0.5rem 1rem;
+  }
+
+  .wordmark {
+    font-size: 1.6rem;
+  }
+
+  .site-nav {
+    position: fixed;
+    inset: auto 0 0 0;
+    z-index: 30;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 0;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    background: var(--navy);
+    border-top: 1px solid var(--line);
+  }
+
+  .site-nav-link {
+    flex-direction: column;
+    justify-content: center;
+    gap: 0.15rem;
+    padding: 0.45rem 0 0.5rem;
+    border-bottom: 0;
+    border-top: 2px solid transparent;
+    font-size: 0.72rem;
+  }
+
+  .site-nav-link[aria-current="page"] {
+    color: var(--gold);
+    border-top-color: var(--gold);
+  }
+
+  .nav-icon {
+    display: block;
+  }
+
+  .site-main {
+    padding: 1.25rem 1rem 2rem;
+  }
+
+  /* Room for the tab bar. */
+  .site-footer {
+    padding-bottom: calc(5.5rem + env(safe-area-inset-bottom, 0px));
+  }
 }
 
 .github-icon {
   fill: currentColor;
-  vertical-align: middle;
+  vertical-align: -2px;
 }
 
 .site-footer {
-  padding: 1.5rem 1rem 2rem;
-  border-top: 1px solid var(--bulma-border-weak);
+  display: grid;
+  gap: 0.35rem;
+  padding: 1.75rem 1rem 2.25rem;
+  border-top: 1px solid var(--line);
   font-size: 0.85rem;
   text-align: center;
-  color: var(--bulma-text-weak);
+  color: var(--dim);
+}
+
+.site-footer-credits {
+  font-size: 0.8rem;
 }

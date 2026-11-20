@@ -1,144 +1,73 @@
 use maud::{html, Markup};
 
-/// The checkbox that opens the phone menu, in CSS alone (see base.css).
-/// `out_of_band` renders it for a navigation's response, which swaps it in
-/// unchecked, so the menu closes once the next page is in.
-pub fn menu_toggle(out_of_band: bool) -> Markup {
+/// The wordmark: "5day4cast" with its 4 in gold.
+pub fn wordmark() -> Markup {
     html! {
-        input type="checkbox" id="navToggle" class="nav-toggle is-sr-only"
-              aria-label="Menu" aria-controls="navMenu"
-              hx-swap-oob=[out_of_band.then_some("true")];
+        span class="wordmark" { "5day" b { "4" } "cast" }
     }
 }
 
-/// Public UI navigation bar with integrated branding
-///
-/// Links load pages with htmx; `htmx_auth.js` signs requests for account
-/// pages. Bulma v1's burger needs its four spans. `satchel` is the Satchel
-/// wallet's origin, when configured: the signed-in player's menu opens it.
-pub fn navbar(satchel: Option<&str>) -> Markup {
+/// The thin strip that says a test network's sats are play money; mainnet has none.
+pub fn network_banner(network: &str) -> Markup {
+    let name = match network {
+        "bitcoin" | "mainnet" => return html! {},
+        "signet" => "Mutinynet",
+        "regtest" => "Regtest",
+        "testnet" | "testnet4" => "Testnet",
+        other => other,
+    };
     html! {
-        nav class="navbar is-light" role="navigation" aria-label="main navigation" {
-            (menu_toggle(false))
-            // Tapping outside the open menu closes it.
-            label for="navToggle" class="nav-backdrop" aria-hidden="true" {}
-            div class="container" {
-                // Navbar Brand (logo + hamburger for mobile)
-                div class="navbar-brand" {
-                    div class="navbar-item navbar-brand-text" {
-                        a href="/" {
-                            strong class="is-size-5" { "5day4cast" }
-                        }
-                        span class="is-size-7 brand-note" {
-                            "Powered by "
-                            a href="https://www.4casttruth.win/" target="_blank" rel="noopener" class="is-underlined" { "4cast Truth Oracle" }
-                        }
-                    }
+        div class="network-banner" role="note" {
+            strong { (name) " play money" }
+            span { "Test sats with no real value." }
+            span class="network-banner-more" { "Never send mainnet bitcoin here." }
+        }
+    }
+}
 
-                    label for="navToggle" class="navbar-burger" aria-hidden="true" {
-                        // Bulma v1 requires 4 spans for the burger
-                        span aria-hidden="true" {}
-                        span aria-hidden="true" {}
-                        span aria-hidden="true" {}
-                        span aria-hidden="true" {}
-                    }
+/// The site header, under the test network's banner so both stay in view. Its links load
+/// pages with htmx; `htmx_auth.js` signs requests for account pages. On phones the same
+/// links become the tab bar along the bottom (base.css). `satchel` is the Satchel wallet's
+/// origin, when configured: the signed-in player's menu opens it.
+pub fn navbar(network: &str, satchel: Option<&str>) -> Markup {
+    html! {
+        header class="site-header" {
+            (network_banner(network))
+            div class="site-header-inner" {
+                a class="site-brand" href="/" aria-label="5day4cast lobby" { (wordmark()) }
+
+                nav class="site-nav" aria-label="Main" {
+                    (nav_link("/competitions", "allCompetitionsNavClick", "Lobby", lobby_icon()))
+                    (nav_link("/entries", "allEntriesNavClick", "My entries", ticket_icon()))
+                    (nav_link("/payouts", "payoutsNavClick", "Wallet", wallet_icon()))
+                    (nav_link("/help", "helpNavClick", "How to play", help_icon()))
                 }
 
-                // Navbar Menu
-                div id="navMenu" class="navbar-menu" {
-                    // Left side - navigation items
-                    div class="navbar-start" {
-                        a href="/competitions"
-                          class="navbar-item"
-                          id="allCompetitionsNavClick"
-                          hx-get="/competitions"
-                          hx-target="#main-content"
-                          hx-push-url="true" {
-                            "Competitions"
+                div class="site-account" {
+                    // Shown when logged out.
+                    div class="buttons" id="authButtons" {
+                        button type="button" class="button is-small is-ghost-line" id="loginNavClick"
+                               data-open-modal="loginModal" {
+                            "Log in"
                         }
-
-                        a href="/entries"
-                          class="navbar-item"
-                          id="allEntriesNavClick"
-                          hx-get="/entries"
-                          hx-target="#main-content"
-                          hx-push-url="true" {
-                            "Entries"
-                        }
-
-                        a href="/payouts"
-                          class="navbar-item"
-                          id="payoutsNavClick"
-                          hx-get="/payouts"
-                          hx-target="#main-content"
-                          hx-push-url="true" {
-                            "Payouts"
-                        }
-
-                        a href="/help"
-                          class="navbar-item"
-                          id="helpNavClick"
-                          hx-get="/help"
-                          hx-target="#main-content"
-                          hx-push-url="true" {
-                            "How it works"
+                        button type="button" class="button is-small is-primary" id="registerNavClick"
+                               data-open-modal="registerModal" {
+                            "Sign up"
                         }
                     }
 
-                    // Right side - auth buttons and theme toggle
-                    div class="navbar-end" {
-                        // Theme toggle button
-                        div class="navbar-item" {
-                            button class="button is-small theme-toggle" id="themeToggle"
-                                   aria-label="Toggle dark mode" title="Toggle dark/light mode" {
-                                // Sun icon (shown in dark mode)
-                                span class="icon theme-icon-light" {
-                                    (sun_icon())
-                                }
-                                // Moon icon (shown in light mode)
-                                span class="icon theme-icon-dark" {
-                                    (moon_icon())
-                                }
+                    // Shown when logged in.
+                    div class="buttons is-hidden" id="logoutContainer" {
+                        // Signs the player in to Satchel in its own tab (shared/satchel.js).
+                        @if let Some(satchel) = satchel {
+                            a class="button is-small is-ghost-line" id="openSatchelNavClick"
+                              href=(format!("{satchel}/wallet")) target="_blank" rel="noopener"
+                              data-satchel-next="/wallet" {
+                                "Open Satchel"
                             }
                         }
-
-                        // GitHub link
-                        div class="navbar-item" {
-                            a href="https://github.com/5day4cast/coordinator" target="_blank"
-                              class="has-text-grey" title="View on GitHub" {
-                                (github_icon())
-                            }
-                        }
-
-                        // Auth buttons (shown when logged out)
-                        div class="navbar-item" id="authButtons" {
-                            div class="buttons" {
-                                button type="button" class="button is-primary" id="loginNavClick"
-                                       data-open-modal="loginModal" {
-                                    "Log in"
-                                }
-                                button type="button" class="button is-light" id="registerNavClick"
-                                       data-open-modal="registerModal" {
-                                    "Sign up"
-                                }
-                            }
-                        }
-
-                        // Logout button (shown when logged in, hidden by default)
-                        div class="navbar-item is-hidden" id="logoutContainer" {
-                            div class="buttons" {
-                                // Signs the player in to Satchel in its own tab (shared/satchel.js).
-                                @if let Some(satchel) = satchel {
-                                    a class="button is-light" id="openSatchelNavClick"
-                                      href=(format!("{satchel}/wallet")) target="_blank" rel="noopener"
-                                      data-satchel-next="/wallet" {
-                                        "Open Satchel"
-                                    }
-                                }
-                                button type="button" class="button is-light" id="logoutNavClick" {
-                                    "Log out"
-                                }
-                            }
+                        button type="button" class="button is-small is-ghost-line" id="logoutNavClick" {
+                            "Log out"
                         }
                     }
                 }
@@ -147,33 +76,78 @@ pub fn navbar(satchel: Option<&str>) -> Markup {
     }
 }
 
-/// GitHub icon (Octicons)
-fn github_icon() -> Markup {
+fn nav_link(href: &str, id: &str, label: &str, icon: Markup) -> Markup {
     html! {
-        svg class="github-icon" height="24" width="24" viewBox="0 0 16 16" version="1.1" aria-hidden="true" {
+        a href=(href) class="site-nav-link" id=(id)
+          hx-get=(href) hx-target="#main-content" hx-push-url="true" {
+            (icon)
+            span { (label) }
+        }
+    }
+}
+
+fn icon(body: Markup) -> Markup {
+    html! {
+        svg class="nav-icon" viewBox="0 0 24 24" width="22" height="22" fill="none"
+            stroke="currentColor" stroke-width="1.7" stroke-linecap="round"
+            stroke-linejoin="round" aria-hidden="true" {
+            (body)
+        }
+    }
+}
+
+fn lobby_icon() -> Markup {
+    icon(html! {
+        rect x="3.5" y="3.5" width="7" height="7" rx="1.5" {}
+        rect x="13.5" y="3.5" width="7" height="7" rx="1.5" {}
+        rect x="3.5" y="13.5" width="7" height="7" rx="1.5" {}
+        rect x="13.5" y="13.5" width="7" height="7" rx="1.5" {}
+    })
+}
+
+fn ticket_icon() -> Markup {
+    icon(html! {
+        path d="M3 7.5h18v3a1.75 1.75 0 0 0 0 3.5v3H3v-3a1.75 1.75 0 0 0 0-3.5z" {}
+        path d="M9 7.5v9.5" stroke-dasharray="1.5 2" {}
+    })
+}
+
+fn wallet_icon() -> Markup {
+    icon(html! {
+        rect x="3" y="6" width="18" height="13" rx="2" {}
+        path d="M3 9.5h18" {}
+        circle cx="16.5" cy="14" r="1.2" {}
+    })
+}
+
+fn help_icon() -> Markup {
+    icon(html! {
+        circle cx="12" cy="12" r="8.5" {}
+        path d="M9.6 9.4a2.5 2.5 0 1 1 3.4 2.3c-.6.3-1 .8-1 1.5v.6" {}
+        circle cx="12" cy="16.9" r="0.4" {}
+    })
+}
+
+/// GitHub icon (Octicons)
+pub fn github_icon() -> Markup {
+    html! {
+        svg class="github-icon" height="16" width="16" viewBox="0 0 16 16" version="1.1" aria-hidden="true" {
             path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z" {}
         }
     }
 }
 
-/// Sun icon for light mode indicator (Heroicons)
-fn sun_icon() -> Markup {
-    html! {
-        svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"
-            stroke-width="1.5" stroke="currentColor" width="20" height="20" {
-            path stroke-linecap="round" stroke-linejoin="round"
-                 d="M12 3v2.25m6.364.386-1.591 1.591M21 12h-2.25m-.386 6.364-1.591-1.591M12 18.75V21m-4.773-4.227-1.591 1.591M5.25 12H3m4.227-4.773L5.636 5.636M15.75 12a3.75 3.75 0 1 1-7.5 0 3.75 3.75 0 0 1 7.5 0Z" {}
-        }
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Moon icon for dark mode indicator (Heroicons)
-fn moon_icon() -> Markup {
-    html! {
-        svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"
-            stroke-width="1.5" stroke="currentColor" width="20" height="20" {
-            path stroke-linecap="round" stroke-linejoin="round"
-                 d="M21.752 15.002A9.72 9.72 0 0 1 18 15.75c-5.385 0-9.75-4.365-9.75-9.75 0-1.33.266-2.597.748-3.752A9.753 9.753 0 0 0 3 11.25C3 16.635 7.365 21 12.75 21a9.753 9.753 0 0 0 9.002-5.998Z" {}
-        }
+    #[test]
+    fn only_test_networks_have_the_play_money_banner() {
+        assert_eq!(network_banner("bitcoin").into_string(), "");
+        let mutinynet = network_banner("signet").into_string();
+        assert!(mutinynet.contains("Mutinynet play money"));
+        assert!(network_banner("regtest")
+            .into_string()
+            .contains("Regtest play money"));
     }
 }

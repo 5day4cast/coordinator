@@ -31,7 +31,7 @@ use crate::{
     },
 };
 
-const TITLE: &str = "Feedback - Fantasy Weather";
+const TITLE: &str = "Feedback · 5day4cast";
 /// Largest form body read.
 pub const FEEDBACK_MAX_BODY_BYTES: usize = 16 * 1024;
 

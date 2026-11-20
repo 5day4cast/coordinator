@@ -20,10 +20,6 @@ function focusModal(modal) {
 function openModal($modal, opener = document.activeElement) {
     if (!$modal || $modal.classList.contains('is-active')) return;
     modalOpeners.set($modal, opener);
-    // A dialog opened from the phone menu replaces it. Closing returns focus to the menu
-    // toggle if its original button is no longer visible.
-    const menu = document.getElementById('navToggle');
-    if (menu) menu.checked = false;
     $modal.classList.add('is-active');
     document.documentElement.classList.add('is-clipped');
     focusModal($modal);
@@ -40,7 +36,8 @@ function closeModal($modal) {
     $modal.dispatchEvent(new CustomEvent('fw:modal-closed'));
     const opener = modalOpeners.get($modal);
     modalOpeners.delete($modal);
-    const target = [opener, document.getElementById('navToggle'), document.querySelector('.navbar-brand a[href]')]
+    // Back to whatever opened it, or the brand link when that is gone.
+    const target = [opener, document.querySelector('.site-brand')]
         .find(element => visibleModalElement(element) && element !== document.body && !element.disabled);
     target?.focus({ preventScroll: true });
 }

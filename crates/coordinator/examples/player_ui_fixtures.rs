@@ -2,7 +2,7 @@
 //! leaderboard, picks dialog) with synthetic data and the bundled assets, for offline
 //! screenshots and browser QA.
 //! cargo run -p coordinator --example player_ui_fixtures -- /tmp/player-ui
-//! Serve the directory (python3 -m http.server) and open `<page>-<theme>.html`. Scripts are left
+//! Serve the directory (python3 -m http.server) and open `<page>.html`. Scripts are left
 //! out so nothing loads or rewrites the page: each file is exactly what the server renders.
 use coordinator::{
     domain::{
@@ -232,14 +232,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     for (name, content) in pages {
         let page = without_scripts(&base(&config, content).into_string());
-        for theme in ["light", "dark"] {
-            let themed = page.replacen(
-                r#"<html lang="en">"#,
-                &format!(r#"<html lang="en" data-theme="{theme}">"#),
-                1,
-            );
-            fs::write(output.join(format!("{name}-{theme}.html")), themed)?;
-        }
+        fs::write(output.join(format!("{name}.html")), page)?;
     }
     Ok(())
 }

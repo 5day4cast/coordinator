@@ -5,7 +5,10 @@
 
 use maud::{html, Markup, DOCTYPE};
 
-use crate::templates::assets::{BULMA_CSS, RECOVER_JS, STYLES_CSS, THEME_JS};
+use crate::templates::{
+    assets::{BULMA_CSS, RECOVER_JS, STYLES_CSS},
+    components::network_banner,
+};
 
 pub struct RecoverConfig<'a> {
     pub network: &'a str,
@@ -22,23 +25,23 @@ pub fn recover_page(config: &RecoverConfig) -> Markup {
     };
     html! {
         (DOCTYPE)
-        html lang="en" {
+        html lang="en" data-theme="dark" class="site" {
             head {
                 meta charset="UTF-8";
                 meta name="viewport" content="width=device-width, initial-scale=1.0";
-                title { "Recover your entries - Fantasy Weather" }
+                title { "Recover your entries · 5day4cast" }
                 link rel="stylesheet" href=(BULMA_CSS.url);
                 link rel="stylesheet" href=(STYLES_CSS.url);
-                script src=(THEME_JS.url) {}
                 script src=(RECOVER_JS.url) defer {}
             }
             body data-network=(config.network) data-oracle=(config.oracle_base)
                  data-wasm-glue=(format!("/ui/pkg/coordinator_wasm.js{query}"))
                  data-wasm-module=(format!("/ui/pkg/coordinator_wasm_bg.wasm{query}"))
                  data-info-url="/api/v1/recovery/info" data-telemetry="off" {
+                (network_banner(config.network))
                 section class="section" {
                     main class="container recover-page" {
-                        a class="back-link" href="/competitions" { "← All competitions" }
+                        a class="back-link" href="/competitions" { "← Lobby" }
                         (recover_form())
                     }
                 }

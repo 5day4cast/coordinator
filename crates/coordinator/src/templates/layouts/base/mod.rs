@@ -2,10 +2,11 @@ use maud::{html, Markup, DOCTYPE};
 
 use crate::api::{request_context, telemetry};
 use crate::templates::{
-    assets::{APP_JS, BULMA_CSS, HTMX_JS, LOGIN_WORKER_JS, STYLES_CSS, THEME_JS},
+    assets::{APP_JS, BULMA_CSS, HTMX_JS, LOGIN_WORKER_JS, STYLES_CSS},
     components::{
         auth_modals,
         feedback::{feedback_link, feedback_modal},
+        github_icon,
         mainnet_signup::{mainnet_signup_link, mainnet_signup_modal},
         navbar, RecoveryHelp,
     },
@@ -49,10 +50,12 @@ pub struct PageConfig<'a> {
 pub fn base(config: &PageConfig, content: Markup) -> Markup {
     html! {
         (DOCTYPE)
-        html lang="en" {
+        // One dark theme on every public page (static/styles.css, `.site`).
+        html lang="en" data-theme="dark" class="site" {
             head {
                 meta charset="UTF-8";
                 meta name="viewport" content="width=device-width, initial-scale=1.0";
+                meta name="theme-color" content="#081230";
                 meta name="htmx-config" content=(HTMX_CONFIG);
                 // The page's request id joins the browser's telemetry to the server's log.
                 @if let Some(context) = request_context::current() {
@@ -66,8 +69,6 @@ pub fn base(config: &PageConfig, content: Markup) -> Markup {
                 link rel="stylesheet" href=(BULMA_CSS.url);
                 link rel="stylesheet" href=(STYLES_CSS.url);
 
-                // The saved or system theme, applied before first paint.
-                script src=(THEME_JS.url) {}
                 script src=(HTMX_JS.url) defer {}
                 script src=(APP_JS.url) defer {}
             }
@@ -76,9 +77,9 @@ pub fn base(config: &PageConfig, content: Markup) -> Markup {
                  data-login-worker=(LOGIN_WORKER_JS.url) data-satchel-url=[config.satchel_url] {
                 // Shown while a navigation is loading (see base.css).
                 div class="page-loading" aria-hidden="true" {}
-                (navbar(config.satchel_url))
+                (navbar(config.network, config.satchel_url))
 
-                section class="section pt-3" {
+                section class="section site-main" {
                     // Back swaps in only the page content, fetched again
                     // (see HTMX_CONFIG); the navbar and dialogs keep their
                     // state and listeners.
@@ -88,14 +89,24 @@ pub fn base(config: &PageConfig, content: Markup) -> Markup {
                 }
 
                 footer class="site-footer" {
-                    a href="/help" hx-get="/help" hx-target="#main-content" hx-push-url="true" { "How it works" }
-                    " · Contact "
-                    a href=(format!("mailto:{CONTACT_EMAIL}")) { (CONTACT_EMAIL) }
-                    @if config.feedback {
-                        " · "
-                        (feedback_link())
+                    p {
+                        a href="/help" hx-get="/help" hx-target="#main-content" hx-push-url="true" { "How to play" }
+                        " · Contact "
+                        a href=(format!("mailto:{CONTACT_EMAIL}")) { (CONTACT_EMAIL) }
+                        @if config.feedback {
+                            " · "
+                            (feedback_link())
+                        }
+                        @if config.mainnet_signup { " · " (mainnet_signup_link()) }
                     }
-                    @if config.mainnet_signup { " · " (mainnet_signup_link()) }
+                    p class="site-footer-credits" {
+                        "Results signed by the "
+                        a href="https://www.4casttruth.win/" target="_blank" rel="noopener" { "4cast Truth Oracle" }
+                        " · "
+                        a href="https://github.com/5day4cast/coordinator" target="_blank" rel="noopener" {
+                            (github_icon()) " Source"
+                        }
+                    }
                 }
 
                 (auth_modals(config.recovery, config.satchel_url))

@@ -34,7 +34,7 @@ use crate::{
     infra::refresh_cache::Cached,
     startup::AppState,
     templates::{
-        components::{menu_toggle, RecoveryHelp},
+        components::RecoveryHelp,
         format::{short_npub, Explorers},
         fragments::{
             entries_paused_banner,
@@ -121,15 +121,13 @@ pub(super) fn page(
 ) -> Response {
     let body = if is_fragment(headers) {
         // htmx takes the document title from a <title> in the response; only
-        // navigations of the main content change it, and they close the
-        // phone menu (the navbar's toggle, swapped in unchecked).
+        // navigations of the main content change it.
         let navigation = headers
             .get("HX-Target")
             .is_some_and(|target| target == MAIN_CONTENT);
         html! {
             @if navigation {
                 title { (title) }
-                (menu_toggle(true))
             }
             (content)
         }
@@ -391,7 +389,7 @@ pub async fn competitions_fragment(
     page(
         &headers,
         &state,
-        "Fantasy Weather: call the weather, win the pot",
+        "5day4cast: daily fantasy weather",
         content,
         Caching::Public,
     )
@@ -435,7 +433,7 @@ pub async fn entries_fragment(
     headers: HeaderMap,
     MaybeAuth(auth): MaybeAuth,
 ) -> Response {
-    let title = "Your entries - Fantasy Weather";
+    let title = "My entries · 5day4cast";
     let Some(NostrAuth { pubkey, .. }) = auth else {
         return signed_out(&headers, &state, title, "/entries", "your entries");
     };
@@ -562,7 +560,7 @@ pub async fn payouts_fragment(
     headers: HeaderMap,
     MaybeAuth(auth): MaybeAuth,
 ) -> Response {
-    let title = "Payouts - Fantasy Weather";
+    let title = "Wallet · 5day4cast";
     let Some(NostrAuth { pubkey, .. }) = auth else {
         return signed_out(&headers, &state, title, "/payouts", "your payouts");
     };
@@ -622,7 +620,7 @@ pub async fn help_fragment(
     page(
         &headers,
         &state,
-        "How it works - Fantasy Weather",
+        "How to play · 5day4cast",
         content,
         Caching::Public,
     )
@@ -680,7 +678,7 @@ pub fn not_found(headers: &HeaderMap, state: &AppState, what: &str) -> Response 
     let mut response = page(
         headers,
         state,
-        "Not found - Fantasy Weather",
+        "Not found · 5day4cast",
         content,
         Caching::Public,
     );
@@ -790,7 +788,7 @@ pub async fn entry_form_fragment(
     page(
         &headers,
         &state,
-        "Enter - Fantasy Weather",
+        "Make picks · 5day4cast",
         content,
         Caching::Private,
     )
@@ -1007,7 +1005,7 @@ fn leaderboard_response(state: &AppState, headers: &HeaderMap, view: &Competitio
     page(
         headers,
         state,
-        "Leaderboard - Fantasy Weather",
+        "Leaderboard · 5day4cast",
         content,
         Caching::Public,
     )
@@ -1183,7 +1181,7 @@ pub async fn entry_detail_fragment(
     page(
         &headers,
         &state,
-        "Picks - Fantasy Weather",
+        "Picks · 5day4cast",
         content,
         Caching::Public,
     )
