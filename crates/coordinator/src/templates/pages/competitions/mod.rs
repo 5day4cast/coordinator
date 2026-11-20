@@ -306,6 +306,14 @@ impl CompetitionView {
         }
     }
 
+    /// [`Self::pot`] as a number, to sort by: a queue's smallest pool's.
+    pub fn pot_sats(&self) -> u64 {
+        match &self.queue {
+            Queue::Queued(queue) => self.pool_pots(queue).0,
+            _ => self.total_pool,
+        }
+    }
+
     /// What entering costs now, all in: the ticket price and, when known, the network fee. Players
     /// see it as the "Entry fee"; `entry_fee` itself is only the pot's share of it.
     pub fn price(&self) -> u64 {
@@ -910,7 +918,7 @@ pub fn lobby_page(
     html! {
         div id="competitions-page"
             hx-get=(options.url())
-            hx-trigger="every 30s"
+            hx-trigger="every 30s, fw:countdown-ended from:body"
             hx-select="#competitions-page"
             hx-swap="outerHTML" {
             @match options.tab {
@@ -1204,6 +1212,7 @@ fn featured_card(competition: &CompetitionView, lobby: &Lobby, now: OffsetDateTi
                     }
                 }
             }
+            // The details and Make picks beside the map, so the lists below stay in view.
             div class="featured-body" {
                 div class="featured-main" {
                     div class="featured-heading" {
@@ -1220,17 +1229,12 @@ fn featured_card(competition: &CompetitionView, lobby: &Lobby, now: OffsetDateTi
                     @if !cities.is_empty() {
                         p class="featured-cities" { (cities.join(" · ")) }
                     }
-                    @if let Some((stations, pins)) = &lobby.weather {
-                        @if !pins.is_empty() { (station_map(&map_marks(stations, pins), false)) }
-                    }
-                }
-                div class="featured-side" {
                     dl class="featured-facts" {
                         @if competition.top_prize().is_some() {
                             div {
-                                dt { "1st wins" }
+                                dt { "Prize pool" }
                                 dd {
-                                    (competition.win())
+                                    (competition.pot())
                                     @if let Some(split) = competition.prize_split() { span class="cell-note prize-note" { (split) } }
                                     @if let Some(rule) = competition.prize_rule() { span class="cell-note prize-note" { (rule) } }
                                     @if competition.can_enter && competition.queue.queued().is_some() {
@@ -1242,13 +1246,16 @@ fn featured_card(competition: &CompetitionView, lobby: &Lobby, now: OffsetDateTi
                         @if competition.can_enter {
                             div { dt { "Entry" } dd { (sats(competition.price())) } }
                         }
-                        div { dt { "Seats" } dd class="featured-seats" { (seats(competition)) } }
+                        div class="featured-seat-fact" { dt { "Seats" } dd class="featured-seats" { (seats(competition)) } }
                     }
                     a class="button is-primary is-fullwidth is-medium"
                       href=(competition.url()) hx-get=(competition.url())
                       hx-target="#main-content" hx-push-url="true" {
                         @if competition.can_enter { "Make picks" } @else { "Watch live" }
                     }
+                }
+                @if let Some((stations, pins)) = lobby.weather.as_ref().filter(|(_, pins)| !pins.is_empty()) {
+                    div class="featured-map" { (station_map(&map_marks(stations, pins), false)) }
                 }
             }
         }
@@ -1289,7 +1296,7 @@ fn list(competitions: &[&CompetitionView], lobby: &Lobby, now: OffsetDateTime) -
                     span class="competition-sorts-label" { "Sort" }
                     (sort_heading("Starts", "start"))
                     (sort_heading("Entry fee", "fee"))
-                    (sort_heading("1st prize", "prize"))
+                    (sort_heading("Prize pool", "prize"))
                 }
             }
             @for competition in competitions {
@@ -1333,8 +1340,8 @@ fn contest_card(competition: &CompetitionView, cities: &[&str], now: OffsetDateT
     }
     if competition.top_prize().is_some() {
         facts.push(match competition.prize_split() {
-            Some(split) => format!("1st wins {} ({split})", competition.win()),
-            None => format!("1st wins {}", competition.win()),
+            Some(split) => format!("Prize pool {} ({split})", competition.pot()),
+            None => format!("Prize pool {}", competition.pot()),
         });
     }
     facts.push(format::competition_duration(
@@ -1350,7 +1357,7 @@ fn contest_card(competition: &CompetitionView, cities: &[&str], now: OffsetDateT
         a class=(format!("competition-row contest-card is-{}", phase_class(competition.phase)))
           data-competition-id=(competition.id) data-facts=(facts)
           data-start=(competition.start.unix_timestamp()) data-fee=(competition.price())
-          data-prize=[competition.top_prize()]
+          data-prize=[competition.top_prize().map(|_| competition.pot_sats())]
           href=(competition.url()) hx-get=(competition.url())
           hx-target="#main-content" hx-push-url="true" {
             span class="card-head" {
@@ -1393,8 +1400,8 @@ fn contest_card(competition: &CompetitionView, cities: &[&str], now: OffsetDateT
                 }
                 @if competition.top_prize().is_some() {
                     span class="card-figure cell-win" {
-                        small { "1st wins" }
-                        b { (competition.win()) }
+                        small { "Prize pool" }
+                        b { (competition.pot()) }
                         @if let Some(split) = competition.prize_split() { span class="cell-note prize-note" { (split) } }
                         @if let Some(rule) = competition.prize_rule() { span class="cell-note prize-note" { (rule) } }
                     }
@@ -1671,15 +1678,17 @@ pub(crate) mod tests {
         // once known.
         assert!(html.contains("<dt>Entry</dt><dd>5,250 sats</dd>"));
         assert!(!html.contains(">Price<"));
-        assert!(html.contains("<dt>1st wins</dt><dd>15,000 sats</dd>"));
+        let pot = view("open", Phase::Upcoming, 133).pot();
+        assert!(html.contains(&format!("<dt>Prize pool</dt><dd>{pot}</dd>")));
         assert!(!html.contains("Paid places") && !html.contains(">Pot<"));
         let mut priced = view("open", Phase::Upcoming, 133);
         priced.network_fee = Some(437);
         let row = competition_row(&priced, NOW).into_string();
         assert!(row.contains(r#"<small>Entry</small><b>5,687 sats</b>"#));
-        assert!(
-            row.contains("Entry fee 5,687 sats · 1st wins 15,000 sats · 10 min · 1 of 3 entries")
-        );
+        assert!(row.contains(&format!(
+            "Entry fee 5,687 sats · Prize pool {} · 10 min · 1 of 3 entries",
+            priced.pot()
+        )));
     }
 
     #[test]
@@ -2066,7 +2075,9 @@ pub(crate) mod tests {
         assert!(row.contains("<small>Seats</small>40 entered"), "{row}");
         assert!(row.contains("pools of up to 25"));
         // Forty entries make two pools of twenty.
-        assert!(row.contains("Entry fee 5,250 sats · 1st wins 100,000 sats · 10 min · 40 entered"));
+        assert!(row.contains(
+            "Entry fee 5,250 sats · Prize pool 100,000 sats per pool · 10 min · 40 entered"
+        ));
         assert_eq!(queue.pot(), "100,000 sats per pool");
         let six = queued("q", 6);
         assert_eq!(six.win(), "30,000 sats");
@@ -2096,7 +2107,7 @@ pub(crate) mod tests {
         assert_eq!(queue.win(), "65,000–70,000 sats");
         assert_eq!(queue.top_prize(), Some(65_000));
         let row = competition_row(&queue, NOW).into_string();
-        assert!(row.contains(r#"<small>1st wins</small><b>65,000–70,000 sats</b>"#));
+        assert!(row.contains(r#"<small>Prize pool</small><b>65,000–70,000 sats per pool</b>"#));
 
         // Once formed, the pools' own sizes decide, whatever the entry count says.
         let mut split = queued("q", 30);
@@ -2396,7 +2407,7 @@ pub(crate) mod tests {
         );
         assert!(row.contains("1st 70% · 2nd 30%"));
         assert!(row.contains("Under 10 players: winner takes all"));
-        assert!(row.contains("1st wins 15,000 sats (1st 70% · 2nd 30%)"));
+        assert!(row.contains(&format!("Prize pool {} (1st 70% · 2nd 30%)", open.pot())));
         // One pool: no pool size to explain.
         assert!(!row.contains("pools of up to"));
 

@@ -54,20 +54,32 @@ function untilText(seconds) {
   return `${days} days`;
 }
 
-// Countdowns marked data-countdown (a unix time) stay current while the page is open.
+// Countdowns marked data-countdown (a unix time) stay current while the page is open. One that
+// runs out says so once, with `fw:countdown-ended` from the body: the lobby reloads, and the
+// entry form stops taking picks.
 function tickCountdowns() {
   const now = Date.now() / 1000;
   for (const element of document.querySelectorAll("[data-countdown]")) {
-    element.textContent = untilText(Number(element.dataset.countdown) - now);
+    const left = Number(element.dataset.countdown) - now;
+    if (left > 0) {
+      element.textContent = untilText(left);
+    } else if (!element.dataset.ended) {
+      element.dataset.ended = "true";
+      element.textContent = "now";
+      document.body.dispatchEvent(new CustomEvent("fw:countdown-ended", { detail: { element } }));
+    }
   }
 }
 
-// The header link for the section the reader is in. A competition's own pages belong to the
-// Lobby, as does the home page.
+// The header link for the section the reader is in. The Lobby's is the lobby alone; a
+// competition's own pages are none of the four.
 function markCurrentNav(path = location.pathname) {
-  const section = path === "/" || path.startsWith("/competitions") ? "/competitions" : path;
   for (const link of document.querySelectorAll(".site-nav-link")) {
-    if (section.startsWith(link.getAttribute("href"))) link.setAttribute("aria-current", "page");
+    const href = link.getAttribute("href");
+    const current = href === "/competitions"
+      ? path === "/" || path === "/competitions"
+      : path.startsWith(href);
+    if (current) link.setAttribute("aria-current", "page");
     else link.removeAttribute("aria-current");
   }
 }
@@ -75,7 +87,7 @@ function markCurrentNav(path = location.pathname) {
 function setupPage() {
   localizeTimes(document);
   markCurrentNav();
-  setInterval(tickCountdowns, 30_000);
+  setInterval(tickCountdowns, 10_000);
   // A navigation changes the address after its click, and Back without one.
   document.addEventListener("click", (event) => {
     const link = event.target.closest?.("a[hx-push-url][href]");

@@ -376,18 +376,21 @@
   mix-blend-mode: screen;
 }
 
+.fm-glow {
+  color: var(--gold);
+}
+
 .fm-glow stop {
   stop-color: currentColor;
 }
 
-.station-pin-caption tspan,
-.station-pin-ring {
+.station-pin-caption tspan {
   fill: currentColor;
 }
 
 .station-pin-ring {
   fill: none;
-  stroke: currentColor;
+  stroke: var(--gold);
   stroke-width: 2;
   transform-box: fill-box;
   transform-origin: center;
@@ -488,11 +491,11 @@
   }
 }
 
-/* A city's forecast panel, in the Weather Channel's blue. */
+/* A city's forecast panel, in the Weather Channel's blue. Nothing clips it, so the tips in
+   its heading can open over what is around it. */
 .station-picks {
   margin: 0 0 1rem;
   padding: 0;
-  overflow: hidden;
   border: 1px solid var(--wx-edge);
   border-radius: 12px;
   background: linear-gradient(180deg, var(--wx-a), var(--wx-b));
@@ -538,6 +541,7 @@
 
 .station-rows {
   clear: both;
+  border-radius: 0 0 11px 11px;
   background: rgb(8 18 48 / 0.55);
 }
 
@@ -616,7 +620,6 @@
 
 .tenths {
   font-size: 0.8em;
-  opacity: 0.8;
 }
 
 .is-under .pick-word { color: var(--cold); }

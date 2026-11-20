@@ -29,7 +29,7 @@ function sortCompetitionLists() {
       const order = button.dataset.sort === "start"
         ? descending ? "latest first" : "soonest first"
         : descending ? "highest first" : "lowest first";
-      const label = { start: "Starts", fee: "Entry fee", prize: "1st prize" }[button.dataset.sort];
+      const label = { start: "Starts", fee: "Entry fee", prize: "Prize pool" }[button.dataset.sort];
       button.setAttribute("aria-label", `${label}: sort ${order}`);
       button.setAttribute("aria-pressed", String(selected));
     }

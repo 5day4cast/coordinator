@@ -1,7 +1,5 @@
 use maud::{html, Markup};
 
-use crate::templates::format::temperature_band;
-
 /// Geographic region based on longitude
 pub fn get_region(longitude: f64) -> u8 {
     if longitude < -140.0 {
@@ -93,10 +91,8 @@ pub struct StationPin {
 #[derive(Debug, Clone)]
 pub struct MapMark<'a> {
     pub pin: &'a StationPin,
-    /// A temperature in °F: the glow around the pin and the caption take its colour.
-    pub temperature: Option<f64>,
     /// Under the city's name, in pixel numerals: the forecast high and low, or the readings
-    /// so far, each temperature in its colour (`tspan`s).
+    /// so far, each in its category's colour (`tspan`s).
     pub caption: Option<Markup>,
 }
 
@@ -105,14 +101,10 @@ const MAP_HEIGHT: f64 = 327.28;
 /// The shown part's proportions: wider than the country, so the map stays short on a page.
 const VIEW_ASPECT: f64 = 2.4;
 
-/// The weather map: the stations' part of the country at night, a glow around each station in
-/// its temperature's colour, and each city named with its caption. On the entry form (`linked`)
+/// The weather map: the stations' part of the country at night, a glow around each station,
+/// and each city named with its caption. On the entry form (`linked`)
 /// each pin links to that station's picks further down; no script is involved.
 pub fn station_map(marks: &[MapMark], linked: bool) -> Markup {
-    let bands: std::collections::BTreeSet<&str> = marks
-        .iter()
-        .filter_map(|mark| mark.temperature.map(temperature_band))
-        .collect();
     let view = View::around(marks);
     // Pins, glows and type keep their size on screen however far the map zooms in.
     let k = view.width / MAP_WIDTH;
@@ -125,12 +117,10 @@ pub fn station_map(marks: &[MapMark], linked: bool) -> Markup {
                 role="group"
                 aria-label=(if linked { "The contest's cities: choose one to jump to its picks" } else { "The contest's cities" }) {
                 defs {
-                    @for band in &bands {
-                        radialGradient id=(format!("fm-glow-{band}")) class=(format!("fm-glow {band}")) {
-                            stop offset="0" stop-opacity="0.9" {}
-                            stop offset="0.4" stop-opacity="0.45" {}
-                            stop offset="1" stop-opacity="0" {}
-                        }
+                    radialGradient id="fm-glow" class="fm-glow" {
+                        stop offset="0" stop-opacity="0.75" {}
+                        stop offset="0.4" stop-opacity="0.35" {}
+                        stop offset="1" stop-opacity="0" {}
                     }
                 }
                 rect class="fm-sea" width=(MAP_WIDTH) height=(MAP_HEIGHT) {}
@@ -145,11 +135,8 @@ pub fn station_map(marks: &[MapMark], linked: bool) -> Markup {
                 use class="fm-land" href=(format!("{}#Layer_1", crate::templates::assets::USA_MAP_SVG.url)) {}
                 g class="fm-glows" aria-hidden="true" {
                     @for mark in marks {
-                        @if let Some(temperature) = mark.temperature {
-                            circle cx=(format!("{:.1}", mark.pin.svg_x)) cy=(format!("{:.1}", mark.pin.svg_y))
-                                   r=(format!("{:.1}", 80.0 * k))
-                                   fill=(format!("url(#fm-glow-{})", temperature_band(temperature))) {}
-                        }
+                        circle cx=(format!("{:.1}", mark.pin.svg_x)) cy=(format!("{:.1}", mark.pin.svg_y))
+                               r=(format!("{:.1}", 80.0 * k)) fill="url(#fm-glow)" {}
                     }
                 }
                 g class="station-pins" {
@@ -261,13 +248,12 @@ fn map_city(name: &str) -> String {
 
 fn pin(mark: &MapMark, label: &Label, k: f64) -> Markup {
     let (x, y) = (mark.pin.svg_x, mark.pin.svg_y);
-    let band = mark.temperature.map(temperature_band);
     html! {
         title { (mark.pin.name) }
         // The pin's tap on a touch screen (entry_form.css).
         rect class="station-pin-hit" x=(format!("{:.1}", x - 0.5)) y=(format!("{:.1}", y - 0.5))
              width="1" height="1" {}
-        circle class=(format!("station-pin-ring {}", band.unwrap_or("")))
+        circle class="station-pin-ring"
                cx=(format!("{x:.1}")) cy=(format!("{y:.1}")) r=(format!("{:.1}", 9.0 * k)) {}
         circle class="station-pin" cx=(format!("{x:.1}")) cy=(format!("{y:.1}")) r=(format!("{:.1}", 5.0 * k)) {}
         text class="station-pin-label" x=(format!("{:.1}", label.x)) y=(format!("{:.1}", label.y))

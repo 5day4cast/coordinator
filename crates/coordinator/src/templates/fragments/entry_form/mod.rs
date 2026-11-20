@@ -10,7 +10,7 @@ use crate::domain::{
     ENTRIES_PAUSED, LAPSED_ENTRY, SETTLE_ONLY_PAUSED,
 };
 use crate::templates::{
-    components::{tip, tip_start},
+    components::{tip, tip_end, tip_start},
     format::{self, city_name, sats, MetricText, TimeStyle},
     fragments::entries_paused_banner,
     fragments::loading::{placeholder, Pending},
@@ -162,6 +162,10 @@ pub fn entry_form(
                                 (format::duration(competition.start - time::OffsetDateTime::now_utc()))
                             }
                         }
+                    }
+                    div {
+                        dt { "Duration" }
+                        dd { (format::competition_duration(competition.start, competition.end)) }
                     }
                     div {
                         dt { "Entry fee" }
@@ -452,8 +456,7 @@ pub fn forecast_choices(competition_id: &str, forecasts: &Forecasts, asked: u8) 
     }
 }
 
-/// Each pin with its station's forecast: its high (or low, at night) tints it, and its
-/// caption reads `37° / 15°`.
+/// Each pin with its station's forecast as its caption, `37° / 15°`.
 pub fn map_marks<'a>(stations: &[StationForecast], pins: &'a [StationPin]) -> Vec<MapMark<'a>> {
     pins.iter()
         .map(|pin| {
@@ -474,19 +477,18 @@ pub fn map_marks<'a>(stations: &[StationForecast], pins: &'a [StationPin]) -> Ve
                 forecast(Metric::TempLow),
                 forecast(Metric::WindSpeed),
             );
-            let temperature = |value: f64| {
-                html! { tspan class=(format::temperature_band(value)) { (format!("{:.0}°", value.round())) } }
+            let value = |metric: Metric, value: f64| {
+                html! { tspan class=(metric.color()) { (metric.short_value(value)) } }
             };
             let caption = match (high, low) {
-                (Some(high), Some(low)) => Some(html! { (temperature(high)) " / " (temperature(low)) }),
-                (Some(only), None) | (None, Some(only)) => Some(temperature(only)),
-                (None, None) => wind.map(|wind| html! { (Metric::WindSpeed.short_value(wind)) }),
+                (Some(high), Some(low)) => Some(html! {
+                    (value(Metric::TempHigh, high)) " / " (value(Metric::TempLow, low))
+                }),
+                (Some(high), None) => Some(value(Metric::TempHigh, high)),
+                (None, Some(low)) => Some(value(Metric::TempLow, low)),
+                (None, None) => wind.map(|wind| value(Metric::WindSpeed, wind)),
             };
-            MapMark {
-                pin,
-                temperature: high.or(low),
-                caption,
-            }
+            MapMark { pin, caption }
         })
         .collect()
 }
@@ -556,7 +558,7 @@ fn station_picks(station: &StationForecast) -> Markup {
                     "NOAA forecast · "
                     span class="station-code" { (station.station_id) }
                     @if let Some(name) = &station.station_name {
-                        (tip(&format!("Measured at {name} ({}). The forecast is NOAA's; the ranges come from how past forecasts missed.", station.station_id)))
+                        (tip_end(&format!("Measured at {name} ({}). The forecast is NOAA's; the ranges come from how past forecasts missed.", station.station_id)))
                     }
                 }
             }
@@ -653,7 +655,7 @@ pub(crate) fn pick_row(
                 span class="pick-label" { (metric.label()) }
                 @match forecast {
                     Some(value) => {
-                        strong class=(format!("pick-forecast pixel {}", metric.tint(value).unwrap_or("")))
+                        strong class=(format!("pick-forecast pixel {}", metric.color()))
                                title=[metric.hint(value)] {
                             (metric.short_value(value))
                         }
@@ -1296,7 +1298,7 @@ mod tests {
         let html = form(PayoutDestination::LoggedOut);
         assert!(html.contains("Portland International, ME"));
         assert!(!html.contains("Station KPWM"));
-        assert!(html.contains(r#"<span class="station-code">KPWM</span><span class="tip""#));
+        assert!(html.contains(r#"<span class="station-code">KPWM</span><span class="tip tip-end""#));
         assert!(html.contains("69°F") && html.contains("41°F") && html.contains("7 knots"));
         assert!(!html.contains("12.5") && !html.contains("75°F") && !html.contains("58°F"));
         assert!(html.contains(r#"name="KPWM_temp_high" value="over""#));
@@ -1561,7 +1563,6 @@ mod tests {
         let map = station_map(
             &[MapMark {
                 pin: &pin,
-                temperature: None,
                 caption: None,
             }],
             true,

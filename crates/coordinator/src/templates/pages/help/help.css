@@ -149,3 +149,15 @@ html.site .help-page .content h2 {
 .help-page details summary {
   cursor: pointer;
 }
+
+/* The example form is half the page wide: each forecast sits above its three picks. */
+.help-shot .pick-row {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.help-shot .pick-metric {
+  grid-template-columns: auto auto;
+  justify-content: start;
+  align-items: baseline;
+  gap: 0.5rem;
+}

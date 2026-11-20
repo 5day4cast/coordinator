@@ -10,10 +10,10 @@
 use maud::{html, Markup};
 use time::OffsetDateTime;
 
-use crate::domain::leaderboard::{Phase, PickState};
+use crate::domain::leaderboard::{Metric, Phase, PickState};
 use crate::templates::{
     components::{tip, tip_start},
-    format::{self, ordinal, sats, temperature_band, TimeStyle},
+    format::{self, ordinal, sats, MetricText, TimeStyle},
     fragments::picks::{detail_url, LIVE_REFRESH},
     pages::competitions::{phase_badge, CompetitionView, PoolLink, Queue, QueueView, Refunds},
     shared_map::{station_map, MapMark, StationPin},
@@ -468,12 +468,12 @@ fn conditions(board: &LeaderboardView) -> Markup {
         Phase::Upcoming => "The contest's cities",
         _ => "Final readings",
     };
-    let temperature = |value: f64| {
-        html! { span class=(temperature_band(value)) { (format!("{:.0}°", value.round())) } }
+    let temperature = |metric: Metric, value: f64| {
+        html! { span class=(metric.color()) { (format!("{:.0}°", value.round())) } }
     };
     // The map's captions are SVG text, so their colours go on tspans.
-    let on_map = |value: f64| {
-        html! { tspan class=(temperature_band(value)) { (format!("{:.0}°", value.round())) } }
+    let on_map = |metric: Metric, value: f64| {
+        html! { tspan class=(metric.color()) { (format!("{:.0}°", value.round())) } }
     };
     let marks: Vec<MapMark> = board
         .pins
@@ -489,10 +489,12 @@ fn conditions(board: &LeaderboardView) -> Markup {
             );
             MapMark {
                 pin,
-                temperature: high.or(low),
                 caption: match (high, low) {
-                    (Some(high), Some(low)) => Some(html! { (on_map(high)) " / " (on_map(low)) }),
-                    (Some(only), None) | (None, Some(only)) => Some(on_map(only)),
+                    (Some(high), Some(low)) => Some(html! {
+                        (on_map(Metric::TempHigh, high)) " / " (on_map(Metric::TempLow, low))
+                    }),
+                    (Some(high), None) => Some(on_map(Metric::TempHigh, high)),
+                    (None, Some(low)) => Some(on_map(Metric::TempLow, low)),
                     (None, None) => None,
                 },
             }
@@ -514,10 +516,11 @@ fn conditions(board: &LeaderboardView) -> Markup {
                                 (station.city.as_deref().unwrap_or(&station.station_id))
                             }
                             span class="condition-values pixel" {
-                                @if let Some(high) = station.high { em { "HI " } (temperature(high)) " " }
-                                @if let Some(low) = station.low { em { "LO " } (temperature(low)) " " }
+                                @if let Some(high) = station.high { em { "HI " } (temperature(Metric::TempHigh, high)) " " }
+                                @if let Some(low) = station.low { em { "LO " } (temperature(Metric::TempLow, low)) " " }
                                 @if let Some(wind) = station.wind {
-                                    em { "WIND " } span title=(format::mph(wind)) { (format!("{:.0} KT", wind.round())) }
+                                    em { "WIND " }
+                                    span class=(Metric::WindSpeed.color()) title=(format::mph(wind)) { (format!("{:.0} KT", wind.round())) }
                                 }
                                 @if station.high.or(station.low).or(station.wind).is_none() { "—" }
                             }

@@ -119,8 +119,9 @@ pub trait MetricText {
     fn short_value(self, value: f64) -> String;
     /// The unit after a pick's bound: `°` or ` kt`.
     fn short_unit(self) -> &'static str;
-    /// The class colouring a value: a temperature's band, none for wind.
-    fn tint(self, value: f64) -> Option<&'static str>;
+    /// The class colouring its values: one colour for highs, one for lows, one for wind,
+    /// wherever they show.
+    fn color(self) -> &'static str;
     /// A value's tooltip: wind in miles per hour too.
     fn hint(self, value: f64) -> Option<String>;
 }
@@ -170,10 +171,11 @@ impl MetricText for Metric {
         }
     }
 
-    fn tint(self, value: f64) -> Option<&'static str> {
+    fn color(self) -> &'static str {
         match self {
-            Metric::TempHigh | Metric::TempLow => Some(temperature_band(value)),
-            Metric::WindSpeed => None,
+            Metric::TempHigh => "metric-high",
+            Metric::TempLow => "metric-low",
+            Metric::WindSpeed => "metric-wind",
         }
     }
 
@@ -259,20 +261,6 @@ fn tenths(value: f64) -> Markup {
     let text = format!("{value:.1}");
     let (whole, tenth) = text.split_once('.').unwrap_or((&text, "0"));
     html! { (whole) span class="tenths" { "." (tenth) } }
-}
-
-/// The colour band of a temperature in °F, as NWS maps band them; its class colours it
-/// (static/styles.css).
-pub fn temperature_band(fahrenheit: f64) -> &'static str {
-    match fahrenheit {
-        t if t < 10.0 => "temp-frigid",
-        t if t < 32.0 => "temp-freezing",
-        t if t < 50.0 => "temp-cool",
-        t if t < 70.0 => "temp-mild",
-        t if t < 85.0 => "temp-warm",
-        t if t < 100.0 => "temp-hot",
-        _ => "temp-scorching",
-    }
 }
 
 /// A wind pick's bound in miles per hour, for its button's tooltip: `≈ 9–11 mph`. Temperatures

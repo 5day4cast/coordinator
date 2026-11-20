@@ -138,10 +138,10 @@ test.describe("Competitions", () => {
     await registerWithUsername(page, username, password);
   });
 
-  test("the featured contest shows what it costs, what first place wins and its seats", async ({ page }) => {
+  test("the featured contest shows what it costs, its prize pool and its seats", async ({ page }) => {
     const facts = page.locator("#competitions-page .featured-facts");
     // What it costs, all in, and what first place wins; nothing else about fees or places.
-    await expect(facts).toContainText("1st wins");
+    await expect(facts).toContainText("Prize pool");
     await expect(facts).toContainText("Entry");
     await expect(facts).toContainText("Seats");
   });

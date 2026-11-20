@@ -41,6 +41,11 @@
 }
 
 [data-tip]::after {
+  /* The bubble reads as a sentence, whatever its label's lettering. */
+  text-transform: none;
+  letter-spacing: normal;
+  font-family: var(--font-body, inherit);
+  font-weight: 400;
   content: attr(data-tip);
   position: absolute;
   z-index: 20;

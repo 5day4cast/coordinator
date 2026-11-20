@@ -1099,7 +1099,26 @@ function unpickWithSpace(event) {
   showPicksLeft(input.form);
 }
 
+// Picks lock when the window starts: once the form's own countdown runs out, Pay stops and says
+// why, rather than starting a payment for a competition that no longer takes entries. A payment
+// already under way, or a paid ticket still to enter, is left for the server to settle.
+function closeEntries(event) {
+  if (!event.detail?.element?.classList.contains("lock-clock")) return;
+  const pay = document.getElementById("submitEntry");
+  if (pay?.classList.contains("is-loading") || document.getElementById("entryPaid")?.dataset.ticketId) return;
+  if (pay) {
+    pay.disabled = true;
+    pay.textContent = "Entries closed";
+  }
+  const error = document.getElementById("errorMessage");
+  if (error) {
+    error.textContent = "This contest has started, so it takes no more entries. Pick another in the Lobby.";
+    error.classList.remove("hidden");
+  }
+}
+
 function setupEntryForm() {
+  document.body.addEventListener("fw:countdown-ended", closeEntries);
   document.addEventListener("click", (event) => {
     if (event.target.closest?.("#submitEntry")) submitEntry();
     if (event.target instanceof HTMLInputElement && event.target.matches(PICK)) {

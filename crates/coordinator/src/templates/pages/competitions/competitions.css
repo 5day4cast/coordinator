@@ -3,8 +3,8 @@
 
 .intro {
   display: grid;
-  gap: 1.25rem;
-  margin-bottom: 1.75rem;
+  gap: 1rem;
+  margin-bottom: 1.5rem;
 }
 
 .intro-text {
@@ -23,7 +23,7 @@
 
 .intro .intro-title {
   margin: 0;
-  font-size: clamp(2.2rem, 6vw, 3.4rem);
+  font-size: clamp(2rem, 5vw, 2.6rem);
   line-height: 1;
 }
 
@@ -67,9 +67,9 @@
 
 .featured-body {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 17rem;
+  grid-template-columns: minmax(19rem, 1fr) minmax(0, 1fr);
   gap: 1.25rem;
-  padding: 1.1rem;
+  padding: 1rem 1.1rem;
 }
 
 .featured-main {
@@ -87,7 +87,7 @@
 
 .featured-title {
   margin: 0;
-  font-size: 2rem;
+  font-size: 1.8rem;
   line-height: 1;
 }
 
@@ -98,26 +98,30 @@
 
 .featured-cities {
   font-family: var(--font-display);
-  font-size: 1.3rem;
+  font-size: 1.25rem;
   font-weight: 600;
   letter-spacing: 0.02em;
   color: var(--gold);
 }
 
-.featured-main .station-map {
-  margin: 0.5rem 0 0;
+.featured-map {
+  align-self: center;
+  min-width: 0;
 }
 
-.featured-side {
-  display: grid;
-  gap: 1rem;
-  align-content: start;
+.featured-map .station-map {
+  margin: 0;
 }
 
 .featured-facts {
   display: grid;
-  gap: 0.75rem;
-  margin: 0;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.6rem 1rem;
+  margin: 0.4rem 0 0.6rem;
+}
+
+.featured-seat-fact {
+  grid-column: 1 / -1;
 }
 
 .featured-facts dt,
@@ -134,7 +138,7 @@
   display: grid;
   margin: 0;
   font-family: var(--font-display);
-  font-size: 1.9rem;
+  font-size: 1.6rem;
   font-weight: 700;
   line-height: 1.1;
 }
@@ -153,14 +157,6 @@
 @media screen and (max-width: 900px) {
   .featured-body {
     grid-template-columns: minmax(0, 1fr);
-  }
-
-  .featured-facts {
-    grid-template-columns: 1fr 1fr;
-  }
-
-  .featured-facts div:last-child {
-    grid-column: 1 / -1;
   }
 }
 
