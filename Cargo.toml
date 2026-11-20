@@ -162,6 +162,17 @@ opt-level = 3
 inherits = "release"
 lto = "thin"
 
+# CI's tests and end-to-end server (ci.yml): the workspace compiles as in dev,
+# while every dependency is optimized once into the build cache. Unoptimized,
+# the Keymeld and dlctix signing in the integration tests takes minutes.
+[profile.ci]
+inherits = "dev"
+debug = "line-tables-only"
+incremental = false
+
+[profile.ci.package."*"]
+opt-level = 2
+
 # The browser module (coordinator-wasm): smallest code overall, but the
 # key-derivation crates at full speed, since log-in runs scrypt (N=2^17)
 # on the page. panic=abort drops the unwinding tables wasm never uses.

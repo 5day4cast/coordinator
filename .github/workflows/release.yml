@@ -4,9 +4,10 @@ on:
   push:
     tags:
       - "v*.*.*"
-    # A push to master builds the release jobs to warm their caches (see
+    # A push to master builds the Linux release jobs to warm their caches (see
     # prepare-release), so a tagged release, including a hotfix, compiles only
-    # the workspace's own crates.
+    # the workspace's own crates there, and uploads the Linux packages the home
+    # lab deploys. macOS builds only for a tag or a manual run.
     branches:
       - master
   workflow_dispatch:
@@ -50,6 +51,7 @@ jobs:
       dry_run: ${{ steps.release.outputs.dry_run }}
       build_images: ${{ steps.release.outputs.build_images }}
       warm: ${{ steps.release.outputs.warm }}
+      native: ${{ steps.release.outputs.native }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -69,6 +71,10 @@ jobs:
           INPUT_DRY_RUN: ${{ inputs.dry_run }}
           INPUT_BUILD_IMAGES: ${{ inputs.build_images }}
         run: |
+          # The native targets. Master builds Linux only: the lab deploys its
+          # packages, and nothing should wait on a macOS runner.
+          linux='{"os":"ubuntu-latest","target":"x86_64-unknown-linux-gnu","asset":"coordinator-x86_64-linux"},{"os":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-gnu","asset":"coordinator-aarch64-linux"}'
+          macos='{"os":"macos-latest","target":"x86_64-apple-darwin","asset":"coordinator-x86_64-macos"},{"os":"macos-latest","target":"aarch64-apple-darwin","asset":"coordinator-aarch64-macos"}'
           if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF_TYPE" = "branch" ]; then
             # Cache warming on master: build like a release, publish nothing.
             VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
@@ -79,6 +85,7 @@ jobs:
               echo "dry_run=true"
               echo "build_images=false"
               echo "warm=true"
+              echo "native={\"include\":[$linux]}"
             } >> "$GITHUB_OUTPUT"
             echo "Warming release caches at $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
             exit 0
@@ -105,6 +112,7 @@ jobs:
             echo "dry_run=$DRY_RUN"
             echo "build_images=$BUILD_IMAGES"
             echo "warm=false"
+            echo "native={\"include\":[$linux,$macos]}"
           } >> "$GITHUB_OUTPUT"
           echo "Release v$VERSION from $SOURCE (dry_run=$DRY_RUN)" >> "$GITHUB_STEP_SUMMARY"
 
@@ -176,23 +184,10 @@ jobs:
     name: Build Native Binaries (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     needs: prepare-release
+    # Linux targets also supply the container images' binaries.
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            asset: coordinator-x86_64-linux
-          # Also the arm64 container images' binaries.
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            asset: coordinator-aarch64-linux
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            asset: coordinator-x86_64-macos
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            asset: coordinator-aarch64-macos
+      matrix: ${{ fromJSON(needs.prepare-release.outputs.native) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -253,14 +248,6 @@ jobs:
           path: release-recover/*
           if-no-files-found: error
           retention-days: 14
-      - name: Build the verifier enclave, LNURL relay, ark-swapd, and synth (Linux)
-        if: runner.os == 'Linux'
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          cargo build --release --locked --target "$TARGET" \
-            -p coordinator-verifier-enclave --features coordinator-verifier-enclave/lnurl \
-            -p coordinator-lnurl-relay -p coordinator-payout-witness -p coordinator-ark-swap -p coordinator-synth
       - name: Stage the coordinator binaries for packaging
         env:
           TARGET: ${{ matrix.target }}
@@ -273,15 +260,70 @@ jobs:
           path: native-bin/*
           if-no-files-found: error
           retention-days: 14
-      - name: Package the verifier enclave for Keymeld hosts (Linux)
-        if: runner.os == 'Linux'
+
+  # The Linux hosts' packages, beside build-release instead of after it: the
+  # verifier enclave and LNURL relay for Keymeld hosts, ark-swapd, and synth.
+  build-hosts:
+    name: Build Host Packages (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    needs: prepare-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-release.outputs.source }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Free disk space in the background
+        run: |
+          nohup sudo sh -c 'rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; docker image prune --all --force; apt-get clean' \
+            >/dev/null 2>&1 &
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # See build-wasm: dependencies from master's cache; only master saves it.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-hosts-${{ matrix.target }}
+          save-if: ${{ needs.prepare-release.outputs.warm == 'true' }}
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config perl curl
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/coordinator-openssl-${{ matrix.target }}
+          key: openssl-${{ matrix.target }}-${{ hashFiles('scripts/build-release-openssl.sh') }}
+      - name: Build verified static OpenSSL for the native target
+        env:
+          TARGET: ${{ matrix.target }}
+          OPENSSL_REUSE_PREFIX: "1"
+        run: |
+          OPENSSL_BUILD_JOBS=$(getconf _NPROCESSORS_ONLN) \
+            bash scripts/build-release-openssl.sh "$TARGET" "$RUNNER_TEMP/coordinator-openssl-$TARGET"
+      - name: Build the verifier enclave, LNURL relay, ark-swapd, and synth
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo build --release --locked --target "$TARGET" \
+            -p coordinator-verifier-enclave --features coordinator-verifier-enclave/lnurl \
+            -p coordinator-lnurl-relay -p coordinator-payout-witness -p coordinator-ark-swap -p coordinator-synth
+      - name: Package the verifier enclave for Keymeld hosts
         env:
           VERSION: ${{ needs.prepare-release.outputs.version }}
           SOURCE: ${{ needs.prepare-release.outputs.source }}
           TARGET: ${{ matrix.target }}
         run: python3 scripts/release.py enclave --version "$VERSION" --source "$SOURCE" --target "$TARGET"
-      - name: Build and package the explicit simulation verifier (Linux)
-        if: runner.os == 'Linux'
+      - name: Build and package the explicit simulation verifier
         env:
           VERSION: ${{ needs.prepare-release.outputs.version }}
           SOURCE: ${{ needs.prepare-release.outputs.source }}
@@ -290,43 +332,32 @@ jobs:
           cargo build --release --locked --target "$TARGET" -p coordinator-verifier-enclave \
             --features coordinator-verifier-enclave/lnurl,coordinator-verifier-enclave/payout-witness-local
           python3 scripts/release.py enclave-simulation --version "$VERSION" --source "$SOURCE" --target "$TARGET"
-      - name: Package ark-swapd for the Arkade swap host (Linux)
-        if: runner.os == 'Linux'
+      - name: Package ark-swapd for the Arkade swap host
         env:
           VERSION: ${{ needs.prepare-release.outputs.version }}
           SOURCE: ${{ needs.prepare-release.outputs.source }}
           TARGET: ${{ matrix.target }}
         run: python3 scripts/release.py swap --version "$VERSION" --source "$SOURCE" --target "$TARGET"
-      - name: Package synth for the synthetic-traffic host (Linux)
-        if: runner.os == 'Linux'
+      - name: Package synth for the synthetic-traffic host
         env:
           VERSION: ${{ needs.prepare-release.outputs.version }}
           SOURCE: ${{ needs.prepare-release.outputs.source }}
           TARGET: ${{ matrix.target }}
         run: python3 scripts/release.py synth --version "$VERSION" --source "$SOURCE" --target "$TARGET"
       - uses: actions/upload-artifact@v4
-        if: runner.os == 'Linux'
         with:
           name: release-hosts-${{ matrix.target }}
           path: release/*
           if-no-files-found: error
           retention-days: 14
-      # The container images copy these binaries instead of compiling again.
-      - name: Stage binaries for the container images (Linux)
-        if: runner.os == 'Linux'
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          mkdir -p image-bin
-          cp "target/$TARGET/release/coordinator" "target/$TARGET/release/wallet-cli" \
-            "target/$TARGET/release/synth" image-bin/
+      # The synth image copies this binary instead of compiling it again.
       - uses: actions/upload-artifact@v4
-        if: runner.os == 'Linux'
         with:
-          name: image-bin-${{ matrix.target }}
-          path: image-bin/*
+          name: image-synth-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/synth
           if-no-files-found: error
           retention-days: 14
+
 
   # The coordinator package: build-release's binaries plus the WASM package.
   # Only copying and archiving, so every target packages on one small runner.
@@ -336,16 +367,7 @@ jobs:
     needs: [prepare-release, build-wasm, build-release]
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            asset: coordinator-x86_64-linux
-          - target: aarch64-unknown-linux-gnu
-            asset: coordinator-aarch64-linux
-          - target: x86_64-apple-darwin
-            asset: coordinator-x86_64-macos
-          - target: aarch64-apple-darwin
-            asset: coordinator-aarch64-macos
+      matrix: ${{ fromJSON(needs.prepare-release.outputs.native) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -413,7 +435,7 @@ jobs:
     # build on one amd64 runner without emulation.
     name: Build Docker Images (${{ matrix.arch }})
     runs-on: ubuntu-latest
-    needs: [prepare-release, build-release, build-wasm]
+    needs: [prepare-release, build-release, build-hosts, build-wasm]
     if: needs.prepare-release.outputs.build_images == 'true'
     permissions:
       contents: read
@@ -433,7 +455,11 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: image-bin-${{ matrix.target }}
+          name: native-bin-${{ matrix.target }}
+          path: image/bin/${{ matrix.arch }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-synth-${{ matrix.target }}
           path: image/bin/${{ matrix.arch }}
       - uses: actions/download-artifact@v4
         with:
@@ -498,7 +524,7 @@ jobs:
   publish-images:
     name: Publish Container Manifests
     runs-on: ubuntu-latest
-    needs: [prepare-release, build-release, build-wasm, package-charts, build-docker]
+    needs: [prepare-release, build-release, build-hosts, build-wasm, package-charts, build-docker]
     if: needs.prepare-release.outputs.dry_run != 'true'
     permissions:
       packages: write
@@ -523,7 +549,7 @@ jobs:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
     # The tarballs don't wait for the container images, which publish on their own.
-    needs: [prepare-release, build-release, build-wasm, package-native, package-charts]
+    needs: [prepare-release, build-release, build-hosts, build-wasm, package-native, package-charts]
     if: needs.prepare-release.outputs.dry_run != 'true'
     permissions:
       contents: write

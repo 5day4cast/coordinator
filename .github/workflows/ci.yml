@@ -167,7 +167,9 @@ jobs:
         with:
           key: ubuntu-24.04-${{ runner.arch }}
 
-      - run: cargo test --workspace --locked
+      # Dependencies optimized (Cargo.toml [profile.ci]): the signing-heavy
+      # Keymeld integration tests otherwise take minutes each.
+      - run: cargo test --workspace --locked --profile ci
 
   # Build check
   build:
@@ -227,14 +229,16 @@ jobs:
         with:
           key: ubuntu-24.04-${{ runner.arch }}
 
-      - name: Build with e2e-testing feature
-        run: cargo build --workspace --release --features e2e-testing --locked
+      # Only the server E2E runs, with optimized dependencies; the release
+      # workflow builds every crate in release.
+      - name: Build the E2E server
+        run: cargo build -p coordinator --features e2e-testing --locked --profile ci
 
       - name: Upload coordinator binary
         uses: actions/upload-artifact@v4
         with:
           name: coordinator-binary
-          path: target/release/coordinator
+          path: target/ci/coordinator
           retention-days: 1
           compression-level: 1
           if-no-files-found: error
