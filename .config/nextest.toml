@@ -1,0 +1,5 @@
+# CI's Test job (.github/workflows/ci.yml). Tests over 15 s are reported as
+# SLOW so the job's critical path stays visible.
+[profile.default]
+slow-timeout = { period = "15s" }
+final-status-level = "slow"
