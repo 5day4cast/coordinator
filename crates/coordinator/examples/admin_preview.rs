@@ -487,10 +487,10 @@ fn large_pools_preview(
                 maud::html! {main.admin-workspace {(heading.clone()) (funds_graph(&c,&page,"signet",""))}},
             ),
         )?;
-        for row in 0..25 {
+        for (row, ticket) in page.tickets.iter().take(25).enumerate() {
             let entry_page = FundsPage {
                 total: 1,
-                tickets: vec![page.tickets[row].clone()],
+                tickets: vec![ticket.clone()],
                 commitment: None,
             };
             std::fs::write(
