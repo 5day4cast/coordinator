@@ -1128,7 +1128,11 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Result<Router, anyhow
             get(crate::api::routes::own_entry_detail_fragment),
         )
         .route("/payouts", get(payouts_fragment))
-        .route("/help", get(crate::api::routes::help_fragment));
+        .route("/help", get(crate::api::routes::help_fragment))
+        .route(
+            crate::templates::fragments::national::NATIONAL_URL,
+            get(crate::api::routes::national_fragment),
+        );
 
     let api_routes = Router::new()
         .route("/", get(public_page_handler))

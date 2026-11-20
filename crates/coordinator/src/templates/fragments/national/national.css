@@ -1,0 +1,240 @@
+/* The national forecast: the Weather Channel's travel cities screen, a map beside a table, the
+   cities taking turns a group at a time. */
+.national {
+  margin-bottom: 1.5rem;
+  overflow: hidden;
+  border: 2px solid #3d5fd6;
+  border-radius: 14px;
+  background: linear-gradient(180deg, #2b47c9, #1a1f7a 75%, #2d1d72);
+}
+
+.national-bar {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.45rem 1rem;
+  background: linear-gradient(90deg, #f28c1b, #d6501b);
+  color: #fff6c8;
+}
+
+.national-title {
+  font-family: var(--font-display);
+  font-size: 1.25rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.national-date {
+  font-size: 1.4rem;
+  line-height: 1;
+}
+
+.national-key {
+  margin-left: auto;
+  padding: 0.05rem 0.5rem;
+  border-radius: 4px;
+  background: rgb(8 18 48 / 0.7);
+  font-family: var(--font-pixel);
+  font-size: 1.2rem;
+  color: var(--ink);
+}
+
+.national-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1.7fr) minmax(14rem, 1fr);
+}
+
+.national-map {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.national-map .fm-sea {
+  fill: #0a1a5c;
+}
+
+.national-map .fm-grid line {
+  stroke: #1f2f80;
+  stroke-width: 0.4;
+}
+
+.national-map .fm-land {
+  fill: #2442a8;
+  stroke: #7d97f0;
+  stroke-width: 0.5;
+}
+
+.national-city-mark circle {
+  fill: #fff;
+  stroke: #0a1a5c;
+  stroke-width: 1;
+}
+
+.national-city-mark.is-contest circle {
+  fill: var(--gold);
+}
+
+.national-name {
+  font-family: var(--font-display);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  fill: #ffe066;
+  paint-order: stroke;
+  stroke: #0a1a5c;
+  stroke-width: 2.5px;
+}
+
+.national-temps {
+  font-size: 12px;
+  fill: var(--ink);
+  paint-order: stroke;
+  stroke: #0a1a5c;
+  stroke-width: 2.5px;
+}
+
+.national-temps tspan {
+  fill: currentColor;
+}
+
+.national-table {
+  display: grid;
+  align-content: start;
+  border-left: 2px solid #3d5fd6;
+  background: rgb(8 18 48 / 0.35);
+}
+
+.national-head,
+.national-rows li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 2.75rem 2.75rem;
+  align-items: baseline;
+  gap: 0.5rem;
+  padding: 0.25rem 1rem;
+}
+
+.national-head {
+  padding-top: 0.5rem;
+  font-family: var(--font-display);
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: #ffe066;
+}
+
+.national-head span + span,
+.national-rows li span + span {
+  text-align: right;
+}
+
+/* The groups share one place; each takes its turn there. */
+.national-rows {
+  display: grid;
+}
+
+.national-rows > .national-group {
+  grid-area: 1 / 1;
+}
+
+.national-city {
+  overflow: hidden;
+  font-family: var(--font-display);
+  font-size: 1.15rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: #fff;
+}
+
+.national-rows li.is-contest .national-city {
+  color: var(--gold);
+}
+
+.national-rows .pixel {
+  font-size: 1.6rem;
+  line-height: 1;
+}
+
+/* Each group shows for 8 s of a cycle of 8 s per group, fading in and out at its ends. */
+.national-cycle-2 .national-group {
+  animation: national-turn-2 16s infinite both;
+}
+
+.national-cycle-3 .national-group {
+  animation: national-turn-3 24s infinite both;
+}
+
+.national-cycle-4 .national-group {
+  animation: national-turn-4 32s infinite both;
+}
+
+.national .national-group-1 {
+  animation-delay: 8s;
+}
+
+.national .national-group-2 {
+  animation-delay: 16s;
+}
+
+.national .national-group-3 {
+  animation-delay: 24s;
+}
+
+@keyframes national-turn-2 {
+  0% { opacity: 0; }
+  3%, 47% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+
+@keyframes national-turn-3 {
+  0% { opacity: 0; }
+  2%, 31% { opacity: 1; }
+  33.4%, 100% { opacity: 0; }
+}
+
+@keyframes national-turn-4 {
+  0% { opacity: 0; }
+  2%, 23% { opacity: 1; }
+  25%, 100% { opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .national .national-group {
+    animation: none;
+    opacity: 0;
+  }
+
+  .national .national-group-0 {
+    opacity: 1;
+  }
+}
+
+/* Phones: the table under the map, and the map's numbers without names. */
+@media screen and (max-width: 768px) {
+  .national-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .national-table {
+    border-left: 0;
+    border-top: 2px solid #3d5fd6;
+  }
+
+  .national-name {
+    display: none;
+  }
+
+  .national-temps {
+    font-size: 18px;
+  }
+
+  .national-date {
+    display: none;
+  }
+}
