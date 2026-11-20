@@ -3,7 +3,7 @@ use maud::{html, Markup};
 /// The wordmark: "5day4cast" with its 4 in gold.
 pub fn wordmark() -> Markup {
     html! {
-        span class="wordmark" { "5day" b { "4" } "cast" }
+        span class="wordmark" { "5day" b { "4cast" } }
     }
 }
 
