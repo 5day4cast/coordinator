@@ -1128,11 +1128,7 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Result<Router, anyhow
             get(crate::api::routes::own_entry_detail_fragment),
         )
         .route("/payouts", get(payouts_fragment))
-        .route("/help", get(crate::api::routes::help_fragment))
-        .route(
-            crate::templates::fragments::national::NATIONAL_URL,
-            get(crate::api::routes::national_fragment),
-        );
+        .route("/help", get(crate::api::routes::help_fragment));
 
     let api_routes = Router::new()
         .route("/", get(public_page_handler))
@@ -1502,6 +1498,14 @@ async fn public_fallback(
 fn static_files(state: &AppState) -> Router<Arc<AppState>> {
     crate::api::ui_files::router(&state.ui_dir, state.wasm_version.clone())
         .route("/assets/{file}", get(crate::templates::assets::serve_asset))
+        .route(
+            "/weatherstar/",
+            get(crate::api::weatherstar::serve_weatherstar),
+        )
+        .route(
+            "/weatherstar/{*path}",
+            get(crate::api::weatherstar::serve_weatherstar),
+        )
 }
 
 /// Gzip for browsers that accept it. The public listener compresses its static

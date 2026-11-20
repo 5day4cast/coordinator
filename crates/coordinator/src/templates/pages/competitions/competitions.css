@@ -1,6 +1,18 @@
 /* The lobby: how to play, the contest to act on now as a forecast panel, then every contest
    as a card. */
 
+/* The regional forecast, at most WeatherStar's own widescreen size so its type stays sharp. */
+.weatherstar {
+  display: block;
+  width: 100%;
+  max-width: 854px;
+  aspect-ratio: 854 / 480;
+  margin: 0 auto 1.5rem;
+  border: 1px solid var(--wx-edge);
+  border-radius: 14px;
+  background: var(--wx-b);
+}
+
 .intro {
   display: grid;
   gap: 1rem;

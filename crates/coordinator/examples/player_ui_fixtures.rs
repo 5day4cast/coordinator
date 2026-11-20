@@ -20,7 +20,6 @@ use coordinator::{
                 leaderboard, leaderboard_scores, LeaderboardRow, LeaderboardView, Ownership,
                 PickMark, StationReadings,
             },
-            national::{national_forecast, national_groups, NationalCity},
             picks::{picks_detail, PickView},
         },
         layouts::base::{base, PageConfig},
@@ -263,50 +262,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
 
-    // Synthetic highs and lows at real airports, for the national forecast.
-    let national_cities: Vec<NationalCity> = [
-        ("KSEA", "Seattle", 47.45, -122.31, 52.0, 41.0),
-        ("KPDX", "Portland", 45.59, -122.60, 55.0, 43.0),
-        ("KSFO", "San Francisco", 37.62, -122.38, 63.0, 50.0),
-        ("KLAX", "Los Angeles", 33.94, -118.41, 75.0, 58.0),
-        ("KPHX", "Phoenix", 33.43, -112.01, 81.0, 57.0),
-        ("KLAS", "Las Vegas", 36.08, -115.15, 70.0, 49.0),
-        ("KSLC", "Salt Lake City", 40.79, -111.98, 47.0, 30.0),
-        ("KBOI", "Boise", 43.56, -116.22, 45.0, 28.0),
-        ("KDEN", "Denver", 39.86, -104.67, 54.0, 27.0),
-        ("KABQ", "Albuquerque", 35.04, -106.61, 58.0, 33.0),
-        ("KMSP", "Minneapolis", 44.88, -93.22, 36.0, 24.0),
-        ("KDFW", "Dallas", 32.90, -97.04, 72.0, 52.0),
-        ("KIAH", "Houston", 29.98, -95.34, 78.0, 61.0),
-        ("KMCI", "Kansas City", 39.30, -94.71, 49.0, 33.0),
-        ("KORD", "Chicago", 41.98, -87.90, 77.0, 55.0),
-        ("KDTW", "Detroit", 42.21, -83.35, 44.0, 32.0),
-        ("KATL", "Atlanta", 33.64, -84.43, 66.0, 47.0),
-        ("KMIA", "Miami", 25.79, -80.29, 82.0, 71.0),
-        ("KMSY", "New Orleans", 29.99, -90.26, 76.0, 60.0),
-        ("KCLT", "Charlotte", 35.21, -80.94, 62.0, 41.0),
-        ("KDCA", "Washington", 38.85, -77.04, 55.0, 40.0),
-        ("KJFK", "New York", 40.64, -73.78, 73.0, 59.0),
-        ("KBOS", "Boston", 42.36, -71.01, 49.0, 38.0),
-        ("KPWM", "Portland", 43.65, -70.31, 43.0, 30.0),
-    ]
-    .into_iter()
-    .filter_map(|(id, name, lat, lon, high, low)| NationalCity::new(id, name, lat, lon, high, low))
-    .collect();
-    let national = national_forecast(
-        &national_groups(national_cities, &["KORD".to_owned(), "KJFK".to_owned()]),
-        now + Duration::days(1),
-    );
-
     let pages: [(&str, Markup); 6] = [
         (
             "home",
-            html! { (national) (lobby_page(
+            lobby_page(
                 &[open.clone(), queued.clone(), live.clone(), finished],
                 &ListOptions::default(),
                 &lobby,
                 now,
-            )) },
+            ),
         ),
         ("entry", entry),
         ("entry-queued", entry_queued),

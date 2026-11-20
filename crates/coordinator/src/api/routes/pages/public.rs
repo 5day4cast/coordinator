@@ -33,7 +33,7 @@ use crate::{
         },
         Competition, Error, LedgerTotals, RefundProgress, Returned, UnenteredTickets, UnpaidTicket,
     },
-    infra::{admin_weather::Filters, oracle::ValueOptions, refresh_cache::Cached},
+    infra::{oracle::ValueOptions, refresh_cache::Cached},
     startup::AppState,
     templates::{
         components::RecoveryHelp,
@@ -50,7 +50,6 @@ use crate::{
                 LeaderboardView, Ownership, PickMark, StationReadings,
             },
             loading::{placeholder, Pending, MAX_ASKS},
-            national::{national_forecast, national_groups, NationalCity},
             picks::{detail_url, own_picks_detail, picks_detail, withheld_picks_detail, PickView},
         },
         layouts::base::{base, PageConfig},
@@ -385,21 +384,11 @@ pub async fn competitions_fragment(
     options.stations = named;
     let shown = shown_ids(&competitions, &options);
     let featured = featured_id(&competitions, &options);
-    // The next contest's cities lead the national forecast.
-    let contest = featured
-        .as_ref()
-        .and_then(|id| competitions.iter().find(|view| &view.id == id))
-        .map(|view| view.locations.clone())
-        .unwrap_or_default();
-    let (_, lobby, national) = tokio::join!(
+    let (_, lobby) = tokio::join!(
         complete(&state, &mut competitions, &shown),
         lobby(&state, featured),
-        national(&state, &contest, options.tab == Tab::Overview),
     );
-    let content = html! {
-        (national)
-        (lobby_page(&competitions, &options, &lobby, now))
-    };
+    let content = lobby_page(&competitions, &options, &lobby, now);
     let content = if state.coordinator.settle_only() {
         html! { (entries_paused_banner()) (content) }
     } else {
@@ -412,50 +401,6 @@ pub async fn competitions_fragment(
         content,
         Caching::Public,
     )
-}
-
-/// The national forecast at the top of the lobby: tomorrow's highs and lows at the stations
-/// the oracle can score, from the discovery cache kept warm for operators. Nothing on the other
-/// tabs, or while the cache has nothing.
-async fn national(state: &AppState, contest: &[String], shown: bool) -> Markup {
-    let Some(window) = shown
-        .then(|| Filters::default().window(now()).ok())
-        .flatten()
-    else {
-        return html! {};
-    };
-    let discovery = state.admin_weather.read(window.clone()).await;
-    let Some(discovery) = discovery.value() else {
-        return html! {};
-    };
-    let cities = discovery
-        .candidates
-        .iter()
-        .filter_map(|candidate| {
-            let station = &candidate.eligible.station;
-            NationalCity::new(
-                &station.station_id,
-                &city_name(&station.station_name),
-                station.latitude,
-                station.longitude,
-                candidate.high as f64,
-                candidate.low as f64,
-            )
-        })
-        .collect();
-    national_forecast(&national_groups(cities, contest), window.start)
-}
-
-/// The national forecast again, for its own refresh: the lobby's never restarts its turns.
-pub async fn national_fragment(State(state): State<Arc<AppState>>) -> Response {
-    let now = now();
-    let competitions = competition_views(&state, now).await;
-    let options = ListOptions::default();
-    let contest = featured_id(&competitions, &options)
-        .and_then(|id| competitions.iter().find(|view| view.id == id))
-        .map(|view| view.locations.clone())
-        .unwrap_or_default();
-    fragment(national(&state, &contest, true).await, Caching::Public)
 }
 
 /// The lobby's cities, from the oracle's stations, and the featured competition's forecasts

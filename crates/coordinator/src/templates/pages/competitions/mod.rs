@@ -905,6 +905,17 @@ impl Lobby {
     }
 }
 
+/// WeatherStar 4000+ (`vendor/ws4kp`) in widescreen kiosk mode with its Regional Forecast and any
+/// weather alerts, opening on the first region its `scripts/custom.js` tours. The alerts stay on:
+/// WeatherStar's start-up fails without them.
+const WEATHERSTAR_TOUR: &str = concat!(
+    "/weatherstar/?kiosk=true&viewMode=wide-enhanced&regional-forecast=true",
+    "&current-weather=false&latest-observations=false&hourly=false",
+    "&hourly-graph=false&travel=false&local-forecast=false&extended-forecast=false",
+    "&almanac=false&spc-outlook=false&climate=false&radar=false&future-radar=false",
+    "&latLon=%7B%22lat%22%3A41.9%2C%22lon%22%3A-87.6%7D",
+);
+
 /// [`competitions_page`] with the cities and the featured competition's weather.
 pub fn lobby_page(
     competitions: &[CompetitionView],
@@ -916,6 +927,10 @@ pub fn lobby_page(
     let sections = Sections::of(competitions, options);
 
     html! {
+        // Outside the refreshed part, so the 30 second refresh never restarts its tour.
+        @if options.tab == Tab::Overview {
+            iframe class="weatherstar" src=(WEATHERSTAR_TOUR) title="Regional forecast" tabindex="-1" {}
+        }
         div id="competitions-page"
             hx-get=(options.url())
             hx-trigger="every 30s, fw:countdown-ended from:body"

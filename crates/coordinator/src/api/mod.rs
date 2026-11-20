@@ -7,3 +7,4 @@ pub mod request_context;
 pub mod routes;
 pub mod telemetry;
 pub mod ui_files;
+pub mod weatherstar;

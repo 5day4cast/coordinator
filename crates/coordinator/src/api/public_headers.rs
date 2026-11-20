@@ -54,6 +54,15 @@ const RECOVER_POLICY: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe
     base-uri 'none'; frame-ancestors 'none'; form-action 'self'; \
     require-trusted-types-for 'script'; trusted-types 'none'";
 
+/// WeatherStar 4000+'s policy (`api/weatherstar.rs`): this site's own files, NOAA's weather API
+/// for its data, and framing by this site alone, for the lobby. Its script writes HTML with
+/// `innerHTML`, so it runs without the Trusted Types the other pages require; it has no inline
+/// script or style.
+const WEATHERSTAR_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
+    font-src 'self'; img-src 'self' data:; connect-src 'self' https://api.weather.gov; \
+    manifest-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'self'; \
+    form-action 'none'";
+
 fn origin(url: &str) -> Option<String> {
     let url = reqwest::Url::parse(url).ok()?;
     matches!(url.scheme(), "http" | "https").then(|| url.origin().ascii_serialization())
@@ -85,6 +94,8 @@ pub fn content_security_policy(connect: &[&str], forms: &[&str]) -> String {
         "style-src 'self'".to_owned(),
         "font-src 'self'".to_owned(),
         "img-src 'self' data:".to_owned(),
+        // The lobby frames WeatherStar, from this site.
+        "frame-src 'self'".to_owned(),
         format!("connect-src {}", sources(connect)),
         "object-src 'none'".to_owned(),
         "base-uri 'none'".to_owned(),
@@ -106,6 +117,10 @@ pub async fn public_response_headers(
 ) -> Response {
     let signed = request.headers().contains_key(AUTHORIZATION);
     let recover = request.uri().path() == RECOVER_PATH;
+    let weatherstar = request
+        .uri()
+        .path()
+        .starts_with(crate::api::weatherstar::WEATHERSTAR_PREFIX);
     let mut response = next.run(request).await;
     let is_html = response
         .headers()
@@ -114,13 +129,18 @@ pub async fn public_response_headers(
         .is_some_and(|value| value.starts_with("text/html"));
     let response_headers = response.headers_mut();
     if is_html {
-        let policy = if recover {
-            &headers.recover_policy
+        let policy = if weatherstar {
+            HeaderValue::from_static(WEATHERSTAR_POLICY)
+        } else if recover {
+            headers.recover_policy.clone()
         } else {
-            &headers.content_security_policy
+            headers.content_security_policy.clone()
         };
-        response_headers.insert(CONTENT_SECURITY_POLICY, policy.clone());
-        response_headers.insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+        response_headers.insert(CONTENT_SECURITY_POLICY, policy);
+        response_headers.insert(
+            X_FRAME_OPTIONS,
+            HeaderValue::from_static(if weatherstar { "SAMEORIGIN" } else { "DENY" }),
+        );
     }
     if signed {
         response_headers.insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
@@ -186,6 +206,9 @@ mod tests {
         assert!(policy.contains("connect-src 'self' https://5day4cast.com https://4casttruth.win https://keymeld.example.net;"));
         assert!(policy.contains("style-src 'self';"));
         assert!(policy.contains("font-src 'self';"));
+        assert!(policy.contains("frame-src 'self';"));
+        assert!(!WEATHERSTAR_POLICY.contains("unsafe"));
+        assert!(WEATHERSTAR_POLICY.contains("frame-ancestors 'self'"));
         for directive in [
             "require-trusted-types-for 'script'",
             "trusted-types htmx login-worker pow-worker",
