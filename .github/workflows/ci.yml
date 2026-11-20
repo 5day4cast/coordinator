@@ -167,9 +167,15 @@ jobs:
         with:
           key: ubuntu-24.04-${{ runner.arch }}
 
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
       # Dependencies optimized (Cargo.toml [profile.ci]): the signing-heavy
-      # Keymeld integration tests otherwise take minutes each.
-      - run: cargo test --workspace --locked --profile ci
+      # Keymeld integration tests otherwise take minutes each. nextest runs
+      # every test binary at once, where cargo test runs them in turn.
+      - run: cargo nextest run --workspace --locked --cargo-profile ci
+      - run: cargo test --workspace --locked --profile ci --doc
 
   # Build check
   build:
