@@ -1,4 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
+import { finishUsernameSignup } from "./signup";
 
 function uniqueUsername(): string {
   return `user${Date.now()}${Math.random().toString(36).slice(2, 6)}`;
@@ -34,11 +35,7 @@ async function registerWithUsername(
 
   await page.locator("#usernameNsecSavedCheckbox").check();
 
-  await page.locator("#usernameRegisterStep2Button").click();
-
-  await expect(page.locator("#logoutContainer")).toBeVisible({
-    timeout: 10000,
-  });
+  await finishUsernameSignup(page);
 
   return nsec;
 }
@@ -122,11 +119,7 @@ test.describe("Username/Password Authentication", () => {
     await page.locator("#usernameNsecSavedCheckbox").check();
     await expect(page.locator("#usernameRegisterStep2Button")).toBeEnabled();
 
-    await page.locator("#usernameRegisterStep2Button").click();
-
-    await expect(page.locator("#logoutContainer")).toBeVisible({
-      timeout: 10000,
-    });
+    await finishUsernameSignup(page);
     await expect(page.locator("#authButtons")).toHaveClass(/is-hidden/);
   });
 

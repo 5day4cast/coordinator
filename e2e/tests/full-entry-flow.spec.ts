@@ -1,4 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
+import { finishUsernameSignup } from "./signup";
 
 function uniqueUsername(): string {
   return `user${Date.now()}${Math.random().toString(36).slice(2, 6)}`;
@@ -31,11 +32,7 @@ async function registerAndLogin(page: Page): Promise<string> {
 
   await page.locator("#usernameNsecSavedCheckbox").check();
 
-  await page.locator("#usernameRegisterStep2Button").click();
-
-  await expect(page.locator("#logoutContainer")).toBeVisible({
-    timeout: 10000,
-  });
+  await finishUsernameSignup(page);
   return username;
 }
 
