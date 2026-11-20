@@ -1,0 +1,57 @@
+/* Sign-up: where it is, and the password's rules as they are met. */
+.signup-steps {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.5rem;
+  margin: 0 0 1rem;
+  padding: 0;
+  list-style: none;
+  counter-reset: step;
+}
+
+.signup-steps li {
+  padding-top: 0.4rem;
+  border-top: 3px solid var(--raise);
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--dim);
+  counter-increment: step;
+}
+
+.signup-steps li::before {
+  content: counter(step) " · ";
+}
+
+/* The step shown marks its place; the ones before it are done. */
+#registerUsername:has(#usernameRegisterStep1:not(.is-hidden)) .signup-steps li:nth-child(1),
+#registerUsername:has(#usernameRegisterStep2:not(.is-hidden)) .signup-steps li:nth-child(2),
+#registerUsername:has(#usernameRegisterStep3:not(.is-hidden)) .signup-steps li:nth-child(3) {
+  border-color: var(--gold);
+  color: var(--ink);
+}
+
+#registerUsername:has(#usernameRegisterStep2:not(.is-hidden)) .signup-steps li:nth-child(1),
+#registerUsername:has(#usernameRegisterStep3:not(.is-hidden)) .signup-steps li:nth-child(-n + 2) {
+  border-color: var(--win);
+}
+
+.password-checks {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.1rem 0.75rem;
+  margin-top: 0.4rem;
+  font-size: 0.78rem;
+  color: var(--dim);
+}
+
+.password-checks li::before {
+  content: "○ ";
+}
+
+.password-checks li.is-met {
+  color: var(--win);
+}
+
+.password-checks li.is-met::before {
+  content: "✓ ";
+}

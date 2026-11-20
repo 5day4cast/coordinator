@@ -52,7 +52,7 @@ pub fn entries_page(
 ) -> Markup {
     html! {
         div id="allEntries" class="account-page" {
-            h1 class="title is-4" { "Your entries" }
+            h1 class="title page-title" { "My entries" }
             (paid_entries(paid, OffsetDateTime::now_utc()))
             (unpaid_entries(unpaid, OffsetDateTime::now_utc()))
             @if rows.is_empty() {
@@ -63,7 +63,7 @@ pub fn entries_page(
                     table id="entriesDataTable" class="table is-fullwidth is-hoverable entries-table" {
                         thead {
                             tr {
-                                th { "Competition" }
+                                th { "Contest" }
                                 th { "Status" }
                                 th { "Entry fee" }
                                 th { "Returned" }

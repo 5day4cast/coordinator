@@ -27,11 +27,25 @@ pub fn help_page_with_terms(
     html! {
         div class="help-page" {
             a class="back-link" href="/competitions" hx-get="/competitions"
-              hx-target="#main-content" hx-push-url="true" { "← All competitions" }
-            h1 class="title is-4" { "How it works" }
+              hx-target="#main-content" hx-push-url="true" { "← Lobby" }
+            h1 class="title page-title" { "How to play" }
             p class="content" {
-                "Daily Fantasy Weather works like daily fantasy sports: make weather picks for a roster of US cities, "
-                "then compete on how well your picks match the observed weather."
+                "5day4cast is daily fantasy weather. As in daily fantasy sports, you make picks for a roster of "
+                "US cities, then compete on how well your picks match the observed weather."
+            }
+            ol class="howto-steps" {
+                li {
+                    strong { "Pick" }
+                    span { "Choose Under, In range or Over on NOAA's forecast for every city and category." }
+                }
+                li {
+                    strong { "Lock in" }
+                    span { "Pay the entry fee over Lightning before the observation window starts." }
+                }
+                li {
+                    strong { "Watch and win" }
+                    span { "Follow the readings live. The top of each pool is paid automatically." }
+                }
             }
 
             nav class="help-contents" aria-label="On this page" {
@@ -50,9 +64,8 @@ pub fn help_page_with_terms(
             section id="scoring" class="content" {
                 h2 { "Scoring" }
                 p {
-                    "Each competition lists its cities and weather categories. For each category — high temperature, "
-                    "low temperature or sustained wind speed — choose below (<), within the displayed range, "
-                    "or above (>)."
+                    "Each contest lists its cities and weather categories. For each category (high temperature, "
+                    "low temperature or sustained wind speed), choose Under, In range or Over."
                 }
                 ul {
                     li {
@@ -76,9 +89,9 @@ pub fn help_page_with_terms(
             section id="readings" class="content" {
                 h2 { "Readings" }
                 ul {
-                    li { strong { "Highest temperature" } ": the highest temperature observed during the window." }
-                    li { strong { "Lowest temperature" } ": the lowest temperature observed during the window." }
-                    li { strong { "Highest wind speed" } ": the highest sustained wind speed observed during the window, in knots." }
+                    li { strong { "High" } ": the highest temperature observed during the window." }
+                    li { strong { "Low" } ": the lowest temperature observed during the window." }
+                    li { strong { "Peak wind" } ": the highest sustained wind speed observed during the window, in knots." }
                 }
                 p {
                     "All observations come from NOAA's reports for the airport station named beside each city. "
@@ -111,7 +124,7 @@ pub fn help_page_with_terms(
                         "If coverage never becomes complete, the contract expires and entrants can recover their funds."
                     }
                     li {
-                        "When the oracle signs, the competition is " strong { "finished" } ": the leaderboard "
+                        "When the oracle signs, the competition is " strong { "final" } ": the leaderboard "
                         "stops changing and payout processing begins."
                     }
                     li {
@@ -254,16 +267,21 @@ fn walkthrough() -> Markup {
             div class="help-walkthrough" {
                 figure class="help-shot entry-form" inert aria-label="An example entry form" {
                     dl class="entry-facts" {
-                        div { dt { "Entries close" (callout(1)) } dd { "Sun, 1:00 PM EDT" } }
+                        div { dt { "Locks in" (callout(1)) } dd { "Sun, 1:00 PM EDT" } }
                         div { dt { "Entry fee" (callout(2)) } dd { "5,687 sats" } }
-                        div { dt { "Prizes" (callout(3)) } dd { "30,000 sats" } }
+                        div { dt { "1st wins" (callout(3)) } dd { "30,000 sats" } }
                     }
                     fieldset class="station-picks" {
-                        legend { "Chicago, IL " span class="station-code" { "KORD" } (callout(4)) }
-                        (pick_row("KORD", Metric::TempHigh, Some(77.0), Some(band)))
-                        p class="help-pointer" { "↑ " (callout(5)) }
+                        legend class="station-head" {
+                            span class="station-city" { "Chicago, IL" }
+                            span class="station-source" { "NOAA forecast · " span class="station-code" { "KORD" } (callout(4)) }
+                        }
+                        div class="station-rows" {
+                            (pick_row("KORD", Metric::TempHigh, Some(77.0), Some(band)))
+                            p class="help-pointer" { "↑ " (callout(5)) }
+                        }
                     }
-                    button type="button" class="button is-primary" { "Pay 5,687 sats and enter" (callout(6)) }
+                    button type="button" class="button is-primary" { "Lock in 9 picks · 5,687 sats" (callout(6)) }
                 }
                 ol class="help-callouts content" {
                     li { "The deadline. Picks lock when the observation window starts." }
@@ -271,7 +289,7 @@ fn walkthrough() -> Markup {
                     li { "What first place wins once the result is final." }
                     li { "The city and NOAA forecast: here, a 77°F high for Chicago. The city tooltip identifies the airport station." }
                     li {
-                        "Your pick, left to right: < 73.4°F, 73.4–76.0°F (both ends included), or > 76.0°F. "
+                        "Your pick, left to right: Under 73.4°F, In range 73.4–76.0°F (both ends included), or Over 76.0°F. "
                         "Choose one range for each category. You can change a pick before paying."
                     }
                     li { "Pay the Lightning invoice and you're in. Your picks show on the leaderboard once entries close." }
@@ -338,9 +356,9 @@ mod tests {
         let html = help_page(false).into_string();
         assert!(html.contains(r#"class="help-shot entry-form" inert"#));
         assert!(
-            html.contains("&lt; 73.4°F")
-                && html.contains("73.4–76.0°F")
-                && html.contains("&gt; 76.0°F")
+            html.contains(r#"aria-label="Under 73.4°F""#)
+                && html.contains(r#"aria-label="73.4–76.0°F""#)
+                && html.contains(r#"aria-label="Over 76.0°F""#)
         );
         // Nothing the live form's script looks for.
         assert!(!html.contains("entryForm") && !html.contains("submitEntry"));

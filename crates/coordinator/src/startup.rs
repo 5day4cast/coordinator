@@ -21,8 +21,8 @@ use crate::{
         operator_delete_competition, operator_owed_winners, operator_payout_holds,
         operator_release_payout_hold, operator_settle_owed_winner, operator_write_off_refunds,
         payouts_fragment, public_page_handler, register, register_ticket, register_username,
-        request_competition_ticket, send_to_address, set_lightning_address, signup_pow_challenge,
-        submit_final_signatures, submit_public_nonces, submit_ticket_payout,
+        request_competition_ticket, send_to_address, set_display_name, set_lightning_address,
+        signup_pow_challenge, submit_final_signatures, submit_public_nonces, submit_ticket_payout,
         ticket_status_fragment,
     },
     config::Settings,
@@ -1065,6 +1065,7 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Result<Router, anyhow
         .route("/register", post(register))
         .route("/username/register", post(register_username))
         .route("/lightning-address", post(set_lightning_address))
+        .route("/display-name", post(set_display_name))
         .route("/username/login", post(login_username))
         .route("/username/change-password", post(change_password))
         .route("/username/forgot-password", post(forgot_password_challenge))

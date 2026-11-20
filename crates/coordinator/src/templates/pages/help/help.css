@@ -1,7 +1,55 @@
-/* How it works: the rules, and an example entry form with numbered notes. */
+/* How to play: three steps, the rules, and an example entry form with numbered notes. */
 
 .help-page {
-  max-width: 48rem;
+  max-width: 52rem;
+}
+
+.howto-steps {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 13rem), 1fr));
+  gap: 0.75rem;
+  margin: 1.25rem 0 1.75rem;
+  padding: 0;
+  list-style: none;
+  counter-reset: step;
+}
+
+.howto-steps li {
+  display: grid;
+  gap: 0.25rem;
+  align-content: start;
+  padding: 1rem;
+  border: 1px solid var(--wx-edge);
+  border-radius: 12px;
+  background: linear-gradient(180deg, var(--wx-a), var(--wx-b));
+  counter-increment: step;
+}
+
+.howto-steps strong {
+  font-family: var(--font-display);
+  font-size: 1.4rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--gold);
+}
+
+.howto-steps strong::before {
+  content: counter(step) " · ";
+  font-family: var(--font-pixel);
+  font-weight: 400;
+  color: var(--ink);
+}
+
+.howto-steps span {
+  color: #d6def5;
+  font-size: 0.9rem;
+}
+
+html.site .help-page .content h2 {
+  font-size: 1.6rem;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
 }
 
 .help-page section {
@@ -33,9 +81,9 @@
 .help-shot {
   margin: 0;
   padding: 1rem;
-  border: 1px dashed var(--bulma-border);
+  border: 1px dashed var(--line);
   border-radius: 0.75rem;
-  background: var(--bulma-scheme-main-bis);
+  background: var(--navy);
 }
 
 .help-shot .station-picks {

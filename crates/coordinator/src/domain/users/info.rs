@@ -52,6 +52,38 @@ impl UserInfo {
         self.user_store.get_username_by_pubkey(nostr_pubkey).await
     }
 
+    pub async fn get_display_name_by_pubkey(
+        &self,
+        nostr_pubkey: &str,
+    ) -> Result<Option<String>, Error> {
+        self.user_store
+            .get_display_name_by_pubkey(nostr_pubkey)
+            .await
+    }
+
+    /// Sets the player's leaderboard name, or clears it with `None`. Another account's name,
+    /// in any case, is refused.
+    pub async fn set_display_name(
+        &self,
+        nostr_pubkey: &str,
+        display_name: Option<String>,
+    ) -> Result<(), Error> {
+        if let Some(name) = &display_name {
+            if self
+                .user_store
+                .display_name_taken(name, nostr_pubkey)
+                .await?
+            {
+                return Err(Error::BadRequest(
+                    "Another player already uses that name".to_string(),
+                ));
+            }
+        }
+        self.user_store
+            .update_display_name(nostr_pubkey, display_name)
+            .await
+    }
+
     pub async fn get_user_by_username(&self, username: &str) -> Result<User, Error> {
         self.user_store.get_user_by_username(username).await
     }

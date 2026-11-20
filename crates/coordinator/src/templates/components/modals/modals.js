@@ -109,7 +109,24 @@ function openAuthModal(id, opener = document.activeElement) {
   modal?.addEventListener("input", loadWallet, { once: true });
 }
 
+// The sign-up password's rules, as `validatePasswordStrength` checks them, each marked as met.
+function showPasswordChecks(password) {
+  const met = {
+    length: password.length >= 10,
+    upper: /[A-Z]/.test(password),
+    lower: /[a-z]/.test(password),
+    number: /[0-9]/.test(password),
+    symbol: /[^a-zA-Z0-9]/.test(password),
+  };
+  for (const rule of document.querySelectorAll("#registerPasswordChecks [data-check]")) {
+    rule.classList.toggle("is-met", met[rule.dataset.check]);
+  }
+}
+
 function setupAuthModals(authManager) {
+  document.addEventListener("input", (event) => {
+    if (event.target?.id === "registerPassword") showPasswordChecks(event.target.value);
+  });
   document.addEventListener("click", (event) => {
     const opener = event.target.closest?.("[data-open-modal]");
     if (!opener) return;

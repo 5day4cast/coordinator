@@ -207,6 +207,14 @@ class Payouts {
     }, { isActive });
   }
 
+  async saveDisplayName(name) {
+    const response = await this.client.post(
+      `${this.coordinator_url}/api/v1/users/display-name`,
+      { display_name: name },
+    );
+    return response.json();
+  }
+
   async saveLightningAddress(address) {
     const response = await this.client.post(
       `${this.coordinator_url}/api/v1/users/lightning-address`,
@@ -395,6 +403,31 @@ function toggleLightningAddressForm() {
   (hidden ? toggle : document.getElementById("payoutLightningAddress"))?.focus();
 }
 
+// The leaderboard name: blank clears it, so the player shows as their short npub.
+async function saveDisplayName() {
+  const errorElement = document.getElementById("displayNameError");
+  const button = document.getElementById("saveDisplayName");
+  const name = document.getElementById("displayNameInput")?.value.trim() ?? "";
+  if (!payoutsInstance) {
+    if (errorElement) errorElement.textContent = "Please log in again.";
+    return;
+  }
+  if (errorElement) errorElement.textContent = "";
+  button.disabled = true;
+  button.classList.add("is-loading");
+  try {
+    await payoutsInstance.saveDisplayName(name || null);
+    reloadPayouts();
+  } catch (error) {
+    console.error("Saving the leaderboard name failed:", error);
+    if (errorElement)
+      errorElement.textContent = await requestErrorMessage(error, "Failed to save your leaderboard name");
+  } finally {
+    button.disabled = false;
+    button.classList.remove("is-loading");
+  }
+}
+
 async function saveLightningAddress() {
   const errorElement = document.getElementById("lightningAddressError");
   const button = document.getElementById("saveLightningAddress");
@@ -483,6 +516,9 @@ function setupPayoutModal() {
         break;
       case "save-address":
         saveLightningAddress();
+        break;
+      case "save-display-name":
+        saveDisplayName();
         break;
       case "recovery-file":
         downloadRecoveryFile();

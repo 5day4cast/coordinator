@@ -3,27 +3,41 @@ use maud::{html, Markup};
 use crate::domain::EligiblePayout;
 use crate::templates::format::{copyable_id, sats};
 
-/// Payout status and invoice fallback. Each entry retains its authorized address;
-/// the profile address is a default for future entries only. `recovery_file` offers the
-/// player's recovery file; `satchel`, the Satchel wallet's origin when configured, a
+/// The Wallet page: where winnings go, the name the player shows on leaderboards, their
+/// recovery file, then payout status and invoice fallback. Each entry retains its authorized
+/// address; the profile address is a default for future entries only. `recovery_file` offers
+/// the player's recovery file; `satchel`, the Satchel wallet's origin when configured, a
 /// Lightning Address from it.
 pub fn payouts_page(
     payouts: &[EligiblePayout],
     lightning_address: Option<&str>,
+    display_name: Option<&str>,
     recovery_file: bool,
     satchel: Option<&str>,
 ) -> Markup {
     html! {
-        div id="payouts" class="account-page" {
+        div id="payouts" class="account-page wallet-page" {
             div {
-                h1 class="title is-4 mb-4" { "Payouts" }
+                h1 class="title page-title" { "Wallet" }
 
-                (lightning_address_panel(lightning_address, satchel))
-
-                @if recovery_file {
-                    (recovery_file_link())
+                div class="wallet-cards" {
+                    section class="wallet-card" {
+                        h2 class="wallet-card-title" { "Winnings go to" }
+                        (lightning_address_panel(lightning_address, satchel))
+                    }
+                    section class="wallet-card" {
+                        h2 class="wallet-card-title" { "Leaderboard name" }
+                        (display_name_panel(display_name))
+                    }
+                    @if recovery_file {
+                        section class="wallet-card" {
+                            h2 class="wallet-card-title" { "Account safety" }
+                            (recovery_file_link())
+                        }
+                    }
                 }
 
+                h2 class="title wallet-section-title" { "Payouts" }
                 @if payouts.is_empty() {
                     (no_payouts())
                 } @else {
@@ -31,7 +45,7 @@ pub fn payouts_page(
                         table class="table is-fullwidth is-striped is-hoverable is-card-mobile" {
                             thead {
                                 tr {
-                                    th { "Competition" }
+                                    th { "Contest" }
                                     th { "Entry" }
                                     th { "Amount" }
                                     th { "Status" }
@@ -41,7 +55,7 @@ pub fn payouts_page(
                             tbody {
                                 @for payout in payouts {
                                     tr {
-                                        td data-label="Competition" {
+                                        td data-label="Contest" {
                                             a href=(format!("/competitions/{}/leaderboard", payout.competition_id))
                                               hx-get=(format!("/competitions/{}/leaderboard", payout.competition_id))
                                               hx-target="#main-content" hx-push-url="true" { "Leaderboard" }
@@ -93,7 +107,7 @@ pub fn payouts_page(
 fn lightning_address_panel(lightning_address: Option<&str>, satchel: Option<&str>) -> Markup {
     html! {
         // Telemetry ignores the address and its form (shared/telemetry.js).
-        div class="content mb-4" id="payoutAddressPanel" data-telemetry="off" {
+        div class="content" id="payoutAddressPanel" data-telemetry="off" {
             @match lightning_address {
                 Some(address) => {
                     p id="payoutAddress" {
@@ -134,6 +148,38 @@ fn lightning_address_panel(lightning_address: Option<&str>, satchel: Option<&str
     }
 }
 
+/// The name the player shows on leaderboards, with a field to set or clear it (`payouts.js`).
+/// Without one they show as their short npub.
+fn display_name_panel(display_name: Option<&str>) -> Markup {
+    html! {
+        div id="displayNamePanel" data-telemetry="off" {
+            p id="displayName" {
+                @match display_name {
+                    Some(name) => { "You show as " strong { (name) } " on leaderboards." }
+                    None => { "You show as your short npub on leaderboards." }
+                }
+            }
+            div class="field has-addons" {
+                div class="control is-expanded" {
+                    label class="is-sr-only" for="displayNameInput" { "Leaderboard name" }
+                    input class="input" type="text" id="displayNameInput" maxlength="24"
+                          placeholder="Storm Chaser" value=[display_name] autocomplete="off"
+                          spellcheck="false" aria-describedby="displayNameError";
+                }
+                div class="control" {
+                    button type="button" class="button is-primary" id="saveDisplayName"
+                           data-payout-action="save-display-name" { "Save" }
+                }
+            }
+            p class="help" {
+                "3 to 24 letters, numbers or spaces. Leave it empty to stay anonymous. "
+                "Your login username stays private, so pick something else."
+            }
+            p class="help is-danger" id="displayNameError" role="alert" {}
+        }
+    }
+}
+
 /// One line under the address field: a link that signs the player in to Satchel for a
 /// Lightning Address there. `shared/satchel.js` replaces it with a button that fills in the
 /// address once Satchel says the player has one.
@@ -150,7 +196,7 @@ fn satchel_address(satchel: &str) -> Markup {
 /// The recovery file, downloaded with the player's signature (`payouts.js`).
 fn recovery_file_link() -> Markup {
     html! {
-        p class="help mb-4" id="recoveryFile" {
+        p class="help" id="recoveryFile" {
             a href="/api/v1/recovery/kit" data-payout-action="recovery-file" { "Download recovery file" }
             ". With your recovery key (nsec), it is what you need to recover your funds with our recovery tool if this site is ever gone."
         }
@@ -181,7 +227,8 @@ mod tests {
             allow_invoice_fallback: true,
             escrow_enabled: true,
         };
-        let html = payouts_page(&[payout], Some("freya@lnurl.example"), false, None).into_string();
+        let html =
+            payouts_page(&[payout], Some("freya@lnurl.example"), None, false, None).into_string();
         // The page's CSP allows no inline script, handlers included.
         assert!(!html.contains("onclick"));
         assert!(html.contains(r#"data-payout-action="invoice""#));
@@ -209,11 +256,11 @@ mod tests {
             allow_invoice_fallback: false,
             escrow_enabled: false,
         };
-        let closed = payouts_page(&[payout.clone()], None, false, None).into_string();
+        let closed = payouts_page(&[payout.clone()], None, None, false, None).into_string();
         assert!(!closed.contains("Legacy recovery"));
         payout.status = "Awaiting invoice".into();
         payout.allow_invoice_fallback = true;
-        assert!(payouts_page(&[payout], None, false, None)
+        assert!(payouts_page(&[payout], None, None, false, None)
             .into_string()
             .contains("Legacy recovery"));
     }
@@ -222,11 +269,17 @@ mod tests {
     #[test]
     fn satchel_is_offered_under_the_address_field_only_when_configured() {
         for address in [None, Some("freya@lnurl.example")] {
-            let html = payouts_page(&[], address, false, None).into_string();
+            let html = payouts_page(&[], address, None, false, None).into_string();
             assert!(!html.contains("Satchel"), "{address:?}");
 
-            let html = payouts_page(&[], address, false, Some("https://wallet.5day4cast.com"))
-                .into_string();
+            let html = payouts_page(
+                &[],
+                address,
+                None,
+                false,
+                Some("https://wallet.5day4cast.com"),
+            )
+            .into_string();
             let field = html.find(r#"id="payoutLightningAddress""#).unwrap();
             let line = html.find(r#"id="satchelAddress""#).unwrap();
             assert!(line > field, "{address:?}");

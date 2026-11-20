@@ -311,6 +311,11 @@ html.site .button.is-small {
     font-size: 0.95rem;
 }
 
+html.site .button.is-light:not(.is-warning) {
+    background: var(--raise);
+    color: var(--ink);
+}
+
 html.site .button.is-ghost-line {
     background: transparent;
     border: 1px solid var(--line);

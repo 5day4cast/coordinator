@@ -590,20 +590,27 @@ pub async fn payouts_fragment(
 ) -> Response {
     let title = "Wallet · 5day4cast";
     let Some(NostrAuth { pubkey, .. }) = auth else {
-        return signed_out(&headers, &state, title, "/payouts", "your payouts");
+        return signed_out(&headers, &state, title, "/payouts", "your wallet");
     };
     let pubkey_hex = pubkey.to_hex();
-    let (payouts, user) = tokio::join!(
+    let npub = npub(&pubkey);
+    let (payouts, user, display_name) = tokio::join!(
         state.coordinator.eligible_payouts(&pubkey_hex),
-        state.users_info.login(npub(&pubkey)),
+        state.users_info.login(npub.clone()),
+        state.users_info.get_display_name_by_pubkey(&npub),
     );
     let payouts = payouts
         .inspect_err(|error| error!("failed to load payouts: {error}"))
         .unwrap_or_default();
     let lightning_address = user.ok().and_then(|user| user.lightning_address);
+    let display_name = display_name
+        .inspect_err(|error| error!("failed to load the leaderboard name: {error}"))
+        .ok()
+        .flatten();
     let content = payouts_page(
         &payouts,
         lightning_address.as_deref(),
+        display_name.as_deref(),
         state.recovery.is_some(),
         state.satchel_url.as_deref(),
     );

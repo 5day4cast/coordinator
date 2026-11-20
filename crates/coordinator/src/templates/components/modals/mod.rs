@@ -234,6 +234,12 @@ fn register_modal(recovery: RecoveryHelp, satchel: Option<&str>) -> Markup {
                     (auth_tabs("registerUsername", "registerExtension"))
 
                     div id="registerUsername" role="tabpanel" aria-labelledby="registerUsernameTab" {
+                        // Where sign-up is; the step shown marks its own (modals.css).
+                        ol class="signup-steps" aria-hidden="true" {
+                            li { "Account" }
+                            li { "Recovery key" }
+                            li { "Done" }
+                        }
                         div id="usernameRegisterStep1" {
                             div class="field" {
                                 label class="label" for="registerUsernameInput" { "Username" }
@@ -247,9 +253,18 @@ fn register_modal(recovery: RecoveryHelp, satchel: Option<&str>) -> Markup {
                                 label class="label" for="registerPassword" { "Password" }
                                 div class="control" {
                                     input class="input" type="password" id="registerPassword"
-                                          placeholder="Choose a strong password" autocomplete="new-password";
+                                          placeholder="Choose a strong password" autocomplete="new-password"
+                                          aria-describedby="registerPasswordRule";
                                 }
-                                p class="help" { (PASSWORD_RULE) }
+                                p class="help is-sr-only" id="registerPasswordRule" { (PASSWORD_RULE) }
+                                // Each rule turns green as the password meets it (modals.js).
+                                ul class="password-checks" id="registerPasswordChecks" aria-hidden="true" {
+                                    li data-check="length" { "10+ characters" }
+                                    li data-check="upper" { "An upper-case letter" }
+                                    li data-check="lower" { "A lower-case letter" }
+                                    li data-check="number" { "A number" }
+                                    li data-check="symbol" { "A symbol" }
+                                }
                             }
                             div class="field" {
                                 label class="label" for="registerPasswordConfirm" { "Confirm Password" }
