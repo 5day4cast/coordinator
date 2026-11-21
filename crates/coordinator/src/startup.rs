@@ -347,6 +347,8 @@ pub struct AppState {
     pub coordinator: Arc<Coordinator>,
     /// One serialized operator inventory, refreshed without decoding contract blobs.
     pub operator_inventory: Arc<crate::infra::refresh_cache::RefreshCache<(), axum::body::Bytes>>,
+    /// NOAA's satellite loop behind the public pages (`api/satellite.rs`).
+    pub satellite: Arc<crate::infra::refresh_cache::RefreshCache<(), axum::body::Bytes>>,
     pub users_info: Arc<UserInfo>,
     /// Leaderboards and the oracle weather pages show, served from a background cache.
     pub leaderboards: Arc<Leaderboards>,
@@ -988,6 +990,7 @@ pub async fn build_app(
         network: config.bitcoin_settings.network.to_string(),
         coordinator,
         operator_inventory: Arc::new(crate::infra::refresh_cache::RefreshCache::new()),
+        satellite: Arc::new(crate::infra::refresh_cache::RefreshCache::new()),
         users_info,
         leaderboards,
         lnurl,
@@ -1505,6 +1508,10 @@ fn static_files(state: &AppState) -> Router<Arc<AppState>> {
         .route(
             "/weatherstar/{*path}",
             get(crate::api::weatherstar::serve_weatherstar),
+        )
+        .route(
+            crate::api::satellite::SATELLITE_PATH,
+            get(crate::api::satellite::serve_satellite),
         )
 }
 

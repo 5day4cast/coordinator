@@ -5,6 +5,7 @@ pub mod nip98_replay;
 pub mod public_headers;
 pub mod request_context;
 pub mod routes;
+pub mod satellite;
 pub mod telemetry;
 pub mod ui_files;
 pub mod weatherstar;

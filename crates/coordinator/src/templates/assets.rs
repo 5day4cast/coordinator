@@ -6,6 +6,7 @@
 //! to the router's `CompressionLayer`. A single byte range is served as asked.
 
 use axum::{
+    body::Bytes,
     extract::Path,
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
@@ -33,33 +34,46 @@ pub async fn serve_asset(Path(file): Path<String>, request: HeaderMap) -> Respon
     let Some(asset) = find(&file) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let len = asset.bytes.len();
+    serve_bytes(
+        &request,
+        Bytes::from_static(asset.bytes),
+        asset.content_type,
+        CACHE_POLICY,
+    )
+}
+
+/// `bytes`, or the single byte range `request` asks for, as `content_type`.
+pub fn serve_bytes(
+    request: &HeaderMap,
+    bytes: Bytes,
+    content_type: &'static str,
+    cache_control: &'static str,
+) -> Response {
+    let len = bytes.len();
     let (status, body, range) = match request
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok())
         .map(|value| byte_range(value, len))
     {
-        None | Some(Range::Ignored) => (StatusCode::OK, asset.bytes, None),
+        None | Some(Range::Ignored) => (StatusCode::OK, bytes, None),
         Some(Range::Bytes(range)) => (
             StatusCode::PARTIAL_CONTENT,
-            &asset.bytes[range.clone()],
+            bytes.slice(range.clone()),
             Some(format!("bytes {}-{}/{len}", range.start(), range.end())),
         ),
         Some(Range::Unsatisfiable) => (
             StatusCode::RANGE_NOT_SATISFIABLE,
-            &[][..],
+            Bytes::new(),
             Some(format!("bytes */{len}")),
         ),
     };
+    let body_len = body.len();
     let mut response = (status, body).into_response();
     let headers = response.headers_mut();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(asset.content_type),
-    );
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     headers.insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static(CACHE_POLICY),
+        HeaderValue::from_static(cache_control),
     );
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
@@ -68,7 +82,7 @@ pub async fn serve_asset(Path(file): Path<String>, request: HeaderMap) -> Respon
     headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     // Stated outright: a cache in front of the site serves byte ranges of a
     // stored copy only when it knows the whole length.
-    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(body.len()));
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(body_len));
     if let Some(range) = range.and_then(|range| HeaderValue::from_str(&range).ok()) {
         headers.insert(header::CONTENT_RANGE, range);
     }

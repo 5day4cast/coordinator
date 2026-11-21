@@ -276,8 +276,9 @@ html.site {
     background-color: var(--night);
 }
 
+/* The page's colour comes from html, so the satellite loop (base.css) shows through. */
 html.site body {
-    background-color: var(--night);
+    background-color: transparent;
     color: var(--ink);
     font-family: var(--font-body);
 }

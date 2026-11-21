@@ -94,6 +94,8 @@ pub fn content_security_policy(connect: &[&str], forms: &[&str]) -> String {
         "style-src 'self'".to_owned(),
         "font-src 'self'".to_owned(),
         "img-src 'self' data:".to_owned(),
+        // The satellite loop behind the page, from this site (api/satellite.rs).
+        "media-src 'self'".to_owned(),
         // The lobby frames WeatherStar, from this site.
         "frame-src 'self'".to_owned(),
         format!("connect-src {}", sources(connect)),
@@ -207,6 +209,7 @@ mod tests {
         assert!(policy.contains("style-src 'self';"));
         assert!(policy.contains("font-src 'self';"));
         assert!(policy.contains("frame-src 'self';"));
+        assert!(policy.contains("media-src 'self';"));
         assert!(!WEATHERSTAR_POLICY.contains("unsafe"));
         assert!(WEATHERSTAR_POLICY.contains("frame-ancestors 'self'"));
         for directive in [

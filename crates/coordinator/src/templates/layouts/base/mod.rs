@@ -1,6 +1,6 @@
 use maud::{html, Markup, DOCTYPE};
 
-use crate::api::{request_context, telemetry};
+use crate::api::{request_context, satellite::SATELLITE_PATH, telemetry};
 use crate::templates::{
     assets::{APP_JS, BULMA_CSS, HTMX_JS, LOGIN_WORKER_JS, STYLES_CSS},
     components::{
@@ -77,6 +77,9 @@ pub fn base(config: &PageConfig, content: Markup) -> Markup {
                  data-login-worker=(LOGIN_WORKER_JS.url) data-satchel-url=[config.satchel_url] {
                 // Shown while a navigation is loading (see base.css).
                 div class="page-loading" aria-hidden="true" {}
+                // NOAA's satellite loop behind the page; shared/page.js starts it.
+                video class="satellite" data-src=(SATELLITE_PATH) muted loop playsinline
+                      disableremoteplayback aria-hidden="true" {}
                 (navbar(config.network, config.satchel_url))
 
                 section class="section site-main" {
@@ -102,6 +105,8 @@ pub fn base(config: &PageConfig, content: Markup) -> Markup {
                     p class="site-footer-credits" {
                         "Results signed by the "
                         a href="https://www.4casttruth.win/" target="_blank" rel="noopener" { "4cast Truth Oracle" }
+                        " · Satellite loop from "
+                        a href="https://www.star.nesdis.noaa.gov/GOES/" target="_blank" rel="noopener" { "NOAA GOES-19" }
                         " · "
                         a href="https://github.com/5day4cast/coordinator" target="_blank" rel="noopener" {
                             (github_icon()) " Source"

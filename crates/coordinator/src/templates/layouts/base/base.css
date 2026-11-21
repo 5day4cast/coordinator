@@ -287,6 +287,22 @@ tr.is-own td {
   padding-top: 1.75rem;
 }
 
+/* The satellite loop, fixed behind the page and dimmed so text over it stays readable. Its
+   frames are 1250 by 750 with NOAA's caption in the bottom 25 rows; the box runs that far past
+   the window's bottom, so the caption never shows. */
+.satellite {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: -1;
+  width: 100%;
+  height: calc(100% * 750 / 725);
+  object-fit: cover;
+  object-position: top;
+  opacity: 0.25;
+  pointer-events: none;
+}
+
 @media (max-width: 768px) {
   .network-banner {
     padding: 0.2rem 0.75rem;

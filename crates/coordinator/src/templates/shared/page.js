@@ -95,7 +95,20 @@ function markCurrentNav(path = location.pathname) {
   }
 }
 
+// The satellite loop behind the page, at half speed, near the pace of NOAA's own page. Readers
+// who ask for less motion or less data never download it.
+function startSatellite() {
+  const video = document.querySelector("video.satellite");
+  const still = matchMedia("(prefers-reduced-motion: reduce)").matches || navigator.connection?.saveData;
+  if (!video || still) return;
+  // Loading resets the speed to the default one.
+  video.defaultPlaybackRate = 0.5;
+  video.src = video.dataset.src;
+  video.play().catch(() => {});
+}
+
 function setupPage() {
+  startSatellite();
   localizeTimes(document);
   markCurrentNav();
   setInterval(tickCountdowns, 1_000);
