@@ -137,7 +137,7 @@ test("upcoming sorting and personal counts survive refreshes and account changes
   }
 });
 
-test("full weather labels and numeric pick ranges fit narrow dialogs", { timeout: 30000 }, async () => {
+test("weather labels and numeric pick ranges fit narrow dialogs", { timeout: 30000 }, async () => {
   const browser = await chromium.launch({ headless: true,
     ...(process.env.CHROMIUM_EXECUTABLE ? { executablePath: process.env.CHROMIUM_EXECUTABLE } : {}) });
   try {
@@ -148,9 +148,9 @@ test("full weather labels and numeric pick ranges fit narrow dialogs", { timeout
       path.join(templates, "fragments/picks.css"),
     ].map(file => readFileSync(file, "utf8")).join("\n");
     const picks = [
-      ["Highest temperature", "67.4–70.2°F", "69°F"],
-      ["Lowest temperature", "&lt; 41.2°F", "40°F"],
-      ["Highest wind speed", "&gt; 18.0 kt", "20 knots"],
+      ["High", "67.4–70.2°F", "69°F"],
+      ["Low", "Under 41.2°F", "40°F"],
+      ["Peak wind", "Over 18.0 kt", "20 knots"],
     ];
     await page.setContent(`<style>${styles}</style><div id="entryScore" class="modal is-active">
       <div class="modal-background"></div><div class="modal-content"><div class="box"><div class="picks-detail">

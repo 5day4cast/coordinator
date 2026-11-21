@@ -257,6 +257,69 @@ impl UserStore {
         Ok(username)
     }
 
+    /// The name the player shows on leaderboards, if they chose one.
+    pub async fn get_display_name_by_pubkey(
+        &self,
+        nostr_pubkey: &str,
+    ) -> Result<Option<String>, Error> {
+        let name: Option<String> =
+            sqlx::query_scalar("SELECT display_name FROM user WHERE nostr_pubkey = ?")
+                .bind(nostr_pubkey)
+                .fetch_optional(self.db_connection.read())
+                .await?
+                .flatten();
+        Ok(name)
+    }
+
+    /// Whether another account already shows `display_name`, ignoring case.
+    pub async fn display_name_taken(
+        &self,
+        display_name: &str,
+        nostr_pubkey: &str,
+    ) -> Result<bool, Error> {
+        let taken: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM user
+             WHERE display_name = ? COLLATE NOCASE AND nostr_pubkey != ?)",
+        )
+        .bind(display_name)
+        .bind(nostr_pubkey)
+        .fetch_one(self.db_connection.read())
+        .await?;
+        Ok(taken == 1)
+    }
+
+    /// Sets or, with `None`, clears the name the player shows on leaderboards.
+    pub async fn update_display_name(
+        &self,
+        nostr_pubkey: &str,
+        display_name: Option<String>,
+    ) -> Result<(), Error> {
+        let now = OffsetDateTime::now_utc();
+        let nostr_pubkey = nostr_pubkey.to_string();
+        let updated = self
+            .db_connection
+            .execute_write(move |pool| async move {
+                sqlx::query(
+                    "UPDATE user
+                    SET display_name = ?,
+                        updated_at = ?
+                    WHERE nostr_pubkey = ?",
+                )
+                .bind(display_name)
+                .bind(now)
+                .bind(&nostr_pubkey)
+                .execute(&pool)
+                .await
+                .map(|result| result.rows_affected())
+            })
+            .await
+            .map_err(Error::from)?;
+        if updated == 0 {
+            return Err(Error::NotFound("User not found".to_string()));
+        }
+        Ok(())
+    }
+
     pub async fn user_exists(&self, nostr_pubkey: &str) -> Result<bool, Error> {
         let result: i64 =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM user WHERE nostr_pubkey = ?)")

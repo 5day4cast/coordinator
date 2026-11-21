@@ -10,12 +10,14 @@
 use maud::{html, Markup};
 use time::OffsetDateTime;
 
-use crate::domain::leaderboard::Phase;
+use crate::domain::leaderboard::{Metric, Phase, PickState, Rule};
+use crate::infra::oracle::ValueOptions;
 use crate::templates::{
     components::{tip, tip_start},
-    format::{self, ordinal, sats, TimeStyle},
+    format::{self, ordinal, sats, MetricText, TimeStyle},
     fragments::picks::{detail_url, LIVE_REFRESH},
     pages::competitions::{phase_badge, CompetitionView, PoolLink, Queue, QueueView, Refunds},
+    shared_map::{station_map, MapMark, StationPin},
 };
 use uuid::Uuid;
 
@@ -29,6 +31,86 @@ pub struct LeaderboardRow {
     /// Hash of the entrant's npub; the browser marks rows matching its own.
     pub owner: String,
     pub score: i32,
+    /// How each pick stands, one square each; none before the window opens.
+    pub picks: Vec<PickMark>,
+    /// The most the entry can still finish with, while the window is open.
+    pub max: Option<i32>,
+}
+
+/// How a pick stands, as one square in its row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickMark {
+    Right,
+    /// Right if the window ended now.
+    LeaningRight,
+    /// Wrong if the window ended now.
+    LeaningWrong,
+    Wrong,
+    /// Nothing observed yet.
+    Open,
+}
+
+impl PickMark {
+    /// A pick in `state` with `points` if the window ended now.
+    pub fn of(state: PickState, points: u64) -> Self {
+        match state {
+            PickState::LockedIn => PickMark::Right,
+            PickState::Out => PickMark::Wrong,
+            PickState::OnTrack => PickMark::LeaningRight,
+            PickState::OffTrack => PickMark::LeaningWrong,
+            PickState::AwaitingResult if points > 0 => PickMark::LeaningRight,
+            PickState::AwaitingResult => PickMark::LeaningWrong,
+            PickState::Final if points > 0 => PickMark::Right,
+            PickState::Final => PickMark::Wrong,
+            PickState::Pending => PickMark::Open,
+        }
+    }
+
+    fn class(self) -> &'static str {
+        match self {
+            PickMark::Right => "is-right",
+            PickMark::LeaningRight => "is-leaning-right",
+            PickMark::LeaningWrong => "is-leaning-wrong",
+            PickMark::Wrong => "is-wrong",
+            PickMark::Open => "is-open",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            PickMark::Right => "Locked in",
+            PickMark::LeaningRight => "Right so far",
+            PickMark::LeaningWrong => "Wrong so far",
+            PickMark::Wrong => "Out",
+            PickMark::Open => "No reading yet",
+        }
+    }
+}
+
+/// How the entries split on one row of picks, once picks are public.
+#[derive(Debug, Clone)]
+pub struct Ownership {
+    pub station_id: String,
+    /// `Afton, WY`, when the oracle knows the station.
+    pub city: Option<String>,
+    pub metric: Metric,
+    pub forecast: Option<f64>,
+    pub rule: Option<Rule>,
+    /// Entries on Under, In range and Over.
+    pub counts: [usize; 3],
+    /// The side that is right so far, when the readings say.
+    pub right: Option<usize>,
+}
+
+/// A station's readings over the window so far: the running high, low and peak wind.
+#[derive(Debug, Clone, Default)]
+pub struct StationReadings {
+    pub station_id: String,
+    /// `Afton, WY`, when the oracle knows the station.
+    pub city: Option<String>,
+    pub high: Option<f64>,
+    pub low: Option<f64>,
+    pub wind: Option<f64>,
 }
 
 /// The address the leaderboard loads its rows from.
@@ -49,6 +131,13 @@ pub struct LeaderboardView {
     pub any_readings: bool,
     /// The oracle could not verify the window's weather data.
     pub unverified: bool,
+    /// Each station's readings so far, in the competition's order.
+    pub readings: Vec<StationReadings>,
+    /// The stations on the map.
+    pub pins: Vec<StationPin>,
+    /// How the entries split on each row, in the competition's order; none before the window
+    /// opens, while picks are private.
+    pub ownership: Vec<Ownership>,
 }
 
 /// Whether a competition in `phase` ran, so its entries have scores. One that didn't fill, or
@@ -67,11 +156,11 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
     html! {
         div id="competitionLeaderboard" class="leaderboard" {
             a class="back-link" href="/competitions" hx-get="/competitions"
-              hx-target="#main-content" hx-push-url="true" { "← All competitions" }
+              hx-target="#main-content" hx-push-url="true" { "← Lobby" }
 
+            p class="leaderboard-kicker" { (phase_badge(competition)) " Leaderboard" }
             div class="leaderboard-heading" {
-                h1 class="title is-4" { "Leaderboard" }
-                (phase_badge(competition))
+                h1 class="title leaderboard-title" { (format::time(competition.start, TimeStyle::Weekday)) }
             }
             @if let Queue::Pool(pool) = &competition.queue {
                 p class="pool-of" {
@@ -85,13 +174,18 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
                 (format::window(competition.start, competition.end))
                 @match competition.phase {
                     Phase::Upcoming => { " · starts in " (format::duration(competition.start - now)) }
-                    Phase::Live => { " · results in " (format::duration(competition.end - now)) }
+                    Phase::Live => {
+                        " · ends in "
+                        span class="pixel leaderboard-clock" data-countdown=(competition.end.unix_timestamp()) {
+                            (format::duration(competition.end - now))
+                        }
+                    }
                     _ => {}
                 }
             }
 
             dl class="leaderboard-facts" {
-                div { dt { "Pot" } dd { (competition.pot()) } }
+                div { dt { "Prize pool" } dd { (competition.pot()) } }
                 @if let Some(queue) = queue {
                     div {
                         dt { "Paid places" (tip(&format!("{}.", queue.pool_note()))) }
@@ -127,7 +221,7 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
                         }
                     }
                 }
-                div { dt { "Entries" } dd { (competition.entries()) } }
+                div { dt { "Players" } dd { (competition.entries()) } }
             }
             @if let Some(queue) = queue.filter(|_| split) {
                 (queue_pools(&competition.id, queue, None))
@@ -159,7 +253,7 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
             @if competition.can_enter {
                 a class="button is-primary mb-4"
                   href=(competition.url()) hx-get=(competition.url())
-                  hx-target="#main-content" hx-push-url="true" { "Enter this competition" }
+                  hx-target="#main-content" hx-push-url="true" { "Make picks" }
             }
             @if competition.did_not_fill() {
                 p class="notice" {
@@ -200,6 +294,7 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
                                 }
                             }
                         },
+                        false,
                     ))
                 }
             }
@@ -323,18 +418,183 @@ pub fn leaderboard_scores(
                         "payouts; this page couldn't work out each entry's share."
                     }
                 }
+                Phase::Scored => {
+                    p class="provisional-note final-note" { "Final · signed by the 4cast Truth Oracle" }
+                }
                 _ => {}
             }
-            (scores_table(leaderboard_rows(
-                &board.rows,
-                ran(board.phase) && competition.has_ranked_prizes(),
-                paid,
-            )))
+            @if paid > 0 {
+                div class="podium" {
+                    @for (place, (row, (_, amount))) in board.rows.iter().zip(competition.prizes()).take(paid).enumerate() {
+                        div class="podium-place" {
+                            span class="podium-rank" { (ordinal(place + 1)) " · " (row.score) " pts" }
+                            span class="podium-amount" { (sats(amount)) }
+                            span class="podium-player" { (row.player) }
+                        }
+                    }
+                }
+            }
+            (conditions(board))
+            @if !board.ownership.is_empty() { (ownership(&board.ownership)) }
+            (scores_table(
+                leaderboard_rows(
+                    &board.rows,
+                    ran(board.phase) && competition.has_ranked_prizes(),
+                    paid,
+                    in_the_money(competition, board),
+                ),
+                live,
+            ))
+            @if board.rows.iter().any(|row| !row.picks.is_empty()) {
+                p class="pick-legend" {
+                    @for mark in [PickMark::Right, PickMark::LeaningRight, PickMark::LeaningWrong, PickMark::Wrong, PickMark::Open] {
+                        span { i class=(mark.class()) {} (mark.label()) }
+                    }
+                    @if live { span { "Max: points if every open pick comes right" } }
+                }
+            }
         }
     }
 }
 
-fn scores_table(rows: Markup) -> Markup {
+/// How many rows the prizes pay if the result is what the scores say now; none while nobody
+/// has scored, or when nothing is won by rank.
+fn in_the_money(competition: &CompetitionView, board: &LeaderboardView) -> usize {
+    let scored = matches!(
+        board.phase,
+        Phase::Live | Phase::AwaitingResult | Phase::Scored
+    ) && competition.has_ranked_prizes()
+        && !competition.pot_refunded
+        && board.rows.iter().any(|row| row.score > 0);
+    if scored {
+        competition.prizes().len()
+    } else {
+        0
+    }
+}
+
+/// The readings so far, in the Weather Channel's style, over the map of the stations.
+fn conditions(board: &LeaderboardView) -> Markup {
+    let any = board
+        .readings
+        .iter()
+        .any(|station| station.high.or(station.low).or(station.wind).is_some());
+    if !any && board.pins.is_empty() {
+        return html! {};
+    }
+    let title = match board.phase {
+        Phase::Live => "Current conditions",
+        Phase::AwaitingResult => "Readings so far",
+        Phase::Upcoming => "The contest's cities",
+        _ => "Final readings",
+    };
+    let temperature = |metric: Metric, value: f64| {
+        html! { span class=(metric.color()) { (format!("{:.0}°", value.round())) } }
+    };
+    // The map's captions are SVG text, so their colours go on tspans.
+    let on_map = |metric: Metric, value: f64| {
+        html! { tspan class=(metric.color()) { (format!("{:.0}°", value.round())) } }
+    };
+    let marks: Vec<MapMark> = board
+        .pins
+        .iter()
+        .map(|pin| {
+            let station = board
+                .readings
+                .iter()
+                .find(|station| station.station_id == pin.station_id);
+            let (high, low) = (
+                station.and_then(|station| station.high),
+                station.and_then(|station| station.low),
+            );
+            MapMark {
+                pin,
+                caption: match (high, low) {
+                    (Some(high), Some(low)) => Some(html! {
+                        (on_map(Metric::TempHigh, high)) " / " (on_map(Metric::TempLow, low))
+                    }),
+                    (Some(high), None) => Some(on_map(Metric::TempHigh, high)),
+                    (None, Some(low)) => Some(on_map(Metric::TempLow, low)),
+                    (None, None) => None,
+                },
+            }
+        })
+        .collect();
+    html! {
+        section class="conditions" {
+            div class="wx-bar" {
+                span { (title) }
+                @if any { span class="wx-note" { "Stations report hourly" } }
+            }
+            div class="conditions-body" {
+            @if !marks.is_empty() { (station_map(&marks, false)) }
+            @if any {
+                div class="conditions-grid" {
+                    @for station in &board.readings {
+                        div class="condition" {
+                            span class="condition-city" {
+                                (station.city.as_deref().unwrap_or(&station.station_id))
+                            }
+                            span class="condition-values pixel" {
+                                @if let Some(high) = station.high { em { "HI " } (temperature(Metric::TempHigh, high)) " " }
+                                @if let Some(low) = station.low { em { "LO " } (temperature(Metric::TempLow, low)) " " }
+                                @if let Some(wind) = station.wind {
+                                    em { "WIND " }
+                                    span class=(Metric::WindSpeed.color()) title=(format::mph(wind)) { (format!("{:.0} KT", wind.round())) }
+                                }
+                                @if station.high.or(station.low).or(station.wind).is_none() { "—" }
+                            }
+                        }
+                    }
+                }
+            }
+            }
+        }
+    }
+}
+
+/// What share of the entries took each side on each row, the side right so far marked.
+fn ownership(rows: &[Ownership]) -> Markup {
+    let sides = [
+        (ValueOptions::Under, "is-under"),
+        (ValueOptions::Par, "is-par"),
+        (ValueOptions::Over, "is-over"),
+    ];
+    html! {
+        section class="ownership" {
+            h2 class="ownership-title" { "Pick ownership" }
+            p class="ownership-note" { "How the entries split on each row. ✓ marks the side that's right so far." }
+            div class="ownership-grid" {
+                @for row in rows {
+                    @let total = row.counts.iter().sum::<usize>().max(1);
+                    div class="ownership-row" {
+                        p class="ownership-what" {
+                            (row.city.as_deref().unwrap_or(&row.station_id)) " "
+                            span class=(row.metric.color()) { (row.metric.label()) }
+                            @if let Some(forecast) = row.forecast {
+                                span class="ownership-forecast" { " · forecast " (row.metric.short_value(forecast)) }
+                            }
+                        }
+                        @for (side, (pick, class)) in sides.iter().enumerate() {
+                            @let share = (row.counts[side] * 100 + total / 2) / total;
+                            @let right = row.right == Some(side);
+                            div class=(if right { format!("ownership-side {class} is-right") } else { format!("ownership-side {class}") }) {
+                                span class="ownership-word" {
+                                    (format::pick_word(pick, row.rule))
+                                    @if right { " ✓" }
+                                }
+                                meter min="0" max="100" value=(share) {}
+                                span class="ownership-share" { (share) "%" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn scores_table(rows: Markup, live: bool) -> Markup {
     html! {
         div class="table-container" {
             table id="competitionLeaderboardData" class="table is-fullwidth is-hoverable leaderboard-table" {
@@ -342,8 +602,9 @@ fn scores_table(rows: Markup) -> Markup {
                     tr {
                         th { "Rank" }
                         th { "Player" }
-                        th { "Entry" }
-                        th class="has-text-right" { "Score" }
+                        th class="picks-column" { "Picks" }
+                        th class="has-text-right" { "Points" }
+                        @if live { th class="has-text-right max-column" { "Max" } }
                         th {}
                     }
                 }
@@ -422,17 +683,41 @@ fn refund_note(competition: &CompetitionView, now: OffsetDateTime) -> Markup {
 
 /// The rows of the leaderboard's table. Entries of a competition that didn't run are listed
 /// without a rank or score. `paid` is how many of the first rows, in payout order, the final
-/// result pays: none until it is in.
-pub fn leaderboard_rows(rows: &[LeaderboardRow], scored: bool, paid: usize) -> Markup {
+/// result pays: none until it is in. A line under the first `money` rows marks what the prizes
+/// would pay now, and says when a tie runs across it.
+pub fn leaderboard_rows(
+    rows: &[LeaderboardRow],
+    scored: bool,
+    paid: usize,
+    money: usize,
+) -> Markup {
     // Until someone scores, everyone would share first place: no ranks yet.
     let ranked = scored && rows.iter().any(|row| row.score != 0);
+    let columns = if rows.iter().any(|row| row.max.is_some()) {
+        6
+    } else {
+        5
+    };
+    let line = (ranked && money > 0 && rows.len() > money).then_some(money);
+    let tied = line.is_some_and(|line| rows[line - 1].score == rows[line].score);
     html! {
         @for (position, row) in rows.iter().enumerate() {
-            (leaderboard_row(row, scored, ranked, position < paid))
+            (leaderboard_row(row, scored, ranked, position < paid, line.is_some_and(|line| position < line)))
+            @if line == Some(position + 1) {
+                tr class="money-line" aria-hidden="true" {
+                    td colspan=(columns) {
+                        span {
+                            "In the money · " (money) " "
+                            (if money == 1 { "place" } else { "places" }) " paid"
+                            @if tied { " · Tie at " (ordinal(money)) ": the earliest entry is paid" }
+                        }
+                    }
+                }
+            }
         }
         @if rows.is_empty() {
             tr {
-                td colspan="5" class="empty-state" {
+                td colspan=(columns) class="empty-state" {
                     "No scores yet: they appear once the oracle has the entries."
                 }
             }
@@ -440,30 +725,58 @@ pub fn leaderboard_rows(rows: &[LeaderboardRow], scored: bool, paid: usize) -> M
     }
 }
 
-/// A click anywhere on the row opens the entry's picks. The copy button
-/// stops its own click (see page.js); the Picks button's click reaches the row.
-fn leaderboard_row(row: &LeaderboardRow, scored: bool, ranked: bool, paid: bool) -> Markup {
+/// A click anywhere on the row opens the entry's picks; the Picks button's click reaches the
+/// row. `money`: the prizes would pay this entry if the result were the scores now.
+fn leaderboard_row(
+    row: &LeaderboardRow,
+    scored: bool,
+    ranked: bool,
+    paid: bool,
+    money: bool,
+) -> Markup {
     html! {
-        tr class="is-clickable" data-owner=(row.owner)
+        tr class=(if money { "is-clickable is-in-the-money" } else { "is-clickable" }) data-owner=(row.owner)
            hx-get=(detail_url(&row.entry_id)) hx-target="#entryValues" hx-swap="innerHTML"
            "hx-status:500"="swap:innerHTML" {
-            td data-label="Rank" {
+            td data-label="Rank" class="rank-cell" {
                 @if ranked { (row.rank) } @else { "—" }
                 @if paid { " " span class="paid-badge" { "Paid" } }
             }
             td data-label="Player" {
-                (row.player)
+                span class="player-name" { (row.player) }
                 span class="you-badge" { "You" }
+                @if money && !paid { span class="money-badge" { "Paid now" } }
             }
-            td data-label="Entry" { (format::copyable_id(&row.entry_id)) }
-            td data-label="Score" class="has-text-right" {
+            td data-label="Picks" class="picks-column" {
+                @if !row.picks.is_empty() {
+                    span class="pick-squares" role="img"
+                         aria-label=(pick_summary(&row.picks)) {
+                        @for mark in &row.picks {
+                            i class=(mark.class()) title=(mark.label()) {}
+                        }
+                    }
+                }
+            }
+            td data-label="Points" class="has-text-right points-cell" {
                 @if scored { (row.score) " pts" } @else { "not scored" }
+            }
+            @if let Some(max) = row.max {
+                td data-label="Max" class="has-text-right max-column" { (max) }
             }
             td class="has-text-right" {
                 button type="button" class="button is-small is-text picks-button" { "Picks" }
             }
         }
     }
+}
+
+/// `4 locked in, 1 out, 4 still open`, for a screen reader.
+fn pick_summary(picks: &[PickMark]) -> String {
+    let count = |marks: &[PickMark]| picks.iter().filter(|mark| marks.contains(mark)).count();
+    let right = count(&[PickMark::Right]);
+    let wrong = count(&[PickMark::Wrong]);
+    let open = picks.len() - right - wrong;
+    format!("{right} locked in, {wrong} out, {open} still open")
 }
 
 #[cfg(test)]
@@ -478,6 +791,8 @@ mod tests {
             player: player.to_owned(),
             owner: format!("owner-{player}"),
             score,
+            picks: vec![],
+            max: None,
         }
     }
 
@@ -576,7 +891,7 @@ mod tests {
         .into_string();
         assert!(html.contains("1st 70% · 2nd 30%"), "{html}");
         assert!(html.contains("Under 10 players: winner takes all"));
-        assert!(html.contains("20 seats · 16 left"));
+        assert!(html.contains("4 of 20 seats filled · 16 left"));
         assert!(html.contains(r#"data-tip="Up to 20 players, all in one pool.""#));
 
         let mut one = crate::templates::pages::competitions::tests::twenty_seats(4);
@@ -689,20 +1004,73 @@ mod tests {
             ),
             row("01a0d0f5-0000-7000-8000-00000000cccc", "carol", 20, 1),
         ];
-        let html = leaderboard_rows(&rows, true, 0).into_string();
-        assert!(html.contains("…0000aaaa") && html.contains("…0000bbbb"));
-        assert!(html.contains(r#"data-copy="01a0d0f5-0000-7000-8000-00000000aaaa""#));
+        let html = leaderboard_rows(&rows, true, 0, 0).into_string();
+        // Each row opens its own entry's picks, where its id is shown.
+        assert!(html.contains(r#"hx-get="/entries/01a0d0f5-0000-7000-8000-00000000aaaa/detail""#));
+        assert!(html.contains(r#"hx-get="/entries/01a0d0f5-0000-7000-8000-00000000bbbb/detail""#));
         assert!(html.contains(r#"data-owner="owner-alice""#));
         assert!(html.contains("npub1abcd…wxyz"));
         assert!(!html.contains("No scores yet"));
-        assert!(leaderboard_rows(&[], true, 0)
+        assert!(leaderboard_rows(&[], true, 0, 0)
             .into_string()
             .contains("No scores yet"));
     }
 
+    /// A line runs under the places the prizes would pay now, saying so when a tie crosses it;
+    /// the rows above it are marked.
+    #[test]
+    fn the_money_line_runs_under_the_paid_places_and_says_when_a_tie_crosses_it() {
+        let rows = vec![
+            row("e1", "amy", 40, 1),
+            row("e2", "bob", 30, 2),
+            row("e3", "cal", 30, 2),
+            row("e4", "dee", 10, 4),
+        ];
+        let html = leaderboard_rows(&rows, true, 0, 2).into_string();
+        let line = html.find("money-line").unwrap();
+        assert!(html.find("/entries/e2/detail").unwrap() < line);
+        assert!(line < html.find("/entries/e3/detail").unwrap());
+        assert!(html.contains("2 places paid · Tie at 2nd: the earliest entry is paid"));
+        assert_eq!(html.matches("Paid now").count(), 2);
+
+        let untied = leaderboard_rows(&rows[2..], true, 0, 1).into_string();
+        assert!(untied.contains("1 place paid<") && !untied.contains("Tie at"));
+        // Nobody ranked yet, or no more rows than places: no line.
+        assert!(!leaderboard_rows(&rows, false, 0, 2)
+            .into_string()
+            .contains("money-line"));
+        assert!(!leaderboard_rows(&rows[..2], true, 0, 2)
+            .into_string()
+            .contains("money-line"));
+    }
+
+    /// Once picks are public, each row's split shows as shares, the side right so far marked.
+    #[test]
+    fn pick_ownership_shows_each_sides_share_and_the_side_right_so_far() {
+        let html = ownership(&[Ownership {
+            station_id: "KORD".into(),
+            city: Some("Chicago, IL".into()),
+            metric: Metric::TempHigh,
+            forecast: Some(77.0),
+            rule: Some(Rule::Line {
+                lower: -1.0,
+                upper: 1.0,
+            }),
+            counts: [1, 2, 0],
+            right: Some(1),
+        }])
+        .into_string();
+        assert!(html.contains("Chicago, IL"));
+        assert!(html.contains(r#"<span class="ownership-share">33%</span>"#));
+        assert!(html.contains(r#"<span class="ownership-share">67%</span>"#));
+        assert!(html.contains(r#"<span class="ownership-share">0%</span>"#));
+        assert_eq!(html.matches("is-right").count(), 1);
+        assert!(html.contains("In range ✓"));
+    }
+
     #[test]
     fn rows_open_the_picks_without_script_filters() {
-        let html = leaderboard_rows(&[row("e1", "bob", 0, 1)], true, 0).into_string();
+        let html = leaderboard_rows(&[row("e1", "bob", 0, 1)], true, 0, 0).into_string();
         assert!(html.contains(r#"hx-get="/entries/e1/detail""#));
         assert!(
             !html.contains("hx-trigger"),
@@ -717,7 +1085,7 @@ mod tests {
     fn a_live_board_shows_provisional_scores_and_refreshes_until_the_window_closes() {
         let competition = view("c1", Phase::Live, -5);
         let page = leaderboard(&competition, NOW).into_string();
-        assert!(page.contains("results in 5 min"));
+        assert!(page.contains(" · ends in ") && page.contains(">5 min</span>"));
         assert!(page.contains(r#"hx-trigger="load""#));
 
         let board = LeaderboardView {
@@ -726,6 +1094,9 @@ mod tests {
             updated_at: Some(NOW - time::Duration::minutes(12)),
             any_readings: true,
             unverified: false,
+            readings: vec![],
+            pins: vec![],
+            ownership: vec![],
         };
         let live = leaderboard_scores(&competition, &board, NOW).into_string();
         assert!(live.contains("Updated <time"));
@@ -771,12 +1142,15 @@ mod tests {
             updated_at: None,
             any_readings: true,
             unverified: false,
+            readings: vec![],
+            pins: vec![],
+            ownership: vec![],
         };
         let html = leaderboard_scores(&competition, &tied, NOW).into_string();
         assert_eq!(html.matches("paid-badge").count(), 1);
-        assert!(
-            html.contains(r#"<td data-label="Rank">1 <span class="paid-badge">Paid</span></td>"#)
-        );
+        assert!(html.contains(
+            r#"<td data-label="Rank" class="rank-cell">1 <span class="paid-badge">Paid</span></td>"#
+        ));
         let live = LeaderboardView {
             phase: Phase::Live,
             ..tied
@@ -796,14 +1170,21 @@ mod tests {
             updated_at: None,
             any_readings: false,
             unverified: false,
+            readings: vec![],
+            pins: vec![],
+            ownership: vec![],
         };
         let html = leaderboard_scores(&competition, &board, NOW).into_string();
-        assert_eq!(html.matches(r#"<td data-label="Rank">—</td>"#).count(), 2);
+        assert_eq!(
+            html.matches(r#"<td data-label="Rank" class="rank-cell">—</td>"#)
+                .count(),
+            2
+        );
         assert_eq!(html.matches("0 pts").count(), 2);
         board.rows = vec![row("e2", "bob", 10, 1), row("e1", "amy", 0, 2)];
         let html = leaderboard_scores(&competition, &board, NOW).into_string();
-        assert!(html.contains(r#"<td data-label="Rank">1</td>"#));
-        assert!(html.contains(r#"<td data-label="Rank">2</td>"#));
+        assert!(html.contains(r#"<td data-label="Rank" class="rank-cell">1</td>"#));
+        assert!(html.contains(r#"<td data-label="Rank" class="rank-cell">2</td>"#));
     }
 
     /// A competition cancelled mid-window stops polling.
@@ -816,6 +1197,9 @@ mod tests {
             updated_at: None,
             any_readings: false,
             unverified: false,
+            readings: vec![],
+            pins: vec![],
+            ownership: vec![],
         };
         assert!(!leaderboard_scores(&competition, &board, NOW)
             .into_string()
@@ -870,6 +1254,9 @@ mod tests {
             updated_at: None,
             any_readings: true,
             unverified: false,
+            readings: vec![],
+            pins: vec![],
+            ownership: vec![],
         };
         let scores = leaderboard_scores(&competition, &board, NOW).into_string();
         assert!(!scores.contains("30 pts"), "{scores}");
@@ -1009,6 +1396,9 @@ mod tests {
             updated_at: None,
             any_readings: false,
             unverified: false,
+            readings: vec![],
+            pins: vec![],
+            ownership: vec![],
         };
         let html = leaderboard_scores(&competition, &board, NOW).into_string();
         assert!(html.contains("No-score outcome."));
@@ -1020,7 +1410,7 @@ mod tests {
         assert!(!html.contains("0 pts"), "{html}");
         assert_eq!(html.matches("not scored").count(), 3);
         let badge = phase_badge(&competition).into_string();
-        assert!(badge.contains(">Finished</span>"));
+        assert!(badge.contains(">Final</span>"));
         assert!(badge.contains("the pot is shared back"));
 
         board.any_readings = true;
@@ -1039,7 +1429,7 @@ mod tests {
         assert!(html.contains("0 pts"));
         assert!(phase_badge(&competition)
             .into_string()
-            .contains(">Finished</span>"));
+            .contains(">Final</span>"));
 
         board.any_readings = true;
         assert!(!leaderboard_scores(&competition, &board, NOW)
@@ -1076,6 +1466,9 @@ mod tests {
             updated_at: None,
             any_readings: false,
             unverified: false,
+            readings: vec![],
+            pins: vec![],
+            ownership: vec![],
         };
         assert!(leaderboard_scores(&competition, &board, NOW)
             .into_string()
@@ -1101,7 +1494,7 @@ mod tests {
         competition.ticket_price = 1_000;
         competition.refund_shares = Some(vec![1_000; 3]);
         let html = leaderboard(&competition, NOW).into_string();
-        assert!(html.contains(">Finished</span>"));
+        assert!(html.contains(">Final</span>"));
         assert!(html.contains("Each entry&#39;s share") || html.contains("Each entry's share"));
         assert!(html.contains("1,000 sats per entry"));
         assert!(html.contains("payment may still be pending"));
@@ -1115,6 +1508,9 @@ mod tests {
             updated_at: None,
             any_readings: false,
             unverified: false,
+            readings: vec![],
+            pins: vec![],
+            ownership: vec![],
         };
         let scores = leaderboard_scores(&competition, &board, NOW).into_string();
         assert!(scores.contains("never signed a result in time"));
@@ -1124,6 +1520,9 @@ mod tests {
         // The oracle couldn't verify the window's data: said plainly, with no detail.
         let unverified = LeaderboardView {
             unverified: true,
+            readings: vec![],
+            pins: vec![],
+            ownership: vec![],
             ..board
         };
         let scores = leaderboard_scores(&competition, &unverified, NOW).into_string();

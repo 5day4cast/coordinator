@@ -387,9 +387,9 @@ mod tests {
         assert!(html.contains(
             r#"title="Weather station: New York/JFK International, NY (KJFK)">New York, NY</h3>"#
         ));
-        assert!(html.contains(r#"<span class="pick-target">&lt; 69°F</span>"#));
+        assert!(html.contains(r#"<span class="pick-target">Under 69°F</span>"#));
         assert!(html.contains(r#"<span class="pick-reading">55°F</span>"#));
-        assert!(html.contains("&gt; 18 knots"));
+        assert!(html.contains("Over 18 knots"));
         assert!(html.contains("✓ +10"));
         assert!(html.contains("✗ 0"));
         assert!(html.contains("10 pts"));
@@ -538,7 +538,7 @@ mod tests {
         )];
         let own = own_picks_detail("e", &views(&picks), NOW).into_string();
         assert!(own.contains("Your picks"));
-        assert!(own.contains(r#"<span class="pick-target">&gt; 69°F</span>"#));
+        assert!(own.contains(r#"<span class="pick-target">Over 69°F</span>"#));
         assert!(
             !own.contains("No readings"),
             "nothing is due before the window"
@@ -585,7 +585,7 @@ mod tests {
         let html = picks_detail("e1", &views(&picks), Phase::Live, updated, NOW).into_string();
         // One line per pick: the metric, the pick and what it needs, the reading so far.
         assert!(html.contains(
-            r#"<span class="pick-metric">Highest temperature</span><span class="pick-choice"><span class="pick-target">&gt; 69°F</span></span><span class="pick-reading">71°F</span>"#
+            r#"<span class="pick-metric">High</span><span class="pick-choice"><span class="pick-target">Over 69°F</span></span><span class="pick-reading">71°F</span>"#
         ), "{html}");
         assert!(html.contains(r#"<span class="pick-reading">14 knots</span>"#));
         assert!(!html.contains("Forecast") && !html.contains("lately"));

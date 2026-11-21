@@ -1244,7 +1244,7 @@ test("a paid ticket past the hour to finish it says it is refunded, and Pay star
     paid: PAID,
     entry: () => ({ ok: false, status: 400, json: async () => ({ error: late }) }),
   });
-  const label = "Pay 5,300 sats and enter";
+  const label = "Lock in 9 picks · 5,300 sats";
   Object.assign(elements.submitEntry, { textContent: "Enter", dataset: { payLabel: label } });
   await sandbox.submitEntry();
   assert.equal(entries().length, 1);
@@ -1262,7 +1262,7 @@ test("a paid ticket past the hour to finish it says it is refunded, and Pay star
 
 test("Pay reads Enter while the form shows a paid ticket, and its price otherwise", () => {
   const { elements, document } = entryPage();
-  const label = "Pay 5,300 sats and enter";
+  const label = "Lock in 9 picks · 5,300 sats";
   Object.assign(elements.submitEntry, { textContent: label, dataset: { payLabel: label } });
   const sandbox = load({}, document, termsFetch());
   elements.entryPaid = element({ dataset: { ...PAID } });
@@ -1281,7 +1281,7 @@ test("Pay reads Enter while the form shows a paid ticket, and its price otherwis
 
 test("Pay is hidden while the notice says no ticket would be issued, and back without it", () => {
   const { elements, document } = entryPage();
-  const label = "Pay 5,300 sats and enter";
+  const label = "Lock in 9 picks · 5,300 sats";
   Object.assign(elements.submitEntry, { textContent: label, dataset: { payLabel: label } });
   const sandbox = load({}, document, termsFetch());
   // A single competition's player whose paid entry lapsed: it still counts as their entry.

@@ -21,8 +21,8 @@ use crate::{
         operator_delete_competition, operator_owed_winners, operator_payout_holds,
         operator_release_payout_hold, operator_settle_owed_winner, operator_write_off_refunds,
         payouts_fragment, public_page_handler, register, register_ticket, register_username,
-        request_competition_ticket, send_to_address, set_lightning_address, signup_pow_challenge,
-        submit_final_signatures, submit_public_nonces, submit_ticket_payout,
+        request_competition_ticket, send_to_address, set_display_name, set_lightning_address,
+        signup_pow_challenge, submit_final_signatures, submit_public_nonces, submit_ticket_payout,
         ticket_status_fragment,
     },
     config::Settings,
@@ -347,6 +347,8 @@ pub struct AppState {
     pub coordinator: Arc<Coordinator>,
     /// One serialized operator inventory, refreshed without decoding contract blobs.
     pub operator_inventory: Arc<crate::infra::refresh_cache::RefreshCache<(), axum::body::Bytes>>,
+    /// NOAA's satellite loop behind the public pages (`api/satellite.rs`).
+    pub satellite: Arc<crate::infra::refresh_cache::RefreshCache<(), crate::api::satellite::Loop>>,
     pub users_info: Arc<UserInfo>,
     /// Leaderboards and the oracle weather pages show, served from a background cache.
     pub leaderboards: Arc<Leaderboards>,
@@ -988,6 +990,7 @@ pub async fn build_app(
         network: config.bitcoin_settings.network.to_string(),
         coordinator,
         operator_inventory: Arc::new(crate::infra::refresh_cache::RefreshCache::new()),
+        satellite: Arc::new(crate::infra::refresh_cache::RefreshCache::new()),
         users_info,
         leaderboards,
         lnurl,
@@ -1065,6 +1068,7 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Result<Router, anyhow
         .route("/register", post(register))
         .route("/username/register", post(register_username))
         .route("/lightning-address", post(set_lightning_address))
+        .route("/display-name", post(set_display_name))
         .route("/username/login", post(login_username))
         .route("/username/change-password", post(change_password))
         .route("/username/forgot-password", post(forgot_password_challenge))
@@ -1497,6 +1501,18 @@ async fn public_fallback(
 fn static_files(state: &AppState) -> Router<Arc<AppState>> {
     crate::api::ui_files::router(&state.ui_dir, state.wasm_version.clone())
         .route("/assets/{file}", get(crate::templates::assets::serve_asset))
+        .route(
+            "/weatherstar/",
+            get(crate::api::weatherstar::serve_weatherstar),
+        )
+        .route(
+            "/weatherstar/{*path}",
+            get(crate::api::weatherstar::serve_weatherstar),
+        )
+        .route(
+            crate::api::satellite::SATELLITE_PATH,
+            get(crate::api::satellite::serve_satellite),
+        )
 }
 
 /// Gzip for browsers that accept it. The public listener compresses its static

@@ -488,6 +488,73 @@ pub async fn set_lightning_address(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct DisplayNamePayload {
+    /// Blank or missing clears it.
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisplayNameResponse {
+    pub display_name: Option<String>,
+}
+
+/// A leaderboard name, its spaces tidied: 3 to 24 ASCII letters, digits, spaces, `_`, `-` or
+/// `.`, starting with a letter or digit. It can't look like the npub other players show as, or
+/// be the account's own login username, which stays private. Blank means none.
+fn checked_display_name(name: &str, username: Option<&str>) -> Result<Option<String>, String> {
+    let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    if name.is_empty() {
+        return Ok(None);
+    }
+    if !(3..=24).contains(&name.len()) {
+        return Err("A leaderboard name is 3 to 24 characters".to_string());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '_' | '-' | '.'))
+    {
+        return Err("Use letters, numbers, spaces, _, - or .".to_string());
+    }
+    if !name.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+        return Err("Start with a letter or a number".to_string());
+    }
+    if name.to_ascii_lowercase().starts_with("npub") {
+        return Err("A leaderboard name can't start with npub".to_string());
+    }
+    if username.is_some_and(|username| username.eq_ignore_ascii_case(&name)) {
+        return Err("Pick a name other than your login username, which stays private".to_string());
+    }
+    Ok(Some(name))
+}
+
+/// Set or clear the name the player shows on leaderboards. Signed with the account's Nostr key.
+pub async fn set_display_name(
+    State(state): State<Arc<AppState>>,
+    AuthedJson {
+        auth: NostrAuth { pubkey, .. },
+        body,
+    }: AuthedJson<DisplayNamePayload>,
+) -> Result<impl IntoResponse, ApiError> {
+    let nostr_pubkey = pubkey.to_bech32().unwrap_or_else(|never| match never {});
+    let username = state
+        .users_info
+        .get_username_by_pubkey(&nostr_pubkey)
+        .await?;
+    let display_name = checked_display_name(
+        body.display_name.as_deref().unwrap_or_default(),
+        username.as_deref(),
+    )
+    .map_err(|message| ApiError::from(domain::Error::BadRequest(message)))?;
+    state
+        .users_info
+        .set_display_name(&nostr_pubkey, display_name.clone())
+        .await?;
+    Ok((StatusCode::OK, Json(DisplayNameResponse { display_name })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PasswordChangePayload {
     pub current_auth_key: AuthKey,
     pub new_auth_key: AuthKey,
@@ -723,6 +790,33 @@ async fn claim_reset_challenge(
         (username.to_owned(), std::time::Instant::now()),
     );
     true
+}
+
+#[cfg(test)]
+mod display_name_tests {
+    use super::*;
+
+    #[test]
+    fn a_leaderboard_name_is_short_plain_and_never_the_login() {
+        assert_eq!(
+            checked_display_name("  Storm   Chaser ", None),
+            Ok(Some("Storm Chaser".to_string()))
+        );
+        assert_eq!(checked_display_name("   ", Some("alice")), Ok(None));
+        for refused in [
+            "ab",
+            "a".repeat(25).as_str(),
+            "_lead",
+            "café",
+            "Npub1abc",
+            "Alice",
+        ] {
+            assert!(
+                checked_display_name(refused, Some("alice")).is_err(),
+                "{refused}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -5,5 +5,5 @@ mod navbar;
 mod tip;
 
 pub use modals::{auth_modals, RecoveryHelp};
-pub use navbar::{menu_toggle, navbar};
+pub use navbar::{github_icon, navbar, network_banner, wordmark};
 pub use tip::{tip, tip_end, tip_start};

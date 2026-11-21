@@ -1,3 +1,54 @@
+/* The Wallet page: where winnings go, the leaderboard name and account safety as cards, then
+   the payouts. */
+.page-title {
+  font-size: clamp(2rem, 5vw, 2.75rem);
+  margin-bottom: 1.25rem !important;
+}
+
+.wallet-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 19rem), 1fr));
+  gap: 1rem;
+  margin-bottom: 2rem;
+}
+
+.wallet-card {
+  display: grid;
+  gap: 0.5rem;
+  align-content: start;
+  padding: 1rem 1.1rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--navy);
+}
+
+html.site .wallet-card-title,
+html.site .wallet-section-title {
+  margin: 0 0 0.25rem;
+  font-size: 1.3rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.wallet-card .content p,
+.wallet-card p {
+  margin-bottom: 0.4rem;
+}
+
+html.site .wallet-card .help {
+  color: var(--dim);
+}
+
+html.site .wallet-card .help.is-danger {
+  color: var(--out);
+}
+
+html.site .wallet-card .input {
+  background: var(--night);
+  border-color: var(--line);
+  color: var(--ink);
+}
+
 /* Long Lightning Addresses must fit both desktop tables and phone cards. */
 #payoutAddressPanel {
   overflow-wrap: anywhere;

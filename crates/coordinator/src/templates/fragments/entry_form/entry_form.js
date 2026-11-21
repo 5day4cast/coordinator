@@ -589,6 +589,31 @@ function showPicksLeft(form) {
   const rows = parseInt(form.dataset.pickRows, 10) || need;
   const made = Object.values(collectPicks(form)).reduce((n, station) => n + Object.keys(station).length, 0);
   counter.textContent = picksLeft(made, need, rows);
+  showEntryPanel(form, made, need);
+}
+
+// The entry panel beside the picks: how many are made, a bar segment for each, and a line for
+// each pick, "Afton, WY High · In range 34.1–37.1°".
+function showEntryPanel(form, made, need) {
+  const count = document.getElementById("pickCount");
+  if (count) count.textContent = `${made} of ${need}`;
+  document.querySelectorAll("#pickMeter i").forEach((segment, index) => {
+    segment.classList.toggle("is-made", index < made);
+  });
+  const summary = document.getElementById("pickSummary");
+  if (!summary) return;
+  const text = (root, selector) => root?.querySelector(selector)?.textContent.trim() ?? "";
+  summary.replaceChildren(...[...form.querySelectorAll(`${PICK}:checked`)].map((input) => {
+    const option = input.closest(".pick-option");
+    const what = document.createElement("span");
+    what.textContent = `${text(input.closest(".station-picks"), ".station-city")} ${text(input.closest(".pick-row"), ".pick-label")}`;
+    const pick = document.createElement("b");
+    pick.className = `is-${input.value}`;
+    pick.textContent = `${text(option, ".pick-word")} ${text(option, ".pick-value")}`;
+    const line = document.createElement("li");
+    line.append(what, pick);
+    return line;
+  }));
 }
 
 // The entry every ticket request for a competition carries, by competition id, until it is
@@ -1037,7 +1062,13 @@ function showNetworkFee(fee, total) {
   const $total = document.getElementById("ticketTotal");
   if ($total) $total.textContent = formatSats(total);
   const $pay = document.getElementById("submitEntry");
-  if ($pay) $pay.textContent = `Pay ${formatSats(total)} and enter`;
+  if ($pay) $pay.textContent = lockInLabel(total);
+}
+
+// Pay's label, as the form renders it (`pay_label` in mod.rs): "Lock in 9 picks · 5,383 sats".
+function lockInLabel(total) {
+  const picks = parseInt(document.getElementById("entryForm")?.dataset.maxValues, 10) || 1;
+  return `Lock in ${picks} ${picks === 1 ? "pick" : "picks"} · ${formatSats(total)}`;
 }
 
 const PICK = ".pick-option input[type=radio]";
@@ -1068,7 +1099,26 @@ function unpickWithSpace(event) {
   showPicksLeft(input.form);
 }
 
+// Picks lock when the window starts: once the form's own countdown runs out, Pay stops and says
+// why, rather than starting a payment for a competition that no longer takes entries. A payment
+// already under way, or a paid ticket still to enter, is left for the server to settle.
+function closeEntries(event) {
+  if (!event.detail?.element?.classList.contains("lock-clock")) return;
+  const pay = document.getElementById("submitEntry");
+  if (pay?.classList.contains("is-loading") || document.getElementById("entryPaid")?.dataset.ticketId) return;
+  if (pay) {
+    pay.disabled = true;
+    pay.textContent = "Entries closed";
+  }
+  const error = document.getElementById("errorMessage");
+  if (error) {
+    error.textContent = "This contest has started, so it takes no more entries. Pick another in the Lobby.";
+    error.classList.remove("hidden");
+  }
+}
+
 function setupEntryForm() {
+  document.body.addEventListener("fw:countdown-ended", closeEntries);
   document.addEventListener("click", (event) => {
     if (event.target.closest?.("#submitEntry")) submitEntry();
     if (event.target instanceof HTMLInputElement && event.target.matches(PICK)) {

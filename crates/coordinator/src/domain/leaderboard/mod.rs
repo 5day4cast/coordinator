@@ -201,7 +201,7 @@ pub struct LeaderboardRow {
 
 #[derive(Debug, Clone)]
 pub struct Player {
-    /// Username, or the start of the public key for a player without one.
+    /// The player's leaderboard name, or the start of the public key for a player without one.
     pub name: String,
     /// Nostr public key, hex.
     pub pubkey: String,
@@ -321,18 +321,19 @@ impl Leaderboards {
             if names.contains_key(&entry.pubkey) {
                 continue;
             }
-            let username = match nostr::PublicKey::from_hex(&entry.pubkey) {
+            // The name the player chose to show; a login username stays private.
+            let display_name = match nostr::PublicKey::from_hex(&entry.pubkey) {
                 Ok(pubkey) => {
                     let npub = pubkey.to_bech32().unwrap_or_else(|never| match never {});
                     self.users
-                        .get_username_by_pubkey(&npub)
+                        .get_display_name_by_pubkey(&npub)
                         .await
                         .ok()
                         .flatten()
                 }
                 Err(_) => None,
             };
-            let name = username.unwrap_or_else(|| entry.pubkey.chars().take(8).collect());
+            let name = display_name.unwrap_or_else(|| entry.pubkey.chars().take(8).collect());
             names.insert(entry.pubkey.clone(), name);
         }
         names

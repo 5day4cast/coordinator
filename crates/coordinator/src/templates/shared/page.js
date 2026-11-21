@@ -44,12 +44,100 @@ async function setOwnerTag(npub) {
   markOwnRows(document);
 }
 
+// "7 h 52 min" for `seconds` from now, as `format::duration` writes it.
+function untilText(seconds) {
+  const minutes = Math.max(0, Math.floor(seconds / 60));
+  const [days, hours, mins] = [Math.floor(minutes / 1440), Math.floor(minutes / 60) % 24, minutes % 60];
+  if (days === 0 && hours === 0) return mins === 0 ? "under a minute" : `${mins} min`;
+  if (days === 0) return mins === 0 ? `${hours} h` : `${hours} h ${mins} min`;
+  if (days === 1) return hours === 0 ? "1 day" : `1 day ${hours} h`;
+  return `${days} days`;
+}
+
+// "04:59:12", or "1d 04:59:12", as `format::clock` writes it.
+function clockText(seconds) {
+  const left = Math.max(0, Math.floor(seconds));
+  const days = Math.floor(left / 86_400);
+  const rest = left % 86_400;
+  const pad = (value) => String(value).padStart(2, "0");
+  const time = `${pad(Math.floor(rest / 3600))}:${pad(Math.floor(rest / 60) % 60)}:${pad(rest % 60)}`;
+  return days > 0 ? `${days}d ${time}` : time;
+}
+
+// Countdowns marked data-countdown (a unix time) stay current while the page is open, to the
+// second where marked data-clock. One that
+// runs out says so once, with `fw:countdown-ended` from the body: the lobby reloads, and the
+// entry form stops taking picks.
+function tickCountdowns() {
+  const now = Date.now() / 1000;
+  for (const element of document.querySelectorAll("[data-countdown]")) {
+    const left = Number(element.dataset.countdown) - now;
+    if (left > 0) {
+      element.textContent = element.hasAttribute("data-clock") ? clockText(left) : untilText(left);
+    } else if (!element.dataset.ended) {
+      element.dataset.ended = "true";
+      element.textContent = element.hasAttribute("data-clock") ? clockText(0) : "now";
+      document.body.dispatchEvent(new CustomEvent("fw:countdown-ended", { detail: { element } }));
+    }
+  }
+}
+
+// The header link for the section the reader is in. The Lobby's is the lobby alone; a
+// competition's own pages are none of the four.
+function markCurrentNav(path = location.pathname) {
+  for (const link of document.querySelectorAll(".site-nav-link")) {
+    const href = link.getAttribute("href");
+    const current = href === "/competitions"
+      ? path === "/" || path === "/competitions"
+      : path.startsWith(href);
+    if (current) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
+  }
+}
+
+// The satellite loop behind the page, at half speed, near the pace of NOAA's own page. It
+// downloads once the page has loaded, and never for readers who ask for less motion or less
+// data, or whose connection the browser puts under 5 Mbps (only Chromium browsers say).
+function startSatellite() {
+  const video = document.querySelector("video.satellite");
+  if (!video || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  const start = () => {
+    const connection = navigator.connection;
+    if (connection?.saveData || connection?.downlink < 5) return;
+    // Loading resets the speed to the default one.
+    video.defaultPlaybackRate = 0.5;
+    video.src = video.dataset.src;
+    video.play().catch(() => {});
+  };
+  if (document.readyState === "complete") start();
+  else window.addEventListener("load", start, { once: true });
+}
+
+// The lobby's WeatherStar frame, where the page shows it (desktop). A hidden frame with a src
+// would still load, so its src waits in data-src.
+function loadWeatherstar() {
+  for (const frame of document.querySelectorAll("iframe.weatherstar:not([src])")) {
+    if (getComputedStyle(frame).display !== "none") frame.src = frame.dataset.src;
+  }
+}
+
 function setupPage() {
+  startSatellite();
+  loadWeatherstar();
   localizeTimes(document);
+  markCurrentNav();
+  setInterval(tickCountdowns, 1_000);
+  // A navigation changes the address after its click, and Back without one.
+  document.addEventListener("click", (event) => {
+    const link = event.target.closest?.("a[hx-push-url][href]");
+    if (link) markCurrentNav(new URL(link.href, location.href).pathname);
+  });
+  window.addEventListener("popstate", () => markCurrentNav());
   // htmx processes every swapped-in element, and the page itself at start.
   document.addEventListener("htmx:after:process", (event) => {
     localizeTimes(event.target);
     markOwnRows(event.target);
+    loadWeatherstar();
     showKeymeldTrust();
   });
 

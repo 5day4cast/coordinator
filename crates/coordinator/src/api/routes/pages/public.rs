@@ -23,19 +23,21 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::oracle_view::{
-    station_forecasts, station_name, station_pins, stations_by_id, stations_named,
+    station_forecasts, station_name, station_pins, stations_by_id, stations_named, StationsById,
 };
 use crate::{
     api::extractors::NostrAuth,
     domain::{
-        leaderboard::{Leaderboard, Phase, FIRST_READ_WAIT},
+        leaderboard::{
+            progress::best_points, Leaderboard, Metric, Phase, PickState, FIRST_READ_WAIT,
+        },
         Competition, Error, LedgerTotals, RefundProgress, Returned, UnenteredTickets, UnpaidTicket,
     },
-    infra::refresh_cache::Cached,
+    infra::{oracle::ValueOptions, refresh_cache::Cached},
     startup::AppState,
     templates::{
-        components::{menu_toggle, RecoveryHelp},
-        format::{short_npub, Explorers},
+        components::RecoveryHelp,
+        format::{city_name, short_npub, Explorers},
         fragments::{
             entries_paused_banner,
             entry_form::{
@@ -45,14 +47,16 @@ use crate::{
             },
             leaderboard::{
                 leaderboard, leaderboard_scores, queue_pools, rows_url, LeaderboardRow,
-                LeaderboardView,
+                LeaderboardView, Ownership, PickMark, StationReadings,
             },
             loading::{placeholder, Pending, MAX_ASKS},
             picks::{detail_url, own_picks_detail, picks_detail, withheld_picks_detail, PickView},
         },
         layouts::base::{base, PageConfig},
         pages::{
-            competitions::{competitions_page, shown_ids, CompetitionView, ListOptions, Tab},
+            competitions::{
+                featured_id, lobby_page, shown_ids, CompetitionView, ListOptions, Lobby, Tab,
+            },
             entries::{
                 entries_page, older_entries, sign_in_required, EntryRow, PaidRow, UnpaidRow,
                 PAGE_SIZE,
@@ -121,15 +125,13 @@ pub(super) fn page(
 ) -> Response {
     let body = if is_fragment(headers) {
         // htmx takes the document title from a <title> in the response; only
-        // navigations of the main content change it, and they close the
-        // phone menu (the navbar's toggle, swapped in unchecked).
+        // navigations of the main content change it.
         let navigation = headers
             .get("HX-Target")
             .is_some_and(|target| target == MAIN_CONTENT);
         html! {
             @if navigation {
                 title { (title) }
-                (menu_toggle(true))
             }
             (content)
         }
@@ -381,8 +383,12 @@ pub async fn competitions_fragment(
     let (mut competitions, named) = tokio::join!(competition_views(&state, now), named);
     options.stations = named;
     let shown = shown_ids(&competitions, &options);
-    complete(&state, &mut competitions, &shown).await;
-    let content = competitions_page(&competitions, &options, now);
+    let featured = featured_id(&competitions, &options);
+    let (_, lobby) = tokio::join!(
+        complete(&state, &mut competitions, &shown),
+        lobby(&state, featured),
+    );
+    let content = lobby_page(&competitions, &options, &lobby, now);
     let content = if state.coordinator.settle_only() {
         html! { (entries_paused_banner()) (content) }
     } else {
@@ -391,10 +397,30 @@ pub async fn competitions_fragment(
     page(
         &headers,
         &state,
-        "Fantasy Weather: call the weather, win the pot",
+        "5day4cast: daily fantasy weather",
         content,
         Caching::Public,
     )
+}
+
+/// The lobby's cities, from the oracle's stations, and the featured competition's forecasts
+/// for its map, when the caches have them in time.
+async fn lobby(state: &AppState, featured: Option<String>) -> Lobby {
+    let featured = async {
+        let id = Uuid::parse_str(&featured?).ok()?;
+        let competition = find_competition(state, id).await.ok().flatten()?;
+        match forecasts(state, &competition, FIRST_READ_WAIT).await {
+            Forecasts::Ready { stations, pins } => Some((stations, pins)),
+            Forecasts::Pending(_) => None,
+        }
+    };
+    let (stations, weather) = tokio::join!(state.leaderboards.stations(FIRST_READ_WAIT), featured);
+    let stations = stations_by_id(stations.value().map(Vec::as_slice).unwrap_or_default());
+    let cities = stations
+        .keys()
+        .filter_map(|id| Some((id.clone(), city_name(&station_name(&stations, id)?))))
+        .collect();
+    Lobby { cities, weather }
 }
 
 /// Only the signed-in player's submitted entry counts. Never stored by a shared cache.
@@ -435,7 +461,7 @@ pub async fn entries_fragment(
     headers: HeaderMap,
     MaybeAuth(auth): MaybeAuth,
 ) -> Response {
-    let title = "Your entries - Fantasy Weather";
+    let title = "My entries · 5day4cast";
     let Some(NostrAuth { pubkey, .. }) = auth else {
         return signed_out(&headers, &state, title, "/entries", "your entries");
     };
@@ -562,22 +588,29 @@ pub async fn payouts_fragment(
     headers: HeaderMap,
     MaybeAuth(auth): MaybeAuth,
 ) -> Response {
-    let title = "Payouts - Fantasy Weather";
+    let title = "Wallet · 5day4cast";
     let Some(NostrAuth { pubkey, .. }) = auth else {
-        return signed_out(&headers, &state, title, "/payouts", "your payouts");
+        return signed_out(&headers, &state, title, "/payouts", "your wallet");
     };
     let pubkey_hex = pubkey.to_hex();
-    let (payouts, user) = tokio::join!(
+    let npub = npub(&pubkey);
+    let (payouts, user, display_name) = tokio::join!(
         state.coordinator.eligible_payouts(&pubkey_hex),
-        state.users_info.login(npub(&pubkey)),
+        state.users_info.login(npub.clone()),
+        state.users_info.get_display_name_by_pubkey(&npub),
     );
     let payouts = payouts
         .inspect_err(|error| error!("failed to load payouts: {error}"))
         .unwrap_or_default();
     let lightning_address = user.ok().and_then(|user| user.lightning_address);
+    let display_name = display_name
+        .inspect_err(|error| error!("failed to load the leaderboard name: {error}"))
+        .ok()
+        .flatten();
     let content = payouts_page(
         &payouts,
         lightning_address.as_deref(),
+        display_name.as_deref(),
         state.recovery.is_some(),
         state.satchel_url.as_deref(),
     );
@@ -622,7 +655,7 @@ pub async fn help_fragment(
     page(
         &headers,
         &state,
-        "How it works - Fantasy Weather",
+        "How to play · 5day4cast",
         content,
         Caching::Public,
     )
@@ -680,7 +713,7 @@ pub fn not_found(headers: &HeaderMap, state: &AppState, what: &str) -> Response 
     let mut response = page(
         headers,
         state,
-        "Not found - Fantasy Weather",
+        "Not found · 5day4cast",
         content,
         Caching::Public,
     );
@@ -790,7 +823,7 @@ pub async fn entry_form_fragment(
     page(
         &headers,
         &state,
-        "Enter - Fantasy Weather",
+        "Make picks · 5day4cast",
         content,
         Caching::Private,
     )
@@ -1007,7 +1040,7 @@ fn leaderboard_response(state: &AppState, headers: &HeaderMap, view: &Competitio
     page(
         headers,
         state,
-        "Leaderboard - Fantasy Weather",
+        "Leaderboard · 5day4cast",
         content,
         Caching::Public,
     )
@@ -1064,17 +1097,45 @@ pub async fn leaderboard_rows_fragment(
         );
     }
     let now = now();
-    let view = competition_view(&state, &competition, now).await;
-    fragment(
-        leaderboard_scores(&view, &leaderboard_view(&board), now),
-        Caching::Public,
-    )
+    let (view, stations) = tokio::join!(
+        competition_view(&state, &competition, now),
+        state.leaderboards.stations(FIRST_READ_WAIT),
+    );
+    let stations = stations_by_id(stations.value().map(Vec::as_slice).unwrap_or_default());
+    let board = leaderboard_view(&board, &competition.event_submission.locations, &stations);
+    fragment(leaderboard_scores(&view, &board, now), Caching::Public)
 }
 
 /// The domain's leaderboard as the page shows it: shared ranks, player names,
 /// and a tag the browser matches to mark the viewer's own rows.
-fn leaderboard_view(board: &Leaderboard) -> LeaderboardView {
+fn leaderboard_view(
+    board: &Leaderboard,
+    locations: &[String],
+    stations: &StationsById,
+) -> LeaderboardView {
+    let live = board.phase == Phase::Live;
+    // Every entry's picks at a station see the same observations: the first found will do.
+    let reading = |station_id: &str, metric: Metric| {
+        board
+            .rows
+            .iter()
+            .flat_map(|row| &row.picks)
+            .find(|pick| pick.station_id == station_id && pick.metric == metric)
+            .and_then(|pick| pick.observed)
+    };
     LeaderboardView {
+        readings: locations
+            .iter()
+            .map(|station_id| StationReadings {
+                station_id: station_id.clone(),
+                city: station_name(stations, station_id).map(|name| city_name(&name)),
+                high: reading(station_id, Metric::TempHigh),
+                low: reading(station_id, Metric::TempLow),
+                wind: reading(station_id, Metric::WindSpeed),
+            })
+            .collect(),
+        pins: station_pins(locations, stations),
+        ownership: ownership(board, stations),
         rows: board
             .rows
             .iter()
@@ -1097,6 +1158,24 @@ fn leaderboard_view(board: &Leaderboard) -> LeaderboardView {
                     },
                     owner: npub.as_deref().map(owner_tag).unwrap_or_default(),
                     score: i32::try_from(row.standing.score).unwrap_or(i32::MAX),
+                    picks: row
+                        .picks
+                        .iter()
+                        .map(|pick| PickMark::of(pick.state, pick.points))
+                        .collect(),
+                    // Settled picks count what they scored; the rest what a right pick scores.
+                    max: (live && !row.picks.is_empty()).then(|| {
+                        let max: u64 = row
+                            .picks
+                            .iter()
+                            .map(|pick| match pick.state {
+                                PickState::LockedIn | PickState::Final => pick.points,
+                                PickState::Out => 0,
+                                _ => best_points(&pick.pick, pick.rule),
+                            })
+                            .sum();
+                        i32::try_from(max).unwrap_or(i32::MAX)
+                    }),
                 }
             })
             .collect(),
@@ -1108,6 +1187,42 @@ fn leaderboard_view(board: &Leaderboard) -> LeaderboardView {
             .any(|row| row.picks.iter().any(|pick| pick.observed.is_some())),
         unverified: board.settlement_blocked,
     }
+}
+
+/// How the entries split on each row of picks, in the order the picks come. A side is right so
+/// far when any entry on it is.
+fn ownership(board: &Leaderboard, stations: &StationsById) -> Vec<Ownership> {
+    let mut rows: Vec<Ownership> = Vec::new();
+    for pick in board.rows.iter().flat_map(|row| &row.picks) {
+        let side = match pick.pick {
+            ValueOptions::Under => 0,
+            ValueOptions::Par => 1,
+            ValueOptions::Over => 2,
+        };
+        let index = rows
+            .iter()
+            .position(|row| row.station_id == pick.station_id && row.metric == pick.metric)
+            .unwrap_or_else(|| {
+                rows.push(Ownership {
+                    station_id: pick.station_id.clone(),
+                    city: station_name(stations, &pick.station_id).map(|name| city_name(&name)),
+                    metric: pick.metric,
+                    forecast: pick.forecast,
+                    rule: pick.rule,
+                    counts: [0; 3],
+                    right: None,
+                });
+                rows.len() - 1
+            });
+        rows[index].counts[side] += 1;
+        if matches!(
+            PickMark::of(pick.state, pick.points),
+            PickMark::Right | PickMark::LeaningRight
+        ) {
+            rows[index].right = Some(side);
+        }
+    }
+    rows
 }
 
 /// Public, like the leaderboard; ownership is highlighted locally without a signature.
@@ -1183,7 +1298,7 @@ pub async fn entry_detail_fragment(
     page(
         &headers,
         &state,
-        "Picks - Fantasy Weather",
+        "Picks · 5day4cast",
         content,
         Caching::Public,
     )
