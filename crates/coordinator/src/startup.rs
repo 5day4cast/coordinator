@@ -348,7 +348,7 @@ pub struct AppState {
     /// One serialized operator inventory, refreshed without decoding contract blobs.
     pub operator_inventory: Arc<crate::infra::refresh_cache::RefreshCache<(), axum::body::Bytes>>,
     /// NOAA's satellite loop behind the public pages (`api/satellite.rs`).
-    pub satellite: Arc<crate::infra::refresh_cache::RefreshCache<(), axum::body::Bytes>>,
+    pub satellite: Arc<crate::infra::refresh_cache::RefreshCache<(), crate::api::satellite::Loop>>,
     pub users_info: Arc<UserInfo>,
     /// Leaderboards and the oracle weather pages show, served from a background cache.
     pub leaderboards: Arc<Leaderboards>,

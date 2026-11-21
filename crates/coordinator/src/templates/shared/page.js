@@ -95,16 +95,22 @@ function markCurrentNav(path = location.pathname) {
   }
 }
 
-// The satellite loop behind the page, at half speed, near the pace of NOAA's own page. Readers
-// who ask for less motion or less data never download it.
+// The satellite loop behind the page, at half speed, near the pace of NOAA's own page. It
+// downloads once the page has loaded, and never for readers who ask for less motion or less
+// data, or whose connection the browser puts under 5 Mbps (only Chromium browsers say).
 function startSatellite() {
   const video = document.querySelector("video.satellite");
-  const still = matchMedia("(prefers-reduced-motion: reduce)").matches || navigator.connection?.saveData;
-  if (!video || still) return;
-  // Loading resets the speed to the default one.
-  video.defaultPlaybackRate = 0.5;
-  video.src = video.dataset.src;
-  video.play().catch(() => {});
+  if (!video || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  const start = () => {
+    const connection = navigator.connection;
+    if (connection?.saveData || connection?.downlink < 5) return;
+    // Loading resets the speed to the default one.
+    video.defaultPlaybackRate = 0.5;
+    video.src = video.dataset.src;
+    video.play().catch(() => {});
+  };
+  if (document.readyState === "complete") start();
+  else window.addEventListener("load", start, { once: true });
 }
 
 // The lobby's WeatherStar frame, where the page shows it (desktop). A hidden frame with a src
