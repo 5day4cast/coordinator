@@ -231,7 +231,7 @@ pub fn help_page_with_terms(
                         li {
                             "If the result is never settled cooperatively, entrants can reclaim their funds "
                             "on-chain after a timelock. Follow the entry page's “How your entry is held and paid” "
-                            "link to see that competition's timelock and fee cap here."
+                            "link to see that competition's timelock and fee cap."
                         }
                     }
                     @if let Some((competition, terms)) = competition_terms {
