@@ -905,11 +905,11 @@ impl Lobby {
     }
 }
 
-/// WeatherStar 4000+ (`vendor/ws4kp`) in widescreen kiosk mode with its Regional Forecast and any
-/// weather alerts, opening on the first region its `scripts/custom.js` tours. The alerts stay on:
-/// WeatherStar's start-up fails without them.
+/// WeatherStar 4000+ (`vendor/ws4kp`) in widescreen kiosk mode with its Regional Forecast alone,
+/// opening on the first region its `scripts/custom.js` tours. With its alerts screen off,
+/// WeatherStar 8.2.3 throws a few errors as it starts; the forecast plays regardless.
 const WEATHERSTAR_TOUR: &str = concat!(
-    "/weatherstar/?kiosk=true&viewMode=wide-enhanced&regional-forecast=true",
+    "/weatherstar/?kiosk=true&viewMode=wide-enhanced&regional-forecast=true&hazards=false",
     "&current-weather=false&latest-observations=false&hourly=false",
     "&hourly-graph=false&travel=false&local-forecast=false&extended-forecast=false",
     "&almanac=false&spc-outlook=false&climate=false&radar=false&future-radar=false",
