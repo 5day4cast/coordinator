@@ -15,13 +15,14 @@ use crate::{startup::AppState, templates::assets::serve_bytes};
 
 pub const SATELLITE_PATH: &str = "/satellite.mp4";
 
-/// Band 7, shortwave infrared, which shows clouds by day and night. About five hours of frames,
-/// one every five minutes; NOAA renews the file about hourly.
+/// Band 7, shortwave infrared, which shows clouds by day and night. About four hours of frames;
+/// NOAA renews the file about hourly.
 const SOURCE: &str =
     "https://cdn.star.nesdis.noaa.gov/GOES19/ABI/CONUS/07/GOES19-CONUS-07-625x375.mp4";
 const REFRESH_AFTER: Duration = Duration::from_secs(10 * 60);
-/// How long a request waits for the first download, before any copy is cached.
-const FIRST_WAIT: Duration = Duration::from_secs(20);
+/// How long a request waits for a due download before it takes the older copy, so the first
+/// visitor after a quiet night never gets the night's loop.
+const WAIT: Duration = Duration::from_secs(20);
 /// NOAA's loop is about 3.6 MB.
 const MAX_BYTES: usize = 20_000_000;
 
@@ -30,7 +31,7 @@ const MAX_BYTES: usize = 20_000_000;
 pub async fn serve_satellite(State(state): State<Arc<AppState>>, request: HeaderMap) -> Response {
     let cached = state
         .satellite
-        .get((), REFRESH_AFTER, FIRST_WAIT, fetch)
+        .get_fresh((), REFRESH_AFTER, WAIT, fetch)
         .await;
     match cached.value() {
         Some(video) => serve_bytes(&request, video.clone(), "video/mp4", "public, max-age=600"),
