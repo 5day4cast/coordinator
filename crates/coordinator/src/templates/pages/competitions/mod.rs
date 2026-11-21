@@ -927,9 +927,10 @@ pub fn lobby_page(
     let sections = Sections::of(competitions, options);
 
     html! {
-        // Outside the refreshed part, so the 30 second refresh never restarts its tour.
+        // Outside the refreshed part, so the 30 second refresh never restarts its tour. Desktop
+        // only: shared/page.js loads it where competitions.css shows it.
         @if options.tab == Tab::Overview {
-            iframe class="weatherstar" src=(WEATHERSTAR_TOUR) title="Regional forecast" tabindex="-1" {}
+            iframe class="weatherstar" data-src=(WEATHERSTAR_TOUR) title="Regional forecast" tabindex="-1" {}
         }
         div id="competitions-page"
             hx-get=(options.url())

@@ -13,6 +13,13 @@
   background: var(--wx-b);
 }
 
+/* Desktop only. */
+@media (max-width: 768px) {
+  .weatherstar {
+    display: none;
+  }
+}
+
 .intro {
   display: grid;
   gap: 1rem;

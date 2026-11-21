@@ -107,8 +107,17 @@ function startSatellite() {
   video.play().catch(() => {});
 }
 
+// The lobby's WeatherStar frame, where the page shows it (desktop). A hidden frame with a src
+// would still load, so its src waits in data-src.
+function loadWeatherstar() {
+  for (const frame of document.querySelectorAll("iframe.weatherstar:not([src])")) {
+    if (getComputedStyle(frame).display !== "none") frame.src = frame.dataset.src;
+  }
+}
+
 function setupPage() {
   startSatellite();
+  loadWeatherstar();
   localizeTimes(document);
   markCurrentNav();
   setInterval(tickCountdowns, 1_000);
@@ -122,6 +131,7 @@ function setupPage() {
   document.addEventListener("htmx:after:process", (event) => {
     localizeTimes(event.target);
     markOwnRows(event.target);
+    loadWeatherstar();
     showKeymeldTrust();
   });
 
