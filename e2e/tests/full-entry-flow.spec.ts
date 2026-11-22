@@ -304,7 +304,7 @@ test.describe("Competition Status Display", () => {
     await page.goto("/");
 
     await page.waitForSelector("#competitions-page", { timeout: 10000 });
-    await expect(page.locator("#competitions-page .intro")).toContainText("Daily fantasy weather");
+    await expect(page.locator("#competitions-page .intro")).toContainText("Daily Fantasy Weather");
 
     const rows = page.locator("#competitions-page a.competition-row");
     const count = await rows.count();
@@ -341,7 +341,7 @@ test.describe("Competition Status Display", () => {
     await expect(page.locator("#competitions-page .empty-state")).toContainText("Nothing matches");
     await expect(page).toHaveURL(/show=finished.*q=no-such-competition/);
     await page.locator("#competitions-page .competition-tabs a", { hasText: "Open & recent" }).click();
-    await expect(page.locator("#competitions-page .intro")).toContainText("Daily fantasy weather");
+    await expect(page.locator("#competitions-page .intro")).toContainText("Daily Fantasy Weather");
   });
 
   test("an account page opened by its address offers the log-in dialog", async ({ page }) => {
