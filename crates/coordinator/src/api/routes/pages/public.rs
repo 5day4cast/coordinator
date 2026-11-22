@@ -38,7 +38,7 @@ use crate::{
     startup::AppState,
     templates::{
         components::RecoveryHelp,
-        format::{city_name, pick_target, short_npub, Explorers, MetricText},
+        format::{city_name, short_npub, Explorers, MetricText},
         fragments::{
             entries_paused_banner,
             entry_form::{
@@ -47,7 +47,7 @@ use crate::{
                 PayoutDestination, TicketProgress,
             },
             leaderboard::{
-                leaderboard, leaderboard_scores, queue_pools, rows_url, LeaderboardRow,
+                leaderboard, leaderboard_scores, pick_text, queue_pools, rows_url, LeaderboardRow,
                 LeaderboardView, Ownership, PickMark, PickSquare, StationReadings,
             },
             loading::{placeholder, Pending, MAX_ASKS},
@@ -1170,7 +1170,7 @@ fn leaderboard_view(
                                     .map(|name| city_name(&name))
                                     .unwrap_or_else(|| pick.station_id.clone()),
                                 pick.metric.label(),
-                                pick_target(pick.metric, pick.forecast, pick.rule, &pick.pick),
+                                pick_text(pick.metric, pick.forecast, pick.rule, &pick.pick),
                             ),
                         })
                         .collect(),

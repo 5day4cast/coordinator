@@ -657,4 +657,22 @@ html.site .leaderboard-table tr.is-own td {
     width: 11px;
     height: 11px;
   }
+
+  /* A square's tip sits over the row's squares, its right edge on theirs, and narrower than
+     the room to their left, so it stays on the screen; centred on a square near the edge it ran
+     off it. */
+  .pick-squares {
+    position: relative;
+  }
+
+  .pick-squares > i[data-tip] {
+    position: static;
+  }
+
+  .pick-squares > i[data-tip]::after {
+    left: auto;
+    right: 0;
+    max-width: 13rem;
+    transform: none;
+  }
 }

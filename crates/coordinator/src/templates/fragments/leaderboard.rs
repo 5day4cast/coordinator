@@ -675,9 +675,11 @@ fn ownership_card(row: &Ownership) -> Markup {
             div class="ownership-shares" {
                 @for (side, (pick, _)) in SIDES.iter().enumerate() {
                     @let share = (row.counts[side] * 100 + entries.max(1) / 2) / entries.max(1);
-                    @let target = format::pick_target(row.metric, row.forecast, row.rule, pick);
-                    @let target = if *pick == ValueOptions::Par { format!("{} {target}", format::pick_word(pick, row.rule)) } else { target };
-                    @let tip = format!("{target} · {} of {entries} entries", row.counts[side]);
+                    @let tip = format!(
+                        "{} · {} of {entries} entries",
+                        pick_text(row.metric, row.forecast, row.rule, pick),
+                        row.counts[side],
+                    );
                     span class=(if row.right == Some(side) { "ownership-share is-on" } else { "ownership-share" })
                         tabindex="0" data-tip=(tip) aria-label=(tip) {
                         (people()) (share) "%"
@@ -702,6 +704,20 @@ pub(crate) fn strip_position(value: f64, low: f64, high: f64) -> f64 {
         third + (value - low) / (high - low) * third
     } else {
         50.0
+    }
+}
+
+/// A pick as its tips say it: `Under 73.4°F`, `In range 73.4–76.0°F` or `Exactly 71°F`.
+pub fn pick_text(
+    metric: Metric,
+    forecast: Option<f64>,
+    rule: Option<Rule>,
+    pick: &ValueOptions,
+) -> String {
+    let target = format::pick_target(metric, forecast, rule, pick);
+    match pick {
+        ValueOptions::Par => format!("{} {target}", format::pick_word(pick, rule)),
+        _ => target,
     }
 }
 
@@ -1263,6 +1279,18 @@ mod tests {
         // A fixed rule's Par is one value.
         assert_eq!(strip_position(71.0, 71.0, 71.0), 50.0);
         assert_eq!(bound(Metric::TempHigh, 73.4), "73.4°");
+        // A middle pick names its side, as its button does.
+        let line = Some(Rule::Line {
+            lower: -1.0,
+            upper: 1.0,
+        });
+        let par = |rule| pick_text(Metric::TempHigh, Some(71.0), rule, &ValueOptions::Par);
+        assert_eq!(par(line), "In range 70.0–72.0°F");
+        assert_eq!(par(Some(Rule::Fixed)), "Exactly 71°F");
+        assert_eq!(
+            pick_text(Metric::TempHigh, Some(71.0), line, &ValueOptions::Under),
+            "Under 70.0°F"
+        );
         assert_eq!(bound(Metric::WindSpeed, 16.0), "16 kt");
     }
 
