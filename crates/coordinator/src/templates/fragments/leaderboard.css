@@ -508,13 +508,22 @@ html.site .leaderboard-table tr.is-own td {
   color: var(--gold);
 }
 
-/* What the row would win now, under the name so every row's badge lines up. A darker green
-   than --win, which white reads on at 5.1:1. */
+/* Every name takes the same width, cut short with "…", so the badges after it line up. */
+.player-name {
+  display: inline-block;
+  width: 9.5rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+/* What the row would win now. A darker green than --win, which white reads on at 5.1:1. */
 .money-badge {
-  display: block;
-  width: fit-content;
-  margin-top: 0.2rem;
+  display: inline-block;
+  margin-left: 0.5rem;
   padding: 0 0.4rem;
+  vertical-align: middle;
   border-radius: 4px;
   background: #0f7d57;
   font-size: 0.7rem;
@@ -627,12 +636,17 @@ html.site .leaderboard-table tr.is-own td {
     white-space: nowrap;
   }
 
+  /* Too narrow for both on one line: the badge goes under the name. */
   .player-name {
     display: block;
+    width: auto;
     max-width: 8.5rem;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+  }
+
+  .money-badge {
+    display: block;
+    width: fit-content;
+    margin: 0.2rem 0 0;
   }
 
   .wx-note {

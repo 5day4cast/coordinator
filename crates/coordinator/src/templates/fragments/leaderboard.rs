@@ -885,9 +885,9 @@ fn leaderboard_row(
                 @if paid { " " span class="paid-badge" { "Paid" } }
             }
             td data-label="Player" {
-                span class="player-name" { (row.player) }
-                span class="you-badge" { "You" }
+                span class="player-name" title=(row.player) { (row.player) }
                 @if let Some(amount) = money.filter(|_| !paid) { span class="money-badge" { (sats(amount)) } }
+                span class="you-badge" { "You" }
             }
             td data-label="Picks" class="picks-column" {
                 @if !row.picks.is_empty() {
