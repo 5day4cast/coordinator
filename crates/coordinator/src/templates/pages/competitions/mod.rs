@@ -1208,31 +1208,31 @@ fn intro(featured: Option<&CompetitionView>, lobby: &Lobby, now: OffsetDateTime)
 }
 
 /// The competition to act on now, as a forecast panel: the next to lock, or with none open the
-/// next live one to end.
+/// next live one to end. Its countdown is the headline, to the second (`format::clock`).
 fn featured_card(competition: &CompetitionView, lobby: &Lobby, now: OffsetDateTime) -> Markup {
     let live = competition.phase == Phase::Live;
+    let upcoming = competition.phase == Phase::Upcoming;
     let cities = lobby.cities(competition);
+    let until = if live {
+        competition.end
+    } else {
+        competition.start
+    };
     html! {
         article class="featured-card" data-featured-id=(competition.id) {
-            div class="wx-bar" {
-                span { @if live { "Live now" } @else { "Next to lock" } }
-                span class="wx-clock" {
-                    @if live { "Ends in " } @else { "Locks in " }
-                    span class="pixel" data-countdown=(if live { competition.end } else { competition.start }.unix_timestamp()) {
-                        (format::duration(if live { competition.end - now } else { competition.start - now }))
-                    }
-                }
-            }
             // The details and Make picks beside the map, so the lists below stay in view.
             div class="featured-body" {
                 div class="featured-main" {
-                    div class="featured-heading" {
-                        (list_badge(competition))
-                        h2 class="featured-title" { (format::zoned_time(competition.start, TimeStyle::Weekday)) }
+                    p class="featured-kicker" {
+                        @if live { (list_badge(competition)) " Ends in" } @else { "Picks lock in" }
+                    }
+                    p class="pixel featured-clock" data-countdown=(until.unix_timestamp()) data-clock {
+                        (format::clock(until - now))
                     }
                     p class="featured-window" {
-                        (competition.number_of_values_per_entry) " picks · scored over "
-                        (format::competition_duration(competition.start, competition.end))
+                        (format::zoned_time(competition.start, TimeStyle::Weekday)) " · "
+                        (format::competition_duration(competition.start, competition.end)) " · "
+                        (competition.number_of_values_per_entry) " picks"
                         @if let Some(queue) = competition.queue.queued().filter(|queue| queue.pools.len() > 1) {
                             " · " (queue.pools.len()) " pools"
                         }
@@ -1244,20 +1244,23 @@ fn featured_card(competition: &CompetitionView, lobby: &Lobby, now: OffsetDateTi
                         @if competition.top_prize().is_some() {
                             div {
                                 dt { "Prize pool" }
-                                dd {
-                                    (competition.pot())
-                                    @if let Some(split) = competition.prize_split() { span class="cell-note prize-note" { (split) } }
-                                    @if let Some(rule) = competition.prize_rule() { span class="cell-note prize-note" { (rule) } }
-                                    @if competition.can_enter && competition.queue.queued().is_some() {
-                                        span class="cell-note prize-note" { "Grows as seats fill" }
-                                    }
-                                }
+                                dd { (competition.pot()) }
+                                @if let Some(note) = prize_note(competition) { small class="prize-note" { (note) } }
                             }
                         }
                         @if competition.can_enter {
                             div { dt { "Entry" } dd { (sats(competition.price())) } }
                         }
-                        div class="featured-seat-fact" { dt { "Seats" } dd class="featured-seats" { (seats(competition)) } }
+                        div {
+                            dt { @if upcoming { "Seats" } @else { "Players" } }
+                            @match competition.seat_fill() {
+                                Some((filled, seats)) => {
+                                    dd { (filled) "/" (seats) }
+                                    @if upcoming { small { (seats - filled) " left" } }
+                                }
+                                None => { dd class="featured-entered" { (competition.entries()) } }
+                            }
+                        }
                     }
                     a class="button is-primary is-fullwidth is-medium"
                       href=(competition.url()) hx-get=(competition.url())
@@ -1271,6 +1274,13 @@ fn featured_card(competition: &CompetitionView, lobby: &Lobby, now: OffsetDateTi
             }
         }
     }
+}
+
+/// The one line under a prize pool: how it splits, or that the winner takes it all.
+fn prize_note(competition: &CompetitionView) -> Option<String> {
+    competition
+        .prize_split()
+        .or_else(|| competition.prize_rule())
 }
 
 /// One group of competitions under its heading, with a link to all of them when the group
@@ -1332,8 +1342,9 @@ pub fn competition_row(competition: &CompetitionView, now: OffsetDateTime) -> Ma
     contest_card(competition, &[], now)
 }
 
-/// One competition as a card: when it starts, its cities, and the figures that decide whether
-/// to enter. The whole card links to its entry form or leaderboard.
+/// One competition as a ticket: when it starts, how long it runs, its cities and seats, with a
+/// stub for its prize pool and what it costs. The whole card links to its entry form or
+/// leaderboard.
 fn contest_card(competition: &CompetitionView, cities: &[&str], now: OffsetDateTime) -> Markup {
     let action = if competition.can_enter {
         "Make picks"
@@ -1371,53 +1382,46 @@ fn contest_card(competition: &CompetitionView, cities: &[&str], now: OffsetDateT
           data-prize=[competition.top_prize().map(|_| competition.pot_sats())]
           href=(competition.url()) hx-get=(competition.url())
           hx-target="#main-content" hx-push-url="true" {
-            span class="card-head" {
-                span class="cell-status" { (list_badge(competition)) }
-                span class="cell-window" {
-                    span class="card-title" { (format::zoned_time(competition.start, format::TimeStyle::Weekday)) }
-                    @match competition.phase {
-                        Phase::Upcoming => {
-                            span class="cell-note" { "locks in " span data-countdown=(competition.start.unix_timestamp()) { (format::duration(competition.start - now)) } }
+            span class="ticket-main" {
+                span class="card-head" {
+                    span class="cell-status" { (list_badge(competition)) }
+                    span class="cell-window" {
+                        span class="card-title" { (format::zoned_time(competition.start, format::TimeStyle::Weekday)) }
+                        @match competition.phase {
+                            Phase::Upcoming => {
+                                span class="cell-note" { "locks in " span data-countdown=(competition.start.unix_timestamp()) { (format::duration(competition.start - now)) } }
+                            }
+                            Phase::Live => {
+                                span class="cell-note" { "observations end in " span data-countdown=(competition.end.unix_timestamp()) { (format::duration(competition.end - now)) } }
+                            }
+                            Phase::AwaitingResult if competition.result_is_late(now) => { span class="cell-note" { "results are late" } }
+                            Phase::Expired => { span class="cell-note" { "no result · pot shared back" } }
+                            Phase::Scored if competition.pot_refunded => { span class="cell-note" { "no winner · pot shared back" } }
+                            _ => {}
                         }
-                        Phase::Live => {
-                            span class="cell-note" { "observations end in " span data-countdown=(competition.end.unix_timestamp()) { (format::duration(competition.end - now)) } }
+                        @if let Some(refunds) = refund_line(competition, now) {
+                            span class="cell-note refund-line" { (refunds) }
                         }
-                        Phase::AwaitingResult if competition.result_is_late(now) => { span class="cell-note" { "results are late" } }
-                        Phase::Expired => { span class="cell-note" { "no result · pot shared back" } }
-                        Phase::Scored if competition.pot_refunded => { span class="cell-note" { "no winner · pot shared back" } }
-                        _ => {}
+                        @match &competition.queue {
+                            Queue::Queued(queue) if queue.pools.is_empty() && queue.seats().is_none() => {
+                                span class="cell-note" { "pools of up to " (queue.max_players) }
+                            }
+                            Queue::Queued(queue) if queue.pools.is_empty() => {}
+                            Queue::Queued(queue) if queue.pools.len() == 1 => { span class="cell-note" { "1 pool" } }
+                            Queue::Queued(queue) => { span class="cell-note" { (queue.pools.len()) " pools" } }
+                            Queue::Pool(pool) => { span class="cell-note" { (pool.label()) } }
+                            Queue::Single => {}
+                        }
                     }
-                    @if let Some(refunds) = refund_line(competition, now) {
-                        span class="cell-note refund-line" { (refunds) }
-                    }
-                    @match &competition.queue {
-                        Queue::Queued(queue) if queue.pools.is_empty() && queue.seats().is_none() => {
-                            span class="cell-note" { "pools of up to " (queue.max_players) }
-                        }
-                        Queue::Queued(queue) if queue.pools.is_empty() => {}
-                        Queue::Queued(queue) if queue.pools.len() == 1 => { span class="cell-note" { "1 pool" } }
-                        Queue::Queued(queue) => { span class="cell-note" { (queue.pools.len()) " pools" } }
-                        Queue::Pool(pool) => { span class="cell-note" { (pool.label()) } }
-                        Queue::Single => {}
+                    span class="card-duration cell-duration" {
+                        small { "Duration" }
+                        b { (format::competition_duration(competition.start, competition.end)) }
                     }
                 }
-            }
-            @if !cities.is_empty() {
-                span class="card-cities" { (cities.join(" · ")) }
-            }
-            span class="card-figures" {
-                @if competition.can_enter {
-                    span class="card-figure cell-fee" { small { "Entry" } b { (sats(competition.price())) } }
+                @if !cities.is_empty() {
+                    span class="card-cities" { (cities.join(" · ")) }
                 }
-                @if competition.top_prize().is_some() {
-                    span class="card-figure cell-win" {
-                        small { "Prize pool" }
-                        b { (competition.pot()) }
-                        @if let Some(split) = competition.prize_split() { span class="cell-note prize-note" { (split) } }
-                        @if let Some(rule) = competition.prize_rule() { span class="cell-note prize-note" { (rule) } }
-                    }
-                }
-                span class="card-figure cell-entries" {
+                span class="cell-entries" {
                     small { @if competition.phase == Phase::Upcoming { "Seats" } @else { "Players" } }
                     (seats(competition))
                     @if competition.phase == Phase::Upcoming {
@@ -1427,12 +1431,20 @@ fn contest_card(competition: &CompetitionView, cities: &[&str], now: OffsetDateT
                         }
                     }
                 }
-                span class="card-figure cell-duration" {
-                    small { "Window" }
-                    b { (format::competition_duration(competition.start, competition.end)) }
-                }
             }
-            span class="cell-action" { (action) " →" }
+            span class="ticket-stub" {
+                @if competition.top_prize().is_some() {
+                    span class="card-figure cell-win" {
+                        small { "Prize pool" }
+                        b { (competition.pot()) }
+                        @if let Some(note) = prize_note(competition) { span class="cell-note prize-note" { (note) } }
+                    }
+                }
+                @if competition.can_enter {
+                    span class="card-figure cell-fee" { small { "Entry" } b { (sats(competition.price())) } }
+                }
+                span class="cell-action" { (action) " →" }
+            }
         }
     }
 }
@@ -1681,7 +1693,9 @@ pub(crate) mod tests {
             NOW,
         )
         .into_string();
-        assert!(html.contains(">2 h 13 min</span>") && html.contains("Locks in "));
+        // The countdown is the card's headline, to the second.
+        assert!(html.contains("Picks lock in</p>"), "{html}");
+        assert!(html.contains(r#"data-clock>02:13:00</p>"#), "{html}");
         assert!(html.contains(r#"href="/competitions/open/entry-form""#));
         assert!(html.contains(">Daily Fantasy Weather</h1>"));
         assert!(html.contains(r#"href="/help""#));
@@ -2061,7 +2075,7 @@ pub(crate) mod tests {
         let html = competition_row(&view("live", Phase::Live, -5), NOW).into_string();
         assert!(html.starts_with("<a class=\"competition-row "));
         assert!(html.contains(r#"href="/competitions/live/leaderboard""#));
-        assert!(html.contains(r#"<small>Window</small><b>10 min</b>"#));
+        assert!(html.contains(r#"<small>Duration</small><b>10 min</b>"#));
         assert!(!html.contains("ends in"));
     }
 
@@ -2416,8 +2430,9 @@ pub(crate) mod tests {
             row.contains(r#"<meter min="0" max="20" value="3"></meter><span class="seat-text">3 of 20 seats filled · 17 left</span>"#),
             "{row}"
         );
-        assert!(row.contains("1st 70% · 2nd 30%"));
-        assert!(row.contains("Under 10 players: winner takes all"));
+        assert!(row.contains(r#"<span class="cell-note prize-note">1st 70% · 2nd 30%</span>"#));
+        // The ticket keeps one line under the pot; the rule for small pools is on the entry form.
+        assert!(!row.contains("Under 10 players"));
         assert!(row.contains(&format!("Prize pool {} (1st 70% · 2nd 30%)", open.pot())));
         // One pool: no pool size to explain.
         assert!(!row.contains("pools of up to"));
