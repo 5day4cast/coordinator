@@ -29,7 +29,8 @@ use crate::{
     api::extractors::NostrAuth,
     domain::{
         leaderboard::{
-            progress::best_points, Leaderboard, Metric, Phase, PickState, FIRST_READ_WAIT,
+            progress::{best_points, pick_state},
+            Leaderboard, Metric, Phase, PickState, FIRST_READ_WAIT,
         },
         Competition, Error, LedgerTotals, RefundProgress, Returned, UnenteredTickets, UnpaidTicket,
     },
@@ -37,7 +38,7 @@ use crate::{
     startup::AppState,
     templates::{
         components::RecoveryHelp,
-        format::{city_name, short_npub, Explorers},
+        format::{city_name, short_npub, Explorers, MetricText},
         fragments::{
             entries_paused_banner,
             entry_form::{
@@ -46,8 +47,8 @@ use crate::{
                 PayoutDestination, TicketProgress,
             },
             leaderboard::{
-                leaderboard, leaderboard_scores, queue_pools, rows_url, LeaderboardRow,
-                LeaderboardView, Ownership, PickMark, StationReadings,
+                leaderboard, leaderboard_scores, pick_text, queue_pools, rows_url, LeaderboardRow,
+                LeaderboardView, Ownership, PickMark, PickSquare, StationReadings,
             },
             loading::{placeholder, Pending, MAX_ASKS},
             picks::{detail_url, own_picks_detail, picks_detail, withheld_picks_detail, PickView},
@@ -1161,7 +1162,17 @@ fn leaderboard_view(
                     picks: row
                         .picks
                         .iter()
-                        .map(|pick| PickMark::of(pick.state, pick.points))
+                        .map(|pick| PickSquare {
+                            mark: PickMark::of(pick.state, pick.points),
+                            pick: format!(
+                                "{} {} · {}",
+                                station_name(stations, &pick.station_id)
+                                    .map(|name| city_name(&name))
+                                    .unwrap_or_else(|| pick.station_id.clone()),
+                                pick.metric.label(),
+                                pick_text(pick.metric, pick.forecast, pick.rule, &pick.pick),
+                            ),
+                        })
                         .collect(),
                     // Settled picks count what they scored; the rest what a right pick scores.
                     max: (live && !row.picks.is_empty()).then(|| {
@@ -1189,8 +1200,8 @@ fn leaderboard_view(
     }
 }
 
-/// How the entries split on each row of picks, in the order the picks come. A side is right so
-/// far when any entry on it is.
+/// How the entries split on each row of picks, in the order the picks come, with the side the
+/// reading so far is on, locked while the window is open if the reading can't leave it.
 fn ownership(board: &Leaderboard, stations: &StationsById) -> Vec<Ownership> {
     let mut rows: Vec<Ownership> = Vec::new();
     for pick in board.rows.iter().flat_map(|row| &row.picks) {
@@ -1208,19 +1219,23 @@ fn ownership(board: &Leaderboard, stations: &StationsById) -> Vec<Ownership> {
                     city: station_name(stations, &pick.station_id).map(|name| city_name(&name)),
                     metric: pick.metric,
                     forecast: pick.forecast,
+                    observed: pick.observed,
                     rule: pick.rule,
                     counts: [0; 3],
                     right: None,
+                    locked: false,
                 });
                 rows.len() - 1
             });
         rows[index].counts[side] += 1;
-        if matches!(
-            PickMark::of(pick.state, pick.points),
-            PickMark::Right | PickMark::LeaningRight
-        ) {
-            rows[index].right = Some(side);
-        }
+    }
+    for row in &mut rows {
+        let states = [ValueOptions::Under, ValueOptions::Par, ValueOptions::Over]
+            .map(|pick| pick_state(&pick, row.metric, row.rule, row.forecast, row.observed));
+        row.right = states
+            .iter()
+            .position(|state| matches!(state, PickState::LockedIn | PickState::OnTrack));
+        row.locked = board.phase == Phase::Live && states.contains(&PickState::LockedIn);
     }
     rows
 }

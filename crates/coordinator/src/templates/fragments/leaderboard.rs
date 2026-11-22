@@ -32,9 +32,17 @@ pub struct LeaderboardRow {
     pub owner: String,
     pub score: i32,
     /// How each pick stands, one square each; none before the window opens.
-    pub picks: Vec<PickMark>,
+    pub picks: Vec<PickSquare>,
     /// The most the entry can still finish with, while the window is open.
     pub max: Option<i32>,
+}
+
+/// One pick's square in a leaderboard row.
+#[derive(Debug, Clone)]
+pub struct PickSquare {
+    pub mark: PickMark,
+    /// Which pick it is, for its tip: `Topeka, KS High · Over 72.0°F`.
+    pub pick: String,
 }
 
 /// How a pick stands, as one square in its row.
@@ -95,11 +103,15 @@ pub struct Ownership {
     pub city: Option<String>,
     pub metric: Metric,
     pub forecast: Option<f64>,
+    /// Observed so far: the running high, low or peak wind.
+    pub observed: Option<f64>,
     pub rule: Option<Rule>,
     /// Entries on Under, In range and Over.
     pub counts: [usize; 3],
-    /// The side that is right so far, when the readings say.
+    /// The side the reading so far is on: Under, In range or Over.
     pub right: Option<usize>,
+    /// The reading can't leave its side before the window closes.
+    pub locked: bool,
 }
 
 /// A station's readings over the window so far: the running high, low and peak wind.
@@ -441,7 +453,7 @@ pub fn leaderboard_scores(
                     &board.rows,
                     ran(board.phase) && competition.has_ranked_prizes(),
                     paid,
-                    in_the_money(competition, board),
+                    &in_the_money(competition, board),
                 ),
                 live,
             ))
@@ -457,9 +469,9 @@ pub fn leaderboard_scores(
     }
 }
 
-/// How many rows the prizes pay if the result is what the scores say now; none while nobody
-/// has scored, or when nothing is won by rank.
-fn in_the_money(competition: &CompetitionView, board: &LeaderboardView) -> usize {
+/// What each of the first rows would win if the result were the scores now, in payout order;
+/// nothing while nobody has scored, or when nothing is won by rank.
+fn in_the_money(competition: &CompetitionView, board: &LeaderboardView) -> Vec<u64> {
     let scored = matches!(
         board.phase,
         Phase::Live | Phase::AwaitingResult | Phase::Scored
@@ -467,9 +479,13 @@ fn in_the_money(competition: &CompetitionView, board: &LeaderboardView) -> usize
         && !competition.pot_refunded
         && board.rows.iter().any(|row| row.score > 0);
     if scored {
-        competition.prizes().len()
+        competition
+            .prizes()
+            .into_iter()
+            .map(|(_, amount)| amount)
+            .collect()
     } else {
-        0
+        vec![]
     }
 }
 
@@ -553,43 +569,185 @@ fn conditions(board: &LeaderboardView) -> Markup {
     }
 }
 
-/// What share of the entries took each side on each row, the side right so far marked.
+/// Under, In range and Over, as the ownership cards colour them.
+const SIDES: [(ValueOptions, &str); 3] = [
+    (ValueOptions::Under, "is-under"),
+    (ValueOptions::Par, "is-par"),
+    (ValueOptions::Over, "is-over"),
+];
+
+/// What share of the entries took each side on each row, under a strip of the three sides that
+/// marks the reading so far.
 fn ownership(rows: &[Ownership]) -> Markup {
-    let sides = [
-        (ValueOptions::Under, "is-under"),
-        (ValueOptions::Par, "is-par"),
-        (ValueOptions::Over, "is-over"),
-    ];
+    let rule = rows.first().and_then(|row| row.rule);
     html! {
         section class="ownership" {
             h2 class="ownership-title" { "Pick ownership" }
-            p class="ownership-note" { "How the entries split on each row. ✓ marks the side that's right so far." }
+            p class="ownership-note" {
+                "The marker is the reading so far, and the bright part is the side it's on. A locked "
+                "card can't change sides. " (people()) " is the share of entries on each side."
+            }
+            p class="ownership-key" {
+                @for (pick, class) in &SIDES { span class=(class) { i {} (format::pick_word(pick, rule)) } }
+            }
             div class="ownership-grid" {
-                @for row in rows {
-                    @let total = row.counts.iter().sum::<usize>().max(1);
-                    div class="ownership-row" {
-                        p class="ownership-what" {
-                            (row.city.as_deref().unwrap_or(&row.station_id)) " "
-                            span class=(row.metric.color()) { (row.metric.label()) }
-                            @if let Some(forecast) = row.forecast {
-                                span class="ownership-forecast" { " · forecast " (row.metric.short_value(forecast)) }
-                            }
+                @for row in rows { (ownership_card(row)) }
+            }
+        }
+    }
+}
+
+/// One row's card. The strip's marks are SVG, whose percentage positions are attributes, as the
+/// CSP allows no inline styles.
+fn ownership_card(row: &Ownership) -> Markup {
+    let entries: usize = row.counts.iter().sum();
+    let bounds = row
+        .forecast
+        .zip(row.rule)
+        .map(|(forecast, rule)| match rule {
+            Rule::Line { lower, upper } => (forecast + lower, forecast + upper),
+            Rule::Fixed => (forecast, forecast),
+        });
+    // Held inside its side's third, where a rounded comparison can put it past a bound.
+    let reading = row
+        .observed
+        .zip(bounds)
+        .zip(row.right)
+        .map(|((value, (low, high)), side)| {
+            let third = 100.0 / 3.0;
+            let start = side as f64 * third;
+            (
+                value,
+                strip_position(value, low, high).clamp(start + 2.0, start + third - 2.0),
+            )
+        });
+    let so_far = match row.metric {
+        Metric::TempHigh => "Highest",
+        Metric::TempLow => "Lowest",
+        Metric::WindSpeed => "Peak",
+    };
+    let label = match (reading, row.right) {
+        (Some((value, _)), Some(side)) => format!(
+            "{so_far} so far {}, {}{}",
+            row.metric.short_value(value),
+            format::pick_word(&SIDES[side].0, row.rule),
+            if row.locked { ", locked in" } else { "" },
+        ),
+        _ => "No reading yet".to_owned(),
+    };
+    let percent = |at: f64| format!("{at:.1}%");
+    html! {
+        div class=(if row.locked { "ownership-row is-locked" } else { "ownership-row" }) {
+            p class="ownership-what" {
+                span {
+                    (row.city.as_deref().unwrap_or(&row.station_id))
+                    @if row.locked { span class="locked-chip" { (lock()) "Locked in" } }
+                }
+                span class=(row.metric.color()) { (row.metric.label()) }
+            }
+            div class="ownership-line" role="img" aria-label=(label) {
+                div class="ownership-zones" {
+                    @for (side, (_, class)) in SIDES.iter().enumerate() {
+                        span class=(if row.right == Some(side) { format!("{class} is-on") } else { (*class).to_owned() }) {}
+                    }
+                }
+                svg class="ownership-marks" aria-hidden="true" {
+                    @if let Some((forecast, (low, high))) = row.forecast.zip(bounds) {
+                        @let at = percent(strip_position(forecast, low, high));
+                        line class="ownership-forecast" x1=(at) x2=(at) y1="20" y2="32" {}
+                        @if high > low {
+                            text class="ownership-bound" x="33.3%" y="47" { (bound(row.metric, low)) }
+                            text class="ownership-bound" x="66.7%" y="47" { (bound(row.metric, high)) }
+                        } @else {
+                            text class="ownership-bound" x="50%" y="47" { (row.metric.short_value(forecast)) }
                         }
-                        @for (side, (pick, class)) in sides.iter().enumerate() {
-                            @let share = (row.counts[side] * 100 + total / 2) / total;
-                            @let right = row.right == Some(side);
-                            div class=(if right { format!("ownership-side {class} is-right") } else { format!("ownership-side {class}") }) {
-                                span class="ownership-word" {
-                                    (format::pick_word(pick, row.rule))
-                                    @if right { " ✓" }
-                                }
-                                meter min="0" max="100" value=(share) {}
-                                span class="ownership-share" { (share) "%" }
-                            }
+                    }
+                    @if let Some((value, at)) = reading {
+                        @let anchor = if at > 85.0 { "end" } else if at < 15.0 { "start" } else { "middle" };
+                        line class="ownership-marker-edge" x1=(percent(at)) x2=(percent(at)) y1="16" y2="36" {}
+                        line class="ownership-marker" x1=(percent(at)) x2=(percent(at)) y1="16" y2="36" {}
+                        text class="ownership-reading" x=(percent(at)) y="12" text-anchor=(anchor) {
+                            (row.metric.short_value(value))
                         }
                     }
                 }
             }
+            div class="ownership-shares" {
+                @for (side, (pick, _)) in SIDES.iter().enumerate() {
+                    @let share = (row.counts[side] * 100 + entries.max(1) / 2) / entries.max(1);
+                    @let tip = format!(
+                        "{} · {} of {entries} entries",
+                        pick_text(row.metric, row.forecast, row.rule, pick),
+                        row.counts[side],
+                    );
+                    span class=(if row.right == Some(side) { "ownership-share is-on" } else { "ownership-share" })
+                        tabindex="0" data-tip=(tip) aria-label=(tip) {
+                        (people()) (share) "%"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Where `value` sits on an ownership strip, or a pick line on the entry form, in percent. Under,
+/// In range and Over take a third each, and the outer thirds reach three range widths, at least
+/// 3 units, past the bounds.
+pub(crate) fn strip_position(value: f64, low: f64, high: f64) -> f64 {
+    let third = 100.0 / 3.0;
+    let past = |miss: f64| (miss / (3.0 * (high - low)).max(3.0)).min(1.0) * third * 0.9;
+    if value < low {
+        third - past(low - value)
+    } else if value > high {
+        2.0 * third + past(value - high)
+    } else if high > low {
+        third + (value - low) / (high - low) * third
+    } else {
+        50.0
+    }
+}
+
+/// A pick as its tips say it: `Under 73.4°F`, `In range 73.4–76.0°F` or `Exactly 71°F`.
+pub fn pick_text(
+    metric: Metric,
+    forecast: Option<f64>,
+    rule: Option<Rule>,
+    pick: &ValueOptions,
+) -> String {
+    let target = format::pick_target(metric, forecast, rule, pick);
+    match pick {
+        ValueOptions::Par => format!("{} {target}", format::pick_word(pick, rule)),
+        _ => target,
+    }
+}
+
+/// A bound under the strip: `70°`, or `73.4°` when it has tenths.
+pub(crate) fn bound(metric: Metric, value: f64) -> String {
+    let unit = metric.short_unit();
+    if (value - value.round()).abs() < 0.05 {
+        format!("{value:.0}{unit}")
+    } else {
+        format!("{value:.1}{unit}")
+    }
+}
+
+/// Two people, beside a share of the entries.
+fn people() -> Markup {
+    html! {
+        svg class="people" viewBox="0 0 16 12" aria-hidden="true" {
+            circle cx="5" cy="3" r="2.4" {}
+            path d="M0.5 11.5c0-2.8 2-4.6 4.5-4.6s4.5 1.8 4.5 4.6z" {}
+            circle cx="11.3" cy="3.4" r="2" {}
+            path d="M10.2 7.1c.4-.1.7-.1 1.1-.1 2.3 0 4.2 1.7 4.2 4.5h-4.4c0-1.8-.3-3.2-.9-4.4z" {}
+        }
+    }
+}
+
+fn lock() -> Markup {
+    html! {
+        svg class="lock" viewBox="0 0 12 14" aria-hidden="true" {
+            path d="M3.2 6V4.2a2.8 2.8 0 0 1 5.6 0V6" fill="none" stroke="currentColor" stroke-width="1.6" {}
+            rect x="1" y="6" width="10" height="7.5" rx="1.6" fill="currentColor" {}
         }
     }
 }
@@ -683,13 +841,13 @@ fn refund_note(competition: &CompetitionView, now: OffsetDateTime) -> Markup {
 
 /// The rows of the leaderboard's table. Entries of a competition that didn't run are listed
 /// without a rank or score. `paid` is how many of the first rows, in payout order, the final
-/// result pays: none until it is in. A line under the first `money` rows marks what the prizes
-/// would pay now, and says when a tie runs across it.
+/// result pays: none until it is in. `money` is what each place's prize would pay now: a line
+/// under those rows marks them, and says when a tie runs across it.
 pub fn leaderboard_rows(
     rows: &[LeaderboardRow],
     scored: bool,
     paid: usize,
-    money: usize,
+    money: &[u64],
 ) -> Markup {
     // Until someone scores, everyone would share first place: no ranks yet.
     let ranked = scored && rows.iter().any(|row| row.score != 0);
@@ -698,18 +856,19 @@ pub fn leaderboard_rows(
     } else {
         5
     };
-    let line = (ranked && money > 0 && rows.len() > money).then_some(money);
+    let places = money.len();
+    let line = (ranked && places > 0 && rows.len() > places).then_some(places);
     let tied = line.is_some_and(|line| rows[line - 1].score == rows[line].score);
     html! {
         @for (position, row) in rows.iter().enumerate() {
-            (leaderboard_row(row, scored, ranked, position < paid, line.is_some_and(|line| position < line)))
+            (leaderboard_row(row, scored, ranked, position < paid, line.and_then(|_| money.get(position).copied())))
             @if line == Some(position + 1) {
                 tr class="money-line" aria-hidden="true" {
                     td colspan=(columns) {
                         span {
-                            "In the money · " (money) " "
-                            (if money == 1 { "place" } else { "places" }) " paid"
-                            @if tied { " · Tie at " (ordinal(money)) ": the earliest entry is paid" }
+                            "In the money · " (places) " "
+                            (if places == 1 { "place" } else { "places" }) " paid"
+                            @if tied { " · Tie at " (ordinal(places)) ": the earliest entry is paid" }
                         }
                     }
                 }
@@ -726,16 +885,16 @@ pub fn leaderboard_rows(
 }
 
 /// A click anywhere on the row opens the entry's picks; the Picks button's click reaches the
-/// row. `money`: the prizes would pay this entry if the result were the scores now.
+/// row. `money`: what the prizes would pay this entry if the result were the scores now.
 fn leaderboard_row(
     row: &LeaderboardRow,
     scored: bool,
     ranked: bool,
     paid: bool,
-    money: bool,
+    money: Option<u64>,
 ) -> Markup {
     html! {
-        tr class=(if money { "is-clickable is-in-the-money" } else { "is-clickable" }) data-owner=(row.owner)
+        tr class=(if money.is_some() { "is-clickable is-in-the-money" } else { "is-clickable" }) data-owner=(row.owner)
            hx-get=(detail_url(&row.entry_id)) hx-target="#entryValues" hx-swap="innerHTML"
            "hx-status:500"="swap:innerHTML" {
             td data-label="Rank" class="rank-cell" {
@@ -743,16 +902,18 @@ fn leaderboard_row(
                 @if paid { " " span class="paid-badge" { "Paid" } }
             }
             td data-label="Player" {
-                span class="player-name" { (row.player) }
+                span class="player-name" title=(row.player) { (row.player) }
+                @if let Some(amount) = money.filter(|_| !paid) { span class="money-badge" { (sats(amount)) } }
                 span class="you-badge" { "You" }
-                @if money && !paid { span class="money-badge" { "Paid now" } }
             }
             td data-label="Picks" class="picks-column" {
                 @if !row.picks.is_empty() {
                     span class="pick-squares" role="img"
                          aria-label=(pick_summary(&row.picks)) {
-                        @for mark in &row.picks {
-                            i class=(mark.class()) title=(mark.label()) {}
+                        // Focusable without a tab stop each, so a tap shows the tip.
+                        @for square in &row.picks {
+                            i class=(square.mark.class()) tabindex="-1"
+                              data-tip=(format!("{} · {}", square.pick, square.mark.label())) {}
                         }
                     }
                 }
@@ -771,8 +932,13 @@ fn leaderboard_row(
 }
 
 /// `4 locked in, 1 out, 4 still open`, for a screen reader.
-fn pick_summary(picks: &[PickMark]) -> String {
-    let count = |marks: &[PickMark]| picks.iter().filter(|mark| marks.contains(mark)).count();
+fn pick_summary(picks: &[PickSquare]) -> String {
+    let count = |marks: &[PickMark]| {
+        picks
+            .iter()
+            .filter(|square| marks.contains(&square.mark))
+            .count()
+    };
     let right = count(&[PickMark::Right]);
     let wrong = count(&[PickMark::Wrong]);
     let open = picks.len() - right - wrong;
@@ -1004,14 +1170,14 @@ mod tests {
             ),
             row("01a0d0f5-0000-7000-8000-00000000cccc", "carol", 20, 1),
         ];
-        let html = leaderboard_rows(&rows, true, 0, 0).into_string();
+        let html = leaderboard_rows(&rows, true, 0, &[]).into_string();
         // Each row opens its own entry's picks, where its id is shown.
         assert!(html.contains(r#"hx-get="/entries/01a0d0f5-0000-7000-8000-00000000aaaa/detail""#));
         assert!(html.contains(r#"hx-get="/entries/01a0d0f5-0000-7000-8000-00000000bbbb/detail""#));
         assert!(html.contains(r#"data-owner="owner-alice""#));
         assert!(html.contains("npub1abcd…wxyz"));
         assert!(!html.contains("No scores yet"));
-        assert!(leaderboard_rows(&[], true, 0, 0)
+        assert!(leaderboard_rows(&[], true, 0, &[])
             .into_string()
             .contains("No scores yet"));
     }
@@ -1026,51 +1192,127 @@ mod tests {
             row("e3", "cal", 30, 2),
             row("e4", "dee", 10, 4),
         ];
-        let html = leaderboard_rows(&rows, true, 0, 2).into_string();
+        let html = leaderboard_rows(&rows, true, 0, &[7_000, 3_000]).into_string();
         let line = html.find("money-line").unwrap();
         assert!(html.find("/entries/e2/detail").unwrap() < line);
         assert!(line < html.find("/entries/e3/detail").unwrap());
         assert!(html.contains("2 places paid · Tie at 2nd: the earliest entry is paid"));
-        assert_eq!(html.matches("Paid now").count(), 2);
+        // Each row above the line shows what it would win now, in payout order.
+        assert_eq!(html.matches("money-badge").count(), 2);
+        assert!(
+            html.contains(r#"<span class="money-badge">7,000 sats</span>"#),
+            "{html}"
+        );
+        assert!(html.contains(r#"<span class="money-badge">3,000 sats</span>"#));
 
-        let untied = leaderboard_rows(&rows[2..], true, 0, 1).into_string();
+        let untied = leaderboard_rows(&rows[2..], true, 0, &[7_000]).into_string();
         assert!(untied.contains("1 place paid<") && !untied.contains("Tie at"));
         // Nobody ranked yet, or no more rows than places: no line.
-        assert!(!leaderboard_rows(&rows, false, 0, 2)
+        assert!(!leaderboard_rows(&rows, false, 0, &[7_000, 3_000])
             .into_string()
             .contains("money-line"));
-        assert!(!leaderboard_rows(&rows[..2], true, 0, 2)
+        assert!(!leaderboard_rows(&rows[..2], true, 0, &[7_000, 3_000])
             .into_string()
             .contains("money-line"));
     }
 
-    /// Once picks are public, each row's split shows as shares, the side right so far marked.
+    /// Once picks are public, each row's split shows as shares under a strip of the sides, its
+    /// bounds and the reading so far marked; a reading that can't leave its side locks the card.
     #[test]
-    fn pick_ownership_shows_each_sides_share_and_the_side_right_so_far() {
-        let html = ownership(&[Ownership {
+    fn pick_ownership_shows_each_sides_share_under_the_reading_so_far() {
+        let row = Ownership {
             station_id: "KORD".into(),
             city: Some("Chicago, IL".into()),
             metric: Metric::TempHigh,
             forecast: Some(77.0),
+            observed: Some(76.4),
             rule: Some(Rule::Line {
                 lower: -1.0,
                 upper: 1.0,
             }),
             counts: [1, 2, 0],
             right: Some(1),
+            locked: false,
+        };
+        let html = ownership(std::slice::from_ref(&row)).into_string();
+        assert!(html.contains("Chicago, IL"));
+        assert!(
+            html.contains(r#"aria-label="Highest so far 76°, In range""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"x="33.3%" y="47">76°</text>"#), "{html}");
+        assert!(html.contains(r#"x="66.7%" y="47">78°</text>"#));
+        // 76.4 is 0.4 into a 2° range: 33.3% + 0.2 of a third.
+        assert!(html.contains(r#"x1="40.0%""#), "{html}");
+        assert!(html.contains(">76°</text>"));
+        assert!(html.contains(r#"<span class="is-par is-on">"#));
+        // Each side's share, its bounds and count on hover or a tap.
+        assert!(
+            html.contains(r#"data-tip="Under 76.0°F · 1 of 3 entries""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"data-tip="In range 76.0–78.0°F · 2 of 3 entries""#));
+        assert!(html.contains("</svg>33%</span>") && html.contains("</svg>67%</span>"));
+        assert_eq!(html.matches("ownership-share is-on").count(), 1);
+        assert!(!html.contains("Locked in"));
+
+        let locked = ownership(&[Ownership {
+            observed: Some(79.0),
+            right: Some(2),
+            locked: true,
+            ..row
         }])
         .into_string();
-        assert!(html.contains("Chicago, IL"));
-        assert!(html.contains(r#"<span class="ownership-share">33%</span>"#));
-        assert!(html.contains(r#"<span class="ownership-share">67%</span>"#));
-        assert!(html.contains(r#"<span class="ownership-share">0%</span>"#));
-        assert_eq!(html.matches("is-right").count(), 1);
-        assert!(html.contains("In range ✓"));
+        assert!(locked.contains(r#"class="ownership-row is-locked""#));
+        assert!(locked.contains("</svg>Locked in</span>"));
+        assert!(locked.contains(r#"aria-label="Highest so far 79°, Over, locked in""#));
+    }
+
+    #[test]
+    fn the_strip_gives_each_side_a_third_and_reaches_past_the_bounds() {
+        assert_eq!(strip_position(71.0, 70.0, 72.0), 50.0);
+        assert!((strip_position(70.0, 70.0, 72.0) - 100.0 / 3.0).abs() < 1e-9);
+        // Past a bound by a range width, a third of the way out; far past, near the end.
+        assert!((strip_position(74.0, 70.0, 72.0) - 76.67).abs() < 0.01);
+        assert!((strip_position(99.0, 70.0, 72.0) - 96.67).abs() < 0.01);
+        assert!((strip_position(40.0, 70.0, 72.0) - 3.33).abs() < 0.01);
+        // A fixed rule's Par is one value.
+        assert_eq!(strip_position(71.0, 71.0, 71.0), 50.0);
+        assert_eq!(bound(Metric::TempHigh, 73.4), "73.4°");
+        // A middle pick names its side, as its button does.
+        let line = Some(Rule::Line {
+            lower: -1.0,
+            upper: 1.0,
+        });
+        let par = |rule| pick_text(Metric::TempHigh, Some(71.0), rule, &ValueOptions::Par);
+        assert_eq!(par(line), "In range 70.0–72.0°F");
+        assert_eq!(par(Some(Rule::Fixed)), "Exactly 71°F");
+        assert_eq!(
+            pick_text(Metric::TempHigh, Some(71.0), line, &ValueOptions::Under),
+            "Under 70.0°F"
+        );
+        assert_eq!(bound(Metric::WindSpeed, 16.0), "16 kt");
+    }
+
+    /// Each square says which pick it is and how it stands, on hover or a tap.
+    #[test]
+    fn each_square_names_its_pick() {
+        let mut entry = row("e1", "bob", 10, 1);
+        entry.picks = vec![PickSquare {
+            mark: PickMark::LeaningRight,
+            pick: "Topeka, KS High · Over 72.0°F".into(),
+        }];
+        let html = leaderboard_rows(&[entry], true, 0, &[]).into_string();
+        assert!(
+            html.contains(r#"<i class="is-leaning-right" tabindex="-1" data-tip="Topeka, KS High · Over 72.0°F · Right so far"></i>"#),
+            "{html}"
+        );
+        assert!(html.contains(r#"aria-label="0 locked in, 0 out, 1 still open""#));
     }
 
     #[test]
     fn rows_open_the_picks_without_script_filters() {
-        let html = leaderboard_rows(&[row("e1", "bob", 0, 1)], true, 0, 0).into_string();
+        let html = leaderboard_rows(&[row("e1", "bob", 0, 1)], true, 0, &[]).into_string();
         assert!(html.contains(r#"hx-get="/entries/e1/detail""#));
         assert!(
             !html.contains("hx-trigger"),

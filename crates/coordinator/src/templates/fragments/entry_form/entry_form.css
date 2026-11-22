@@ -539,6 +539,59 @@
   color: inherit;
 }
 
+.station-loop-toggle {
+  align-self: center;
+}
+
+.station-loop {
+  clear: both;
+  margin: 0;
+  padding: 0 1rem 0.75rem;
+}
+
+/* Bulma's reset shows every figure, hidden or not. */
+.station-loop[hidden] {
+  display: none;
+}
+
+.station-loop video {
+  display: block;
+  width: 100%;
+  max-width: 600px;
+  aspect-ratio: 1;
+  margin: 0 auto;
+  border-radius: 8px;
+  background: rgb(8 18 48 / 0.55);
+}
+
+.station-loop figcaption {
+  margin-top: 0.4rem;
+  text-align: center;
+  font-size: 0.75rem;
+  color: #c9d5f5;
+}
+
+/* Beside the entry panel, the loop pops out over the panel next to its city, so opening it
+   moves nothing on the page. Under the header and tips, over the panel. */
+@media screen and (min-width: 1024px) {
+  .station-picks {
+    position: relative;
+  }
+
+  .station-loop {
+    position: absolute;
+    top: 0;
+    left: calc(100% + 1.5rem);
+    z-index: 10;
+    width: 21rem;
+    padding: 0.75rem;
+    border: 1px solid var(--wx-edge);
+    border-radius: 12px;
+    background: var(--navy);
+    box-shadow: 0 10px 24px rgb(4 9 26 / 0.6);
+  }
+}
+
 .station-rows {
   clear: both;
   border-radius: 0 0 11px 11px;
@@ -578,11 +631,22 @@
   font-style: italic;
 }
 
+/* A forecast's picks are the leaderboard's ownership strip, tall enough to tap: each side tinted
+   in its colour and filled once picked, its bounds under the seams. */
+.pick-line {
+  position: relative;
+  padding-bottom: 20px;
+}
+
 .pick-options {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 0.4rem;
+  gap: 3px;
 }
+
+.pick-option.is-under { --side: var(--cold); }
+.pick-option.is-par { --side: var(--gold); }
+.pick-option.is-over { --side: var(--warm); }
 
 .pick-option input {
   position: absolute;
@@ -590,44 +654,33 @@
   pointer-events: none;
 }
 
-/* 44 px tall at least: a pick is tapped more than anything else on the page. */
+/* 46 px tall: a pick is tapped more than anything else on the page. */
 .pick-option .pick-choice {
   display: grid;
-  align-content: center;
-  justify-items: center;
-  min-height: 52px;
-  padding: 0.35rem 0.4rem;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--navy);
-  text-align: center;
-  cursor: pointer;
-  user-select: none;
-  transition: background-color 0.12s ease, border-color 0.12s ease;
-}
-
-.pick-option .pick-word {
-  font-size: 0.66rem;
+  place-items: center;
+  height: 46px;
+  padding: 0 0.3rem;
+  background: color-mix(in srgb, var(--side) 22%, transparent);
+  font-size: 0.7rem;
   font-weight: 700;
   letter-spacing: 0.1em;
   text-transform: uppercase;
+  text-align: center;
+  cursor: pointer;
+  user-select: none;
+  transition: background-color 0.12s ease;
 }
 
-.pick-option .pick-value {
-  font-weight: 600;
-  white-space: nowrap;
+.pick-option:first-child .pick-choice {
+  border-radius: 8px 0 0 8px;
 }
 
-.tenths {
-  font-size: 0.8em;
+.pick-option:last-child .pick-choice {
+  border-radius: 0 8px 8px 0;
 }
-
-.is-under .pick-word { color: var(--cold); }
-.is-par .pick-word { color: var(--gold); }
-.is-over .pick-word { color: var(--warm); }
 
 .pick-option:hover .pick-choice {
-  border-color: var(--dim);
+  background: color-mix(in srgb, var(--side) 40%, transparent);
 }
 
 .pick-option input:focus-visible + .pick-choice {
@@ -636,21 +689,37 @@
 }
 
 .pick-option input:checked + .pick-choice {
-  border-color: transparent;
+  background: var(--side);
   color: var(--night);
+  box-shadow: inset 0 0 0 2px var(--ink);
 }
-
-.pick-option input:checked + .pick-choice .pick-word {
-  color: inherit;
-}
-
-.pick-option.is-under input:checked + .pick-choice { background: var(--cold); }
-.pick-option.is-par input:checked + .pick-choice { background: var(--gold); }
-.pick-option.is-over input:checked + .pick-choice { background: var(--warm); }
 
 .pick-option input:disabled + .pick-choice {
   cursor: not-allowed;
   opacity: 0.4;
+}
+
+/* SVG units are CSS pixels: the tick crosses the 46 px strip and the bounds sit under it. */
+.pick-marks {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.pick-forecast-tick {
+  stroke: var(--ink);
+  stroke-width: 2;
+  stroke-dasharray: 4 3;
+}
+
+.pick-bound {
+  fill: var(--dim);
+  font-size: 0.78rem;
+  text-anchor: middle;
+  font-variant-numeric: tabular-nums;
 }
 
 /* The ticket invoice's QR code, drawn by the server. */
@@ -723,10 +792,6 @@
 
   .entry-form .pick-forecast {
     font-size: 1.6rem;
-  }
-
-  .pick-option .pick-value {
-    font-size: 0.85rem;
   }
 
   .station-source {

@@ -593,7 +593,8 @@ function showPicksLeft(form) {
 }
 
 // The entry panel beside the picks: how many are made, a bar segment for each, and a line for
-// each pick, "Afton, WY High · In range 34.1–37.1°".
+// each pick, "Afton, WY High · In range 34.1–37.1°F". A button's label reads its target, which
+// for the middle pick needs its word.
 function showEntryPanel(form, made, need) {
   const count = document.getElementById("pickCount");
   if (count) count.textContent = `${made} of ${need}`;
@@ -604,12 +605,12 @@ function showEntryPanel(form, made, need) {
   if (!summary) return;
   const text = (root, selector) => root?.querySelector(selector)?.textContent.trim() ?? "";
   summary.replaceChildren(...[...form.querySelectorAll(`${PICK}:checked`)].map((input) => {
-    const option = input.closest(".pick-option");
+    const target = input.getAttribute("aria-label");
     const what = document.createElement("span");
     what.textContent = `${text(input.closest(".station-picks"), ".station-city")} ${text(input.closest(".pick-row"), ".pick-label")}`;
     const pick = document.createElement("b");
     pick.className = `is-${input.value}`;
-    pick.textContent = `${text(option, ".pick-word")} ${text(option, ".pick-value")}`;
+    pick.textContent = input.value === "par" ? `${text(input.closest(".pick-option"), ".pick-choice")} ${target}` : target;
     const line = document.createElement("li");
     line.append(what, pick);
     return line;
@@ -1117,10 +1118,33 @@ function closeEntries(event) {
   }
 }
 
+// A city's satellite loop shows and hides under its name, one city's at a time, since beside
+// the entry panel every loop pops out into the same column. The video downloads on its first
+// open, not with the form, and pauses while hidden.
+function toggleSatelliteLoop(button) {
+  const figure = document.getElementById(button.getAttribute("aria-controls"));
+  const video = figure?.querySelector("video");
+  if (!video) return;
+  const opening = figure.hidden;
+  if (opening) {
+    document.querySelectorAll('.station-loop-toggle[aria-expanded="true"]').forEach(toggleSatelliteLoop);
+  }
+  figure.hidden = !opening;
+  button.setAttribute("aria-expanded", String(opening));
+  if (!opening) {
+    video.pause();
+    return;
+  }
+  if (!video.getAttribute("src")) video.src = video.dataset.src;
+  video.play().catch(() => {});
+}
+
 function setupEntryForm() {
   document.body.addEventListener("fw:countdown-ended", closeEntries);
   document.addEventListener("click", (event) => {
     if (event.target.closest?.("#submitEntry")) submitEntry();
+    const satellite = event.target.closest?.(".station-loop-toggle");
+    if (satellite) toggleSatelliteLoop(satellite);
     if (event.target instanceof HTMLInputElement && event.target.matches(PICK)) {
       togglePick(event.target);
       hidePicksMessage();

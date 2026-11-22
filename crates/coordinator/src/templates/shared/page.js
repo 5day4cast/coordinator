@@ -141,9 +141,13 @@ function setupPage() {
     showKeymeldTrust();
   });
 
-  // A tip or a disclosure inside a clickable row opens without opening the row.
+  // A tip or a disclosure inside a clickable row opens without opening the row. A pick's square
+  // still opens it where a pointer hovers, since hovering already shows the square's tip.
   document.addEventListener("click", (event) => {
-    if (event.target.closest?.("tr.is-clickable :is([data-tip], details)")) event.stopPropagation();
+    const held = event.target.closest?.("tr.is-clickable :is([data-tip], details)");
+    if (held && !(held.matches(".pick-squares > i") && matchMedia("(hover: hover)").matches)) {
+      event.stopPropagation();
+    }
   }, true);
 
   document.addEventListener("click", async (event) => {

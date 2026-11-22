@@ -5,6 +5,7 @@
 //! Serve the directory (python3 -m http.server) and open `<page>.html`. Scripts are left
 //! out so nothing loads or rewrites the page: each file is exactly what the server renders.
 use coordinator::{
+    api::satellite::sector_loop,
     domain::{
         leaderboard::{Metric, Phase, PickProgress, PickState, Rule},
         RefundProgress,
@@ -18,7 +19,7 @@ use coordinator::{
             },
             leaderboard::{
                 leaderboard, leaderboard_scores, LeaderboardRow, LeaderboardView, Ownership,
-                PickMark, StationReadings,
+                PickMark, PickSquare, StationReadings,
             },
             picks::{picks_detail, PickView},
         },
@@ -129,12 +130,23 @@ fn main() -> Result<(), Box<dyn Error>> {
         score: [40, 30, 30, 10][index],
         picks: ["RRRROW", "RRRWLO", "RRRWWO", "RWWLKO"][index]
             .chars()
-            .map(|mark| match mark {
-                'R' => PickMark::Right,
-                'W' => PickMark::Wrong,
-                'L' => PickMark::LeaningRight,
-                'K' => PickMark::LeaningWrong,
-                _ => PickMark::Open,
+            .zip([
+                "Chicago, IL High · 74.0–76.4°F",
+                "Chicago, IL Low · Under 56.0°F",
+                "Chicago, IL Peak wind · Over 9.5 kt",
+                "New York, NY High · Over 72.0°F",
+                "New York, NY Low · 59.0–61.0°F",
+                "New York, NY Peak wind · Under 8.5 kt",
+            ])
+            .map(|(mark, pick)| PickSquare {
+                mark: match mark {
+                    'R' => PickMark::Right,
+                    'W' => PickMark::Wrong,
+                    'L' => PickMark::LeaningRight,
+                    'K' => PickMark::LeaningWrong,
+                    _ => PickMark::Open,
+                },
+                pick: pick.into(),
             })
             .collect(),
         max: Some([50, 50, 40, 30][index]),
@@ -169,18 +181,44 @@ fn main() -> Result<(), Box<dyn Error>> {
                 city: Some("Chicago, IL".into()),
                 metric: Metric::TempHigh,
                 forecast: Some(77.0),
+                observed: Some(74.0),
                 rule: Some(line(-3.6, -1.0)),
                 counts: [1, 2, 1],
                 right: Some(1),
+                locked: false,
             },
             Ownership {
                 station_id: "KJFK".into(),
                 city: Some("New York, NY".into()),
                 metric: Metric::WindSpeed,
                 forecast: Some(8.0),
+                observed: Some(12.0),
                 rule: Some(line(0.5, 2.5)),
                 counts: [3, 0, 1],
+                right: Some(2),
+                locked: true,
+            },
+            Ownership {
+                station_id: "KORD".into(),
+                city: Some("Chicago, IL".into()),
+                metric: Metric::TempLow,
+                forecast: Some(58.0),
+                observed: Some(60.0),
+                rule: Some(line(-1.0, 1.0)),
+                counts: [1, 1, 2],
+                right: Some(2),
+                locked: false,
+            },
+            Ownership {
+                station_id: "KJFK".into(),
+                city: Some("New York, NY".into()),
+                metric: Metric::TempHigh,
+                forecast: Some(72.0),
+                observed: None,
+                rule: Some(line(-1.0, 1.0)),
+                counts: [2, 1, 1],
                 right: None,
+                locked: false,
             },
         ],
     };
@@ -347,6 +385,7 @@ fn station(id: &str, name: &str, high: f64, low: f64, wind: f64) -> StationForec
     StationForecast {
         station_id: id.into(),
         station_name: Some(name.into()),
+        satellite_loop: name.rsplit(", ").next().and_then(sector_loop),
         forecasts: vec![
             (Metric::TempHigh, Some(high), Some(line(-3.6, -1.0))),
             (Metric::TempLow, Some(low), Some(line(0.4, 4.0))),
