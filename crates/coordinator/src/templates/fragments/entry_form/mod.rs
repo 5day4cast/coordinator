@@ -459,7 +459,7 @@ pub fn forecast_choices(competition_id: &str, forecasts: &Forecasts, asked: u8) 
     }
 }
 
-/// Each pin with its station's forecast as its caption, `37° / 15°`.
+/// Each pin with its station's forecast as its caption, low then high: `15° / 37°`.
 pub fn map_marks<'a>(stations: &[StationForecast], pins: &'a [StationPin]) -> Vec<MapMark<'a>> {
     pins.iter()
         .map(|pin| {
@@ -485,7 +485,7 @@ pub fn map_marks<'a>(stations: &[StationForecast], pins: &'a [StationPin]) -> Ve
             };
             let caption = match (high, low) {
                 (Some(high), Some(low)) => Some(html! {
-                    (value(Metric::TempHigh, high)) " / " (value(Metric::TempLow, low))
+                    (value(Metric::TempLow, low)) " / " (value(Metric::TempHigh, high))
                 }),
                 (Some(high), None) => Some(value(Metric::TempHigh, high)),
                 (None, Some(low)) => Some(value(Metric::TempLow, low)),
@@ -1338,6 +1338,24 @@ mod tests {
         assert!(html.contains("69°F") && html.contains("41°F") && html.contains("7 knots"));
         assert!(!html.contains("12.5") && !html.contains("75°F") && !html.contains("58°F"));
         assert!(html.contains(r#"name="KPWM_temp_high" value="over""#));
+    }
+
+    /// The map's caption for a city reads its low, then its high.
+    #[test]
+    fn the_map_reads_each_city_s_low_then_high() {
+        let pins = [crate::templates::shared_map::StationPin {
+            station_id: "KPWM".into(),
+            label: "PWM".into(),
+            name: "Portland".into(),
+            svg_x: 0.0,
+            svg_y: 0.0,
+        }];
+        let marks = map_marks(&[station()], &pins);
+        let caption = marks[0].caption.clone().unwrap().into_string();
+        assert!(
+            caption.find("41°").unwrap() < caption.find("69°").unwrap(),
+            "{caption}"
+        );
     }
 
     /// The Satellite button beside the city opens its region's loop, which the page names but
