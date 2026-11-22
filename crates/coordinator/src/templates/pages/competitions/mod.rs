@@ -1195,12 +1195,7 @@ fn intro(featured: Option<&CompetitionView>, lobby: &Lobby, now: OffsetDateTime)
     html! {
         section class="intro" {
             div class="intro-text" {
-                p class="intro-eyebrow" { "Daily fantasy weather" }
-                h1 class="title intro-title" { "Call the weather. Win the pot." }
-                p class="intro-copy" {
-                    "Pick Under, In range or Over on NOAA's forecast for every city in a contest. "
-                    "Right calls score points, and the top of each pool splits the prize in sats over Lightning."
-                }
+                h1 class="title intro-title" { "Daily Fantasy Weather" }
                 p class="intro-link" {
                     a href="/help" hx-get="/help" hx-target="#main-content" hx-push-url="true" { "How to play →" }
                 }
@@ -1688,7 +1683,7 @@ pub(crate) mod tests {
         .into_string();
         assert!(html.contains(">2 h 13 min</span>") && html.contains("Locks in "));
         assert!(html.contains(r#"href="/competitions/open/entry-form""#));
-        assert!(html.contains("Daily fantasy weather"));
+        assert!(html.contains(">Daily Fantasy Weather</h1>"));
         assert!(html.contains(r#"href="/help""#));
         // What it costs, all in, and what first place wins; the network fee is in the entry fee
         // once known.
