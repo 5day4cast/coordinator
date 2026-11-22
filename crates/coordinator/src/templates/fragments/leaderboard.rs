@@ -673,15 +673,9 @@ fn ownership_card(row: &Ownership) -> Markup {
                 }
             }
             div class="ownership-shares" {
-                @for (side, (pick, _)) in SIDES.iter().enumerate() {
+                @for side in 0..SIDES.len() {
                     @let share = (row.counts[side] * 100 + entries.max(1) / 2) / entries.max(1);
-                    @let tip = format!(
-                        "{} · {} of {entries} entries",
-                        pick_text(row.metric, row.forecast, row.rule, pick),
-                        row.counts[side],
-                    );
-                    span class=(if row.right == Some(side) { "ownership-share is-on" } else { "ownership-share" })
-                        tabindex="0" data-tip=(tip) aria-label=(tip) {
+                    span class=(if row.right == Some(side) { "ownership-share is-on" } else { "ownership-share" }) {
                         (people()) (share) "%"
                     }
                 }
@@ -1246,13 +1240,9 @@ mod tests {
         assert!(html.contains(r#"x1="40.0%""#), "{html}");
         assert!(html.contains(">76°</text>"));
         assert!(html.contains(r#"<span class="is-par is-on">"#));
-        // Each side's share, its bounds and count on hover or a tap.
-        assert!(
-            html.contains(r#"data-tip="Under 76.0°F · 1 of 3 entries""#),
-            "{html}"
-        );
-        assert!(html.contains(r#"data-tip="In range 76.0–78.0°F · 2 of 3 entries""#));
+        // Each side's share, with no tip.
         assert!(html.contains("</svg>33%</span>") && html.contains("</svg>67%</span>"));
+        assert!(!html.contains("data-tip"), "{html}");
         assert_eq!(html.matches("ownership-share is-on").count(), 1);
         assert!(!html.contains("Locked in"));
 
