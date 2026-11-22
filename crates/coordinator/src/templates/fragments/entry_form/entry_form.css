@@ -631,8 +631,8 @@
   font-style: italic;
 }
 
-/* A forecast's picks are the leaderboard's ownership strip, tall enough to tap: each side tinted
-   in its colour and filled once picked, its bounds under the seams. */
+/* A forecast's picks are the leaderboard's ownership strip, tall enough to tap: each side a
+   solid shade of its colour and filled once picked, its bounds under the seams. */
 .pick-line {
   position: relative;
   padding-bottom: 20px;
@@ -660,7 +660,8 @@
   place-items: center;
   height: 46px;
   padding: 0 0.3rem;
-  background: color-mix(in srgb, var(--side) 22%, transparent);
+  /* Mixed with the night, not see-through: white reads on each at 4.5:1 or better. */
+  background: color-mix(in srgb, var(--side) 45%, var(--night));
   font-size: 0.7rem;
   font-weight: 700;
   letter-spacing: 0.1em;
@@ -680,7 +681,7 @@
 }
 
 .pick-option:hover .pick-choice {
-  background: color-mix(in srgb, var(--side) 40%, transparent);
+  background: color-mix(in srgb, var(--side) 60%, var(--night));
 }
 
 .pick-option input:focus-visible + .pick-choice {
