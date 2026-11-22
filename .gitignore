@@ -31,6 +31,7 @@ result-*
 
 # Development data (created by start-all script)
 data/
+!vendor/ws4kp/*/data/
 logs/
 
 # WASM build output
