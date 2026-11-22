@@ -29,7 +29,8 @@ use crate::{
     api::extractors::NostrAuth,
     domain::{
         leaderboard::{
-            progress::best_points, Leaderboard, Metric, Phase, PickState, FIRST_READ_WAIT,
+            progress::{best_points, pick_state},
+            Leaderboard, Metric, Phase, PickState, FIRST_READ_WAIT,
         },
         Competition, Error, LedgerTotals, RefundProgress, Returned, UnenteredTickets, UnpaidTicket,
     },
@@ -1199,8 +1200,8 @@ fn leaderboard_view(
     }
 }
 
-/// How the entries split on each row of picks, in the order the picks come. A side is right so
-/// far when any entry on it is.
+/// How the entries split on each row of picks, in the order the picks come, with the side the
+/// reading so far is on, locked while the window is open if the reading can't leave it.
 fn ownership(board: &Leaderboard, stations: &StationsById) -> Vec<Ownership> {
     let mut rows: Vec<Ownership> = Vec::new();
     for pick in board.rows.iter().flat_map(|row| &row.picks) {
@@ -1222,16 +1223,19 @@ fn ownership(board: &Leaderboard, stations: &StationsById) -> Vec<Ownership> {
                     rule: pick.rule,
                     counts: [0; 3],
                     right: None,
+                    locked: false,
                 });
                 rows.len() - 1
             });
         rows[index].counts[side] += 1;
-        if matches!(
-            PickMark::of(pick.state, pick.points),
-            PickMark::Right | PickMark::LeaningRight
-        ) {
-            rows[index].right = Some(side);
-        }
+    }
+    for row in &mut rows {
+        let states = [ValueOptions::Under, ValueOptions::Par, ValueOptions::Over]
+            .map(|pick| pick_state(&pick, row.metric, row.rule, row.forecast, row.observed));
+        row.right = states
+            .iter()
+            .position(|state| matches!(state, PickState::LockedIn | PickState::OnTrack));
+        row.locked = board.phase == Phase::Live && states.contains(&PickState::LockedIn);
     }
     rows
 }

@@ -194,9 +194,39 @@ html.site .ownership-title {
   gap: 0.6rem;
 }
 
+/* The sides' colours, as the key, the strip and the pick buttons show them. */
+.ownership .is-under { --side: var(--cold); }
+.ownership .is-par { --side: var(--gold); }
+.ownership .is-over { --side: var(--warm); }
+
+.ownership-key {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem 1.2rem;
+  margin-bottom: 0.7rem;
+  font-size: 0.78rem;
+  color: var(--dim);
+}
+
+.ownership-key i {
+  display: inline-block;
+  width: 0.8rem;
+  height: 0.55rem;
+  margin-right: 0.35rem;
+  border-radius: 2px;
+  background: var(--side);
+}
+
+.people {
+  width: 0.95rem;
+  height: 0.75rem;
+  fill: currentColor;
+  vertical-align: -0.05em;
+}
+
 .ownership-row {
   display: grid;
-  gap: 0.3rem;
+  gap: 0.2rem;
   padding: 0.7rem 0.85rem;
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -204,82 +234,144 @@ html.site .ownership-title {
 }
 
 .ownership-what {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.6rem;
   font-weight: 600;
 }
 
-.ownership-forecast {
-  font-size: 0.85rem;
-  color: var(--dim);
-}
-
-.ownership-observed {
-  font-weight: 700;
-}
-
-.ownership-side {
-  display: grid;
-  grid-template-columns: 5.5rem minmax(0, 1fr) 2.75rem;
+.ownership-what > span:first-child {
+  display: inline-flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 0.5rem;
-  font-size: 0.8rem;
 }
 
-.ownership-word {
+/* The strip: a third for each side, the reading's side bright. The marks are SVG, laid out
+   in px to match: the reading above the bar, the bounds below. */
+.ownership-line {
+  position: relative;
+  height: 50px;
+}
+
+.ownership-zones {
+  position: absolute;
+  top: 20px;
+  left: 0;
+  right: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  height: 12px;
+  overflow: hidden;
+  border-radius: 4px;
+}
+
+.ownership-zones span {
+  background: var(--side);
+  opacity: 0.3;
+}
+
+.ownership-zones .is-on {
+  opacity: 1;
+}
+
+.ownership-marks {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.ownership-forecast {
+  stroke: var(--navy);
+  stroke-width: 2;
+  stroke-dasharray: 2 2;
+}
+
+.ownership-marker {
+  stroke: var(--ink);
+  stroke-width: 3;
+  stroke-linecap: round;
+}
+
+.ownership-marker-edge {
+  stroke: var(--navy);
+  stroke-width: 7;
+  stroke-linecap: round;
+}
+
+.ownership-reading {
+  fill: var(--ink);
+  font-size: 0.85rem;
   font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
 }
 
-.ownership-side.is-under .ownership-word { color: var(--cold); }
-.ownership-side.is-par .ownership-word { color: var(--gold); }
-.ownership-side.is-over .ownership-word { color: var(--warm); }
+.ownership-bound {
+  fill: var(--dim);
+  font-size: 0.72rem;
+  text-anchor: middle;
+}
 
-.ownership-share {
-  text-align: right;
+.ownership-shares {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  font-size: 0.85rem;
   font-variant-numeric: tabular-nums;
 }
 
-.ownership-side meter {
-  width: 100%;
-  height: 0.5rem;
-  border: 0;
-  border-radius: 999px;
-  background: var(--raise);
-  appearance: none;
+.ownership-share {
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  gap: 0.3rem;
 }
 
-.ownership-side meter::-webkit-meter-bar {
-  border: 0;
-  border-radius: 999px;
-  background: var(--raise);
+.ownership-share .people {
+  color: var(--dim);
 }
 
-.ownership-side meter::-webkit-meter-optimum-value,
-.ownership-side meter::-webkit-meter-suboptimum-value,
-.ownership-side meter::-webkit-meter-even-less-good-value {
-  border-radius: 999px;
-  background: var(--dim);
-}
-
-.ownership-side meter::-moz-meter-bar {
-  border-radius: 999px;
-  background: var(--dim);
-}
-
-/* The side right so far fills green. */
-.ownership-side.is-right meter::-webkit-meter-optimum-value,
-.ownership-side.is-right meter::-webkit-meter-suboptimum-value,
-.ownership-side.is-right meter::-webkit-meter-even-less-good-value {
-  background: var(--win);
-}
-
-.ownership-side.is-right meter::-moz-meter-bar {
-  background: var(--win);
-}
-
-.ownership-side.is-right .ownership-share {
+/* The side the reading is on. */
+.ownership-share.is-on,
+.ownership-share.is-on .people {
   color: var(--win);
   font-weight: 700;
+}
+
+/* A reading that can't leave its side: silver, with the sides it can't reach faded out. */
+.ownership-row.is-locked {
+  border-color: #d6deef;
+  background: linear-gradient(180deg, rgb(214 222 239 / 0.1), transparent), var(--navy);
+  box-shadow: inset 0 0 0 1px #d6deef;
+}
+
+.ownership-row.is-locked .ownership-zones span:not(.is-on) {
+  opacity: 0.12;
+}
+
+.ownership-row.is-locked .ownership-reading {
+  fill: #d6deef;
+}
+
+.lock {
+  width: 0.62rem;
+  height: 0.72rem;
+  margin-right: 0.25rem;
+}
+
+/* Navy on silver reads at 12.3:1. */
+.locked-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.05rem 0.45rem;
+  border-radius: 999px;
+  background: #d6deef;
+  color: var(--navy);
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 /* Scores. */
