@@ -416,9 +416,12 @@ html.site .leaderboard-table tr.is-own td {
   color: var(--gold);
 }
 
-/* What the row would win now. A darker green than --win, which white reads on at 5.1:1. */
+/* What the row would win now, under the name so every row's badge lines up. A darker green
+   than --win, which white reads on at 5.1:1. */
 .money-badge {
-  margin-left: 0.5rem;
+  display: block;
+  width: fit-content;
+  margin-top: 0.2rem;
   padding: 0 0.4rem;
   border-radius: 4px;
   background: #0f7d57;
@@ -538,10 +541,6 @@ html.site .leaderboard-table tr.is-own td {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-
-  .money-badge {
-    margin-left: 0;
   }
 
   .wx-note {
