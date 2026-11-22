@@ -18,7 +18,7 @@ use coordinator::{
             },
             leaderboard::{
                 leaderboard, leaderboard_scores, LeaderboardRow, LeaderboardView, Ownership,
-                PickMark, StationReadings,
+                PickMark, PickSquare, StationReadings,
             },
             picks::{picks_detail, PickView},
         },
@@ -129,12 +129,23 @@ fn main() -> Result<(), Box<dyn Error>> {
         score: [40, 30, 30, 10][index],
         picks: ["RRRROW", "RRRWLO", "RRRWWO", "RWWLKO"][index]
             .chars()
-            .map(|mark| match mark {
-                'R' => PickMark::Right,
-                'W' => PickMark::Wrong,
-                'L' => PickMark::LeaningRight,
-                'K' => PickMark::LeaningWrong,
-                _ => PickMark::Open,
+            .zip([
+                "Chicago, IL High · 74.0–76.4°F",
+                "Chicago, IL Low · Under 56.0°F",
+                "Chicago, IL Peak wind · Over 9.5 kt",
+                "New York, NY High · Over 72.0°F",
+                "New York, NY Low · 59.0–61.0°F",
+                "New York, NY Peak wind · Under 8.5 kt",
+            ])
+            .map(|(mark, pick)| PickSquare {
+                mark: match mark {
+                    'R' => PickMark::Right,
+                    'W' => PickMark::Wrong,
+                    'L' => PickMark::LeaningRight,
+                    'K' => PickMark::LeaningWrong,
+                    _ => PickMark::Open,
+                },
+                pick: pick.into(),
             })
             .collect(),
         max: Some([50, 50, 40, 30][index]),
@@ -169,6 +180,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 city: Some("Chicago, IL".into()),
                 metric: Metric::TempHigh,
                 forecast: Some(77.0),
+                observed: Some(74.0),
                 rule: Some(line(-3.6, -1.0)),
                 counts: [1, 2, 1],
                 right: Some(1),
@@ -178,6 +190,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 city: Some("New York, NY".into()),
                 metric: Metric::WindSpeed,
                 forecast: Some(8.0),
+                observed: Some(12.0),
                 rule: Some(line(0.5, 2.5)),
                 counts: [3, 0, 1],
                 right: None,

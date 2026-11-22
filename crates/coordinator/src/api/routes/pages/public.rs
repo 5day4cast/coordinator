@@ -37,7 +37,7 @@ use crate::{
     startup::AppState,
     templates::{
         components::RecoveryHelp,
-        format::{city_name, short_npub, Explorers},
+        format::{city_name, pick_target, short_npub, Explorers, MetricText},
         fragments::{
             entries_paused_banner,
             entry_form::{
@@ -47,7 +47,7 @@ use crate::{
             },
             leaderboard::{
                 leaderboard, leaderboard_scores, queue_pools, rows_url, LeaderboardRow,
-                LeaderboardView, Ownership, PickMark, StationReadings,
+                LeaderboardView, Ownership, PickMark, PickSquare, StationReadings,
             },
             loading::{placeholder, Pending, MAX_ASKS},
             picks::{detail_url, own_picks_detail, picks_detail, withheld_picks_detail, PickView},
@@ -1161,7 +1161,17 @@ fn leaderboard_view(
                     picks: row
                         .picks
                         .iter()
-                        .map(|pick| PickMark::of(pick.state, pick.points))
+                        .map(|pick| PickSquare {
+                            mark: PickMark::of(pick.state, pick.points),
+                            pick: format!(
+                                "{} {} · {}",
+                                station_name(stations, &pick.station_id)
+                                    .map(|name| city_name(&name))
+                                    .unwrap_or_else(|| pick.station_id.clone()),
+                                pick.metric.label(),
+                                pick_target(pick.metric, pick.forecast, pick.rule, &pick.pick),
+                            ),
+                        })
                         .collect(),
                     // Settled picks count what they scored; the rest what a right pick scores.
                     max: (live && !row.picks.is_empty()).then(|| {
@@ -1208,6 +1218,7 @@ fn ownership(board: &Leaderboard, stations: &StationsById) -> Vec<Ownership> {
                     city: station_name(stations, &pick.station_id).map(|name| city_name(&name)),
                     metric: pick.metric,
                     forecast: pick.forecast,
+                    observed: pick.observed,
                     rule: pick.rule,
                     counts: [0; 3],
                     right: None,

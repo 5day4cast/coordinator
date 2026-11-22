@@ -208,8 +208,12 @@ html.site .ownership-title {
 }
 
 .ownership-forecast {
-  font-weight: 400;
+  font-size: 0.85rem;
   color: var(--dim);
+}
+
+.ownership-observed {
+  font-weight: 700;
 }
 
 .ownership-side {
@@ -336,18 +340,19 @@ html.site .leaderboard-table td {
   line-height: 1;
 }
 
-/* A mark in each square, so right and wrong read without telling green from red. */
-.pick-squares .is-right::after,
-.pick-legend .is-right::after,
-.pick-squares .is-leaning-right::after,
-.pick-legend .is-leaning-right::after {
+/* A mark in each square, so right and wrong read without telling green from red. Before, as
+   a square's ::after is its tip (tip.css). */
+.pick-squares .is-right::before,
+.pick-legend .is-right::before,
+.pick-squares .is-leaning-right::before,
+.pick-legend .is-leaning-right::before {
   content: "✓";
 }
 
-.pick-squares .is-wrong::after,
-.pick-legend .is-wrong::after,
-.pick-squares .is-leaning-wrong::after,
-.pick-legend .is-leaning-wrong::after {
+.pick-squares .is-wrong::before,
+.pick-legend .is-wrong::before,
+.pick-squares .is-leaning-wrong::before,
+.pick-legend .is-leaning-wrong::before {
   content: "✕";
 }
 
@@ -411,16 +416,16 @@ html.site .leaderboard-table tr.is-own td {
   color: var(--gold);
 }
 
+/* What the row would win now. A darker green than --win, which white reads on at 5.1:1. */
 .money-badge {
   margin-left: 0.5rem;
   padding: 0 0.4rem;
-  border: 1px solid var(--gold);
   border-radius: 4px;
-  font-size: 0.65rem;
+  background: #0f7d57;
+  font-size: 0.7rem;
   font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--gold);
+  white-space: nowrap;
+  color: #ffffff;
 }
 
 /* The places the final result pays. */
