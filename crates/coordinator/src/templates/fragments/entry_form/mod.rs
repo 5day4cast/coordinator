@@ -24,6 +24,9 @@ pub struct StationForecast {
     pub station_id: String,
     /// `Portland International, ME`, when the oracle knows the station.
     pub station_name: Option<String>,
+    /// Where NOAA's satellite loop of the station's region plays, when NOAA has one
+    /// (`api/satellite.rs`).
+    pub satellite_loop: Option<String>,
     /// Each metric's forecast and what a pick on it is scored against; the rule is `None` while
     /// a lines competition's band is not known yet.
     pub forecasts: Vec<(Metric, Option<f64>, Option<Rule>)>,
@@ -543,16 +546,22 @@ pub fn payout_line(
     }
 }
 
-/// A station's forecast panel: the city, then a row of picks for each forecast.
+/// A station's forecast panel: the city, then a row of picks for each forecast. The city's
+/// Satellite button opens its region's loop above the picks, which downloads only then
+/// (`entry_form.js`).
 fn station_picks(station: &StationForecast) -> Markup {
+    let city = match &station.station_name {
+        Some(name) => city_name(name),
+        None => station.station_id.clone(),
+    };
+    let loop_id = format!("loop-{}", station.station_id);
     html! {
         fieldset class="station-picks" id=(format!("station-{}", station.station_id)) data-station=(station.station_id) {
             legend class="station-head" {
-                span class="station-city" {
-                    @match &station.station_name {
-                        Some(name) => (city_name(name)),
-                        None => (station.station_id),
-                    }
+                span class="station-city" { (city) }
+                @if station.satellite_loop.is_some() {
+                    button type="button" class="button is-small station-loop-toggle"
+                           aria-expanded="false" aria-controls=(loop_id) { "Satellite" }
                 }
                 span class="station-source" {
                     "NOAA forecast · "
@@ -560,6 +569,13 @@ fn station_picks(station: &StationForecast) -> Markup {
                     @if let Some(name) = &station.station_name {
                         (tip_end(&format!("Measured at {name} ({}). The forecast is NOAA's; the ranges come from how past forecasts missed.", station.station_id)))
                     }
+                }
+            }
+            @if let Some(url) = &station.satellite_loop {
+                figure class="station-loop" id=(loop_id) hidden {
+                    video data-src=(url) muted loop playsinline preload="none"
+                          aria-label=(format!("Satellite loop of the region around {city}")) {}
+                    figcaption { "Infrared satellite, the last 4 hours · NOAA GOES" }
                 }
             }
             div class="station-rows" {
@@ -635,7 +651,9 @@ pub fn ticket_status(url: &str, progress: TicketProgress) -> Markup {
 
 /// Thresholds and a range for one forecast, as radio buttons named `KPWM_temp_high`, none
 /// checked at first; choosing the checked one again takes the pick back (`entry_form.js`).
-/// Each button says which side it takes and its bound; its label reads the whole pick.
+/// The buttons are the three sides of the leaderboard's ownership strip, each bound written once
+/// under the seam it marks and NOAA's forecast a dashed tick where it falls. Each button says
+/// which side it takes; its label reads the whole pick.
 pub(crate) fn pick_row(
     station_id: &str,
     metric: Metric,
@@ -643,12 +661,17 @@ pub(crate) fn pick_row(
     rule: Option<Rule>,
 ) -> Markup {
     use crate::infra::oracle::ValueOptions;
+    use crate::templates::fragments::leaderboard::{bound, strip_position};
     let name = format!("{station_id}_{}", metric.id());
     let options = [
         ("under", ValueOptions::Under),
         ("par", ValueOptions::Par),
         ("over", ValueOptions::Over),
     ];
+    let bounds = forecast.zip(rule).map(|(forecast, rule)| match rule {
+        Rule::Line { lower, upper } => (forecast, forecast + lower, forecast + upper),
+        Rule::Fixed => (forecast, forecast, forecast),
+    });
     html! {
         div class="pick-row" {
             div class="pick-metric" {
@@ -663,15 +686,27 @@ pub(crate) fn pick_row(
                     None => { span class="pick-forecast is-missing" { "no forecast yet" } }
                 }
             }
-            div class="pick-options" role="radiogroup" aria-label=(format!("{} at {station_id}", metric.label())) {
-                @for (value, pick) in &options {
-                    label class=(format!("pick-option is-{value}"))
-                          title=[format::pick_hint(metric, forecast, rule, pick)] {
-                        input type="radio" name=(name) value=(value) disabled[forecast.is_none() || rule.is_none()]
-                              aria-label=(format::pick_target(metric, forecast, rule, pick));
-                        span class="pick-choice" {
-                            span class="pick-word" { (format::pick_word(pick, rule)) }
-                            span class="pick-value" { (format::pick_value(metric, forecast, rule, pick)) }
+            div class="pick-line" {
+                div class="pick-options" role="radiogroup" aria-label=(format!("{} at {station_id}", metric.label())) {
+                    @for (value, pick) in &options {
+                        label class=(format!("pick-option is-{value}"))
+                              title=[format::pick_hint(metric, forecast, rule, pick)] {
+                            input type="radio" name=(name) value=(value) disabled[bounds.is_none()]
+                                  aria-label=(format::pick_target(metric, forecast, rule, pick));
+                            span class="pick-choice" { (format::pick_word(pick, rule)) }
+                        }
+                    }
+                }
+                // Percentage positions are SVG attributes, as the CSP allows no inline styles.
+                @if let Some((forecast, low, high)) = bounds {
+                    @let at = format!("{:.1}%", strip_position(forecast, low, high));
+                    svg class="pick-marks" aria-hidden="true" {
+                        line class="pick-forecast-tick" x1=(at) x2=(at) y1="-4" y2="50" {}
+                        @if high > low {
+                            text class="pick-bound" x="33.3%" y="64" { (bound(metric, low)) }
+                            text class="pick-bound" x="66.7%" y="64" { (bound(metric, high)) }
+                        } @else {
+                            text class="pick-bound" x="50%" y="64" { (metric.short_value(forecast)) }
                         }
                     }
                 }
@@ -977,6 +1012,7 @@ mod tests {
         StationForecast {
             station_id: "KPWM".into(),
             station_name: Some("Portland International, ME".into()),
+            satellite_loop: Some("/satellite/ne".into()),
             forecasts: vec![
                 (Metric::TempHigh, Some(69.0), Some(Rule::Fixed)),
                 (Metric::TempLow, Some(41.0), Some(Rule::Fixed)),
@@ -1304,6 +1340,36 @@ mod tests {
         assert!(html.contains(r#"name="KPWM_temp_high" value="over""#));
     }
 
+    /// The Satellite button beside the city opens its region's loop, which the page names but
+    /// does not download until then. A station outside NOAA's regions has no button.
+    #[test]
+    fn a_city_s_satellite_loop_downloads_only_when_opened() {
+        use crate::templates::css_check::{rule, value};
+        let html = form(PayoutDestination::LoggedOut);
+        let city = html
+            .find(r#"<span class="station-city">Portland, ME</span>"#)
+            .unwrap();
+        let button = html.find(r#"aria-controls="loop-KPWM""#).unwrap();
+        assert!(city < button && button < html.find("station-source").unwrap());
+        assert!(html.contains(r#"<figure class="station-loop" id="loop-KPWM" hidden>"#));
+        assert!(html.contains(r#"data-src="/satellite/ne""#) && html.contains(r#"preload="none""#));
+        assert!(!html.contains(r#" src="/satellite"#));
+        assert_eq!(value(rule(CSS, ".station-loop[hidden]"), "display"), "none");
+
+        let mut station = station();
+        station.satellite_loop = None;
+        let none = forecast_choices(
+            "c1",
+            &Forecasts::Ready {
+                stations: vec![station],
+                pins: vec![],
+            },
+            0,
+        )
+        .into_string();
+        assert!(!none.contains("station-loop"));
+    }
+
     #[test]
     fn entering_is_the_consent_with_one_line_about_refunds() {
         let html = form(PayoutDestination::Address("freya@lnurl.example".into()));
@@ -1381,8 +1447,10 @@ mod tests {
     }
 
     /// With a Par band the buttons are the ranges, low to high, and still say which pick each is.
+    /// Each bound is written once, under the seam it marks, and the forecast's tick sits where
+    /// the leaderboard's strip puts it.
     #[test]
-    fn lines_competitions_put_the_ranges_in_the_pick_buttons() {
+    fn lines_competitions_mark_the_bounds_on_the_pick_line() {
         let mut competition = view("c1", Phase::Upcoming, 60);
         competition.scoring_rules = ScoringRules::Lines;
         let mut station = station();
@@ -1420,11 +1488,25 @@ mod tests {
             .find(r#"aria-label="Over 70.2°F""#)
             .expect("over button");
         assert!(under < par && par < over);
-        // The button reads the range with its tenths set smaller.
-        assert!(html.contains(r#"<span class="pick-value">67<span class="tenths">.4</span>–70<span class="tenths">.2</span>°</span>"#));
+        assert!(html.contains(r#"<span class="pick-choice">In range</span>"#));
+        assert!(html.contains(r#"<text class="pick-bound" x="33.3%" y="64">67.4°</text>"#));
+        assert!(html.contains(r#"<text class="pick-bound" x="66.7%" y="64">70.2°</text>"#));
+        assert_eq!(html.matches("67.4°<").count(), 1, "each bound once");
+        assert!(html.contains(r#"class="pick-forecast-tick" x1="52.4%""#));
         assert!(!html.contains("pick-par") && !html.contains("lately"));
         // No forecast threshold is invented while the scoring range is unknown.
         assert!(html.contains(r#"value="over" disabled aria-label="Over —""#));
+        assert_eq!(
+            html.matches("pick-marks").count(),
+            1,
+            "no line marks without a range"
+        );
+
+        // Under fixed rules the middle pick is the forecast itself, written under it.
+        let fixed = form(PayoutDestination::LoggedOut);
+        assert!(fixed.contains(r#"<span class="pick-choice">Exactly</span>"#));
+        assert!(fixed.contains(r#"<text class="pick-bound" x="50%" y="64">69°</text>"#));
+        assert!(fixed.contains(r#"class="pick-forecast-tick" x1="50.0%""#));
     }
 
     #[test]

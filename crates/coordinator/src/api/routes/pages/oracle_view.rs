@@ -36,6 +36,9 @@ pub fn station_forecasts(
         .map(|station_id| StationForecast {
             station_id: station_id.clone(),
             station_name: station_name(stations, station_id),
+            satellite_loop: stations
+                .get(station_id)
+                .and_then(|station| crate::api::satellite::sector_loop(&station.state)),
             forecasts: metrics
                 .iter()
                 .map(|metric| {

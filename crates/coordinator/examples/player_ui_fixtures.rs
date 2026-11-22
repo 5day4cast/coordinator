@@ -5,6 +5,7 @@
 //! Serve the directory (python3 -m http.server) and open `<page>.html`. Scripts are left
 //! out so nothing loads or rewrites the page: each file is exactly what the server renders.
 use coordinator::{
+    api::satellite::sector_loop,
     domain::{
         leaderboard::{Metric, Phase, PickProgress, PickState, Rule},
         RefundProgress,
@@ -384,6 +385,7 @@ fn station(id: &str, name: &str, high: f64, low: f64, wind: f64) -> StationForec
     StationForecast {
         station_id: id.into(),
         station_name: Some(name.into()),
+        satellite_loop: name.rsplit(", ").next().and_then(sector_loop),
         forecasts: vec![
             (Metric::TempHigh, Some(high), Some(line(-3.6, -1.0))),
             (Metric::TempLow, Some(low), Some(line(0.4, 4.0))),

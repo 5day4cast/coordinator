@@ -688,9 +688,10 @@ fn ownership_card(row: &Ownership) -> Markup {
     }
 }
 
-/// Where `value` sits on an ownership strip, in percent. Under, In range and Over take a third
-/// each, and the outer thirds reach three range widths, at least 3 units, past the bounds.
-fn strip_position(value: f64, low: f64, high: f64) -> f64 {
+/// Where `value` sits on an ownership strip, or a pick line on the entry form, in percent. Under,
+/// In range and Over take a third each, and the outer thirds reach three range widths, at least
+/// 3 units, past the bounds.
+pub(crate) fn strip_position(value: f64, low: f64, high: f64) -> f64 {
     let third = 100.0 / 3.0;
     let past = |miss: f64| (miss / (3.0 * (high - low)).max(3.0)).min(1.0) * third * 0.9;
     if value < low {
@@ -705,7 +706,7 @@ fn strip_position(value: f64, low: f64, high: f64) -> f64 {
 }
 
 /// A bound under the strip: `70°`, or `73.4°` when it has tenths.
-fn bound(metric: Metric, value: f64) -> String {
+pub(crate) fn bound(metric: Metric, value: f64) -> String {
     let unit = metric.short_unit();
     if (value - value.round()).abs() < 0.05 {
         format!("{value:.0}{unit}")

@@ -232,32 +232,6 @@ pub fn pick_target(
     }
 }
 
-/// A pick's target for its button: the bound or range alone, its tenths smaller, the word
-/// beside it saying which side (`pick_word`). The full text is `pick_target`.
-pub fn pick_value(
-    metric: Metric,
-    forecast: Option<f64>,
-    rule: Option<Rule>,
-    pick: &ValueOptions,
-) -> Markup {
-    let (Some(forecast), Some(rule)) = (forecast, rule) else {
-        return html! { "—" };
-    };
-    let unit = metric.short_unit();
-    match (rule, pick) {
-        (Rule::Line { lower, .. }, ValueOptions::Under) => {
-            html! { (tenths(forecast + lower)) (unit) }
-        }
-        (Rule::Line { lower, upper }, ValueOptions::Par) => {
-            html! { (tenths(forecast + lower)) "–" (tenths(forecast + upper)) (unit) }
-        }
-        (Rule::Line { upper, .. }, ValueOptions::Over) => {
-            html! { (tenths(forecast + upper)) (unit) }
-        }
-        (Rule::Fixed, _) => html! { (format!("{:.0}", forecast.round())) (unit) },
-    }
-}
-
 /// Which side of the forecast a pick takes, as its button says it. Under fixed rules the
 /// middle pick is the forecast itself.
 pub fn pick_word(pick: &ValueOptions, rule: Option<Rule>) -> &'static str {
@@ -267,13 +241,6 @@ pub fn pick_word(pick: &ValueOptions, rule: Option<Rule>) -> &'static str {
         (ValueOptions::Par, _) => "In range",
         (ValueOptions::Over, _) => "Over",
     }
-}
-
-/// `73.4` with its tenth set smaller, so the whole degrees read first.
-fn tenths(value: f64) -> Markup {
-    let text = format!("{value:.1}");
-    let (whole, tenth) = text.split_once('.').unwrap_or((&text, "0"));
-    html! { (whole) span class="tenths" { "." (tenth) } }
 }
 
 /// A wind pick's bound in miles per hour, for its button's tooltip: `≈ 9–11 mph`. Temperatures
