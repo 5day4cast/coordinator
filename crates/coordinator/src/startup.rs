@@ -619,6 +619,11 @@ pub async fn build_app(
     let mut threads = HashMap::new();
     let cancel_token = CancellationToken::new();
     // Integrity scans grow with the database. Keep them off the readiness probe.
+    // `PRAGMA quick_check` reads every page, so each scan of a multi-gigabyte
+    // competitions database pulls all of it through the page cache. Every 15
+    // minutes that kept the disk busy all day and evicted the other services'
+    // caches; litestream replication and backups cover recovery, so one scan
+    // every six hours is enough to catch corruption early.
     let integrity_coordinator = coordinator.clone();
     let integrity_cancel = cancel_token.clone();
     let integrity_task = spawn_supervised(
@@ -630,7 +635,7 @@ pub async fn build_app(
                 integrity_coordinator.quick_check().await?;
                 tokio::select! {
                     () = integrity_cancel.cancelled() => return Ok(()),
-                    () = tokio::time::sleep(Duration::from_secs(15 * 60)) => {}
+                    () = tokio::time::sleep(Duration::from_secs(6 * 60 * 60)) => {}
                 }
             }
         },
