@@ -41,7 +41,10 @@
 //! An operator can write off a refund that can never finish. Cleanup then leaves its escrow
 //! alone, and the pages no longer count it as owed.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::PoisonError;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
 use coordinator_ark::{
@@ -446,6 +449,10 @@ impl Coordinator {
     /// Runs from the cleanup queue, so a refund that cannot finish now is retried later: a
     /// provider that is down, an escrow whose locktime has not passed, or a payment that failed.
     /// Each lasting problem is logged once per ticket.
+    ///
+    /// Arkade lists the escrows a pass needs to see in one listing. A refund that needed it and
+    /// still could not go on waits longer each pass it fails, up to [`MAX_REFUND_BACKOFF`],
+    /// before Arkade is asked about its escrow again.
     pub(super) async fn refund_ark_escrows(&self, competition_id: Uuid) {
         let Some(ark) = self.ark() else {
             return;
@@ -524,6 +531,7 @@ impl Coordinator {
         } else {
             (None, BTreeSet::new())
         };
+        let mut ready = Vec::new();
         for refundable in open {
             let ticket_id = refundable.escrow.ticket_id;
             let Some(player) = players.iter().find(|player| player.ticket_id == ticket_id) else {
@@ -556,15 +564,54 @@ impl Coordinator {
                 );
                 continue;
             }
+            if needs_signing(&refundable) && !self.refund_backoff.due(ticket_id, Instant::now()) {
+                debug!("The refund of ticket {ticket_id} waits before Arkade is asked again");
+                continue;
+            }
+            ready.push((refundable, player));
+        }
+        // A refund not yet spent into its swap reads its escrow from Arkade, before minting and
+        // before spending. All of them share one listing: one or two each used to spend the
+        // shared GetVtxos budget on a single competition's refunds, starving the rest of them.
+        let addresses: Vec<String> = ready
+            .iter()
+            .filter(|(refundable, _)| needs_signing(refundable))
+            .map(|(refundable, _)| refundable.escrow.escrow_address.clone())
+            .collect();
+        let listing = if addresses.is_empty() {
+            Ok(Vec::new())
+        } else {
+            coordinator_ark::indexer_budget::payment(ark.transport.vtxos(addresses))
+                .await
+                .map_err(|e| format!("Arkade will not list the escrow's VTXOs: {e}"))
+        };
+        for (refundable, player) in ready {
+            let ticket_id = refundable.escrow.ticket_id;
+            let listed = needs_signing(&refundable);
+            let listing = match &listing {
+                Ok(vtxos) => vtxos.as_slice(),
+                // A listing refused says nothing about the escrow, so the next pass asks again.
+                Err(e) if listed => {
+                    self.report_refund(ticket_id, e);
+                    continue;
+                }
+                Err(_) => &[],
+            };
             match self
-                .refund_ark_escrow(ark, session.as_ref(), refundable, player)
+                .refund_ark_escrow(ark, session.as_ref(), refundable, player, listing)
                 .await
             {
                 Ok(()) => {
+                    self.refund_backoff.clear(ticket_id);
                     self.reported.clear(REFUND_REPORTS, ticket_id);
                     info!("Refunded the escrow of ticket {ticket_id}");
                 }
-                Err(e) => self.report_refund(ticket_id, &e.detail()),
+                Err(e) => {
+                    if listed {
+                        self.refund_backoff.failed(ticket_id, Instant::now());
+                    }
+                    self.report_refund(ticket_id, &e.detail());
+                }
             }
         }
     }
@@ -712,12 +759,17 @@ impl Coordinator {
     }
 
     /// Carry one escrow's refund as far as it can go now.
+    ///
+    /// `listing` is what Arkade listed at the escrows' addresses on this pass. A refund not yet
+    /// spent into its swap reads its escrow from it, before minting and again before spending,
+    /// so minting never leaves the spend waiting for a listing of its own.
     async fn refund_ark_escrow(
         &self,
         ark: &super::Arkade,
         session: Option<&DlcKeygenSession>,
         refundable: Refundable,
         player: &RefundPlayer,
+        listing: &[coordinator_ark::VirtualTxOutPoint],
     ) -> Result<(), Error> {
         let Refundable {
             escrow,
@@ -730,7 +782,7 @@ impl Coordinator {
             Some(refund) => refund,
             None => {
                 // Nothing was ever submitted for this escrow, so it must still be unspent.
-                let listed = self.listed_escrow(ark, &escrow, outpoint).await?;
+                let listed = listed_escrow(listing, outpoint)?;
                 if listed.is_spent {
                     return Err(anyhow!(
                         "its escrow {outpoint} was spent by something other than a refund; \
@@ -765,7 +817,7 @@ impl Coordinator {
             ArkRefundState::Minted => {
                 let mut swap = self.refund_swap(ark, &refund).await?;
                 let mut built = build(ark, &script, outpoint, sats, &swap)?;
-                let listed = self.listed_escrow(ark, &escrow, outpoint).await?;
+                let listed = listed_escrow(listing, outpoint)?;
                 match escrow_spend(&listed, &built) {
                     EscrowSpend::Unspent => {
                         let session = session.context("the refund needs Keymeld, see above")?;
@@ -1444,23 +1496,6 @@ impl Coordinator {
             .await
     }
 
-    /// The escrow's VTXO, as Arkade lists it.
-    async fn listed_escrow(
-        &self,
-        ark: &super::Arkade,
-        escrow: &TicketArkEscrow,
-        outpoint: OutPoint,
-    ) -> Result<coordinator_ark::VirtualTxOutPoint, Error> {
-        coordinator_ark::indexer_budget::payment(
-            ark.transport.vtxos(vec![escrow.escrow_address.clone()]),
-        )
-        .await
-        .map_err(|e| anyhow!("Arkade will not list the escrow's VTXOs: {e}"))?
-        .into_iter()
-        .find(|vtxo| vtxo.outpoint == outpoint)
-        .ok_or_else(|| anyhow!("Arkade does not list its escrow {outpoint}").into())
-    }
-
     /// Pay the player, and give `ark-swapd` the preimage that claims the swap.
     ///
     /// The payment is looked up rather than trusted to the send, so a refund resumed after a
@@ -1535,6 +1570,85 @@ fn ticket_registration(
             .transpose()?,
         escrow_policy: sent.keymeld_escrow_policy,
     })
+}
+
+/// The escrow VTXO at `outpoint`, as the pass's `listing` shows it.
+fn listed_escrow(
+    listing: &[coordinator_ark::VirtualTxOutPoint],
+    outpoint: OutPoint,
+) -> Result<coordinator_ark::VirtualTxOutPoint, Error> {
+    listing
+        .iter()
+        .find(|vtxo| vtxo.outpoint == outpoint)
+        .cloned()
+        .ok_or_else(|| anyhow!("Arkade does not list its escrow {outpoint}").into())
+}
+
+/// How long a refund that could not go on waits before Arkade is asked about its escrow again,
+/// after its first failure in a row: until the next pass. Each further failure doubles it, up to
+/// [`MAX_REFUND_BACKOFF`].
+const FIRST_REFUND_BACKOFF: Duration = Duration::from_secs(30);
+/// An escrow that waits for Arkade to sweep it, a kickoff intent that holds it, or an operator,
+/// is listed four times an hour instead of every pass.
+const MAX_REFUND_BACKOFF: Duration = Duration::from_secs(15 * 60);
+
+/// How long to wait after the `failures`th failure in a row.
+fn refund_backoff(failures: u32) -> Duration {
+    FIRST_REFUND_BACKOFF
+        .saturating_mul(1 << failures.saturating_sub(1).min(5))
+        .min(MAX_REFUND_BACKOFF)
+}
+
+/// The refunds that need Arkade to list their escrow and could not go on, and when each may be
+/// tried again. Kept in memory: after a restart each is tried on the first pass.
+#[derive(Default)]
+pub(crate) struct RefundBackoff {
+    /// By ticket: failures in a row, and when the next try is due.
+    held: std::sync::Mutex<HashMap<Uuid, (u32, Instant)>>,
+    /// Every refund is due: for tests.
+    immediate: AtomicBool,
+}
+
+impl RefundBackoff {
+    #[cfg(test)]
+    pub(crate) fn set_immediate(&self, immediate: bool) {
+        self.immediate.store(immediate, Ordering::Relaxed);
+    }
+
+    /// Bring every wait `by` closer: for tests.
+    #[cfg(test)]
+    pub(crate) fn elapse(&self, by: Duration) {
+        for (_, due) in self.held().values_mut() {
+            *due = due.checked_sub(by).unwrap_or(*due);
+        }
+    }
+
+    fn held(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, (u32, Instant)>> {
+        self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether the refund of `ticket_id` may be tried at `now`.
+    fn due(&self, ticket_id: Uuid, now: Instant) -> bool {
+        self.immediate.load(Ordering::Relaxed)
+            || self
+                .held()
+                .get(&ticket_id)
+                .is_none_or(|(_, due)| *due <= now)
+    }
+
+    /// The refund of `ticket_id` could not go on at `now`.
+    fn failed(&self, ticket_id: Uuid, now: Instant) {
+        let mut held = self.held();
+        let failures = held
+            .get(&ticket_id)
+            .map_or(1, |(failures, _)| failures.saturating_add(1));
+        held.insert(ticket_id, (failures, now + refund_backoff(failures)));
+    }
+
+    /// The refund of `ticket_id` went as far as it could.
+    fn clear(&self, ticket_id: Uuid) {
+        self.held().remove(&ticket_id);
+    }
 }
 
 /// Whether an escrow's refund still has to be signed: it was never minted, or was minted but
@@ -1651,4 +1765,36 @@ fn build(
         swap,
     )
     .map_err(|e| anyhow!("Cannot build the refund: {e}"))?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_refund_that_keeps_failing_waits_longer_each_time_up_to_a_quarter_hour() {
+        let backoff = RefundBackoff::default();
+        let ticket = Uuid::now_v7();
+        let start = Instant::now();
+        assert!(backoff.due(ticket, start));
+        let mut now = start;
+        for wait in [30, 60, 120, 240, 480, 900, 900] {
+            backoff.failed(ticket, now);
+            assert!(!backoff.due(ticket, now + Duration::from_secs(wait - 1)));
+            now += Duration::from_secs(wait);
+            assert!(backoff.due(ticket, now), "due {wait}s after the failure");
+        }
+        assert!(
+            backoff.due(Uuid::now_v7(), start),
+            "each refund waits on its own"
+        );
+        backoff.clear(ticket);
+        assert!(backoff.due(ticket, start));
+        backoff.failed(ticket, start);
+        assert!(
+            !backoff.due(ticket, start + Duration::from_secs(29)),
+            "a refund that went on starts over"
+        );
+        assert!(backoff.due(ticket, start + Duration::from_secs(30)));
+    }
 }

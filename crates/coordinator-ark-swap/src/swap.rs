@@ -98,6 +98,8 @@ pub struct Swapper {
     pub errors: SwapErrors,
     /// The last refund `refund_tick` reached, so the next pass carries on after it.
     pub refund_turn: std::sync::Mutex<Option<Uuid>>,
+    /// The lookups of paid refunds' swaps on Arkade, which their claims share.
+    pub claim_lookups: crate::refund::ClaimLookups,
     /// The coins the last renewal tried to settle, so the same ones wait out a batch session.
     pub renewed: LastRenewal,
 }
@@ -266,8 +268,15 @@ impl Swapper {
     /// Nothing else renews a coin: it would expire a week after its batch, be swept, and take
     /// with it every escrow paid from it. The same coins are tried once a batch session, since
     /// the indexer can list them as unspent for a moment after the batch that took them.
+    ///
+    /// Whether any need renewing is read from the view's last reading when it is recent enough,
+    /// rather than from a listing of its own.
     pub async fn renew_tick(&self) {
-        let coins = match self.wallet.coins().await {
+        let coins = match self
+            .wallet
+            .recent_coins(crate::wallet::RENEWAL_READING_TTL)
+            .await
+        {
             Ok(coins) => coins,
             Err(error) => {
                 log::warn!("list the wallet's coins to renew: {error:#}");

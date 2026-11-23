@@ -46,6 +46,11 @@ const VTXO_PAGE_SIZE: i32 = 100;
 const VIEW_TTL: Duration = Duration::from_secs(120);
 /// A reading of the wallet slower than this is logged.
 const SLOW_VIEW: Duration = Duration::from_secs(5);
+/// How old a reading of the wallet's coins may be to decide whether any need renewing: the
+/// interval between renewals. The view reads the coins more often than that, so a renewal check
+/// rarely needs a listing of its own. A renewal lists the coins it settles again, and leaves out
+/// one spent since.
+pub const RENEWAL_READING_TTL: Duration = Duration::from_secs(240);
 
 type ArkClient = Client<Electrum, BoardingOnlyWallet, InMemorySwapStorage>;
 
@@ -91,6 +96,8 @@ pub struct ArkWallet {
     boards: BoardOutcomes,
     /// The unspent VTXOs as of the last listing, for `coins`. Readings take turns.
     vtxo_sync: tokio::sync::Mutex<Option<VtxoSync>>,
+    /// The last reading of the coins, until the wallet spends: see `recent_coins`.
+    reading: LastReading<Coins>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -251,6 +258,59 @@ impl<T: Clone> Cached<T> {
     }
 }
 
+/// The last reading of a value, for callers that can work from one a little old. Forgetting it,
+/// as a spend does, also refuses a reading that began before.
+pub struct LastReading<T> {
+    /// How often it was forgotten, and the reading.
+    held: std::sync::Mutex<(u64, Option<(std::time::Instant, T)>)>,
+}
+
+impl<T> Default for LastReading<T> {
+    fn default() -> Self {
+        Self {
+            held: std::sync::Mutex::new((0, None)),
+        }
+    }
+}
+
+impl<T: Clone> LastReading<T> {
+    fn held(&self) -> std::sync::MutexGuard<'_, (u64, Option<(std::time::Instant, T)>)> {
+        self.held
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Where a reading begins, for `keep`.
+    pub fn begin(&self) -> u64 {
+        self.held().0
+    }
+
+    /// Keep `value`, read from `at` on since `begun`, unless the reading was forgotten since.
+    pub fn keep(&self, begun: u64, at: std::time::Instant, value: T) {
+        let mut held = self.held();
+        if held.0 == begun {
+            held.1 = Some((at, value));
+        }
+    }
+
+    /// The reading, if it began less than `max_age` before `now`.
+    pub fn within(&self, max_age: Duration, now: std::time::Instant) -> Option<T> {
+        match &self.held().1 {
+            Some((at, value)) if now.saturating_duration_since(*at) < max_age => {
+                Some(value.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Drop the reading, and any that began before now.
+    pub fn forget(&self) {
+        let mut held = self.held();
+        held.0 = held.0.wrapping_add(1);
+        held.1 = None;
+    }
+}
+
 impl ArkWallet {
     pub async fn open(config: &Config) -> anyhow::Result<Self> {
         // Connecting through coordinator-ark installs the rustls provider before ark-client needs it.
@@ -289,6 +349,7 @@ impl ArkWallet {
             view: Cached::new(VIEW_TTL),
             boards: BoardOutcomes::default(),
             vtxo_sync: tokio::sync::Mutex::new(None),
+            reading: LastReading::default(),
         })
     }
 
@@ -366,10 +427,13 @@ impl ArkWallet {
                     coins::grouped(held.awaiting_renewal_sat(now, pay_secs)),
                 )
             })?;
-        self.client
+        let paid = self
+            .client
             .send_selection(&inputs, vec![SendReceiver::bitcoin(address, amount)])
             .await
-            .map_err(|error| anyhow::anyhow!("pay the escrow: {error}"))
+            .map_err(|error| anyhow::anyhow!("pay the escrow: {error}"));
+        self.reading.forget();
+        paid
     }
 
     /// The VTXO at `address` worth `amount` that paid it: the output of `paid_in` when the Ark
@@ -391,6 +455,21 @@ impl ArkWallet {
             .list_vtxos(GetVtxosRequest::new_for_addresses(std::iter::once(address)))
             .await?;
         Ok(payment_among(&response.vtxos, amount, since, paid_in))
+    }
+
+    /// Every VTXO at `addresses`, spent or not, in one listing. Swap and escrow addresses hold
+    /// a VTXO or two each, so the indexer answers in one page.
+    pub async fn vtxos_at(
+        &self,
+        addresses: Vec<ArkAddress>,
+    ) -> anyhow::Result<Vec<VirtualTxOutPoint>> {
+        Ok(self
+            .server
+            .client()
+            .grpc()
+            .list_vtxos(GetVtxosRequest::new_for_addresses(addresses.into_iter()))
+            .await?
+            .vtxos)
     }
 
     /// Claim a refund swap that this service paid for, into its own wallet.
@@ -510,6 +589,8 @@ impl ArkWallet {
             .collect();
         scripts.sort();
         let mut sync = self.vtxo_sync.lock().await;
+        let begun = self.reading.begin();
+        let started = std::time::Instant::now();
         let started_ms = vtxo_sync::now_ms();
         let listing = Listing::next(sync.as_ref(), &scripts, std::time::Instant::now());
         let request = listing
@@ -535,7 +616,19 @@ impl ArkWallet {
         vtxos.retain(|vtxo| {
             !unsigned.contains(&vtxo.script) || coins::recoverable_at(vtxo, info.dust, now)
         });
-        Ok(Coins::classify(&vtxos, info.dust, now))
+        let coins = Coins::classify(&vtxos, info.dust, now);
+        self.reading.keep(begun, started, coins.clone());
+        Ok(coins)
+    }
+
+    /// The wallet's unspent VTXOs as last read, if that reading began less than `max_age` ago
+    /// and the wallet has not spent since; otherwise as `coins` reads them now. For what can
+    /// work from a reading a little old, such as deciding whether any coins need renewing.
+    pub async fn recent_coins(&self, max_age: Duration) -> anyhow::Result<Coins> {
+        match self.reading.within(max_age, std::time::Instant::now()) {
+            Some(coins) => Ok(coins),
+            None => self.coins().await,
+        }
     }
 
     /// Every VTXO `request` matches, a page at a time.
@@ -644,6 +737,7 @@ impl ArkWallet {
             .settle(&mut rng)
             .await
             .map_err(|error| anyhow::anyhow!("board: {error}"));
+        self.reading.forget();
         self.boards.record(&boarded, unix_now());
         boarded
     }
@@ -661,6 +755,7 @@ impl ArkWallet {
             .settle_vtxos(&mut rng, coins, &[])
             .await
             .map_err(|error| anyhow::anyhow!("renew: {error}"));
+        self.reading.forget();
         self.boards.record(&renewed, unix_now());
         renewed
     }
@@ -688,7 +783,7 @@ pub fn load_or_create_key(path: &Path) -> anyhow::Result<Keypair> {
 /// The VTXO among an address's `vtxos` that a payment of `amount` created: the output of
 /// `paid_in` when the Ark transaction is known, spent or not; otherwise an unspent one created
 /// at or after `since` (UNIX seconds).
-fn payment_among(
+pub(crate) fn payment_among(
     vtxos: &[ark_core::server::VirtualTxOutPoint],
     amount: Amount,
     since: i64,
@@ -788,6 +883,35 @@ mod tests {
             assets: Vec::new(),
             depth: 0,
         }
+    }
+
+    /// A renewal check reuses the view's reading of the coins while it is recent, and never one
+    /// from before the wallet last spent.
+    #[test]
+    fn a_recent_reading_is_reused_until_the_wallet_spends() {
+        let reading = LastReading::<u32>::default();
+        let start = std::time::Instant::now();
+        let ttl = RENEWAL_READING_TTL;
+        assert_eq!(reading.within(ttl, start), None);
+
+        reading.keep(reading.begin(), start, 1);
+        assert_eq!(reading.within(ttl, start), Some(1));
+        assert_eq!(
+            reading.within(ttl, start + ttl - Duration::from_millis(1)),
+            Some(1)
+        );
+        assert_eq!(reading.within(ttl, start + ttl), None, "too old");
+
+        reading.forget();
+        assert_eq!(reading.within(ttl, start), None, "the wallet spent");
+
+        // A reading that began before a spend is not kept: it may list a coin the spend took.
+        let begun = reading.begin();
+        reading.forget();
+        reading.keep(begun, start, 2);
+        assert_eq!(reading.within(ttl, start), None);
+        reading.keep(reading.begin(), start, 3);
+        assert_eq!(reading.within(ttl, start), Some(3));
     }
 
     #[test]
