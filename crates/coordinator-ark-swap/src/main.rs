@@ -131,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
         invoices: Default::default(),
         errors: Default::default(),
         refund_turn: Default::default(),
+        claim_lookups: Default::default(),
         renewed: Default::default(),
     });
     // A restart must not reset an exhausted quota or crash-loop until it refills.
