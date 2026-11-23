@@ -376,6 +376,8 @@ pub struct Coordinator {
     /// The pending swaps' escrows the Arkade subscription watches, and when they were last
     /// listed.
     pub(super) escrow_watch: escrow_watch::EscrowWatch,
+    /// The escrow refunds that could not go on, and when Arkade is asked about each again.
+    pub(super) refund_backoff: super::ark_refund::RefundBackoff,
     /// One ticket request at a time per competition and player (`lock_ticket_request`).
     ticket_requests: TicketRequestLocks,
     /// Settle what is owed and take no new money; off until `with_settle_only`.
@@ -456,6 +458,7 @@ impl Coordinator {
             worker_leases,
             reported: super::Reported::default(),
             escrow_watch: Default::default(),
+            refund_backoff: Default::default(),
             ticket_requests: TicketRequestLocks::default(),
             settle_only: SettleOnly::default(),
             reconciled: Reconciled::default(),

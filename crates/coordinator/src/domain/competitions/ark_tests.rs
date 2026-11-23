@@ -505,6 +505,8 @@ impl Fixture {
         // The tests check a swap several times in a row, so every check lists the escrows, and
         // a dropped subscription is opened again at once.
         coordinator.escrow_watch.set_immediate();
+        // So does every cleanup pass try each refund again.
+        coordinator.refund_backoff.set_immediate(true);
 
         let now = OffsetDateTime::now_utc();
         let competition = Competition::new(&CreateEvent {
@@ -1481,6 +1483,97 @@ async fn a_cancelled_arkade_competition_refunds_each_funded_escrow_once() {
     assert_eq!(f.spends(), (2, 2));
     assert_eq!(f.swaps.minted.load(Ordering::SeqCst), 2);
     assert_eq!(f.ln.payments_sent(), 2, "no player is paid twice");
+    f.database.close().await.unwrap();
+}
+
+/// Arkade reads an address's whole history for every listing, and ark-swapd, the coordinator and
+/// synth share a small budget of listings. A cleanup pass asks about every escrow it has to see
+/// in one listing, and reads each escrow from it both before minting its refund and before
+/// spending it: one or two listings per escrow used up the budget on one competition's refunds.
+#[tokio::test]
+async fn a_refund_pass_asks_arkade_about_all_its_escrows_in_one_listing() {
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    let tickets = [
+        f.funded(&session, 21, true).await,
+        f.funded(&session, 23, true).await,
+        f.funded(&session, 25, true).await,
+    ];
+    f.cancel().await;
+    let before = f.arkd.listings().len();
+
+    f.clean_up().await;
+    for ticket in &tickets {
+        assert_eq!(
+            f.refund(ticket).await.unwrap().state,
+            ArkRefundState::Settled
+        );
+    }
+    assert_eq!(f.spends(), (3, 3));
+    let mut listings = f.arkd.listings().split_off(before);
+    assert_eq!(listings.len(), 1, "one listing for the pass: {listings:?}");
+    let mut listed = listings.remove(0);
+    listed.sort();
+    let mut escrows: Vec<String> = tickets
+        .iter()
+        .map(|ticket| ticket.escrow_address.clone())
+        .collect();
+    escrows.sort();
+    assert_eq!(listed, escrows);
+
+    // Spent into their swaps, the escrows need no listing any more.
+    f.coordinator.refund_ark_escrows(f.competition_id).await;
+    assert_eq!(f.arkd.listings().len(), before + 1);
+    f.database.close().await.unwrap();
+}
+
+/// A refund that cannot go on, here because something else spent its escrow, is not listed on
+/// every pass: each failure in a row doubles the wait before Arkade is asked again.
+#[tokio::test]
+async fn a_refund_that_cannot_go_on_waits_longer_each_time_before_arkade_is_asked_again() {
+    let f = Fixture::new().await;
+    f.coordinator.refund_backoff.set_immediate(false);
+    let session = f.keymeld_session().await;
+    let ticket = f.funded(&session, 21, true).await;
+    f.cancel().await;
+    f.arkd
+        .state
+        .lock()
+        .unwrap()
+        .vtxos
+        .iter_mut()
+        .for_each(|vtxo| {
+            vtxo.is_spent = true;
+            vtxo.spent_by = Some(Txid::from_byte_array([0xee; 32]));
+        });
+    let listings = || f.arkd.listings().len();
+    let elapse = |secs| {
+        f.coordinator
+            .refund_backoff
+            .elapse(std::time::Duration::from_secs(secs))
+    };
+    let before = listings();
+
+    f.clean_up().await;
+    assert_eq!(listings(), before + 1);
+    f.clean_up().await;
+    assert_eq!(listings(), before + 1, "the next pass at once waits");
+    elapse(30);
+    f.clean_up().await;
+    assert_eq!(
+        listings(),
+        before + 2,
+        "thirty seconds after the first failure"
+    );
+    elapse(30);
+    f.clean_up().await;
+    assert_eq!(listings(), before + 2, "a minute after the second");
+    elapse(30);
+    f.clean_up().await;
+    assert_eq!(listings(), before + 3);
+    assert!(f.refund(&ticket).await.is_none());
+    assert_eq!(f.swaps.minted.load(Ordering::SeqCst), 0);
+    assert_eq!(f.ln.payments_sent(), 0);
     f.database.close().await.unwrap();
 }
 

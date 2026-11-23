@@ -75,6 +75,9 @@ Every `sweep_interval_secs` the sweep:
 - Starts a runner for every active competition, after a restart or a crash.
 - Releases held invoices and reclaims escrows of dead competitions.
   One coordinator at a time does this, under the `worker:competition-cleanup` lease.
+- Refunds the Arkade escrows of dead competitions.
+  A pass lists every escrow of a competition it has to see in one `GetVtxos` call.
+  A refund that cannot go on waits before its escrow is listed again: thirty seconds, doubling to fifteen minutes.
 
 ## Leases
 
