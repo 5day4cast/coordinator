@@ -22,7 +22,7 @@ Store the `ETag` and send it in `If-None-Match` on the same URL. An unchanged pa
 
 Change timestamps are stored in a separate narrow table. Database triggers update it for competition, entry, ticket, and payout changes, including writes by an older application during a rolling deployment. The migration does not change contract or signing data.
 
-Health probes check database connectivity and supervised task status. A supervised task runs database integrity scans every 15 minutes; an integrity failure stops the service.
+Health probes check database connectivity and supervised task status. A supervised task runs a database integrity scan at startup and every six hours; an integrity failure stops the service.
 # Operator inventory
 
 `GET /api/v1/admin/competitions` keeps its complete inventory and existing response fields.
