@@ -305,6 +305,17 @@
   min-height: 3rem;
 }
 
+/* Pay until the picks are all made: plainly not ready, though a click still says what is
+   missing and goes to the first pick (entry_form.js). */
+.entry-submit .button[aria-disabled="true"],
+.entry-submit .button[aria-disabled="true"]:hover {
+  border-color: rgb(255 255 255 / 0.18);
+  background: rgb(255 255 255 / 0.06);
+  color: var(--dim);
+  box-shadow: none;
+  cursor: not-allowed;
+}
+
 /* On a narrow screen the panel follows the picks and stays pinned above the tab bar while
    they scroll by; only the count, Pay and anything that needs saying show. */
 @media screen and (max-width: 1023px) {

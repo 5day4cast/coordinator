@@ -273,8 +273,9 @@ pub fn entry_form(
                         // relabels the button when the paid notice comes or goes with a log-in, and hides
                         // it while the notice says no ticket would be issued; while entries are paused
                         // there is no price to go back to.
+                        // No picks yet, so Pay looks unavailable until `entry_form.js` counts them all.
                         button type="button" id="submitEntry" class=(pay_class)
-                               disabled[paused.is_some() && paid.ticket.is_none()]
+                               disabled[paused.is_some() && paid.ticket.is_none()] aria-disabled="true"
                                data-pay-label=[paused.is_none().then_some(&pay_label)] {
                             @if paid.ticket.is_some() {
                                 (FINISH_LABEL)
@@ -892,7 +893,9 @@ mod tests {
         // Paused entries take no new money; a paid ticket is still entered.
         let paused = form(Some(&ticket), NetworkFee::Paused(600));
         let button = paused.find(r#"id="submitEntry""#).unwrap();
-        assert!(!paused[button..paused[button..].find('>').unwrap() + button].contains("disabled"));
+        assert!(
+            !paused[button..paused[button..].find('>').unwrap() + button].contains(" disabled")
+        );
         assert!(paused[button..].contains(">Enter</button>"));
         let unpaid = form(None, NetworkFee::Estimate(50));
         assert!(!unpaid.contains("Paid — make"));
@@ -995,6 +998,8 @@ mod tests {
         assert!(
             open.contains(r#"id="submitEntry" class="button is-primary is-medium is-fullwidth""#)
         );
+        // With no picks made yet, Pay looks unavailable.
+        assert!(open.contains(r#"is-fullwidth" aria-disabled="true""#));
         assert!(!open.contains("data-pay-refused"));
 
         let ticket = PaidTicket {
