@@ -273,8 +273,9 @@ pub fn entry_form(
                         // relabels the button when the paid notice comes or goes with a log-in, and hides
                         // it while the notice says no ticket would be issued; while entries are paused
                         // there is no price to go back to.
+                        // No picks yet, so Pay looks unavailable until `entry_form.js` counts them all.
                         button type="button" id="submitEntry" class=(pay_class)
-                               disabled[paused.is_some() && paid.ticket.is_none()]
+                               disabled[paused.is_some() && paid.ticket.is_none()] aria-disabled="true"
                                data-pay-label=[paused.is_none().then_some(&pay_label)] {
                             @if paid.ticket.is_some() {
                                 (FINISH_LABEL)
@@ -651,9 +652,8 @@ pub fn ticket_status(url: &str, progress: TicketProgress) -> Markup {
 
 /// Thresholds and a range for one forecast, as radio buttons named `KPWM_temp_high`, none
 /// checked at first; choosing the checked one again takes the pick back (`entry_form.js`).
-/// The buttons are the three sides of the leaderboard's ownership strip, each bound written once
-/// under the seam it marks and NOAA's forecast a dashed tick where it falls. Each button says
-/// which side it takes; its label reads the whole pick.
+/// The buttons sit beside the forecast's thermometer, each bound written once on its scale.
+/// Each button says which side it takes; its label reads the whole pick.
 pub(crate) fn pick_row(
     station_id: &str,
     metric: Metric,
@@ -661,7 +661,6 @@ pub(crate) fn pick_row(
     rule: Option<Rule>,
 ) -> Markup {
     use crate::infra::oracle::ValueOptions;
-    use crate::templates::fragments::leaderboard::{bound, strip_position};
     let name = format!("{station_id}_{}", metric.id());
     let options = [
         ("under", ValueOptions::Under),
@@ -686,7 +685,7 @@ pub(crate) fn pick_row(
                     None => { span class="pick-forecast is-missing" { "no forecast yet" } }
                 }
             }
-            div class="pick-line" {
+            div class="pick-line" data-metric=(metric.id()) {
                 div class="pick-options" role="radiogroup" aria-label=(format!("{} at {station_id}", metric.label())) {
                     @for (value, pick) in &options {
                         label class=(format!("pick-option is-{value}"))
@@ -697,19 +696,66 @@ pub(crate) fn pick_row(
                         }
                     }
                 }
-                // Percentage positions are SVG attributes, as the CSP allows no inline styles.
-                @if let Some((forecast, low, high)) = bounds {
-                    @let at = format!("{:.1}%", strip_position(forecast, low, high));
-                    svg class="pick-marks" aria-hidden="true" {
-                        line class="pick-forecast-tick" x1=(at) x2=(at) y1="-4" y2="50" {}
-                        @if high > low {
-                            text class="pick-bound" x="33.3%" y="64" { (bound(metric, low)) }
-                            text class="pick-bound" x="66.7%" y="64" { (bound(metric, high)) }
-                        } @else {
-                            text class="pick-bound" x="50%" y="64" { (metric.short_value(forecast)) }
-                        }
-                    }
+                (thermometer(bounds))
+            }
+        }
+    }
+}
+
+/// A pick's height (entry_form.css): each forecast is a thermometer with its three picks stacked
+/// beside the tube, Over on top.
+const GLASS_ZONE: f64 = 44.0;
+
+/// A forecast's thermometer: empty until a pick fills it from the bulb up through the pick's part
+/// (entry_form.css), with the forecast marked beside it and the bounds on the scale. SVG units
+/// are CSS pixels, so it lines up with the picks.
+fn thermometer(bounds: Option<(f64, f64, f64)>) -> Markup {
+    use crate::templates::fragments::leaderboard::strip_position;
+    const TUBE: f64 = 31.0;
+    let top_of_bulb = 3.0 * GLASS_ZONE;
+    let bulb = top_of_bulb + 18.0;
+    let marks = bounds.map(|(forecast, low, high)| {
+        let level = top_of_bulb * (1.0 - strip_position(forecast, low, high) / 100.0);
+        // Bare numbers, as on a thermometer, since the column's head names the unit. Both
+        // take a decimal when either needs one, so they line up.
+        let decimals = usize::from([low, high].iter().any(|v| (v - v.round()).abs() >= 0.05));
+        let bounds = if high > low {
+            vec![
+                (GLASS_ZONE, format!("{high:.decimals$}")),
+                (2.0 * GLASS_ZONE, format!("{low:.decimals$}")),
+            ]
+        } else {
+            vec![(1.5 * GLASS_ZONE, format!("{:.0}", forecast.round()))]
+        };
+        (level, bounds)
+    });
+    // Where each pick's fill tops out: the tube fills from the bulb up through the pick's part.
+    let tops = [
+        ("over", 0.0),
+        ("par", GLASS_ZONE),
+        ("under", 2.0 * GLASS_ZONE),
+    ];
+    html! {
+        svg class="pick-glass" aria-hidden="true" {
+            rect class="glass-tube" x=(TUBE - 8.0) y="-4" width="16" height=(bulb + 4.0) rx="8" {}
+            circle class="glass-tube" cx=(TUBE) cy=(bulb) r="14" {}
+            @if marks.is_some() {
+                @for (value, top) in tops {
+                    rect class=(format!("glass-fill glass-fill-{value}")) x=(TUBE - 4.0) y=(top)
+                         width="8" height=(bulb - top) rx="4" {}
                 }
+            }
+            circle class="glass-bulb" cx=(TUBE) cy=(bulb) r="10" {}
+            circle class="glass-shine" cx=(TUBE - 4.0) cy=(bulb - 4.0) r="3" {}
+            @for y in (1..12).map(|step| f64::from(step) * GLASS_ZONE / 4.0).filter(|y| y % GLASS_ZONE != 0.0) {
+                line class="glass-tick" x1=(TUBE - 12.0) x2=(TUBE - 9.0) y1=(y) y2=(y) {}
+            }
+            @if let Some((level, bounds)) = &marks {
+                @for (y, value) in bounds {
+                    line class="glass-bound-line" x1=(TUBE - 13.0) x2=(TUBE + 8.0) y1=(y) y2=(y) {}
+                    text class="glass-bound" x=(TUBE - 15.0) y=(y + 3.0) { (value) }
+                }
+                path class="glass-mark" d=(format!("M{} {level:.1}l6 -4v8z", TUBE + 9.0)) {}
             }
         }
     }
@@ -847,7 +893,9 @@ mod tests {
         // Paused entries take no new money; a paid ticket is still entered.
         let paused = form(Some(&ticket), NetworkFee::Paused(600));
         let button = paused.find(r#"id="submitEntry""#).unwrap();
-        assert!(!paused[button..paused[button..].find('>').unwrap() + button].contains("disabled"));
+        assert!(
+            !paused[button..paused[button..].find('>').unwrap() + button].contains(" disabled")
+        );
         assert!(paused[button..].contains(">Enter</button>"));
         let unpaid = form(None, NetworkFee::Estimate(50));
         assert!(!unpaid.contains("Paid — make"));
@@ -950,6 +998,8 @@ mod tests {
         assert!(
             open.contains(r#"id="submitEntry" class="button is-primary is-medium is-fullwidth""#)
         );
+        // With no picks made yet, Pay looks unavailable.
+        assert!(open.contains(r#"is-fullwidth" aria-disabled="true""#));
         assert!(!open.contains("data-pay-refused"));
 
         let ticket = PaidTicket {
@@ -1507,24 +1557,45 @@ mod tests {
             .expect("over button");
         assert!(under < par && par < over);
         assert!(html.contains(r#"<span class="pick-choice">In range</span>"#));
-        assert!(html.contains(r#"<text class="pick-bound" x="33.3%" y="64">67.4°</text>"#));
-        assert!(html.contains(r#"<text class="pick-bound" x="66.7%" y="64">70.2°</text>"#));
-        assert_eq!(html.matches("67.4°<").count(), 1, "each bound once");
-        assert!(html.contains(r#"class="pick-forecast-tick" x1="52.4%""#));
+        assert!(html.contains(r#"<div class="pick-line" data-metric="temp_high">"#));
+        // Each bound once, on the thermometer's scale, and the forecast marked beside the tube.
+        assert!(html.contains(r#"<text class="glass-bound" x="16" y="47">70.2</text>"#));
+        assert!(html.contains(r#"<text class="glass-bound" x="16" y="91">67.4</text>"#));
+        assert_eq!(html.matches(">67.4<").count(), 1, "each bound once");
+        assert!(
+            html.contains(r#"class="glass-mark" d="M40 62.9l6 -4v8z""#),
+            "{html}"
+        );
         assert!(!html.contains("pick-par") && !html.contains("lately"));
         // No forecast threshold is invented while the scoring range is unknown.
         assert!(html.contains(r#"value="over" disabled aria-label="Over —""#));
         assert_eq!(
-            html.matches("pick-marks").count(),
+            html.matches("glass-mark").count(),
             1,
-            "no line marks without a range"
+            "no marks without a range"
         );
 
-        // Under fixed rules the middle pick is the forecast itself, written under it.
+        // Under fixed rules the middle pick is the forecast itself, written beside it.
         let fixed = form(PayoutDestination::LoggedOut);
         assert!(fixed.contains(r#"<span class="pick-choice">Exactly</span>"#));
-        assert!(fixed.contains(r#"<text class="pick-bound" x="50%" y="64">69°</text>"#));
-        assert!(fixed.contains(r#"class="pick-forecast-tick" x1="50.0%""#));
+        assert!(fixed.contains(r#"<text class="glass-bound" x="16" y="69">69</text>"#));
+        assert!(fixed.contains(r#"class="glass-mark" d="M40 66.0l6 -4v8z""#));
+    }
+
+    #[test]
+    fn the_thermometer_lines_up_its_bounds_and_fills_up_through_the_pick() {
+        let glass = thermometer(Some((77.0, 73.4, 76.0))).into_string();
+        assert!(glass.contains(r#"y="47">76.0</text>"#), "{glass}");
+        assert!(glass.contains(r#"y="91">73.4</text>"#));
+        // Over fills the whole tube; Under only its bottom part.
+        assert!(glass
+            .contains(r#"class="glass-fill glass-fill-over" x="27" y="0" width="8" height="150""#));
+        assert!(glass.contains(
+            r#"class="glass-fill glass-fill-under" x="27" y="88" width="8" height="62""#
+        ));
+
+        let unpickable = thermometer(None).into_string();
+        assert!(!unpickable.contains("glass-fill"));
     }
 
     #[test]

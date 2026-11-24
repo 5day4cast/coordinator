@@ -589,6 +589,8 @@ function showPicksLeft(form) {
   const rows = parseInt(form.dataset.pickRows, 10) || need;
   const made = Object.values(collectPicks(form)).reduce((n, station) => n + Object.keys(station).length, 0);
   counter.textContent = picksLeft(made, need, rows);
+  // Pay looks unavailable until the picks are exactly right; a click still says what's missing.
+  document.getElementById("submitEntry")?.setAttribute("aria-disabled", String(made !== need));
   showEntryPanel(form, made, need);
 }
 

@@ -278,7 +278,7 @@ fn walkthrough() -> Markup {
                         }
                         div class="station-rows" {
                             (pick_row("KORD", Metric::TempHigh, Some(77.0), Some(band)))
-                            p class="help-pointer" { "↑ " (callout(5)) }
+                            p class="help-pointer" { "← " (callout(5)) }
                         }
                     }
                     button type="button" class="button is-primary" { "Lock in 9 picks · 5,687 sats" (callout(6)) }
@@ -289,7 +289,7 @@ fn walkthrough() -> Markup {
                     li { "What first place wins once the result is final." }
                     li { "The city and NOAA forecast: here, a 77°F high for Chicago. The city tooltip identifies the airport station." }
                     li {
-                        "Your pick, left to right: Under 73.4°F, In range 73.4–76.0°F (both ends included), or Over 76.0°F. "
+                        "Your pick, bottom to top: Under 73.4°F, In range 73.4–76.0°F (both ends included), or Over 76.0°F. "
                         "Choose one range for each category. You can change a pick before paying."
                     }
                     li { "Pay the Lightning invoice and you're in. Your picks show on the leaderboard once entries close." }

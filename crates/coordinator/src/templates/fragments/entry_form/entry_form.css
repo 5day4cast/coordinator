@@ -305,6 +305,17 @@
   min-height: 3rem;
 }
 
+/* Pay until the picks are all made: plainly not ready, though a click still says what is
+   missing and goes to the first pick (entry_form.js). */
+.entry-submit .button[aria-disabled="true"],
+.entry-submit .button[aria-disabled="true"]:hover {
+  border-color: rgb(255 255 255 / 0.18);
+  background: rgb(255 255 255 / 0.06);
+  color: var(--dim);
+  box-shadow: none;
+  cursor: not-allowed;
+}
+
 /* On a narrow screen the panel follows the picks and stays pinned above the tab bar while
    they scroll by; only the count, Pay and anything that needs saying show. */
 @media screen and (max-width: 1023px) {
@@ -598,55 +609,57 @@
   background: rgb(8 18 48 / 0.55);
 }
 
-.entry-form .pick-row {
+/* Each forecast is a thermometer in its colour, its three picks beside the tube with Over on
+   top; a city's forecasts sit side by side. The whole row of a pick is its tap. */
+.entry-form .station-rows {
   display: grid;
-  grid-template-columns: 8.5rem minmax(0, 1fr);
-  align-items: center;
-  gap: 0.5rem 1rem;
-  padding: 0.65rem 1rem;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 15rem);
+  justify-content: space-around;
+  gap: 0.4rem;
+  padding: 0.6rem 0.45rem 0.75rem;
 }
 
-.entry-form .pick-row + .pick-row {
-  border-top: 1px solid rgb(61 95 214 / 0.35);
-}
-
+/* The name over the forecast, so "Peak wind 7 kt" fits a 320 px phone's column. */
 .entry-form .pick-metric {
   display: grid;
+  margin-bottom: 0.4rem;
+  white-space: nowrap;
 }
 
 .entry-form .pick-label {
-  font-size: 0.8rem;
+  font-size: 0.68rem;
   font-weight: 600;
+  line-height: 1.2;
   color: var(--dim);
 }
 
 .entry-form .pick-forecast {
-  font-size: 2rem;
+  font-size: 1.45rem;
   line-height: 1;
 }
 
 .entry-form .pick-forecast.is-missing {
   font-family: var(--font-body);
-  font-size: 0.85rem;
+  font-size: 0.7rem;
   font-style: italic;
+  white-space: normal;
 }
 
-/* A forecast's picks are the leaderboard's ownership strip, tall enough to tap: each side a
-   solid shade of its colour and filled once picked, its bounds under the seams. */
+.pick-line[data-metric="temp_high"] { --m: var(--metric-high); }
+.pick-line[data-metric="temp_low"] { --m: var(--metric-low); }
+.pick-line[data-metric="wind_speed"] { --m: var(--metric-wind); }
+
+/* Room under the picks for the bulb. */
 .pick-line {
   position: relative;
-  padding-bottom: 20px;
+  padding-bottom: 34px;
 }
 
 .pick-options {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 3px;
+  display: flex;
+  flex-direction: column-reverse;
 }
-
-.pick-option.is-under { --side: var(--cold); }
-.pick-option.is-par { --side: var(--gold); }
-.pick-option.is-over { --side: var(--warm); }
 
 .pick-option input {
   position: absolute;
@@ -654,34 +667,35 @@
   pointer-events: none;
 }
 
-/* 46 px tall: a pick is tapped more than anything else on the page. */
+/* 2 + 40 + 2 px: GLASS_ZONE in entry_form/mod.rs; the left 48 px is the tube and its scale.
+   The button's fill answers a tap, as the browser's grey flash would cover the whole row. */
+.pick-option {
+  display: block;
+  padding: 2px 0 2px 48px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
 .pick-option .pick-choice {
   display: grid;
   place-items: center;
-  height: 46px;
-  padding: 0 0.3rem;
-  /* Mixed with the night, not see-through: white reads on each at 4.5:1 or better. */
-  background: color-mix(in srgb, var(--side) 45%, var(--night));
-  font-size: 0.7rem;
+  height: 40px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--m) 12%, transparent);
+  box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--m) 60%, transparent);
+  /* Narrower phones, smaller type: "Exactly" fits a 360 px phone. */
+  font-size: clamp(0.5rem, 2.45vw, 0.7rem);
   font-weight: 700;
-  letter-spacing: 0.1em;
+  letter-spacing: 0.04em;
+  line-height: 1.1;
   text-transform: uppercase;
   text-align: center;
-  cursor: pointer;
   user-select: none;
   transition: background-color 0.12s ease;
 }
 
-.pick-option:first-child .pick-choice {
-  border-radius: 8px 0 0 8px;
-}
-
-.pick-option:last-child .pick-choice {
-  border-radius: 0 8px 8px 0;
-}
-
 .pick-option:hover .pick-choice {
-  background: color-mix(in srgb, var(--side) 60%, var(--night));
+  background: color-mix(in srgb, var(--m) 24%, transparent);
 }
 
 .pick-option input:focus-visible + .pick-choice {
@@ -690,9 +704,9 @@
 }
 
 .pick-option input:checked + .pick-choice {
-  background: var(--side);
+  background: var(--m);
   color: var(--night);
-  box-shadow: inset 0 0 0 2px var(--ink);
+  box-shadow: none;
 }
 
 .pick-option input:disabled + .pick-choice {
@@ -700,8 +714,8 @@
   opacity: 0.4;
 }
 
-/* SVG units are CSS pixels: the tick crosses the 46 px strip and the bounds sit under it. */
-.pick-marks {
+/* The thermometer (pick_row), drawn in CSS pixels. */
+.pick-glass {
   position: absolute;
   inset: 0;
   width: 100%;
@@ -710,16 +724,51 @@
   pointer-events: none;
 }
 
-.pick-forecast-tick {
-  stroke: var(--ink);
-  stroke-width: 2;
-  stroke-dasharray: 4 3;
+.glass-tube {
+  fill: rgb(255 255 255 / 0.07);
+  stroke: #c8d4ff;
+  stroke-width: 1.5;
 }
 
-.pick-bound {
+.glass-bulb,
+.glass-mark {
+  fill: var(--m);
+}
+
+/* A pick fills the tube from the bulb up through its part. */
+.glass-fill {
+  fill: var(--m);
+  opacity: 0;
+  filter: drop-shadow(0 0 4px var(--m));
+  transition: opacity 0.2s ease;
+}
+
+.pick-line:has(input[value="over"]:checked) .glass-fill-over,
+.pick-line:has(input[value="par"]:checked) .glass-fill-par,
+.pick-line:has(input[value="under"]:checked) .glass-fill-under {
+  opacity: 1;
+}
+
+.glass-shine {
+  fill: #fff;
+  opacity: 0.55;
+}
+
+.glass-tick {
+  stroke: #c8d4ff;
+  stroke-opacity: 0.45;
+}
+
+.glass-bound-line {
+  stroke: #fff;
+  stroke-width: 1.5;
+}
+
+.glass-bound {
   fill: var(--dim);
-  font-size: 0.78rem;
-  text-anchor: middle;
+  font-size: 0.58rem;
+  font-weight: 600;
+  text-anchor: end;
   font-variant-numeric: tabular-nums;
 }
 
@@ -777,24 +826,26 @@
   opacity: 0;
 }
 
-/* Phones: the forecast above its three picks. */
-@media screen and (max-width: 600px) {
-  .entry-form .pick-row {
-    grid-template-columns: minmax(0, 1fr);
-    padding: 0.6rem 0.75rem;
+@media screen and (min-width: 601px) {
+  .entry-form .station-rows {
+    gap: 1.5rem;
+    padding: 1rem 1.25rem 1.1rem;
   }
 
-  .entry-form .pick-metric {
-    grid-template-columns: auto auto;
-    justify-content: start;
-    align-items: baseline;
-    gap: 0.5rem;
+  .entry-form .pick-label {
+    font-size: 0.8rem;
   }
 
   .entry-form .pick-forecast {
-    font-size: 1.6rem;
+    font-size: 1.8rem;
   }
 
+  .pick-option .pick-choice {
+    letter-spacing: 0.08em;
+  }
+}
+
+@media screen and (max-width: 600px) {
   .station-source {
     margin-left: 0;
   }
